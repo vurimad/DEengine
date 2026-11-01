@@ -9,11 +9,14 @@
 #include "platform/platform.h"
 #include "platform/thread.h"
 #include "platform/time.h"
+#include "platform/vfs.h"
 #include "platform/window.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <span>
+#include <string_view>
 
 using namespace de::core::literals;
 using de::platform::ActionId;
@@ -46,6 +49,7 @@ bool has_flag(int argc, char** argv, const char* flag) {
 // Placeholder loop until the frame loop lands (M0b): opens the window, pumps events, samples input
 // and logs actions, so the platform layer can be tried by hand.
 //   --frames N       exit after N frames (smoke runs)
+//   --game-dir DIR   folder mounted as game:/ (default ./cooked)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.15)
 //   --show-sticks    deadzone off; log raw stick values twice a second, to measure drift
 int main(int argc, char** argv) {
@@ -62,6 +66,33 @@ int main(int argc, char** argv) {
     const de::core::JobSystem jobs(de::core::JobSystemDesc{
         .on_worker_start = [](uint32_t /*index*/, const char* name) { de::platform::set_current_thread_name(name); }});
     DE_LOG_INFO("engine", "job system: %u workers", jobs.worker_count());
+
+    // game:/ is the cooked data folder (the cooker arrives in M0b): ./cooked unless --game-dir says otherwise.
+    const char* game_dir = flag_value(argc, argv, "--game-dir");
+    auto vfs = de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked"});
+    if (!vfs) {
+        return EXIT_FAILURE;
+    }
+    // A round trip through temp:/ (emptied at every start): blocking atomic write, async read back.
+    {
+        constexpr std::string_view kProbe = "DEengine vfs probe";
+        if (!vfs->write_file("temp:/vfs_probe.txt", std::as_bytes(std::span(kProbe.data(), kProbe.size()))).ok()) {
+            return EXIT_FAILURE;
+        }
+        std::byte buffer[64];
+        const auto read =
+            vfs->read({.path = "temp:/vfs_probe.txt", .dest = buffer, .priority = de::platform::IoPriority::Critical});
+        while (read.ok() && (vfs->status(*read) == de::platform::ReadStatus::Pending ||
+                             vfs->status(*read) == de::platform::ReadStatus::InFlight)) {
+            de::platform::sleep_ns(de::platform::kNsPerMs / 10);
+        }
+        const auto bytes = read.ok() ? vfs->finish(*read) : de::core::Result<size_t>(de::core::fail(read.error()));
+        const bool round_trip = bytes.ok() && std::string_view(reinterpret_cast<const char*>(buffer), *bytes) == kProbe;
+        DE_LOG_INFO("vfs", "temp:/ round trip %s", round_trip ? "ok" : "FAILED");
+        if (!round_trip) {
+            return EXIT_FAILURE;
+        }
+    }
 
     auto window = de::platform::Window::create({.title = "DEengine"});
     if (!window) {

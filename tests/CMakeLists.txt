@@ -7,6 +7,7 @@ add_executable(de_tests
     core/arena_test.cpp
     core/array_test.cpp
     core/assert_test.cpp
+    core/fixed_string_test.cpp
     core/frame_allocator_test.cpp
     core/function_ref_test.cpp
     core/hash_map_test.cpp
@@ -22,7 +23,8 @@ add_executable(de_tests
     core/version_test.cpp
     core/work_stealing_deque_test.cpp
     platform/input_test.cpp
-    platform/thread_test.cpp)
+    platform/thread_test.cpp
+    platform/vfs_test.cpp)
 
 # Platform tests never open a window or initialize SDL's video, so they run on headless CI.
 target_link_libraries(de_tests PRIVATE de::core de::platform de::compile_options doctest::doctest Threads::Threads)

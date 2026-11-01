@@ -20,6 +20,7 @@ The foundation every other system builds on: the core library (containers, strin
 | `hash_map.h` | `HashMap<K, V>` | `std::unordered_map` underneath |
 | `slot_map.h` | `SlotMap<T>`, `SlotHandle<T>` | Own, on `Array` |
 | `string_id.h` | `StringId`, `"name"_sid` | Own (FNV-1a 64, constexpr) |
+| `fixed_string.h` | `FixedString<N>` | Own: inline, never allocates |
 | `function_ref.h` | `FunctionRef<R(Args...)>` | Own |
 | `result.h` | `Result<T, E>`, `Error`, `fail()` | Own |
 | `hash.h` | `Hash<T>`, `mix64`, `fnv1a_64` | Own |

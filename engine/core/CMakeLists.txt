@@ -12,6 +12,7 @@ add_library(de_core STATIC
     compiler.h
     detail/std_allocator.h
     detail/work_stealing_deque.h
+    fixed_string.h
     frame_allocator.cpp
     frame_allocator.h
     function_ref.h
