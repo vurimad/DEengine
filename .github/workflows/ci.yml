@@ -13,6 +13,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Ninja, plus the X11 and Wayland headers SDL3 builds its Linux window backends against.
+  LINUX_PACKAGES: >-
+    ninja-build libx11-dev libxft-dev libxext-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
+
 jobs:
   build:
     name: Build & test (${{ matrix.preset }})
@@ -31,7 +36,7 @@ jobs:
 
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_PACKAGES
 
       - name: Set up MSVC x64 environment
         if: runner.os == 'Windows'
@@ -83,7 +88,7 @@ jobs:
           wget -qO llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x llvm.sh
           sudo ./llvm.sh 22
-          sudo apt-get install -y clang-format-22 clang-tidy-22 ninja-build
+          sudo apt-get install -y clang-format-22 clang-tidy-22 $LINUX_PACKAGES
 
       - name: clang-format
         run: git ls-files '*.h' '*.hpp' '*.cpp' | xargs clang-format-22 --dry-run --Werror
@@ -96,5 +101,6 @@ jobs:
       - name: Configure (compile_commands.json for clang-tidy)
         run: cmake --preset linux-clang
 
+      # Windows-only sources aren't compiled on Linux, so they have no compile command here.
       - name: clang-tidy
-        run: git ls-files '*.cpp' | xargs -P "$(nproc)" -n 1 clang-tidy-22 -p build/linux-clang --quiet
+        run: git ls-files '*.cpp' ':!:*_win32.cpp' | xargs -P "$(nproc)" -n 1 clang-tidy-22 -p build/linux-clang --quiet

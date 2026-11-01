@@ -18,9 +18,12 @@ add_executable(de_tests
     core/slot_map_test.cpp
     core/string_id_test.cpp
     core/test_support.h
-    core/version_test.cpp)
+    core/version_test.cpp
+    platform/input_test.cpp
+    platform/thread_test.cpp)
 
-target_link_libraries(de_tests PRIVATE de::core de::compile_options doctest::doctest Threads::Threads)
+# Platform tests never open a window or initialize SDL's video, so they run on headless CI.
+target_link_libraries(de_tests PRIVATE de::core de::platform de::compile_options doctest::doctest Threads::Threads)
 
 # The engine builds without exceptions, so tests do too. REQUIRE failures terminate the run.
 target_compile_definitions(de_tests PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
