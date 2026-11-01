@@ -35,7 +35,8 @@ struct Hash<SlotHandle<T>> {
 // so iteration order is unspecified. Lookup by handle is O(1).
 //
 // Slot generations are odd while the slot holds a value and even while it is free, so a
-// handle (always odd) only matches a live slot of the same generation.
+// handle (always odd) only matches a live slot of the same generation. A slot whose generation
+// would wrap is retired instead of reused (after 2^31 reuses: 8 bytes lost, safety kept).
 template <typename T>
 class SlotMap {
 public:
@@ -43,6 +44,29 @@ public:
 
     SlotMap() : SlotMap(heap_allocator()) {}
     explicit SlotMap(Allocator& allocator) : values_(allocator), value_slots_(allocator), slots_(allocator) {}
+
+    SlotMap(const SlotMap&) = delete;
+    SlotMap& operator=(const SlotMap&) = delete;
+
+    // The source is left empty and reusable: its free list must not point into its emptied slots.
+    SlotMap(SlotMap&& other) noexcept
+        : values_(std::move(other.values_)), value_slots_(std::move(other.value_slots_)),
+          slots_(std::move(other.slots_)), free_head_(other.free_head_) {
+        other.free_head_ = kNoSlot;
+    }
+
+    SlotMap& operator=(SlotMap&& other) noexcept {
+        if (this != &other) {
+            values_ = std::move(other.values_);
+            value_slots_ = std::move(other.value_slots_);
+            slots_ = std::move(other.slots_);
+            free_head_ = other.free_head_;
+            other.free_head_ = kNoSlot;
+        }
+        return *this;
+    }
+
+    ~SlotMap() = default;
 
     size_t size() const { return values_.size(); }
     [[nodiscard]] bool empty() const { return values_.empty(); }
@@ -103,6 +127,9 @@ public:
         }
 
         slot.generation += 1; // odd (live) -> even (free)
+        if (slot.generation == 0) {
+            return true; // generation wrapped: retire the slot, so no old handle can ever match it again
+        }
         slot.value_or_next_free = free_head_;
         free_head_ = handle.index;
         return true;
@@ -117,6 +144,9 @@ public:
             Slot& slot = slots_[i];
             if ((slot.generation & 1U) != 0) {
                 slot.generation += 1;
+            }
+            if (slot.generation == 0) {
+                continue; // retired (generation wrapped)
             }
             slot.value_or_next_free = free_head_;
             free_head_ = static_cast<uint32_t>(i);

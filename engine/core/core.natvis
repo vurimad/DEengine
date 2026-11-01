@@ -33,7 +33,7 @@
   </Type>
 
   <Type Name="de::core::SlotMap&lt;*&gt;">
-    <DisplayString>{{ size={values_.items_} }}</DisplayString>
+    <DisplayString>{values_}</DisplayString>
     <Expand>
       <ExpandedItem>values_</ExpandedItem>
       <Item Name="[slots]">slots_</Item>

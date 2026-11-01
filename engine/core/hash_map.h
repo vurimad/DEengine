@@ -16,6 +16,9 @@ namespace de::core {
 // with Hash<K>. The API is shaped for the open-addressing table that replaces it: lookups
 // return a pointer or null, nothing inserts behind your back, and iteration order is unspecified.
 // Not copyable. Pointers returned by find stay valid until the map is modified.
+//
+// Phase 1 cost to know: MSVC's unordered_map allocates a sentinel node for the moved-from map,
+// so moving a HashMap allocates on Windows. Don't move maps per frame until the own table lands.
 template <typename K, typename V, typename H = Hash<K>>
 class HashMap {
 public:

@@ -24,7 +24,7 @@ The foundation every other system builds on: the core library (containers, strin
 - No dependencies on other engine folders. Everything else may depend on `core`.
 - Containers built on std expose only our API; no std-only methods leak out, so the implementation can be swapped without touching callers.
 - Every container takes an `Allocator&` (defaulting to the heap) and allocates only through it.
-- Containers are not copyable: copies are explicit (`assign`). Moves are cheap and leave the source empty.
+- Containers are not copyable: copies are explicit (e.g. `Array::assign`). Moves leave the source empty and reusable, and are cheap (except phase 1 `HashMap` on MSVC, which allocates a sentinel node).
 - Removal names its cost: `remove_swap` is O(1) and reorders, `remove_ordered` is O(n) and keeps order.
 - Lookups return a pointer or null; nothing inserts behind your back (`find_or_insert` is explicit).
 - Debug and dev builds check bounds and invariants with `DE_ASSERT`; ship builds don't evaluate them.

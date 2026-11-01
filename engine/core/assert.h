@@ -20,5 +20,5 @@ namespace de::core {
 #else
 // Still type-checked and counts as a use of its variables, but never evaluated.
 #define DE_ASSERT(condition) static_cast<void>(true || (condition))
-#define DE_ASSERT_MSG(condition, message) static_cast<void>(true || (condition))
+#define DE_ASSERT_MSG(condition, message) static_cast<void>(true || (condition) || (static_cast<void>(message), false))
 #endif

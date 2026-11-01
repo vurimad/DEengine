@@ -122,6 +122,30 @@ TEST_CASE("constructs and destroys elements exactly once") {
     CHECK(counting.live_bytes == 0);
 }
 
+TEST_CASE("a moved-from map is empty and reusable") {
+    SlotMap<int> source;
+    const auto removed = source.insert(1);
+    const auto kept = source.insert(2);
+    source.remove(removed); // leaves a free slot: the free list must not survive the move
+
+    SlotMap<int> target(std::move(source));
+    REQUIRE(target.get(kept) != nullptr);
+    CHECK(*target.get(kept) == 2);
+
+    CHECK(source.empty()); // NOLINT(bugprone-use-after-move): moved-from state is specified
+    const auto fresh = source.insert(3);
+    CHECK(fresh.index == 0);
+    CHECK(*source.get(fresh) == 3);
+
+    SlotMap<int> assigned;
+    assigned.insert(9);
+    assigned = std::move(target);
+    CHECK(*assigned.get(kept) == 2);
+    CHECK(target.empty()); // NOLINT(bugprone-use-after-move): moved-from state is specified
+    const auto again = target.insert(4);
+    CHECK(*target.get(again) == 4);
+}
+
 TEST_CASE("handles work as hash map keys") {
     SlotMap<int> map;
     HashMap<SlotMap<int>::Handle, const char*> names;

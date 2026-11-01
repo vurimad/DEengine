@@ -33,7 +33,10 @@ Allocator& heap_allocator();
 
 template <typename T>
 T* allocate_array(Allocator& allocator, size_t count) {
-    DE_ASSERT_MSG(count <= SIZE_MAX / sizeof(T), "allocation size overflows size_t");
+    // Checked in every build: a wrapped size would return a block too small for count elements.
+    if (count > SIZE_MAX / sizeof(T)) [[unlikely]] {
+        assert_failed("count <= SIZE_MAX / sizeof(T)", "allocation size overflows size_t", __FILE__, __LINE__);
+    }
     return static_cast<T*>(allocator.allocate(sizeof(T) * count, alignof(T)));
 }
 

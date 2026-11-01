@@ -36,8 +36,9 @@ private:
 
 namespace literals {
 
-// "longsword_r1_1"_sid, hashed at compile time.
-constexpr StringId operator""_sid(const char* data, size_t length) {
+// "longsword_r1_1"_sid: consteval, so it is hashed at compile time in every build, even in a
+// per-frame loop. Names that only exist at runtime use StringId(data, length) at load time.
+consteval StringId operator""_sid(const char* data, size_t length) {
     return {data, length};
 }
 

@@ -109,6 +109,18 @@ TEST_CASE("assign is the explicit copy") {
     CHECK(copy.data() != source.data());
 }
 
+TEST_CASE("a moved-from array is empty and reusable") {
+    Array<int> source;
+    source.push(1);
+    Array<int> target;
+    target.push(2);
+    target = std::move(source);
+    CHECK(target.size() == 1);
+    CHECK(source.empty()); // NOLINT(bugprone-use-after-move): moved-from state is specified
+    source.push(3);
+    CHECK(source[0] == 3);
+}
+
 TEST_CASE("allocates through the given allocator and frees everything") {
     CountingAllocator counting;
     {

@@ -5,6 +5,7 @@
 #include "core/detail/std_allocator.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -27,8 +28,15 @@ public:
 
     Array(const Array&) = delete;
     Array& operator=(const Array&) = delete;
-    Array(Array&&) noexcept = default;
-    Array& operator=(Array&&) noexcept = default;
+    // Moves leave the source empty (guaranteed, not left to the std implementation).
+    Array(Array&& other) noexcept : items_(std::move(other.items_)) {}
+    Array& operator=(Array&& other) noexcept {
+        if (this != &other) {
+            items_ = std::move(other.items_);
+            other.items_.clear();
+        }
+        return *this;
+    }
     ~Array() = default;
 
     size_t size() const { return items_.size(); }
@@ -118,11 +126,23 @@ public:
     }
 
     // Replaces the contents with copies of items. This is the explicit copy.
-    void assign(std::span<const T> items) { items_.assign(items.begin(), items.end()); }
+    // items must not point into this array.
+    void assign(std::span<const T> items) {
+        DE_ASSERT_MSG(!overlaps(items), "Array::assign from the array's own elements");
+        items_.assign(items.begin(), items.end());
+    }
 
     Allocator& allocator() const { return items_.get_allocator().allocator(); }
 
 private:
+    bool overlaps(std::span<const T> items) const {
+        const auto first = reinterpret_cast<uintptr_t>(items.data());
+        const auto last = first + items.size_bytes();
+        const auto own_first = reinterpret_cast<uintptr_t>(items_.data());
+        const auto own_last = own_first + items_.size() * sizeof(T);
+        return first < own_last && own_first < last;
+    }
+
     std::vector<T, detail::StdAllocator<T>> items_;
 };
 

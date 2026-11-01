@@ -4,6 +4,7 @@ add_executable(de_tests
     main.cpp
     core/allocator_test.cpp
     core/array_test.cpp
+    core/assert_test.cpp
     core/function_ref_test.cpp
     core/hash_map_test.cpp
     core/inline_array_test.cpp
