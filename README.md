@@ -15,6 +15,8 @@ An engine for an open-world action RPG: a large world streamed seamlessly around
 | Ninja | 1.11+ |
 | vcpkg | a standalone clone, with `VCPKG_ROOT` pointing to it |
 | Git LFS | for binary source assets |
+| GPU driver | Vulkan 1.3 |
+| Linux packages | `libx11-dev libxft-dev libxext-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev` (SDL3's window backends) |
 
 ## Build
 
@@ -33,6 +35,12 @@ Linux:
 cmake --preset linux-clang         # or linux-gcc
 cmake --build --preset linux-clang-dev
 ctest --preset linux-clang-dev
+```
+
+Run the engine (a window with input logging until the frame loop lands; Escape quits):
+
+```sh
+build/<preset>/bin/<config>/deengine            # --frames N exits after N frames
 ```
 
 Each configure preset has three build and test presets:

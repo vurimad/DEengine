@@ -27,6 +27,8 @@ PointerAlignment: Left
 ReferenceAlignment: Pointer
 
 # Engine headers use quotes ("core/array.h"); third-party and std use angle brackets.
+# OS-specific files (debug_win32.cpp, thread_linux.cpp) keep their main header (debug.h) first.
+IncludeIsMainRegex: '(_win32|_linux)?$'
 SortIncludes: CaseSensitive
 IncludeBlocks: Regroup
 IncludeCategories:
