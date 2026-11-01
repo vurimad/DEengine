@@ -26,7 +26,9 @@ struct LogMessage {
 };
 
 // Receives log messages. write() runs under the log lock, one message at a time, on the thread
-// that logged. If a sink logs or asserts, that message goes straight to stderr instead.
+// that logged. Error and Fatal messages are followed by flush() on every sink.
+// Inside write(), a sink may add or remove sinks (itself included); the change applies from the
+// next message. If a sink logs or asserts, that message goes straight to stderr instead.
 class LogSink {
 public:
     LogSink(const LogSink&) = delete;

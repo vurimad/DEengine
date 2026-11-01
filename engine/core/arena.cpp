@@ -1,15 +1,10 @@
 #include "core/arena.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <new>
 
 namespace de::core {
-
-namespace {
-
-constexpr size_t kBlockAlignment = alignof(std::max_align_t);
-
-} // namespace
 
 Arena::Arena(Allocator& backing, size_t block_size) : backing_(&backing), block_size_(block_size) {
     DE_ASSERT_MSG(block_size > 0, "arena block size must be positive");
@@ -20,7 +15,7 @@ Arena::~Arena() {
 }
 
 std::byte* Arena::block_data(Block* block) {
-    return reinterpret_cast<std::byte*>(block) + align_up(sizeof(Block), kBlockAlignment);
+    return reinterpret_cast<std::byte*>(block) + kBlockHeaderSize;
 }
 
 void* Arena::bump(size_t size, size_t alignment) {
@@ -63,9 +58,8 @@ void* Arena::allocate(size_t size, size_t alignment) {
 }
 
 Arena::Block* Arena::add_block(size_t minimum_capacity) {
-    const size_t capacity = minimum_capacity > block_size_ ? minimum_capacity : block_size_;
-    const size_t header = align_up(sizeof(Block), kBlockAlignment);
-    void* memory = backing_->allocate(header + capacity, kBlockAlignment);
+    const size_t capacity = std::max(minimum_capacity, block_size_);
+    void* memory = backing_->allocate(kBlockHeaderSize + capacity, kBlockAlignment);
     auto* block = ::new (memory) Block{.next = nullptr, .capacity = capacity};
     if (last_ != nullptr) {
         last_->next = block;
@@ -73,7 +67,7 @@ Arena::Block* Arena::add_block(size_t minimum_capacity) {
         first_ = block;
     }
     last_ = block;
-    reserved_ += header + capacity;
+    reserved_ += kBlockHeaderSize + capacity;
     return block;
 }
 
@@ -96,11 +90,10 @@ void Arena::reset() {
 }
 
 void Arena::release() {
-    const size_t header = align_up(sizeof(Block), kBlockAlignment);
     Block* block = first_;
     while (block != nullptr) {
         Block* next = block->next;
-        backing_->deallocate(block, header + block->capacity, kBlockAlignment);
+        backing_->deallocate(block, kBlockHeaderSize + block->capacity, kBlockAlignment);
         block = next;
     }
     first_ = nullptr;

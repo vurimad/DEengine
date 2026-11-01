@@ -1,21 +1,17 @@
 #include "core/pool.h"
 
+#include <algorithm>
+#include <cstdint>
+
 namespace de::core {
 
-namespace {
-
-constexpr size_t max_of(size_t a, size_t b) {
-    return a > b ? a : b;
-}
-
-} // namespace
-
 Pool::Pool(size_t block_size, size_t block_alignment, size_t blocks_per_chunk, Allocator& backing)
-    : backing_(&backing), block_alignment_(max_of(block_alignment, alignof(FreeBlock))),
-      block_stride_(align_up(max_of(block_size, sizeof(FreeBlock)), block_alignment_)),
+    : backing_(&backing), block_alignment_(std::max(block_alignment, alignof(FreeBlock))),
+      block_stride_(align_up(std::max(block_size, sizeof(FreeBlock)), block_alignment_)),
       blocks_per_chunk_(blocks_per_chunk), chunk_header_(align_up(sizeof(Chunk), block_alignment_)) {
-    DE_ASSERT_MSG(is_power_of_two(block_alignment), "alignment must be a power of two");
-    DE_ASSERT_MSG(blocks_per_chunk > 0, "a chunk needs at least one block");
+    DE_VERIFY_MSG(is_power_of_two(block_alignment), "pool alignment must be a power of two");
+    DE_VERIFY_MSG(blocks_per_chunk > 0 && blocks_per_chunk <= (SIZE_MAX - chunk_header_) / block_stride_,
+                  "pool chunk size is zero or overflows size_t");
 }
 
 Pool::~Pool() {
@@ -29,7 +25,8 @@ Pool::~Pool() {
 }
 
 void* Pool::allocate(size_t size, size_t alignment) {
-    DE_ASSERT_MSG(size <= block_stride_ && alignment <= block_alignment_, "request does not fit the pool's blocks");
+    // Checked in every build: an oversized object would overwrite the next block's free-list link.
+    DE_VERIFY_MSG(size <= block_stride_ && alignment <= block_alignment_, "request does not fit the pool's blocks");
     if (free_list_ == nullptr) {
         add_chunk();
     }

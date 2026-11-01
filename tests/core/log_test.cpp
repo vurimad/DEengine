@@ -103,6 +103,53 @@ TEST_CASE("removed sinks receive nothing") {
     de::core::add_log_sink(sink); // the destructor removes it again
 }
 
+TEST_CASE("a sink can remove itself from inside write()") {
+    class OneShotSink final : public LogSink {
+    public:
+        void write(const LogMessage& /*message*/) override {
+            ++count;
+            de::core::remove_log_sink(*this); // e.g. a file sink disabling itself after an IO error
+        }
+        int count = 0;
+    };
+
+    CaptureSink capture; // NOLINT(misc-const-correctness): the log writes into it
+    OneShotSink once;
+    de::core::add_log_sink(once);
+    DE_LOG_INFO("test", "first");
+    DE_LOG_INFO("test", "second");
+    CHECK(once.count == 1);
+    CHECK(capture.count == 2);
+}
+
+TEST_CASE("a sink can add another sink from inside write(); it hears from the next message") {
+    class LateSink final : public LogSink {
+    public:
+        void write(const LogMessage& /*message*/) override { ++count; }
+        int count = 0;
+    };
+    class InstallerSink final : public LogSink {
+    public:
+        explicit InstallerSink(LateSink& late) : late_(&late) {}
+        void write(const LogMessage& /*message*/) override { de::core::add_log_sink(*late_); }
+
+    private:
+        LateSink* late_;
+    };
+
+    CaptureSink capture; // NOLINT(misc-const-correctness): the log writes into it
+    LateSink late;
+    InstallerSink installer(late);
+    de::core::add_log_sink(installer);
+    DE_LOG_INFO("test", "installs the late sink");
+    CHECK(late.count == 0);
+    DE_LOG_INFO("test", "reaches the late sink");
+    CHECK(late.count == 1);
+    de::core::remove_log_sink(installer);
+    de::core::remove_log_sink(late);
+    CHECK(capture.count == 2);
+}
+
 TEST_CASE("a sink that logs doesn't deadlock") {
     class EchoSink final : public LogSink {
     public:

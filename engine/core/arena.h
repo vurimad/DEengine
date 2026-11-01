@@ -59,6 +59,9 @@ private:
         size_t capacity = 0; // usable bytes after the header
     };
 
+    static constexpr size_t kBlockAlignment = alignof(std::max_align_t);
+    static constexpr size_t kBlockHeaderSize = align_up(sizeof(Block), kBlockAlignment);
+
     static std::byte* block_data(Block* block);
 
     // Allocates from current_, or returns null if the request doesn't fit.

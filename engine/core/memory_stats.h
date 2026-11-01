@@ -21,10 +21,15 @@ MemoryStats memory_stats(MemoryTag tag);
 
 // Heap allocations made so far, through any tagged heap (monotonic). Diff them around a frame
 // to check "zero heap allocations per frame in steady state" (docs/design.md, Performance rules).
+//
+// Limit: only allocations through heap_allocator() are seen. Raw new/malloc, std containers with
+// their default allocator and third-party code that isn't routed through our allocators are
+// invisible here; engine rules forbid the first two, and libraries are hooked up as they arrive.
 uint64_t heap_allocation_count();        // every thread
 uint64_t thread_heap_allocation_count(); // the calling thread only
 
-// Dev builds: asserts that the calling thread made no heap allocation while the scope was alive.
+// Dev builds: asserts that the calling thread made no heap allocation (through the tagged heaps,
+// see above) while the scope was alive.
 //     { const NoHeapAllocationScope no_alloc; simulate(tick); }
 class NoHeapAllocationScope {
 public:

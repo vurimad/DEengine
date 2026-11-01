@@ -21,7 +21,7 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 
 - No exceptions, no RTTI, no iostreams. `Result` for recoverable errors, `DE_ASSERT` for invariants, `DE_VERIFY` for checks that must survive ship builds.
 - Memory: allocate through a tagged allocator (`heap_allocator(MemoryTag::Render)`, an `Arena`, a `Pool`, the frame allocator), never `new`/`malloc` directly.
-- Logging: `DE_LOG_INFO("channel", "fmt", ...)` and friends; no `printf` in engine code (core's console sink is the one exception).
+- Logging: `DE_LOG_INFO("channel", "fmt", ...)` and friends; no `printf` in engine code (core's log and assert internals are the only exception: the console sink and the stderr fallbacks used when logging itself fails).
 - Runtime code never uses `std::string`, `std::map`, `std::unordered_map`, `std::list`, `std::function`, `std::shared_ptr`. Use the core library types (docs/design.md, Core library).
 - Hot paths: no per-frame heap allocations, no copies of collections (pass `std::span`), no O(N) searches, no per-element locks.
 - Naming: types `PascalCase`, functions/variables `snake_case`, private members `snake_case_`, constants `kPascalCase`, macros `DE_UPPER_SNAKE`, namespaces `de::lower`. clang-tidy enforces this.

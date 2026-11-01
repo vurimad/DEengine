@@ -33,9 +33,9 @@ void assert_failed(const char* condition, const char* message, const char* file,
         std::abort();
     }
     reporting_failure = true;
+    // Fatal messages flush every sink as part of dispatch.
     log_message(LogLevel::Fatal, "assert", file, line, "assertion failed: %s%s%s", condition,
                 message != nullptr ? " -- " : "", message != nullptr ? message : "");
-    flush_log();
     abort_after_fatal_error();
 }
 
