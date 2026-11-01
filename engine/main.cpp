@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
     bool was_moving = false;
     bool was_minimized = false;
     while (!window->close_requested()) {
-        const uint64_t frame_start_allocations = de::core::thread_heap_allocation_count();
+        const uint64_t frame_start_allocations = de::core::heap_allocation_count(); // every thread, jobs included
         de::platform::pump_events(*window, input);
         input.sample();
 
@@ -163,7 +163,7 @@ int main(int argc, char** argv) {
 
         // The "zero heap allocations per frame" rule, made visible in the profiler.
         DE_PROFILE_PLOT("heap allocations/frame",
-                        static_cast<int64_t>(de::core::thread_heap_allocation_count() - frame_start_allocations));
+                        static_cast<int64_t>(de::core::heap_allocation_count() - frame_start_allocations));
         DE_PROFILE_FRAME();
 
         ++frame;

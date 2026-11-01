@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <thread>
 #include <vector>
@@ -110,7 +111,39 @@ TEST_CASE("a job can submit and wait for its own child jobs") {
     }
 }
 
-TEST_CASE("threads outside the system can submit and wait") {
+namespace {
+
+// Waits without helping, so only the workers can finish the jobs. False on timeout.
+bool wait_without_helping(const JobCounter& counter) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!counter.done()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("workers pick up jobs submitted from outside the system") {
+    JobSystem jobs(JobSystemDesc{.worker_count = 2});
+    std::atomic<int> runs{0};
+    bool finished = false;
+    std::thread outsider([&] {
+        JobCounter counter;
+        for (int i = 0; i < 1000; ++i) {
+            jobs.submit(Job{.entry = &add_one, .context = &runs, .counter = &counter});
+        }
+        finished = wait_without_helping(counter);
+    });
+    outsider.join();
+    CHECK(finished);
+    CHECK(runs.load() == 1000);
+}
+
+TEST_CASE("an outside thread can also wait by helping") {
     JobSystem jobs;
     std::atomic<int> runs{0};
     std::thread outsider([&] {
@@ -144,9 +177,78 @@ TEST_CASE("sleeping workers wake up for new work") {
         for (int i = 0; i < 200; ++i) {
             jobs.submit(Job{.entry = &add_one, .context = &runs, .counter = &counter});
         }
-        jobs.wait(counter);
+        // The test thread doesn't help: only woken workers can finish these jobs.
+        REQUIRE(wait_without_helping(counter));
     }
     CHECK(runs.load() == 1000);
+}
+
+TEST_CASE("a single job submitted to sleeping workers still runs") {
+    JobSystem jobs(JobSystemDesc{.worker_count = 3});
+    std::atomic<int> runs{0};
+    for (int round = 0; round < 20; ++round) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        JobCounter counter;
+        jobs.submit(Job{.entry = &add_one, .context = &runs, .counter = &counter});
+        REQUIRE(wait_without_helping(counter));
+    }
+    CHECK(runs.load() == 20);
+}
+
+TEST_CASE("wait() sleeps while a worker runs the last job, and wakes when it finishes") {
+    const auto slow = [](void* context) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        static_cast<std::atomic<int>*>(context)->fetch_add(1);
+    };
+    JobSystem jobs(JobSystemDesc{.worker_count = 1});
+    std::atomic<int> runs{0};
+    JobCounter counter;
+    jobs.submit(Job{.entry = slow, .context = &runs, .counter = &counter, .name = "slow"});
+    std::this_thread::sleep_for(std::chrono::milliseconds(10)); // let the worker steal it
+    jobs.wait(counter); // finds nothing to run, sleeps, and must be woken by the job's completion
+    CHECK(runs.load() == 1);
+}
+
+namespace {
+
+std::atomic<uint32_t> started_workers{0};
+std::atomic<uint32_t> worker_index_mask{0};
+std::atomic<uint32_t> badly_named_workers{0};
+
+// Runs on the worker threads, so it records instead of asserting.
+void record_worker_start(uint32_t index, const char* name) {
+    worker_index_mask.fetch_or(1U << index);
+    if (std::strncmp(name, "worker ", 7) != 0) {
+        badly_named_workers.fetch_add(1);
+    }
+    started_workers.fetch_add(1);
+}
+
+} // namespace
+
+TEST_CASE("each worker announces itself once with an index in [0, worker_count)") {
+    started_workers = 0;
+    worker_index_mask = 0;
+    {
+        const JobSystem jobs(JobSystemDesc{.worker_count = 4, .on_worker_start = &record_worker_start});
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (started_workers.load() < 4 && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    CHECK(started_workers.load() == 4);
+    CHECK(worker_index_mask.load() == 0b1111U);
+    CHECK(badly_named_workers.load() == 0);
+}
+
+TEST_CASE("a batch submitted at once runs completely") {
+    JobSystem jobs(JobSystemDesc{.worker_count = 4});
+    std::atomic<int> runs{0};
+    JobCounter counter;
+    std::vector<Job> batch(300, Job{.entry = &add_one, .context = &runs, .counter = &counter});
+    jobs.submit(batch);
+    REQUIRE(wait_without_helping(counter));
+    CHECK(runs.load() == 300);
 }
 
 TEST_CASE("destroying the system runs jobs nobody waited for") {

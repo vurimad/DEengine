@@ -2,6 +2,8 @@
 
 if(PORT STREQUAL "tracy")
     # The profiler client listens on localhost only and doesn't broadcast: no firewall prompt
-    # on dev machines, nothing exposed on the network.
-    set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON)
+    # on dev machines, nothing exposed on the network. No crash handler either (the manifest
+    # already turns the port's default feature off; this keeps it off if that ever changes):
+    # crashes and fatal errors belong to the engine's fatal handler and the debugger.
+    set(VCPKG_CMAKE_CONFIGURE_OPTIONS -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON -DTRACY_NO_CRASH_HANDLER=ON)
 endif()

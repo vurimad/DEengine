@@ -51,8 +51,9 @@ struct JobSystemDesc {
     // job it is submitting immediately instead.
     uint32_t queue_capacity = 4096;
 
-    // Runs first on each worker thread, e.g. to give it its OS name ("worker 3") through the
-    // platform layer. Core already names it in the profiler.
+    // Runs first on each worker thread, with its index in [0, worker_count) and its name
+    // ("worker 3"), e.g. to set the OS thread name through the platform layer. Core already
+    // names it in the profiler.
     void (*on_worker_start)(uint32_t worker_index, const char* name) = nullptr;
 };
 
@@ -61,7 +62,9 @@ struct JobSystemDesc {
 // Each thread of the system owns a queue: it pops its own newest jobs and steals the oldest
 // jobs of others when it runs dry. The thread that creates the system is part of it (index 0)
 // and runs jobs while it waits instead of blocking. Other threads (an IO thread, say) may submit
-// too, through a small shared queue. Idle workers sleep until work arrives.
+// too, through a small shared queue. Idle threads, and threads waiting on a counter whose jobs
+// run elsewhere, sleep until work arrives or the counter reaches zero. The system must be
+// destroyed on the thread that created it.
 //
 // Submitting, waiting and parallel_for never allocate. Parallelism comes from partitioning
 // data, not locking it: give each job its own range to write (docs/design.md, Performance rules).

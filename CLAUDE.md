@@ -14,6 +14,8 @@ ctest --preset msvc-debug
 clang-format --dry-run --Werror <files>   # must be clean
 clang-tidy -p build/clang-cl <cpp files>  # every finding is an error; skip *_linux.cpp on Windows
 build/msvc/bin/Debug/deengine --frames 120  # smoke run: opens the window, exits after 120 frames
+tools/profile.ps1 -Seconds 10               # headless Tracy capture of the dev build: zone and plot tables in text,
+                                            # CSVs + trace.tracy in build/profiles/<timestamp>/ (build msvc-dev first)
 ```
 
 Before calling work done: it builds warning-free (warnings are errors), tests pass, clang-format and clang-tidy are clean.
