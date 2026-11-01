@@ -1,14 +1,27 @@
+find_package(Threads REQUIRED)
+
 add_library(de_core STATIC
     allocator.cpp
     allocator.h
+    arena.cpp
+    arena.h
     array.h
     assert.cpp
     assert.h
+    compiler.h
     detail/std_allocator.h
+    frame_allocator.cpp
+    frame_allocator.h
     function_ref.h
     hash.h
     hash_map.h
     inline_array.h
+    log.cpp
+    log.h
+    memory_stats.h
+    memory_tag.h
+    pool.cpp
+    pool.h
     result.h
     slot_map.h
     string_id.h
@@ -18,7 +31,7 @@ add_library(de::core ALIAS de_core)
 
 # Engine headers are included relative to engine/: #include "core/version.h"
 target_include_directories(de_core PUBLIC "${PROJECT_SOURCE_DIR}/engine")
-target_link_libraries(de_core PUBLIC de::compile_options)
+target_link_libraries(de_core PUBLIC de::compile_options Threads::Threads)
 
 target_compile_definitions(de_core PRIVATE
     DE_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}

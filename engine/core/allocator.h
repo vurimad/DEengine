@@ -1,15 +1,30 @@
 #pragma once
 
 #include "core/assert.h"
+#include "core/memory_tag.h"
 
 #include <cstddef>
 #include <cstdint>
 
 namespace de::core {
 
+constexpr bool is_power_of_two(size_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+// Rounds value up to a multiple of alignment (a power of two).
+constexpr size_t align_up(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+// Bytes to add to ptr to reach the next multiple of alignment.
+inline size_t alignment_padding(const void* ptr, size_t alignment) {
+    const auto address = reinterpret_cast<uintptr_t>(ptr);
+    return align_up(address, alignment) - address;
+}
+
 // The interface every container allocates through (docs/design.md, Core library).
-// Containers take an Allocator& from day one. Phase 1 only has the heap allocator; arenas,
-// pools, the frame allocator and memory tags arrive with the allocators task.
+// Implementations: the tagged heaps (heap_allocator), Arena, Pool and FrameAllocator.
 class Allocator {
 public:
     Allocator(const Allocator&) = delete;
@@ -28,15 +43,14 @@ protected:
     Allocator& operator=(Allocator&&) = default;
 };
 
-// General-purpose process heap. Phase 1: global operator new/delete.
-Allocator& heap_allocator();
+// The process heap: one allocator per memory tag, so every heap byte is attributed to a
+// system (memory_stats.h). Thread-safe. Phase 1: global operator new/delete.
+Allocator& heap_allocator(MemoryTag tag = MemoryTag::General);
 
 template <typename T>
 T* allocate_array(Allocator& allocator, size_t count) {
     // Checked in every build: a wrapped size would return a block too small for count elements.
-    if (count > SIZE_MAX / sizeof(T)) [[unlikely]] {
-        assert_failed("count <= SIZE_MAX / sizeof(T)", "allocation size overflows size_t", __FILE__, __LINE__);
-    }
+    DE_VERIFY_MSG(count <= SIZE_MAX / sizeof(T), "allocation size overflows size_t");
     return static_cast<T*>(allocator.allocate(sizeof(T) * count, alignof(T)));
 }
 

@@ -25,6 +25,9 @@ HeaderFilterRegex: '.*[\\/](engine|tools|tests)[\\/].*'
 FormatStyle: file
 
 CheckOptions:
+  # Const-correctness for values, not pointees: the pointee analysis flags pointers that are
+  # returned as void* or passed to placement new, where const would not compile.
+  - { key: misc-const-correctness.AnalyzePointers,                  value: false }
   # Types: PascalCase
   - { key: readability-identifier-naming.ClassCase,                 value: CamelCase }
   - { key: readability-identifier-naming.StructCase,                value: CamelCase }
