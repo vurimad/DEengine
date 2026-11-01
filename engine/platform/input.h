@@ -70,7 +70,10 @@ struct RawInput {
 // Pushing and sampling never allocate. Not thread-safe: use it from the game thread.
 class Input {
 public:
-    static constexpr float kStickDeadzone = 0.15f;   // stick values below this read as zero
+    // Stick values below the deadzone read as zero. Worn sticks drift: raise it per player
+    // (an options-menu setting) rather than changing the default.
+    static constexpr float kDefaultStickDeadzone = 0.15f;
+    static constexpr float kMaxStickDeadzone = 0.9f;
     static constexpr float kTriggerThreshold = 0.5f; // an axis bound to a button goes down past this...
     static constexpr float kTriggerRelease = 0.4f;   // ...and up below this, so resting near 0.5 can't flicker
 
@@ -101,6 +104,10 @@ public:
 
     // Releases everything that is held, e.g. when the window loses focus, so nothing stays stuck down.
     void release_all(uint64_t timestamp_ns);
+
+    // Takes effect from the next stick event. 0 disables it (to measure drift).
+    void set_stick_deadzone(float deadzone);
+    float stick_deadzone() const { return stick_deadzone_; }
 
     // A gamepad was unplugged: if it was the active one, its held inputs are released.
     void remove_gamepad(uint32_t device, uint64_t timestamp_ns);
@@ -152,6 +159,7 @@ private:
     core::HashMap<core::StringId, uint32_t> actions_by_name_;
     core::HashMap<uint64_t, BindingList> bindings_by_source_;
     uint32_t active_gamepad_ = 0;
+    float stick_deadzone_ = kDefaultStickDeadzone;
 };
 
 } // namespace de::platform

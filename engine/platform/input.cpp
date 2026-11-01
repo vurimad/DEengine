@@ -79,12 +79,12 @@ bool is_gamepad(InputSource source) {
 }
 
 // Stick values inside the deadzone read as zero; the rest is rescaled so output starts at 0.
-float apply_deadzone(float value) {
+float apply_deadzone(float value, float deadzone) {
     const float magnitude = std::fabs(value);
-    if (magnitude < Input::kStickDeadzone) {
+    if (magnitude < deadzone) {
         return 0.0f;
     }
-    const float scaled = std::min(1.0f, (magnitude - Input::kStickDeadzone) / (1.0f - Input::kStickDeadzone));
+    const float scaled = std::min(1.0f, (magnitude - deadzone) / (1.0f - deadzone));
     return value < 0.0f ? -scaled : scaled;
 }
 
@@ -172,7 +172,7 @@ void Input::push(const RawInput& input) {
 void Input::update_binding(Binding& binding, float value, uint64_t timestamp_ns) {
     Action& action = actions_[binding.action];
     const bool is_axis_source = binding.source == InputSource::GamepadAxis;
-    binding.value = is_axis_source ? apply_deadzone(value) : value;
+    binding.value = is_axis_source ? apply_deadzone(value, stick_deadzone_) : value;
 
     // When does this binding count as down: buttons at 0.5; axes past the trigger threshold in the
     // direction their scale points, and back up only below the lower release threshold.
@@ -206,6 +206,12 @@ void Input::release_all(uint64_t timestamp_ns) {
     }
 }
 
+void Input::set_stick_deadzone(float deadzone) {
+    DE_VERIFY_MSG(deadzone >= 0.0f && deadzone <= kMaxStickDeadzone,
+                  "stick deadzone must be in [0, kMaxStickDeadzone]");
+    stick_deadzone_ = deadzone;
+}
+
 void Input::remove_gamepad(uint32_t device, uint64_t timestamp_ns) {
     if (device == active_gamepad_) {
         release_gamepad(timestamp_ns);
@@ -219,7 +225,7 @@ bool Input::accept_gamepad_event(const RawInput& input) {
     }
     // Another pad only takes over with a real press or push, and only from an idle active pad.
     const bool deliberate =
-        input.source == InputSource::GamepadButton ? input.value >= 0.5f : std::fabs(input.value) >= kStickDeadzone;
+        input.source == InputSource::GamepadButton ? input.value >= 0.5f : std::fabs(input.value) >= stick_deadzone_;
     if (!deliberate || !active_gamepad_idle()) {
         return false;
     }

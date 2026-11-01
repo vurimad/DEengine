@@ -121,13 +121,33 @@ TEST_CASE("sticks have a deadzone and keys plus stick clamp to one") {
     CHECK(input.state(move_x).value == 0.0f);
     CHECK_FALSE(input.state(move_x).down);
 
-    const float halfway = -(Input::kStickDeadzone + (1.0f - Input::kStickDeadzone) * 0.5f);
+    const float halfway = -(Input::kDefaultStickDeadzone + (1.0f - Input::kDefaultStickDeadzone) * 0.5f);
     input.push(event("gamepad:leftx", halfway));
     input.sample();
     CHECK(input.state(move_x).value == doctest::Approx(-0.5f));
 
     input.push(event("gamepad:leftx", 1.0f));
     input.push(event("key:D", 1.0f));
+    input.sample();
+    CHECK(input.state(move_x).value == 1.0f);
+}
+
+TEST_CASE("a raised deadzone hides a drifting stick") {
+    Input input;
+    const ActionId move_x = input.add_action("move_x"_sid, ActionKind::Axis);
+    REQUIRE(input.bind(move_x, "gamepad:leftx").ok());
+
+    input.push(event("gamepad:leftx", 0.2f)); // a worn stick resting at 0.2
+    input.sample();
+    CHECK(input.state(move_x).down); // the default deadzone (0.15) lets it through
+
+    input.set_stick_deadzone(0.25f);
+    input.push(event("gamepad:leftx", 0.2f));
+    input.sample();
+    CHECK_FALSE(input.state(move_x).down);
+    CHECK(input.stick_deadzone() == 0.25f);
+
+    input.push(event("gamepad:leftx", 1.0f)); // full deflection still reaches 1
     input.sample();
     CHECK(input.state(move_x).value == 1.0f);
 }

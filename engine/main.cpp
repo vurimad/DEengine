@@ -18,20 +18,32 @@ using de::platform::Input;
 
 namespace {
 
-// --frames N: exit after N frames (smoke runs); 0 runs until the window closes.
-uint64_t frame_limit(int argc, char** argv) {
+// The value after a flag ("--frames 120"), or null if the flag isn't there.
+const char* flag_value(int argc, char** argv, const char* flag) {
     for (int i = 1; i + 1 < argc; ++i) {
-        if (std::strcmp(argv[i], "--frames") == 0) {
-            return std::strtoull(argv[i + 1], nullptr, 10);
+        if (std::strcmp(argv[i], flag) == 0) {
+            return argv[i + 1];
         }
     }
-    return 0;
+    return nullptr;
+}
+
+bool has_flag(int argc, char** argv, const char* flag) {
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], flag) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
 
 // Placeholder loop until the frame loop lands (M0b): opens the window, pumps events, samples input
 // and logs actions, so the platform layer can be tried by hand.
+//   --frames N       exit after N frames (smoke runs)
+//   --deadzone X     stick deadzone, 0..0.9 (default 0.15)
+//   --show-sticks    deadzone off; log raw stick values twice a second, to measure drift
 int main(int argc, char** argv) {
     DE_LOG_INFO("engine", "DEengine %s", de::core::engine_version_string());
 
@@ -71,7 +83,35 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    const uint64_t max_frames = frame_limit(argc, argv);
+    // Raw stick readout for measuring drift: the deadzone is off, so these show the true resting values.
+    const bool show_sticks = has_flag(argc, argv, "--show-sticks");
+    const ActionId sticks[4] = {
+        input.add_action("stick_left_x"_sid, ActionKind::Axis),
+        input.add_action("stick_left_y"_sid, ActionKind::Axis),
+        input.add_action("stick_right_x"_sid, ActionKind::Axis),
+        input.add_action("stick_right_y"_sid, ActionKind::Axis),
+    };
+    bind(sticks[0], "gamepad:leftx");
+    bind(sticks[1], "gamepad:lefty");
+    bind(sticks[2], "gamepad:rightx");
+    bind(sticks[3], "gamepad:righty");
+    if (show_sticks) {
+        input.set_stick_deadzone(0.0f);
+        DE_LOG_INFO("input", "showing raw stick values; leave the sticks alone to measure drift");
+    } else if (const char* deadzone = flag_value(argc, argv, "--deadzone")) {
+        const float value = std::strtof(deadzone, nullptr);
+        if (value < 0.0f || value > Input::kMaxStickDeadzone) {
+            DE_LOG_ERROR("input", "--deadzone must be between 0 and %.1f",
+                         static_cast<double>(Input::kMaxStickDeadzone));
+            return EXIT_FAILURE;
+        }
+        input.set_stick_deadzone(value);
+    }
+    DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
+
+    const char* frames_flag = flag_value(argc, argv, "--frames");
+    const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
+    uint64_t next_stick_report_ns = 0;
     uint64_t frame = 0;
     bool was_moving = false;
     bool was_minimized = false;
@@ -99,6 +139,13 @@ int main(int argc, char** argv) {
         }
         if (window->resized()) {
             DE_LOG_INFO("platform", "drawable size %ux%u", window->pixel_width(), window->pixel_height());
+        }
+        if (show_sticks && de::platform::time_ns() >= next_stick_report_ns) {
+            next_stick_report_ns = de::platform::time_ns() + de::platform::kNsPerSecond / 2;
+            DE_LOG_INFO(
+                "input", "left %+.3f %+.3f   right %+.3f %+.3f", static_cast<double>(input.state(sticks[0]).value),
+                static_cast<double>(input.state(sticks[1]).value), static_cast<double>(input.state(sticks[2]).value),
+                static_cast<double>(input.state(sticks[3]).value));
         }
 
         ++frame;
