@@ -72,7 +72,7 @@
       "name": "test-base",
       "hidden": true,
       "output": { "outputOnFailure": true },
-      "execution": { "noTestsAction": "error" }
+      "execution": { "noTestsAction": "error", "timeout": 120 }
     },
     { "name": "msvc-debug", "inherits": "test-base", "configurePreset": "msvc", "configuration": "Debug" },
     { "name": "msvc-dev", "inherits": "test-base", "configurePreset": "msvc", "configuration": "RelWithDebInfo" },
