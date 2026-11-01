@@ -30,6 +30,8 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 - Engine headers use quotes relative to `engine/` (`#include "core/version.h"`); third-party and std use angle brackets.
 - No platform `#ifdef` outside `engine/platform/` and RHI backends. No Vulkan types above the RHI. No SDL or OS headers outside `engine/platform/` (RHI backends may use `Window::native_handle()`).
 - Input: game code reads actions (`Input::state(action)`), never device codes; bindings are text.
+- Profiling: put `DE_PROFILE_ZONE("name")` at the top of every system's per-frame entry point. Tracy viewer 0.14.1 must match the client in vcpkg.
+- Threads: parallel work goes through `JobSystem` (`submit` + `JobCounter`, or `parallel_for`); don't create threads for work.
 
 ## Git
 
