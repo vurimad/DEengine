@@ -6,6 +6,9 @@
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_video.h>
+
+#include <cstdint>
 
 namespace de::platform {
 
@@ -14,33 +17,35 @@ namespace {
 // SDL reports gamepad axes as Sint16.
 constexpr float kAxisRange = 32767.0f;
 
+bool is_window_event(uint32_t type) {
+    return type >= SDL_EVENT_WINDOW_FIRST && type <= SDL_EVENT_WINDOW_LAST;
+}
+
 } // namespace
 
 void pump_events(Window& window, Input& input) {
     window.resized_ = false;
-    bool refresh_size = false;
+    bool window_changed = false;
 
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
+        // Other SDL windows (tools, message boxes) must not change this window's state.
+        if (is_window_event(event.type) && event.window.windowID != window.window_id_) {
+            continue;
+        }
         switch (event.type) {
         case SDL_EVENT_QUIT:
+        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             window.close_requested_ = true;
             break;
 
-        case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
-            if (event.window.windowID == window.window_id_) {
-                window.close_requested_ = true;
-            }
-            break;
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-            refresh_size = true;
-            break;
         case SDL_EVENT_WINDOW_MINIMIZED:
-            window.minimized_ = true;
-            break;
+        case SDL_EVENT_WINDOW_MAXIMIZED:
         case SDL_EVENT_WINDOW_RESTORED:
-            window.minimized_ = false;
-            refresh_size = true;
+        case SDL_EVENT_WINDOW_SHOWN:
+        case SDL_EVENT_WINDOW_HIDDEN:
+            window_changed = true;
             break;
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
             window.focused_ = true;
@@ -84,20 +89,22 @@ void pump_events(Window& window, Input& input) {
         case SDL_EVENT_GAMEPAD_REMOVED:
             DE_LOG_INFO("input", "gamepad disconnected");
             SDL_CloseGamepad(SDL_GetGamepadFromID(event.gdevice.which));
-            input.release_all(event.gdevice.timestamp);
+            input.remove_gamepad(event.gdevice.which, event.gdevice.timestamp);
             break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP:
             input.push(RawInput{.source = InputSource::GamepadButton,
                                 .code = event.gbutton.button,
                                 .value = event.gbutton.down ? 1.0f : 0.0f,
-                                .timestamp_ns = event.gbutton.timestamp});
+                                .timestamp_ns = event.gbutton.timestamp,
+                                .device = event.gbutton.which});
             break;
         case SDL_EVENT_GAMEPAD_AXIS_MOTION:
             input.push(RawInput{.source = InputSource::GamepadAxis,
                                 .code = event.gaxis.axis,
                                 .value = static_cast<float>(event.gaxis.value) / kAxisRange,
-                                .timestamp_ns = event.gaxis.timestamp});
+                                .timestamp_ns = event.gaxis.timestamp,
+                                .device = event.gaxis.which});
             break;
 
         default:
@@ -105,7 +112,11 @@ void pump_events(Window& window, Input& input) {
         }
     }
 
-    if (refresh_size) {
+    if (window_changed) {
+        // Read the state back from SDL rather than tracking event pairs: maximize, minimize and
+        // restore don't always arrive in matching pairs (minimized from maximized comes back as
+        // MAXIMIZED, not RESTORED).
+        window.minimized_ = (SDL_GetWindowFlags(window.window_) & SDL_WINDOW_MINIMIZED) != 0;
         window.refresh_pixel_size();
     }
 }

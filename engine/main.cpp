@@ -74,6 +74,7 @@ int main(int argc, char** argv) {
     const uint64_t max_frames = frame_limit(argc, argv);
     uint64_t frame = 0;
     bool was_moving = false;
+    bool was_minimized = false;
     while (!window->close_requested()) {
         de::platform::pump_events(*window, input);
         input.sample();
@@ -91,6 +92,10 @@ int main(int argc, char** argv) {
         if (moving != was_moving) {
             DE_LOG_INFO("input", moving ? "moving" : "stopped");
             was_moving = moving;
+        }
+        if (window->minimized() != was_minimized) {
+            was_minimized = window->minimized();
+            DE_LOG_INFO("platform", was_minimized ? "minimized" : "restored");
         }
         if (window->resized()) {
             DE_LOG_INFO("platform", "drawable size %ux%u", window->pixel_width(), window->pixel_height());

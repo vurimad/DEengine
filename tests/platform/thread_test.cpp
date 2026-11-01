@@ -45,6 +45,40 @@ TEST_CASE("a moved thread is still joined exactly once") {
     CHECK(state.runs.load() == 1);
 }
 
+namespace {
+
+constexpr const char* kLongName =
+    "a very long thread name that no operating system keeps whole, not even windows, far past 63 bytes";
+
+struct NameProbe {
+    char full[128] = {};
+    char small[6] = {};
+    bool small_ok = false;
+};
+
+void read_names(void* context) {
+    auto* probe = static_cast<NameProbe*>(context);
+    de::platform::set_current_thread_name(kLongName);
+    de::platform::current_thread_name(probe->full, sizeof(probe->full));
+    probe->small_ok = de::platform::current_thread_name(probe->small, sizeof(probe->small));
+}
+
+} // namespace
+
+TEST_CASE("long thread names are cut, not dropped, and reads truncate to the buffer") {
+    NameProbe probe;
+    {
+        const Thread thread("prober", &read_names, &probe);
+    }
+    // Windows keeps 63 bytes and Linux 15: either way the name is a prefix of the long name.
+    const size_t kept = std::strlen(probe.full);
+    CHECK(kept >= 15);
+    CHECK(kept <= 63);
+    CHECK(std::strncmp(probe.full, kLongName, kept) == 0);
+    CHECK(probe.small_ok);
+    CHECK(std::strcmp(probe.small, "a ver") == 0);
+}
+
 TEST_CASE("the machine reports at least one hardware thread") {
     CHECK(de::platform::hardware_thread_count() >= 1);
 }

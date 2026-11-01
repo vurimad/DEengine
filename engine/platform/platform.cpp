@@ -38,17 +38,17 @@ core::Result<Platform> Platform::create(const PlatformDesc& desc) {
     }
 
     core::set_fatal_handler(&break_into_debugger);
-    if (is_debugger_attached()) {
-        installed_debugger_sink = debugger_log_sink();
-        if (installed_debugger_sink != nullptr) {
-            core::add_log_sink(*installed_debugger_sink);
-        }
+    // Registered whether or not a debugger is attached yet: it writes only while one is.
+    installed_debugger_sink = debugger_log_sink();
+    if (installed_debugger_sink != nullptr) {
+        core::add_log_sink(*installed_debugger_sink);
     }
 
     const int version = SDL_GetVersion();
+    const bool debugger = is_debugger_attached();
     DE_LOG_INFO("platform", "SDL %d.%d.%d, %u hardware threads%s", SDL_VERSIONNUM_MAJOR(version),
                 SDL_VERSIONNUM_MINOR(version), SDL_VERSIONNUM_MICRO(version), hardware_thread_count(),
-                is_debugger_attached() ? ", debugger attached" : "");
+                debugger ? ", debugger attached" : "");
 
     Platform platform;
     platform.owns_platform_ = true;

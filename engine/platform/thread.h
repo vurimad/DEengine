@@ -7,7 +7,7 @@
 namespace de::platform {
 
 // Names the calling thread for debuggers, profilers and crash dumps.
-// Linux keeps the first 15 characters.
+// Longer names are cut: Windows keeps the first 63 bytes, Linux the first 15.
 void set_current_thread_name(const char* name);
 
 // Copies the calling thread's name into buffer (empty if unnamed). False if the OS can't say.

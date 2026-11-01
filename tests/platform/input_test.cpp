@@ -5,6 +5,8 @@
 
 #include <doctest/doctest.h>
 
+#include <initializer_list>
+
 using de::platform::ActionId;
 using de::platform::ActionKind;
 using de::platform::Input;
@@ -139,6 +141,94 @@ TEST_CASE("a trigger drives a button past the threshold") {
     input.push(event("gamepad:righttrigger", 0.8f));
     input.sample();
     CHECK(input.state(heavy).pressed);
+}
+
+TEST_CASE("a trigger resting near the threshold doesn't flicker") {
+    Input input;
+    const ActionId heavy = button(input, "attack_heavy"_sid, "gamepad:righttrigger");
+    input.push(event("gamepad:righttrigger", 0.51f));
+    input.sample();
+    CHECK(input.state(heavy).pressed);
+
+    // Noise around 0.5 stays above the release threshold: no new edges.
+    for (const float noise : {0.49f, 0.51f, 0.48f, 0.52f}) {
+        input.push(event("gamepad:righttrigger", noise));
+        input.sample();
+        CHECK(input.state(heavy).down);
+        CHECK_FALSE(input.state(heavy).pressed);
+        CHECK_FALSE(input.state(heavy).released);
+    }
+
+    input.push(event("gamepad:righttrigger", Input::kTriggerRelease - 0.05f));
+    input.sample();
+    CHECK(input.state(heavy).released);
+}
+
+TEST_CASE("an idle second gamepad's stick noise doesn't disturb the active one") {
+    Input input;
+    const ActionId move_x = input.add_action("move_x"_sid, ActionKind::Axis);
+    REQUIRE(input.bind(move_x, "gamepad:leftx").ok());
+
+    RawInput pad_a = event("gamepad:leftx", 1.0f);
+    pad_a.device = 1;
+    input.push(pad_a);
+    input.sample();
+    CHECK(input.state(move_x).value == 1.0f);
+
+    RawInput pad_b_noise = event("gamepad:leftx", 0.02f);
+    pad_b_noise.device = 2;
+    input.push(pad_b_noise);
+    input.sample();
+    CHECK(input.state(move_x).value == 1.0f);
+}
+
+TEST_CASE("a duplicate gamepad can't steal input while the active one is held") {
+    Input input;
+    const ActionId roll = button(input, "roll"_sid, "gamepad:b");
+    RawInput press = event("gamepad:b", 1.0f);
+    RawInput lift = event("gamepad:b", 0.0f);
+
+    press.device = 1;
+    input.push(press);
+    press.device = 2; // e.g. Steam Input's virtual copy of the same pad
+    lift.device = 2;
+    input.push(press);
+    input.push(lift);
+    input.sample();
+    CHECK(input.state(roll).down);
+    CHECK_FALSE(input.state(roll).released);
+}
+
+TEST_CASE("another gamepad takes over once the active one is idle") {
+    Input input;
+    const ActionId roll = button(input, "roll"_sid, "gamepad:b");
+    RawInput press = event("gamepad:b", 1.0f);
+    RawInput lift = event("gamepad:b", 0.0f);
+
+    press.device = 1;
+    lift.device = 1;
+    input.push(press);
+    input.push(lift);
+    input.sample();
+
+    press.device = 2;
+    input.push(press);
+    input.sample();
+    CHECK(input.state(roll).pressed);
+    CHECK(input.state(roll).down);
+}
+
+TEST_CASE("unplugging the active gamepad releases what it held") {
+    Input input;
+    const ActionId roll = button(input, "roll"_sid, "gamepad:b");
+    RawInput press = event("gamepad:b", 1.0f);
+    press.device = 7;
+    input.push(press);
+    input.sample();
+    input.remove_gamepad(7, 1000);
+    input.sample();
+    CHECK(input.state(roll).released);
+    CHECK_FALSE(input.state(roll).down);
 }
 
 TEST_CASE("a negative scale picks the stick direction that presses a button") {

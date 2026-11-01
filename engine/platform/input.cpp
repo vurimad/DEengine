@@ -74,6 +74,10 @@ bool is_motion(InputSource source) {
     return source == InputSource::MouseMotionX || source == InputSource::MouseMotionY;
 }
 
+bool is_gamepad(InputSource source) {
+    return source == InputSource::GamepadButton || source == InputSource::GamepadAxis;
+}
+
 // Stick values inside the deadzone read as zero; the rest is rescaled so output starts at 0.
 float apply_deadzone(float value) {
     const float magnitude = std::fabs(value);
@@ -87,7 +91,8 @@ float apply_deadzone(float value) {
 } // namespace
 
 Input::Input(core::Allocator& allocator)
-    : actions_(allocator), bindings_(allocator), actions_by_name_(allocator), bindings_by_source_(allocator) {}
+    : allocator_(&allocator), actions_(allocator), bindings_(allocator), actions_by_name_(allocator),
+      bindings_by_source_(allocator) {}
 
 uint64_t Input::source_key(InputSource source, int32_t code) {
     return (static_cast<uint64_t>(source) << 32U) | static_cast<uint32_t>(code);
@@ -99,7 +104,7 @@ ActionId Input::add_action(core::StringId name, ActionKind kind) {
         return ActionId{.index = *existing};
     }
     const auto index = static_cast<uint32_t>(actions_.size());
-    Action& action = actions_.emplace();
+    Action& action = actions_.emplace(*allocator_);
     action.name = name;
     action.kind = kind;
     actions_by_name_.set(name, index);
@@ -136,13 +141,22 @@ core::Result<void> Input::bind(ActionId action, const char* binding, float scale
     const auto index = static_cast<uint32_t>(bindings_.size());
     bindings_.push(Binding{.action = action.index, .source = parsed.source, .code = parsed.code, .scale = scale});
     target.bindings.push(index);
-    bindings_by_source_.find_or_insert(source_key(parsed.source, parsed.code)).push(index);
+
+    const uint64_t key = source_key(parsed.source, parsed.code);
+    BindingList* list = bindings_by_source_.find(key);
+    if (list == nullptr) {
+        list = &bindings_by_source_.set(key, BindingList(*allocator_));
+    }
+    list->push(index);
     return {};
 }
 
 void Input::push(const RawInput& input) {
-    core::InlineArray<uint32_t, 4>* bound = bindings_by_source_.find(source_key(input.source, input.code));
+    BindingList* bound = bindings_by_source_.find(source_key(input.source, input.code));
     if (bound == nullptr) {
+        return;
+    }
+    if (is_gamepad(input.source) && !accept_gamepad_event(input)) {
         return;
     }
     for (const uint32_t index : *bound) {
@@ -160,9 +174,10 @@ void Input::update_binding(Binding& binding, float value, uint64_t timestamp_ns)
     const bool is_axis_source = binding.source == InputSource::GamepadAxis;
     binding.value = is_axis_source ? apply_deadzone(value) : value;
 
-    // When does this binding count as down: buttons at 0.5, axes past the trigger threshold in
-    // the direction their scale points.
-    const bool down = is_axis_source ? value * binding.scale >= kTriggerThreshold : value >= 0.5f;
+    // When does this binding count as down: buttons at 0.5; axes past the trigger threshold in the
+    // direction their scale points, and back up only below the lower release threshold.
+    const float pressure = value * binding.scale;
+    const bool down = is_axis_source ? pressure >= (binding.down ? kTriggerRelease : kTriggerThreshold) : value >= 0.5f;
     if (down == binding.down) {
         return;
     }
@@ -186,6 +201,45 @@ void Input::release_all(uint64_t timestamp_ns) {
     for (Binding& binding : bindings_) {
         binding.motion = 0.0f;
         if (!is_motion(binding.source)) {
+            update_binding(binding, 0.0f, timestamp_ns);
+        }
+    }
+}
+
+void Input::remove_gamepad(uint32_t device, uint64_t timestamp_ns) {
+    if (device == active_gamepad_) {
+        release_gamepad(timestamp_ns);
+        active_gamepad_ = 0;
+    }
+}
+
+bool Input::accept_gamepad_event(const RawInput& input) {
+    if (input.device == active_gamepad_) {
+        return true;
+    }
+    // Another pad only takes over with a real press or push, and only from an idle active pad.
+    const bool deliberate =
+        input.source == InputSource::GamepadButton ? input.value >= 0.5f : std::fabs(input.value) >= kStickDeadzone;
+    if (!deliberate || !active_gamepad_idle()) {
+        return false;
+    }
+    release_gamepad(input.timestamp_ns);
+    active_gamepad_ = input.device;
+    return true;
+}
+
+bool Input::active_gamepad_idle() const {
+    for (const Binding& binding : bindings_) {
+        if (is_gamepad(binding.source) && (binding.down || binding.value != 0.0f)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Input::release_gamepad(uint64_t timestamp_ns) {
+    for (Binding& binding : bindings_) {
+        if (is_gamepad(binding.source)) {
             update_binding(binding, 0.0f, timestamp_ns);
         }
     }

@@ -22,7 +22,7 @@ core::Result<Window> Window::create(const WindowDesc& desc) {
     }
 
     SDL_Window* window =
-        SDL_CreateWindow(desc.title, static_cast<int>(desc.width), static_cast<int>(desc.height), flags);
+        SDL_CreateWindow(desc.title, static_cast<int>(desc.width_points), static_cast<int>(desc.height_points), flags);
     if (window == nullptr) {
         DE_LOG_ERROR("platform", "SDL_CreateWindow failed: %s", SDL_GetError());
         return core::fail(core::ErrorCode::Unsupported, "the window could not be created");

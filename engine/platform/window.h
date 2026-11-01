@@ -12,8 +12,10 @@ class Input;
 
 struct WindowDesc {
     const char* title = "DEengine";
-    uint32_t width = 1600; // in screen coordinates; the drawable size in pixels may be larger (high DPI)
-    uint32_t height = 900;
+    // In points (screen coordinates). On high-DPI displays the drawable size in pixels is larger:
+    // read Window::pixel_width() / pixel_height() for the swapchain.
+    uint32_t width_points = 1600;
+    uint32_t height_points = 900;
     bool resizable = true;
     bool fullscreen = false;
     bool vulkan_surface = true; // the window will present through a Vulkan swapchain
