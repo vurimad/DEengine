@@ -15,26 +15,33 @@ constexpr size_t kBufferAlignment = 64;
 // Checked in every build: an overflowing budget would size the buffer smaller than the
 // allocator believes, and it would hand out memory past the end.
 size_t checked_budget(size_t bytes_per_frame) {
-    DE_VERIFY_MSG(bytes_per_frame > 0 && bytes_per_frame <= SIZE_MAX / (2 * FrameAllocator::kFramesInFlight),
+    DE_VERIFY_MSG(bytes_per_frame > 0 && bytes_per_frame <= SIZE_MAX / (2 * FrameAllocator::kMaxFramesInFlight),
                   "frame allocator budget is zero or not plausible");
     return align_up(bytes_per_frame, kBufferAlignment);
 }
 
+size_t checked_frames_in_flight(size_t frames_in_flight) {
+    DE_VERIFY_MSG(frames_in_flight >= 1 && frames_in_flight <= FrameAllocator::kMaxFramesInFlight,
+                  "frames in flight must be between 1 and kMaxFramesInFlight");
+    return frames_in_flight;
+}
+
 } // namespace
 
-FrameAllocator::FrameAllocator(size_t bytes_per_frame, Allocator& backing)
+FrameAllocator::FrameAllocator(size_t bytes_per_frame, size_t frames_in_flight, Allocator& backing)
     : backing_(&backing), bytes_per_frame_(checked_budget(bytes_per_frame)),
-      buffers_(static_cast<std::byte*>(backing.allocate(bytes_per_frame_ * kFramesInFlight, kBufferAlignment))),
+      frames_in_flight_(checked_frames_in_flight(frames_in_flight)),
+      buffers_(static_cast<std::byte*>(backing.allocate(bytes_per_frame_ * frames_in_flight_, kBufferAlignment))),
       current_(buffers_) {}
 
 FrameAllocator::~FrameAllocator() {
-    backing_->deallocate(buffers_, bytes_per_frame_ * kFramesInFlight, kBufferAlignment);
+    backing_->deallocate(buffers_, bytes_per_frame_ * frames_in_flight_, kBufferAlignment);
 }
 
 void FrameAllocator::begin_frame() {
     peak_ = std::max(peak_, offset_.load(std::memory_order_relaxed));
     ++frame_index_;
-    current_ = buffers_ + (frame_index_ % kFramesInFlight) * bytes_per_frame_;
+    current_ = buffers_ + (frame_index_ % frames_in_flight_) * bytes_per_frame_;
     offset_.store(0, std::memory_order_relaxed);
 }
 

@@ -69,7 +69,7 @@
   </Type>
 
   <Type Name="de::core::FrameAllocator">
-    <DisplayString>{{ frame={frame_index_} used={offset_} budget={bytes_per_frame_} }}</DisplayString>
+    <DisplayString>{{ frame={frame_index_} used={offset_} budget={bytes_per_frame_} in_flight={frames_in_flight_} }}</DisplayString>
   </Type>
 
   <Type Name="de::core::Pool">

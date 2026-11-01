@@ -10,7 +10,7 @@ The foundation every other system builds on: the core library (containers, strin
 | `memory_tag.h` | `MemoryTag` | Own |
 | `memory_stats.h` | `memory_stats()`, heap allocation counters, `NoHeapAllocationScope` | Own (atomics) |
 | `arena.h` | `Arena` (linear, mark/rewind, reset) | Own |
-| `frame_allocator.h` | `FrameAllocator` (per frame, lock-free, frames in flight) | Own |
+| `frame_allocator.h` | `FrameAllocator` (per frame, lock-free, 1–3 frames in flight, default 2) | Own |
 | `pool.h` | `Pool` (fixed-size blocks, free list) | Own |
 | `log.h` | `DE_LOG_*`, `DE_FATAL`, `LogSink` | Own: printf-style, stderr sink by default |
 | `array.h` | `Array<T>` | `std::vector` underneath |

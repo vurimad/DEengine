@@ -23,22 +23,50 @@ TEST_CASE("allocations are aligned and come from the current frame") {
 }
 
 TEST_CASE("data stays valid while its frame is in flight, then the buffer is reused") {
-    FrameAllocator frames(4096);
-    auto* first = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
-    *first = 42;
+    for (size_t frames_in_flight = 1; frames_in_flight <= FrameAllocator::kMaxFramesInFlight; ++frames_in_flight) {
+        CAPTURE(frames_in_flight);
+        FrameAllocator frames(4096, frames_in_flight);
+        CHECK(frames.frames_in_flight() == frames_in_flight);
 
-    // The render thread may still read the frames in flight: their data must survive.
-    for (size_t i = 1; i < FrameAllocator::kFramesInFlight; ++i) {
-        frames.begin_frame();
-        auto* other = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
-        *other = 7;
-        CHECK(other != first);
-        CHECK(*first == 42);
+        auto* first = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
+        *first = 42;
+
+        // Later stages may still read the frames in flight: their data must survive.
+        for (size_t i = 1; i < frames_in_flight; ++i) {
+            frames.begin_frame();
+            auto* other = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
+            *other = 7;
+            CHECK(other != first);
+            CHECK(*first == 42);
+        }
+
+        frames.begin_frame(); // back to the first buffer
+        CHECK(frames.allocate(sizeof(int), alignof(int)) == first);
+        CHECK(frames.frame_index() == frames_in_flight);
     }
+}
 
-    frames.begin_frame(); // back to the first buffer
-    CHECK(frames.allocate(sizeof(int), alignof(int)) == first);
-    CHECK(frames.frame_index() == FrameAllocator::kFramesInFlight);
+TEST_CASE("defaults to two frames in flight") {
+    const FrameAllocator frames(4096);
+    CHECK(frames.frames_in_flight() == 2);
+}
+
+TEST_CASE("three frames in flight keep frame N's data through frames N+1 and N+2") {
+    // Game thread builds N+2 while the render thread records N+1 and the GPU still reads N.
+    FrameAllocator frames(4096, 3);
+    auto* frame_n = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
+    *frame_n = 1;
+    frames.begin_frame();
+    auto* frame_n1 = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
+    *frame_n1 = 2;
+    frames.begin_frame();
+    auto* frame_n2 = static_cast<int*>(frames.allocate(sizeof(int), alignof(int)));
+    *frame_n2 = 3;
+    CHECK(*frame_n == 1);
+    CHECK(*frame_n1 == 2);
+    CHECK(frame_n != frame_n1);
+    CHECK(frame_n1 != frame_n2);
+    CHECK(frame_n != frame_n2);
 }
 
 TEST_CASE("begin_frame resets usage and keeps the peak") {
