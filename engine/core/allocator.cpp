@@ -17,11 +17,21 @@ public:
     }
 
     void deallocate(void* ptr, size_t size, size_t alignment) override {
+#if defined(__cpp_sized_deallocation)
         if (alignment <= __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
             ::operator delete(ptr, size);
             return;
         }
         ::operator delete(ptr, size, std::align_val_t{alignment});
+#else
+        // Sized deallocation is off by default before clang 19.
+        static_cast<void>(size);
+        if (alignment <= __STDCPP_DEFAULT_NEW_ALIGNMENT__) {
+            ::operator delete(ptr);
+            return;
+        }
+        ::operator delete(ptr, std::align_val_t{alignment});
+#endif
     }
 };
 

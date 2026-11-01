@@ -39,7 +39,7 @@ T* allocate_array(Allocator& allocator, size_t count) {
 
 template <typename T>
 void deallocate_array(Allocator& allocator, T* ptr, size_t count) {
-    allocator.deallocate(ptr, sizeof(T) * count, alignof(T));
+    allocator.deallocate(static_cast<void*>(ptr), sizeof(T) * count, alignof(T));
 }
 
 } // namespace de::core
