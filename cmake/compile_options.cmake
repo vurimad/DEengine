@@ -30,6 +30,9 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         /GR-
         /EHs-c-
         $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
+        # C4324 "structure was padded due to alignment specifier": padding to cache lines is
+        # deliberate (docs/design.md, Performance rules: no false sharing).
+        $<$<CXX_COMPILER_ID:MSVC>:/wd4324>
         $<$<BOOL:${DE_WARNINGS_AS_ERRORS}>:/WX>)
 
     target_compile_definitions(de_compile_options INTERFACE
