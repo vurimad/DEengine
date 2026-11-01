@@ -1,4 +1,4 @@
-﻿find_package(SDL3 CONFIG REQUIRED)
+find_package(SDL3 CONFIG REQUIRED)
 
 add_library(de_platform STATIC
     debug.h

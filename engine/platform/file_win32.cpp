@@ -4,6 +4,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace de::platform {
@@ -13,12 +14,36 @@ namespace {
 using core::ErrorCode;
 using core::fail;
 
+// Long enough for kMaxPathLength plus the \\?\UNC\ prefix.
+constexpr DWORD kWideCapacity = kMaxPathLength + 16;
+
 struct WidePath {
-    wchar_t text[kMaxPathLength + 1];
+    wchar_t text[kWideCapacity];
 };
 
+// UTF-8 path -> absolute wide path with the \\?\ prefix, so the OS doesn't stop at MAX_PATH (260).
 bool to_wide(const char* path, WidePath& out) {
-    return MultiByteToWideChar(CP_UTF8, 0, path, -1, out.text, static_cast<int>(kMaxPathLength + 1)) > 0;
+    wchar_t relative[kWideCapacity];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, relative, static_cast<int>(kWideCapacity)) <= 0) {
+        return false;
+    }
+    wchar_t absolute[kWideCapacity];
+    const DWORD length = GetFullPathNameW(relative, kWideCapacity, absolute, nullptr); // also turns / into \.
+    if (length == 0 || length >= kWideCapacity - 8) {
+        return false;
+    }
+    const bool already_prefixed = std::wcsncmp(absolute, L"\\\\?\\", 4) == 0;
+    const bool unc = !already_prefixed && std::wcsncmp(absolute, L"\\\\", 2) == 0;
+    const wchar_t* prefix = already_prefixed ? L"" : (unc ? L"\\\\?\\UNC" : L"\\\\?\\");
+    const wchar_t* rest = unc ? absolute + 1 : absolute; // \\server\share -> \\?\UNC\server\share
+    const size_t prefix_length = std::wcslen(prefix);
+    const size_t rest_length = std::wcslen(rest);
+    if (prefix_length + rest_length + 1 > kWideCapacity) {
+        return false;
+    }
+    std::memcpy(out.text, prefix, prefix_length * sizeof(wchar_t));
+    std::memcpy(out.text + prefix_length, rest, (rest_length + 1) * sizeof(wchar_t));
+    return true;
 }
 
 ErrorCode error_from_last() {
@@ -33,6 +58,30 @@ HANDLE native(intptr_t handle) {
 // ReadFile and WriteFile take DWORD sizes: big transfers go in chunks.
 constexpr DWORD kMaxChunk = 1U << 30;
 
+// "<path>.<process>-<n>.detmp": unique per write, and unlikely to clash with a real file.
+bool temp_path_for(const char* path, PathString& out) {
+    static std::atomic<uint32_t> counter{0};
+    out.assign(path);
+    char suffix[48];
+    size_t length = 0;
+    const auto add_number = [&](uint32_t value) {
+        char digits[10];
+        size_t count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        while (count > 0) {
+            suffix[length++] = digits[--count];
+        }
+    };
+    suffix[length++] = '.';
+    add_number(GetCurrentProcessId());
+    suffix[length++] = '-';
+    add_number(counter.fetch_add(1, std::memory_order_relaxed));
+    return out.append(std::string_view(suffix, length)) && out.append(".detmp");
+}
+
 } // namespace
 
 core::Result<File> File::open_read(const char* path) {
@@ -40,8 +89,10 @@ core::Result<File> File::open_read(const char* path) {
     if (!to_wide(path, wide)) {
         return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
     }
-    HANDLE handle = CreateFileW(wide.text, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                                FILE_ATTRIBUTE_NORMAL, nullptr);
+    // Share everything: tools may hold files open for writing (logs), and the cooker replaces
+    // files by rename while they're being read.
+    HANDLE handle = CreateFileW(wide.text, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         return fail(error_from_last(), "file could not be opened for reading");
     }
@@ -104,15 +155,14 @@ core::Result<size_t> File::read_at(uint64_t offset, std::span<std::byte> dest) c
 }
 
 core::Result<void> write_file_atomic(const char* path, std::span<const std::byte> data) {
+    PathString temp;
     WidePath wide;
     WidePath wide_temp;
-    PathString temp(path);
-    if (!temp.append(".tmp") || !to_wide(path, wide) || !to_wide(temp.c_str(), wide_temp)) {
+    if (!temp_path_for(path, temp) || !to_wide(path, wide) || !to_wide(temp.c_str(), wide_temp)) {
         return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
     }
 
-    HANDLE handle =
-        CreateFileW(wide_temp.text, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE handle = CreateFileW(wide_temp.text, GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         return fail(error_from_last(), "file could not be created");
     }
@@ -130,11 +180,20 @@ core::Result<void> write_file_atomic(const char* path, std::span<const std::byte
         DeleteFileW(wide_temp.text);
         return fail(ErrorCode::IoError, "file write failed");
     }
-    if (MoveFileExW(wide_temp.text, wide.text, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) == 0) {
-        DeleteFileW(wide_temp.text);
-        return fail(ErrorCode::IoError, "file could not be replaced");
+    // Replacing a file fails for a moment while another rename onto it, an antivirus scan or an
+    // indexer holds it: retry those transient errors briefly (up to about half a second).
+    for (int attempt = 0;; ++attempt) {
+        if (MoveFileExW(wide_temp.text, wide.text, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0) {
+            return {};
+        }
+        const DWORD error = GetLastError();
+        const bool transient = error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION;
+        if (!transient || attempt == 100) {
+            DeleteFileW(wide_temp.text);
+            return fail(ErrorCode::IoError, "file could not be replaced");
+        }
+        Sleep(attempt < 10 ? 0 : 5);
     }
-    return {};
 }
 
 bool path_exists(const char* path) {
@@ -147,16 +206,19 @@ core::Result<void> create_directories(const char* path) {
     if (!to_wide(path, wide)) {
         return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
     }
-    // Create each level in turn: "C:/a/b/c" -> "C:/a", "C:/a/b", "C:/a/b/c".
+    // Create each level after the root: \\?\C:\a\b -> \\?\C:\a, \\?\C:\a\b.
     const size_t length = std::wcslen(wide.text);
-    for (size_t i = 1; i <= length; ++i) {
+    const wchar_t* root_end = std::wcschr(wide.text + 4, L'\\'); // first separator after \\?\X:
+    if (root_end == nullptr) {
+        return {}; // a drive root
+    }
+    for (size_t i = static_cast<size_t>(root_end - wide.text) + 1; i <= length; ++i) {
         const wchar_t c = wide.text[i];
-        if (c != L'/' && c != L'\\' && c != L'\0') {
+        if (c != L'\\' && c != L'\0') {
             continue;
         }
         wide.text[i] = L'\0';
-        const bool is_drive = i == 2 && wide.text[1] == L':';
-        if (!is_drive && CreateDirectoryW(wide.text, nullptr) == 0 && GetLastError() != ERROR_ALREADY_EXISTS) {
+        if (CreateDirectoryW(wide.text, nullptr) == 0 && GetLastError() != ERROR_ALREADY_EXISTS) {
             return fail(ErrorCode::IoError, "directory could not be created");
         }
         wide.text[i] = c;
@@ -177,7 +239,7 @@ bool delete_tree_wide(WidePath& path) {
                                                             : DeleteFileW(path.text) != 0;
     }
     const size_t length = std::wcslen(path.text);
-    if (length + 3 > kMaxPathLength) {
+    if (length + 3 > kWideCapacity) {
         return false;
     }
     std::memcpy(path.text + length, L"\\*", sizeof(L"\\*"));
@@ -191,7 +253,7 @@ bool delete_tree_wide(WidePath& path) {
                 continue;
             }
             const size_t name_length = std::wcslen(entry.cFileName);
-            if (length + 1 + name_length > kMaxPathLength) {
+            if (length + 1 + name_length >= kWideCapacity) {
                 ok = false;
                 continue;
             }
@@ -218,6 +280,50 @@ core::Result<void> delete_tree(const char* path) {
     return {};
 }
 
+core::Result<void> list_directory(const char* path,
+                                  core::FunctionRef<void(const char* name, bool is_directory)> visit) {
+    WidePath wide;
+    if (!to_wide(path, wide)) {
+        return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
+    }
+    const size_t length = std::wcslen(wide.text);
+    if (length + 3 > kWideCapacity) {
+        return fail(ErrorCode::InvalidArgument, "path is too long");
+    }
+    std::memcpy(wide.text + length, L"\\*", sizeof(L"\\*"));
+    WIN32_FIND_DATAW entry;
+    HANDLE find = FindFirstFileW(wide.text, &entry);
+    if (find == INVALID_HANDLE_VALUE) {
+        return fail(error_from_last(), "directory could not be listed");
+    }
+    do {
+        if (std::wcscmp(entry.cFileName, L".") == 0 || std::wcscmp(entry.cFileName, L"..") == 0) {
+            continue;
+        }
+        char name[kMaxPathLength + 1];
+        if (WideCharToMultiByte(CP_UTF8, 0, entry.cFileName, -1, name, sizeof(name), nullptr, nullptr) > 0) {
+            visit(name, (entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0);
+        }
+    } while (FindNextFileW(find, &entry) != 0);
+    FindClose(find);
+    return {};
+}
+
+uint32_t current_process_id() {
+    return GetCurrentProcessId();
+}
+
+bool process_alive(uint32_t process_id) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+    if (process == nullptr) {
+        return GetLastError() == ERROR_ACCESS_DENIED; // exists, but belongs to someone else
+    }
+    DWORD exit_code = 0;
+    const bool running = GetExitCodeProcess(process, &exit_code) != 0 && exit_code == STILL_ACTIVE;
+    CloseHandle(process);
+    return running;
+}
+
 core::Result<PathString> user_data_folder() {
     // SDL knows the Saved Games folder (FOLDERID_SavedGames).
     const char* saved_games = SDL_GetUserFolder(SDL_FOLDER_SAVEDGAMES);
@@ -225,9 +331,7 @@ core::Result<PathString> user_data_folder() {
         return fail(ErrorCode::NotFound, "no Saved Games folder");
     }
     PathString folder(saved_games);
-    while (!folder.empty() && (folder[folder.size() - 1] == '\\' || folder[folder.size() - 1] == '/')) {
-        folder.assign(folder.view().substr(0, folder.size() - 1));
-    }
+    folder.trim_trailing('\\', '/');
     return folder;
 }
 
@@ -242,9 +346,7 @@ core::Result<PathString> system_temp_folder() {
         return fail(ErrorCode::InvalidArgument, "the temp folder path is too long");
     }
     PathString folder(utf8);
-    while (!folder.empty() && (folder[folder.size() - 1] == '\\' || folder[folder.size() - 1] == '/')) {
-        folder.assign(folder.view().substr(0, folder.size() - 1));
-    }
+    folder.trim_trailing('\\', '/');
     return folder;
 }
 

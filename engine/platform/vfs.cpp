@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdlib>
 #include <mutex>
 #include <new>
 #include <string_view>
@@ -30,8 +31,23 @@ bool is_path_char(char c) {
     return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '/';
 }
 
-// "game:/characters/knight.demesh" -> Game + "characters/knight.demesh", enforcing the path rules:
-// lowercase, forward slashes, no empty, "." or ".." segments (docs/design.md, File system & IO).
+// Windows treats these names as devices in any folder, with or without an extension
+// ("con.txt" is the console), so a path using one would mean different things per OS.
+bool is_reserved_name(std::string_view segment) {
+    const std::string_view stem = segment.substr(0, segment.find('.'));
+    for (const std::string_view name : {"con", "prn", "aux", "nul"}) {
+        if (stem == name) {
+            return true;
+        }
+    }
+    const bool numbered_device =
+        stem.size() == 4 && (stem.starts_with("com") || stem.starts_with("lpt")) && stem[3] >= '0' && stem[3] <= '9';
+    return numbered_device;
+}
+
+// "game:/characters/knight.demesh" -> Game + "characters/knight.demesh", enforcing the path rules
+// (docs/design.md, File system & IO): lowercase, forward slashes, no empty, "." or ".." segments,
+// and nothing that means something else on another OS (device names, a trailing dot).
 core::Result<ParsedPath> parse_path(const char* path) {
     if (path == nullptr) {
         return fail(ErrorCode::InvalidArgument, "null path");
@@ -66,6 +82,12 @@ core::Result<ParsedPath> parse_path(const char* path) {
             if (segment.empty() || segment == "." || segment == "..") {
                 return fail(ErrorCode::InvalidArgument, "path has an empty, . or .. segment");
             }
+            if (segment.back() == '.') {
+                return fail(ErrorCode::InvalidArgument, "path segment ends with a dot (Windows drops it)");
+            }
+            if (is_reserved_name(segment)) {
+                return fail(ErrorCode::InvalidArgument, "path uses a name Windows reserves for devices");
+            }
             segment_start = i + 1;
         }
         return ParsedPath{.mount = prefix.mount, .relative = relative};
@@ -81,24 +103,66 @@ core::Result<PathString> join(const PathString& root, std::string_view relative)
     return path;
 }
 
+// One separator style in roots, logs and tools: forward slashes work on every OS.
+PathString normalized(PathString path) {
+    for (size_t i = 0; i < path.size(); ++i) {
+        if (path[i] == '\\') {
+            path[i] = '/';
+        }
+    }
+    path.trim_trailing('/', '/', 1);
+    return path;
+}
+
+bool append_number(PathString& path, uint32_t value) {
+    char digits[10];
+    size_t count = 0;
+    do {
+        digits[count++] = static_cast<char>('0' + value % 10);
+        value /= 10;
+    } while (value != 0);
+    bool ok = true;
+    while (count > 0) {
+        ok = path.append(digits[--count]) && ok;
+    }
+    return ok;
+}
+
 struct RequestSlot {
     std::atomic<ReadStatus> status{ReadStatus::Invalid};
     std::atomic<uint32_t> generation{1};
 
-    // Written under the queue lock before the read starts, then owned by one reader thread.
+    // Written under the queue lock while queued, then owned by one reader thread.
     PathString native_path;
     std::span<std::byte> dest;
     uint64_t offset = 0;
     uint64_t size = kWholeFile;
     IoPriority priority = IoPriority::Near;
-    core::Job on_complete;
+    ReadCallback on_complete = nullptr;
+    void* context = nullptr;
+    core::JobCounter* counter = nullptr;
     uint64_t submit_ns = 0;
-    bool cancelled = false;
-    uint32_t next_free = kNoSlot;
+
+    // Queue links while Pending (intrusive, so cancel() unlinks in O(1)); free-list link otherwise.
+    uint32_t prev = kNoSlot;
+    uint32_t next = kNoSlot;
 
     // Written by the reader before status becomes Done or Failed.
     size_t bytes_read = 0;
     core::Error error;
+
+    void* owner = nullptr; // the VfsState, for the completion job
+};
+
+void bump_generation(RequestSlot& slot) {
+    const uint32_t next = slot.generation.load(std::memory_order_relaxed) + 1;
+    slot.generation.store(next == 0 ? 1 : next, std::memory_order_release); // 0 marks the invalid handle
+}
+
+struct Queue {
+    uint32_t head = kNoSlot;
+    uint32_t tail = kNoSlot;
+    uint32_t size = 0;
 };
 
 } // namespace
@@ -111,13 +175,11 @@ struct VfsState {
     RequestSlot* slots = nullptr;
     uint32_t slot_count = 0;
 
-    // Everything below up to `stopping` is guarded by `mutex`: the one lock on the request
-    // queue the design allows (docs/design.md, Performance rules).
+    // Everything below up to `stopping` is guarded by `mutex`: the one lock on the request queue
+    // the design allows (docs/design.md, Performance rules).
     std::mutex mutex;
     std::condition_variable work;
-    uint32_t* queues[kIoPriorityCount] = {}; // rings of slot indices, one per priority
-    uint32_t queue_head[kIoPriorityCount] = {};
-    uint32_t queue_size[kIoPriorityCount] = {};
+    Queue queues[kIoPriorityCount];
     uint32_t free_head = kNoSlot;
     bool stopping = false;
 
@@ -132,39 +194,60 @@ struct VfsState {
 
 namespace {
 
-bool any_queued(const VfsState& state) {
-    for (const uint32_t size : state.queue_size) {
-        if (size > 0) {
-            return true;
-        }
+// The queue helpers below run with the lock held.
+
+void push_queued(VfsState& state, uint32_t index) {
+    RequestSlot& slot = state.slots[index];
+    Queue& queue = state.queues[static_cast<size_t>(slot.priority)];
+    slot.prev = queue.tail;
+    slot.next = kNoSlot;
+    if (queue.tail != kNoSlot) {
+        state.slots[queue.tail].next = index;
+    } else {
+        queue.head = index;
     }
-    return false;
+    queue.tail = index;
+    ++queue.size;
 }
 
-// Highest priority first; first in, first out within a priority. Caller holds the lock.
+void unlink_queued(VfsState& state, uint32_t index) {
+    RequestSlot& slot = state.slots[index];
+    Queue& queue = state.queues[static_cast<size_t>(slot.priority)];
+    (slot.prev != kNoSlot ? state.slots[slot.prev].next : queue.head) = slot.next;
+    (slot.next != kNoSlot ? state.slots[slot.next].prev : queue.tail) = slot.prev;
+    slot.prev = kNoSlot;
+    slot.next = kNoSlot;
+    --queue.size;
+}
+
+// Highest priority first; first in, first out within a priority.
 uint32_t pop_queued(VfsState& state) {
-    for (size_t p = 0; p < kIoPriorityCount; ++p) {
-        if (state.queue_size[p] > 0) {
-            const uint32_t index = state.queues[p][state.queue_head[p]];
-            state.queue_head[p] = (state.queue_head[p] + 1) % state.slot_count;
-            --state.queue_size[p];
+    for (const Queue& queue : state.queues) {
+        if (queue.head != kNoSlot) {
+            const uint32_t index = queue.head;
+            unlink_queued(state, index);
             return index;
         }
     }
     return kNoSlot;
 }
 
-// Returns a slot to the free list. Caller holds the lock.
+bool any_queued(const VfsState& state) {
+    for (const Queue& queue : state.queues) {
+        if (queue.head != kNoSlot) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void release_slot(VfsState& state, uint32_t index) {
     RequestSlot& slot = state.slots[index];
-    uint32_t next_generation = slot.generation.load(std::memory_order_relaxed) + 1;
-    if (next_generation == 0) {
-        next_generation = 1; // 0 marks the invalid handle
-    }
-    slot.generation.store(next_generation, std::memory_order_relaxed);
+    bump_generation(slot);
     slot.status.store(ReadStatus::Invalid, std::memory_order_release);
-    slot.cancelled = false;
-    slot.next_free = state.free_head;
+    slot.on_complete = nullptr;
+    slot.counter = nullptr;
+    slot.next = state.free_head;
     state.free_head = index;
 }
 
@@ -174,6 +257,23 @@ RequestSlot* live_slot(VfsState& state, ReadHandle handle) {
     }
     RequestSlot& slot = state.slots[handle.index];
     return slot.generation.load(std::memory_order_acquire) == handle.generation ? &slot : nullptr;
+}
+
+core::Result<size_t> result_of(const RequestSlot& slot) {
+    if (slot.status.load(std::memory_order_acquire) == ReadStatus::Failed) {
+        return fail(slot.error);
+    }
+    return slot.bytes_read;
+}
+
+// The completion job: hands the result to the callback, then frees the slot. The slot stays
+// allocated until then, so the job's context pointer can't dangle.
+void deliver_result(void* context) {
+    RequestSlot& slot = *static_cast<RequestSlot*>(context);
+    auto& state = *static_cast<VfsState*>(slot.owner);
+    slot.on_complete(slot.context, result_of(slot));
+    const std::scoped_lock lock(state.mutex);
+    release_slot(state, static_cast<uint32_t>(&slot - state.slots));
 }
 
 void perform_read(VfsState& state, RequestSlot& slot) {
@@ -212,12 +312,14 @@ void perform_read(VfsState& state, RequestSlot& slot) {
     } else {
         state.reads_failed.fetch_add(1, std::memory_order_relaxed);
     }
-    // Copy the job out first: once the status is published, the caller may finish() the read
-    // and the slot may be reused.
-    const core::Job on_complete = slot.on_complete;
+    // A read with a callback belongs to its completion job from here on: finish() and cancel()
+    // leave it alone, and the job frees it.
+    const bool has_callback = slot.on_complete != nullptr;
+    core::JobCounter* counter = slot.counter;
     slot.status.store(ok ? ReadStatus::Done : ReadStatus::Failed, std::memory_order_release);
-    if (on_complete.entry != nullptr && state.jobs != nullptr) {
-        state.jobs->submit(on_complete);
+    if (has_callback) {
+        state.jobs->submit_reserved(
+            core::Job{.entry = &deliver_result, .context = &slot, .counter = counter, .name = "vfs read done"});
     }
 }
 
@@ -231,26 +333,11 @@ void reader_main(void* context) {
             if (state.stopping) {
                 return;
             }
-            const uint32_t index = pop_queued(state);
-            if (state.slots[index].cancelled) {
-                release_slot(state, index); // cancelled while it waited
-                continue;
-            }
-            slot = &state.slots[index];
+            slot = &state.slots[pop_queued(state)];
             slot->status.store(ReadStatus::InFlight, std::memory_order_release);
         }
         perform_read(state, *slot);
     }
-}
-
-// One separator style in roots, logs and tools: forward slashes work on every OS.
-PathString normalized(PathString path) {
-    for (size_t i = 0; i < path.size(); ++i) {
-        if (path[i] == '\\') {
-            path[i] = '/';
-        }
-    }
-    return path;
 }
 
 // <configured or OS folder>/<folder_name>: the Vfs always works inside a folder it names itself.
@@ -269,29 +356,61 @@ core::Result<PathString> owned_root(const char* configured, core::Result<PathStr
     return join(normalized(base), folder_name);
 }
 
+// temp:/ is <base>/deengine_temp/<process id>, so instances (game and editor) never clear each
+// other's files. Folders of processes that are gone are cleaned up on the way.
+core::Result<PathString> prepare_temp_root(const char* configured) {
+    const core::Result<PathString> parent = owned_root(configured, &system_temp_folder, "deengine_temp");
+    if (!parent) {
+        return fail(parent.error());
+    }
+    if (const core::Result<void> created = create_directories(parent->c_str()); !created) {
+        return fail(created.error());
+    }
+    static_cast<void>(list_directory(parent->c_str(), [&](const char* name, bool is_directory) {
+        char* end = nullptr;
+        const unsigned long process = std::strtoul(name, &end, 10);
+        const bool numeric = is_directory && end != name && *end == '\0';
+        if (numeric && static_cast<uint32_t>(process) != current_process_id() &&
+            !process_alive(static_cast<uint32_t>(process))) {
+            PathString stale = *parent;
+            if (stale.append('/') && stale.append(name)) {
+                static_cast<void>(delete_tree(stale.c_str())); // best effort
+            }
+        }
+    }));
+
+    PathString root = *parent;
+    if (!root.append('/') || !append_number(root, current_process_id())) {
+        return fail(ErrorCode::InvalidArgument, "temp path is too long");
+    }
+    // Our own folder starts empty. If something in it can't be deleted, keep going.
+    if (!delete_tree(root.c_str()).ok()) {
+        DE_LOG_WARN("vfs", "temp:/ could not be emptied completely: %s", root.c_str());
+    }
+    if (const core::Result<void> created = create_directories(root.c_str()); !created) {
+        return fail(created.error());
+    }
+    return root;
+}
+
 } // namespace
 
 core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     if (desc.game_root == nullptr) {
         return fail(ErrorCode::InvalidArgument, "VfsDesc::game_root is required");
     }
-    DE_VERIFY_MSG(desc.max_reads > 0 && desc.reader_threads > 0, "the Vfs needs reader threads and read slots");
+    DE_VERIFY_MSG(desc.max_reads > 0 && desc.max_reads < kNoSlot && desc.reader_threads > 0,
+                  "the Vfs needs reader threads and read slots");
 
     const PathString game_root = normalized(PathString(desc.game_root));
     const core::Result<PathString> user_root = owned_root(desc.user_root, &user_data_folder, "DEengine");
-    const core::Result<PathString> temp_root = owned_root(desc.temp_root, &system_temp_folder, "deengine_temp");
-    if (!user_root || !temp_root) {
-        DE_LOG_ERROR("vfs", "user:/ or temp:/ has no folder to mount");
-        return fail(!user_root ? user_root.error() : temp_root.error());
+    const core::Result<PathString> temp_root = prepare_temp_root(desc.temp_root);
+    if (!user_root || !temp_root || !create_directories(user_root->c_str()).ok()) {
+        DE_LOG_ERROR("vfs", "user:/ or temp:/ could not be prepared");
+        return fail(ErrorCode::IoError, "user:/ or temp:/ could not be prepared");
     }
     if (!path_exists(game_root.c_str())) {
         DE_LOG_WARN("vfs", "game:/ folder %s doesn't exist yet: reads from game:/ will fail", game_root.c_str());
-    }
-    // temp:/ starts empty. Only the folder the Vfs named itself is cleared, never a configured path.
-    if (!delete_tree(temp_root->c_str()).ok() || !create_directories(temp_root->c_str()).ok() ||
-        !create_directories(user_root->c_str()).ok()) {
-        DE_LOG_ERROR("vfs", "could not prepare %s and %s", user_root->c_str(), temp_root->c_str());
-        return fail(ErrorCode::IoError, "user:/ or temp:/ could not be prepared");
     }
 
     core::Allocator& allocator =
@@ -306,13 +425,11 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     state->slot_count = desc.max_reads;
     state->slots = core::allocate_array<RequestSlot>(allocator, state->slot_count);
     for (uint32_t i = 0; i < state->slot_count; ++i) {
-        ::new (static_cast<void*>(&state->slots[i])) RequestSlot();
-        state->slots[i].next_free = i + 1 < state->slot_count ? i + 1 : kNoSlot;
+        auto* slot = ::new (static_cast<void*>(&state->slots[i])) RequestSlot();
+        slot->owner = state;
+        slot->next = i + 1 < state->slot_count ? i + 1 : kNoSlot;
     }
     state->free_head = 0;
-    for (uint32_t*& queue : state->queues) {
-        queue = core::allocate_array<uint32_t>(allocator, state->slot_count);
-    }
 
     state->reader_count = desc.reader_threads;
     state->readers = core::allocate_array<Thread>(allocator, state->reader_count);
@@ -344,9 +461,6 @@ Vfs::~Vfs() {
         state.readers[i].~Thread(); // joins: reads in flight complete first
     }
     core::deallocate_array(allocator, state.readers, state.reader_count);
-    for (uint32_t* queue : state.queues) {
-        core::deallocate_array(allocator, queue, state.slot_count);
-    }
     for (uint32_t i = 0; i < state.slot_count; ++i) {
         state.slots[i].~RequestSlot();
     }
@@ -427,8 +541,8 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
     if (!native) {
         return fail(native.error());
     }
-    const size_t last_slash = native->view().find_last_of('/');
-    const PathString folder(native->view().substr(0, last_slash));
+    PathString folder = *native;
+    folder.truncate(native->view().find_last_of('/'));
     if (const core::Result<void> created = create_directories(folder.c_str()); !created) {
         return created;
     }
@@ -436,11 +550,18 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
 }
 
 core::Result<ReadHandle> Vfs::read(const ReadRequest& request) {
+    VfsState& state = *state_;
+    if (request.on_complete == nullptr && request.counter != nullptr) {
+        return fail(ErrorCode::InvalidArgument, "a read counter needs a completion callback");
+    }
+    if (request.on_complete != nullptr && state.jobs == nullptr) {
+        return fail(ErrorCode::InvalidArgument, "completion callbacks need VfsDesc::jobs");
+    }
     const core::Result<PathString> native = resolve(request.path);
     if (!native) {
         return fail(native.error());
     }
-    VfsState& state = *state_;
+
     ReadHandle handle;
     {
         const std::scoped_lock lock(state.mutex);
@@ -449,7 +570,7 @@ core::Result<ReadHandle> Vfs::read(const ReadRequest& request) {
         }
         const uint32_t index = state.free_head;
         RequestSlot& slot = state.slots[index];
-        state.free_head = slot.next_free;
+        state.free_head = slot.next;
 
         slot.native_path = *native;
         slot.dest = request.dest;
@@ -457,13 +578,14 @@ core::Result<ReadHandle> Vfs::read(const ReadRequest& request) {
         slot.size = request.size;
         slot.priority = request.priority;
         slot.on_complete = request.on_complete;
+        slot.context = request.context;
+        slot.counter = request.counter;
         slot.submit_ns = time_ns();
-        slot.cancelled = false;
+        if (slot.counter != nullptr) {
+            state.jobs->reserve(*slot.counter); // counted now, so waiting right after read() works
+        }
         slot.status.store(ReadStatus::Pending, std::memory_order_release);
-
-        const auto p = static_cast<size_t>(request.priority);
-        state.queues[p][(state.queue_head[p] + state.queue_size[p]) % state.slot_count] = index;
-        ++state.queue_size[p];
+        push_queued(state, index);
         handle = ReadHandle{.index = index, .generation = slot.generation.load(std::memory_order_relaxed)};
     }
     state.work.notify_one();
@@ -477,24 +599,23 @@ ReadStatus Vfs::status(ReadHandle handle) const {
 
 core::Result<size_t> Vfs::finish(ReadHandle handle) {
     VfsState& state = *state_;
+    // Checked and released under the lock, so a concurrent cancel() or finish() can't free the
+    // slot twice.
+    const std::scoped_lock lock(state.mutex);
     RequestSlot* slot = live_slot(state, handle);
     if (slot == nullptr) {
         return fail(ErrorCode::InvalidArgument, "unknown or already finished read");
+    }
+    if (slot->on_complete != nullptr) {
+        return fail(ErrorCode::InvalidArgument, "this read finishes through its completion callback");
     }
     const ReadStatus status = slot->status.load(std::memory_order_acquire);
     if (status != ReadStatus::Done && status != ReadStatus::Failed) {
         return fail(ErrorCode::InvalidArgument, "read hasn't finished: poll status() first");
     }
-    const size_t bytes = slot->bytes_read;
-    const core::Error error = slot->error;
-    {
-        const std::scoped_lock lock(state.mutex);
-        release_slot(state, handle.index);
-    }
-    if (status == ReadStatus::Failed) {
-        return fail(error);
-    }
-    return bytes;
+    const core::Result<size_t> result = result_of(*slot);
+    release_slot(state, handle.index);
+    return result;
 }
 
 CancelResult Vfs::cancel(ReadHandle handle) {
@@ -506,17 +627,21 @@ CancelResult Vfs::cancel(ReadHandle handle) {
         return CancelResult::UnknownHandle;
     }
     switch (slot->status.load(std::memory_order_acquire)) {
-    case ReadStatus::Pending: {
-        // Still queued: kill the handle now; the reader that dequeues it frees the slot.
-        slot->cancelled = true;
-        const uint32_t next_generation = slot->generation.load(std::memory_order_relaxed) + 1;
-        slot->generation.store(next_generation == 0 ? 1 : next_generation, std::memory_order_relaxed);
+    case ReadStatus::Pending:
+        // Unlinked and freed right away, so cancelled reads never pile up behind busier priorities.
+        unlink_queued(state, handle.index);
+        if (slot->counter != nullptr) {
+            state.jobs->release_reserved(*slot->counter); // the callback will never run
+        }
+        release_slot(state, handle.index);
         return CancelResult::NotStarted;
-    }
     case ReadStatus::InFlight:
         return CancelResult::InFlight;
     case ReadStatus::Done:
     case ReadStatus::Failed:
+        if (slot->on_complete != nullptr) {
+            return CancelResult::InFlight; // its completion callback is still due
+        }
         release_slot(state, handle.index);
         return CancelResult::DiscardedResult;
     case ReadStatus::Invalid:
@@ -534,7 +659,7 @@ IoStats Vfs::stats() const {
     stats.total_latency_ns = state.latency_ns.load(std::memory_order_relaxed);
     const std::scoped_lock lock(state.mutex);
     for (size_t p = 0; p < kIoPriorityCount; ++p) {
-        stats.pending[p] = state.queue_size[p];
+        stats.pending[p] = state.queues[p].size;
     }
     return stats;
 }

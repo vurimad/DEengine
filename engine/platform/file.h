@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/fixed_string.h"
+#include "core/function_ref.h"
 #include "core/result.h"
 
 #include <cstddef>
@@ -44,8 +45,9 @@ private:
     intptr_t handle_ = kInvalid;
 };
 
-// Writes data to path atomically: a temporary file next to it, flushed, then renamed over it.
-// A crash leaves either the old file or the new one, never half of one.
+// Writes data to path atomically: a uniquely named temporary file next to it, flushed, then
+// renamed over it. A crash leaves either the old file or the new one, never half of one, and
+// concurrent writes to one path each land whole (the last rename wins).
 core::Result<void> write_file_atomic(const char* path, std::span<const std::byte> data);
 
 bool path_exists(const char* path);
@@ -53,8 +55,16 @@ bool path_exists(const char* path);
 // Creates path and any missing parents. Succeeds if it already exists.
 core::Result<void> create_directories(const char* path);
 
-// Deletes path and everything under it. Succeeds if it doesn't exist.
+// Deletes path and everything under it, never following links. Succeeds if it doesn't exist.
 core::Result<void> delete_tree(const char* path);
+
+// Calls visit(name, is_directory) for each entry of a folder, except "." and "..".
+core::Result<void> list_directory(const char* path, core::FunctionRef<void(const char* name, bool is_directory)> visit);
+
+uint32_t current_process_id();
+
+// Whether a process with this id is running (ids can be reused, so it may be another program).
+bool process_alive(uint32_t process_id);
 
 // The OS folders the VFS mounts under (without a trailing slash).
 core::Result<PathString> user_data_folder(); // Windows: Saved Games; Linux: ~/.local/share

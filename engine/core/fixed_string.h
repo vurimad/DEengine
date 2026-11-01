@@ -32,6 +32,22 @@ public:
         text_[0] = '\0';
     }
 
+    // Keeps the first length characters (no-op if already shorter).
+    void truncate(size_t length) {
+        if (length < size_) {
+            size_ = length;
+            text_[size_] = '\0';
+        }
+    }
+
+    // Drops trailing characters equal to a or b (e.g. path separators), keeping at least keep.
+    void trim_trailing(char a, char b, size_t keep = 0) {
+        while (size_ > keep && (text_[size_ - 1] == a || text_[size_ - 1] == b)) {
+            --size_;
+        }
+        text_[size_] = '\0';
+    }
+
     // Replaces the contents. Returns false (and keeps the first N characters) if text is too long.
     bool assign(std::string_view text) {
         const size_t length = text.size() <= N ? text.size() : N;

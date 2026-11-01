@@ -81,6 +81,14 @@ public:
     void submit(const Job& job);
     void submit(std::span<const Job> jobs);
 
+    // For a job submitted later, from elsewhere (e.g. when an async read finishes): counts it
+    // on counter now, so wait(counter) can't return before it has run. Submit it with
+    // submit_reserved(), which doesn't count it again, or give the count back with
+    // release_reserved() if it will never run.
+    void reserve(JobCounter& counter, uint32_t count = 1);
+    void submit_reserved(const Job& job);
+    void release_reserved(JobCounter& counter, uint32_t count = 1);
+
     // Runs queued jobs on the calling thread until counter reaches zero.
     void wait(JobCounter& counter);
 

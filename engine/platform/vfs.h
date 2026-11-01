@@ -18,7 +18,7 @@ struct VfsState;
 enum class Mount : uint8_t {
     Game, // game:/  cooked game data. Read only. Dev: loose files; ship: archives (later)
     User, // user:/  saves, settings, logs, caches. Read and write
-    Temp, // temp:/  scratch, emptied every time the Vfs starts. Read and write
+    Temp, // temp:/  scratch, one folder per process, emptied at start. Read and write
 };
 
 enum class IoPriority : uint8_t {
@@ -43,7 +43,7 @@ enum class ReadStatus : uint8_t {
 enum class CancelResult : uint8_t {
     NotStarted,      // dropped before it began: the destination was never touched
     DiscardedResult, // it had already finished: the result is dropped, the destination is free
-    InFlight,        // too late: the destination is still in use, and finish() is still due
+    InFlight,        // too late: the destination is still in use; finish() (or the callback) is still due
     UnknownHandle,   // finished, cancelled or never issued: nothing uses the destination
 };
 
@@ -57,22 +57,31 @@ struct ReadHandle {
 
 inline constexpr uint64_t kWholeFile = UINT64_MAX;
 
+// Delivers a read's result as a job (decompression and setup run on the job system). The read
+// is finished by the Vfs right after the callback returns: don't call finish() or cancel() on it.
+using ReadCallback = void (*)(void* context, core::Result<size_t> result);
+
 struct ReadRequest {
     const char* path = nullptr; // "game:/characters/knight/knight.demesh"
     std::span<std::byte> dest;  // read straight into this memory, never into an intermediate copy
     uint64_t offset = 0;
     uint64_t size = kWholeFile; // kWholeFile: from offset to the end, which must fit in dest
     IoPriority priority = IoPriority::Near;
-    core::Job on_complete = {}; // optional: submitted to VfsDesc::jobs when the read finishes
+
+    // Optional completion, instead of polling. Needs VfsDesc::jobs. If counter is set, it counts
+    // the callback from the moment read() returns: jobs.wait(counter) returns once it has run.
+    ReadCallback on_complete = nullptr;
+    void* context = nullptr;
+    core::JobCounter* counter = nullptr;
 };
 
 struct VfsDesc {
     const char* game_root = nullptr;      // folder with the cooked game data (required)
     const char* user_root = nullptr;      // null: the OS user data folder; the Vfs uses <root>/DEengine
-    const char* temp_root = nullptr;      // null: the OS temp folder; the Vfs uses <root>/deengine_temp
+    const char* temp_root = nullptr;      // null: the OS temp folder; the Vfs uses <root>/deengine_temp/<process>
     uint32_t reader_threads = 2;          // phase 1: blocking positional reads on a small pool
     uint32_t max_reads = 1024;            // reads in flight at once
-    core::JobSystem* jobs = nullptr;      // where ReadRequest::on_complete jobs go
+    core::JobSystem* jobs = nullptr;      // where ReadRequest::on_complete callbacks run
     core::Allocator* allocator = nullptr; // null: heap_allocator(MemoryTag::Platform)
 };
 
@@ -88,7 +97,7 @@ struct IoStats {
 // File system & IO). Engine code reads and writes files only through it.
 //
 // Async reads go straight into caller memory, highest priority first; poll status() and call
-// finish() to collect the result, or get a completion job. Phase 1 runs blocking positional reads
+// finish() to collect the result, or get a completion callback. Phase 1 runs blocking positional reads
 // on reader_threads threads behind one lock on the request queue; phase 2 swaps in IoRing /
 // io_uring behind the same API. Blocking read_file() and write_file() are for startup and tools.
 //

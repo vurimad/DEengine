@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -133,10 +134,17 @@ TEST_CASE("paths follow the rules: mount prefix, lowercase, forward slashes, no 
     CHECK(vfs.resolve("user:/saves/slot_0.sav").ok());
     CHECK(vfs.resolve("temp:/x").ok());
 
-    for (const char* bad : {"characters/knight.demesh", "game:/", "game://a", "game:/a//b", "game:/a/", "game:/../x",
-                            "game:/a/./b", "game:/Knight.demesh", "game:/a\\b", "src:/a", "game:/a b"}) {
+    for (const char* bad :
+         {"characters/knight.demesh", "game:/", "game://a", "game:/a//b", "game:/a/", "game:/../x", "game:/a/./b",
+          "game:/Knight.demesh", "game:/a\\b", "src:/a", "game:/a b", "user:/logs/con.txt", "game:/nul",
+          "game:/a/aux.bin", "game:/com1.bin", "game:/lpt9", "game:/mesh.", "game:/dir./x"}) {
         CAPTURE(bad);
         CHECK_FALSE(vfs.resolve(bad).ok());
+    }
+    // Close to the reserved names, but fine everywhere.
+    for (const char* good : {"game:/console.txt", "game:/com10.bin", "game:/nullable", "game:/a.b.c"}) {
+        CAPTURE(good);
+        CHECK(vfs.resolve(good).ok());
     }
     CHECK_FALSE(vfs.resolve(nullptr).ok());
 }
@@ -380,34 +388,196 @@ TEST_CASE("running out of read slots is an error, not a block") {
     }
 }
 
-TEST_CASE("a completion job runs when the read finishes") {
+namespace {
+
+struct Delivery {
+    std::atomic<int> calls{0};
+    std::atomic<size_t> bytes{0};
+    std::atomic<bool> failed{false};
+};
+
+void on_read(void* context, de::core::Result<size_t> result) {
+    auto* delivery = static_cast<Delivery*>(context);
+    if (result.ok()) {
+        delivery->bytes = *result;
+    } else {
+        delivery->failed = true;
+    }
+    delivery->calls.fetch_add(1);
+}
+
+} // namespace
+
+TEST_CASE("a completion callback gets the result, and waiting on its counter works right away") {
     const QuietLog quiet;
     const Sandbox sandbox;
     sandbox.add_game_file("a.bin", "abc");
     de::core::JobSystem jobs;
     Vfs vfs = sandbox.make_vfs(VfsDesc{.jobs = &jobs});
 
-    std::atomic<int> completions{0};
+    Delivery found;
+    Delivery missing;
     de::core::JobCounter done;
     std::byte buffer[8];
-    const auto handle =
-        vfs.read(ReadRequest{.path = "game:/a.bin",
-                             .dest = buffer,
-                             .on_complete = de::core::Job{
-                                 .entry = [](void* context) { static_cast<std::atomic<int>*>(context)->fetch_add(1); },
-                                 .context = &completions,
-                                 .counter = &done,
-                                 .name = "read done"}});
+    std::byte other[8];
+    const auto handle = vfs.read(ReadRequest{
+        .path = "game:/a.bin", .dest = buffer, .on_complete = &on_read, .context = &found, .counter = &done});
     REQUIRE(handle.ok());
-    // The job is submitted from a reader thread, so the counter only counts it from then on:
-    // wait for the read first, then for the job.
-    REQUIRE(wait_for(vfs, *handle));
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (completions.load() == 0 && std::chrono::steady_clock::now() < deadline) {
-        jobs.wait(done);
+    REQUIRE(vfs.read(ReadRequest{.path = "game:/missing.bin",
+                                 .dest = other,
+                                 .on_complete = &on_read,
+                                 .context = &missing,
+                                 .counter = &done})
+                .ok());
+    jobs.wait(done); // counted from read(): can't return before both callbacks have run
+    CHECK(found.calls.load() == 1);
+    CHECK(found.bytes.load() == 3);
+    CHECK(text_of(std::span(buffer, 3)) == "abc");
+    CHECK(missing.calls.load() == 1);
+    CHECK(missing.failed.load());
+    // The callback finished the read: its handle is dead, and finish() isn't for it.
+    CHECK(vfs.status(*handle) == ReadStatus::Invalid);
+    CHECK_FALSE(vfs.finish(*handle).ok());
+}
+
+TEST_CASE("a cancelled read with a callback never calls it, and gives its count back") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    sandbox.add_game_file("a.bin", "abc");
+    de::core::JobSystem jobs;
+    Vfs vfs = sandbox.make_vfs(VfsDesc{.reader_threads = 1, .jobs = &jobs});
+
+    constexpr int kReads = 100;
+    Delivery delivery;
+    de::core::JobCounter done;
+    std::vector<std::byte> buffers(static_cast<size_t>(kReads) * 8);
+    std::vector<ReadHandle> handles;
+    handles.reserve(kReads);
+    for (int i = 0; i < kReads; ++i) {
+        handles.push_back(*vfs.read(ReadRequest{.path = "game:/a.bin",
+                                                .dest = std::span(buffers).subspan(static_cast<size_t>(i) * 8, 8),
+                                                .priority = IoPriority::Prefetch,
+                                                .on_complete = &on_read,
+                                                .context = &delivery,
+                                                .counter = &done}));
     }
-    CHECK(completions.load() == 1);
-    CHECK(vfs.finish(*handle).ok());
+    int not_started = 0;
+    for (int i = kReads - 1; i >= 0; --i) {
+        not_started += vfs.cancel(handles[i]) == CancelResult::NotStarted ? 1 : 0;
+    }
+    jobs.wait(done); // returns: cancelled reads gave their counts back
+    CHECK(not_started > 0);
+    CHECK(delivery.calls.load() == kReads - not_started);
+}
+
+TEST_CASE("callbacks need a job system, and counters need callbacks") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    Vfs vfs = sandbox.make_vfs();
+    Delivery delivery;
+    de::core::JobCounter done;
+    std::byte buffer[4];
+    CHECK_FALSE(
+        vfs.read(ReadRequest{.path = "game:/a.bin", .dest = buffer, .on_complete = &on_read, .context = &delivery})
+            .ok());
+    CHECK_FALSE(vfs.read(ReadRequest{.path = "game:/a.bin", .dest = buffer, .counter = &done}).ok());
+}
+
+TEST_CASE("cancelling queued reads frees their slots immediately") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    sandbox.add_game_file("a.bin", "a");
+    Vfs vfs = sandbox.make_vfs(VfsDesc{.reader_threads = 1, .max_reads = 8});
+    std::byte buffers[16];
+    std::vector<ReadHandle> handles;
+    handles.reserve(8);
+    for (int i = 0; i < 8; ++i) {
+        handles.push_back(*vfs.read(
+            ReadRequest{.path = "game:/a.bin", .dest = std::span(&buffers[i], 1), .priority = IoPriority::Prefetch}));
+    }
+    int freed = 0;
+    for (const ReadHandle handle : handles) {
+        const CancelResult result = vfs.cancel(handle);
+        freed += result == CancelResult::NotStarted || result == CancelResult::DiscardedResult ? 1 : 0;
+    }
+    REQUIRE(freed > 0);
+    // Every freed slot is usable again at once, even though nothing was dequeued.
+    for (int i = 0; i < freed; ++i) {
+        const auto again = vfs.read(ReadRequest{.path = "game:/a.bin", .dest = std::span(&buffers[8 + i], 1)});
+        REQUIRE(again.ok());
+        REQUIRE(wait_for(vfs, *again));
+        CHECK(vfs.finish(*again).ok());
+    }
+    for (const ReadHandle handle : handles) {
+        if (vfs.status(handle) == ReadStatus::InFlight || vfs.status(handle) == ReadStatus::Done) {
+            REQUIRE(wait_for(vfs, handle));
+            CHECK(vfs.finish(handle).ok());
+        }
+    }
+}
+
+TEST_CASE("concurrent writes to one path each land whole, and leave no temporary files") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    const Vfs vfs = sandbox.make_vfs();
+    const std::string_view contents[4] = {"aaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbb", "cccccccccccccccc",
+                                          "dddddddddddddddd"};
+    std::vector<std::thread> writers;
+    std::atomic<int> failures{0};
+    writers.reserve(4);
+    for (const std::string_view text : contents) {
+        writers.emplace_back([&vfs, &failures, text] {
+            for (int i = 0; i < 20; ++i) {
+                failures += vfs.write_file("user:/settings.cfg", bytes_of(text)).ok() ? 0 : 1;
+            }
+        });
+    }
+    for (std::thread& writer : writers) {
+        writer.join();
+    }
+    CHECK(failures.load() == 0);
+    std::byte buffer[32];
+    const auto read = vfs.read_file("user:/settings.cfg", buffer);
+    REQUIRE(read.ok());
+    const std::string_view result = text_of(std::span(buffer, *read));
+    CHECK((result == contents[0] || result == contents[1] || result == contents[2] || result == contents[3]));
+
+    int entries = 0;
+    REQUIRE(de::platform::list_directory(vfs.mount_root(de::platform::Mount::User), [&](const char*, bool) {
+                ++entries;
+            }).ok());
+    CHECK(entries == 1); // just settings.cfg
+}
+
+TEST_CASE("temp:/ is per process, and folders of dead processes are cleaned up") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    // A leftover from a process that no longer exists (Windows ids are multiples of 4).
+    PathString stale = sandbox.folder("temp");
+    REQUIRE(stale.append("/deengine_temp/999999"));
+    REQUIRE(de::platform::create_directories(stale.c_str()).ok());
+
+    const Vfs vfs = sandbox.make_vfs();
+    const std::string_view root = vfs.mount_root(de::platform::Mount::Temp);
+    CHECK(root.ends_with("/deengine_temp/" + std::to_string(de::platform::current_process_id())));
+    CHECK_FALSE(de::platform::path_exists(stale.c_str()));
+}
+
+TEST_CASE("paths longer than Windows' 260 characters work") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    const Vfs vfs = sandbox.make_vfs();
+    PathString path("user:/");
+    for (int i = 0; i < 12; ++i) {
+        REQUIRE(path.append("a_long_folder_name_for_testing/"));
+    }
+    REQUIRE(path.append("file.bin"));
+    REQUIRE(vfs.resolve(path.c_str())->size() > 300);
+    REQUIRE(vfs.write_file(path.c_str(), bytes_of("deep")).ok());
+    std::byte buffer[8];
+    const auto read = vfs.read_file(path.c_str(), buffer);
+    REQUIRE(read.ok());
+    CHECK(text_of(std::span(buffer, *read)) == "deep");
 }
 
 TEST_CASE("queueing, polling and finishing reads stay off the heap") {
