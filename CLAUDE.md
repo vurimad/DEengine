@@ -12,7 +12,7 @@ cmake --preset msvc                       # configure presets: msvc, clang-cl, l
 cmake --build --preset msvc-debug         # build presets: <configure>-debug | -dev | -ship
 ctest --preset msvc-debug
 clang-format --dry-run --Werror <files>   # must be clean
-clang-tidy -p build/clang-cl <cpp files>  # performance-* findings are errors
+clang-tidy -p build/clang-cl <cpp files>  # every finding is an error
 ```
 
 Before calling work done: it builds warning-free (warnings are errors), tests pass, clang-format and clang-tidy are clean.

@@ -17,6 +17,7 @@ jobs:
   build:
     name: Build & test (${{ matrix.preset }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -71,6 +72,7 @@ jobs:
   lint:
     name: clang-format & clang-tidy
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v7

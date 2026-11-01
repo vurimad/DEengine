@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Visual Studio debugger views for the core library (docs/design.md, Core library). -->
+<AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
+
+  <Type Name="de::core::Array&lt;*&gt;">
+    <DisplayString>{items_}</DisplayString>
+    <Expand>
+      <ExpandedItem>items_</ExpandedItem>
+    </Expand>
+  </Type>
+
+  <Type Name="de::core::InlineArray&lt;*,*&gt;">
+    <DisplayString>{{ size={size_} capacity={capacity_} }}</DisplayString>
+    <Expand>
+      <Item Name="[inline]">(void*)data_ == (void*)inline_storage_</Item>
+      <ArrayItems>
+        <Size>size_</Size>
+        <ValuePointer>data_</ValuePointer>
+      </ArrayItems>
+    </Expand>
+  </Type>
+
+  <Type Name="de::core::HashMap&lt;*,*,*&gt;">
+    <DisplayString>{map_}</DisplayString>
+    <Expand>
+      <ExpandedItem>map_</ExpandedItem>
+    </Expand>
+  </Type>
+
+  <Type Name="de::core::SlotHandle&lt;*&gt;">
+    <DisplayString Condition="generation == 0">invalid</DisplayString>
+    <DisplayString>{{ index={index} generation={generation} }}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::SlotMap&lt;*&gt;">
+    <DisplayString>{values_}</DisplayString>
+    <Expand>
+      <ExpandedItem>values_</ExpandedItem>
+      <Item Name="[slots]">slots_</Item>
+      <Item Name="[free_head]">free_head_</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="de::core::StringId">
+    <DisplayString Condition="value_ == 0">invalid</DisplayString>
+    <DisplayString>{value_,X}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::Error">
+    <DisplayString>{code} {message,s8}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::Result&lt;void,*&gt;">
+    <DisplayString Condition="!has_error_">ok</DisplayString>
+    <DisplayString>error {error_}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::Result&lt;*,*&gt;">
+    <DisplayString Condition="has_value_">ok {value_}</DisplayString>
+    <DisplayString>error {error_}</DisplayString>
+    <Expand>
+      <Item Name="[value]" Condition="has_value_">value_</Item>
+      <Item Name="[error]" Condition="!has_value_">error_</Item>
+    </Expand>
+  </Type>
+
+  <Type Name="de::core::FunctionRef&lt;*&gt;">
+    <DisplayString>{{ trampoline={(void*)trampoline_} }}</DisplayString>
+  </Type>
+
+</AutoVisualizer>

@@ -1,10 +1,12 @@
 # DEengine static analysis (docs/design.md, Performance rules and Code conventions).
-# performance-* findings are errors: an accidental copy or scan is a bug, same as a crash.
+# Every finding is an error, so CI enforces the conventions instead of collecting warnings.
+# Suppress a false positive with NOLINT(check-name) and a reason on the same line.
 Checks: >
   -*,
   bugprone-*,
   -bugprone-easily-swappable-parameters,
   performance-*,
+  -performance-enum-size,
   modernize-*,
   -modernize-use-trailing-return-type,
   -modernize-avoid-c-arrays,
@@ -17,9 +19,7 @@ Checks: >
   -misc-no-recursion,
   readability-identifier-naming
 
-WarningsAsErrors: >
-  performance-*,
-  -performance-enum-size
+WarningsAsErrors: '*'
 
 HeaderFilterRegex: '.*[\\/](engine|tools|tests)[\\/].*'
 FormatStyle: file
