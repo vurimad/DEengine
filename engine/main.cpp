@@ -1,9 +1,13 @@
+#include "core/job_system.h"
 #include "core/log.h"
+#include "core/memory_stats.h"
+#include "core/profile.h"
 #include "core/string_id.h"
 #include "core/version.h"
 #include "platform/events.h"
 #include "platform/input.h"
 #include "platform/platform.h"
+#include "platform/thread.h"
 #include "platform/time.h"
 #include "platform/window.h"
 
@@ -51,6 +55,14 @@ int main(int argc, char** argv) {
     if (!platform) {
         return EXIT_FAILURE;
     }
+    de::platform::set_current_thread_name("main");
+    DE_PROFILE_THREAD_NAME("main");
+
+    // Workers get OS names too, so debuggers and crash dumps show "worker 3" like the profiler does.
+    const de::core::JobSystem jobs(de::core::JobSystemDesc{
+        .on_worker_start = [](uint32_t /*index*/, const char* name) { de::platform::set_current_thread_name(name); }});
+    DE_LOG_INFO("engine", "job system: %u workers", jobs.worker_count());
+
     auto window = de::platform::Window::create({.title = "DEengine"});
     if (!window) {
         return EXIT_FAILURE;
@@ -116,6 +128,7 @@ int main(int argc, char** argv) {
     bool was_moving = false;
     bool was_minimized = false;
     while (!window->close_requested()) {
+        const uint64_t frame_start_allocations = de::core::heap_allocation_count(); // every thread, jobs included
         de::platform::pump_events(*window, input);
         input.sample();
 
@@ -147,6 +160,11 @@ int main(int argc, char** argv) {
                 static_cast<double>(input.state(sticks[1]).value), static_cast<double>(input.state(sticks[2]).value),
                 static_cast<double>(input.state(sticks[3]).value));
         }
+
+        // The "zero heap allocations per frame" rule, made visible in the profiler.
+        DE_PROFILE_PLOT("heap allocations/frame",
+                        static_cast<int64_t>(de::core::heap_allocation_count() - frame_start_allocations));
+        DE_PROFILE_FRAME();
 
         ++frame;
         if (max_frames != 0 && frame >= max_frames) {

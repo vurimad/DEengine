@@ -1,6 +1,7 @@
 #include "platform/input.h"
 
 #include "core/log.h"
+#include "core/profile.h"
 
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
@@ -252,6 +253,7 @@ void Input::release_gamepad(uint64_t timestamp_ns) {
 }
 
 void Input::sample() {
+    DE_PROFILE_ZONE("input_sample");
     for (Action& action : actions_) {
         ActionState& published = action.published;
         published.pressed = action.pending.pressed;

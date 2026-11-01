@@ -1,6 +1,7 @@
 #include "platform/events.h"
 
 #include "core/log.h"
+#include "core/profile.h"
 #include "platform/input.h"
 #include "platform/window.h"
 
@@ -24,6 +25,7 @@ bool is_window_event(uint32_t type) {
 } // namespace
 
 void pump_events(Window& window, Input& input) {
+    DE_PROFILE_ZONE("pump_events");
     window.resized_ = false;
     bool window_changed = false;
 

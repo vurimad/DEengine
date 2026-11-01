@@ -37,6 +37,12 @@ cmake --build --preset linux-clang-dev
 ctest --preset linux-clang-dev
 ```
 
+Profile it without the GUI (Windows; needs the Tracy 0.14.1 tools from `winget install wolfpld.tracy`):
+
+```powershell
+tools/profile.ps1 -Seconds 10      # prints top zones and plots; CSVs and trace.tracy in build/profiles/
+```
+
 Run the engine (a window with input logging until the frame loop lands; Escape quits):
 
 ```sh

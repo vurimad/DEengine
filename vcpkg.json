@@ -19,6 +19,13 @@
           "platform": "linux"
         }
       ]
+    },
+    {
+      "name": "tracy",
+      "default-features": false,
+      "features": [
+        "on-demand"
+      ]
     }
   ]
 }

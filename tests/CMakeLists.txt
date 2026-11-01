@@ -11,6 +11,7 @@ add_executable(de_tests
     core/function_ref_test.cpp
     core/hash_map_test.cpp
     core/inline_array_test.cpp
+    core/job_system_test.cpp
     core/log_test.cpp
     core/memory_test.cpp
     core/pool_test.cpp
@@ -19,6 +20,7 @@ add_executable(de_tests
     core/string_id_test.cpp
     core/test_support.h
     core/version_test.cpp
+    core/work_stealing_deque_test.cpp
     platform/input_test.cpp
     platform/thread_test.cpp)
 

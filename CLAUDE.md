@@ -14,6 +14,8 @@ ctest --preset msvc-debug
 clang-format --dry-run --Werror <files>   # must be clean
 clang-tidy -p build/clang-cl <cpp files>  # every finding is an error; skip *_linux.cpp on Windows
 build/msvc/bin/Debug/deengine --frames 120  # smoke run: opens the window, exits after 120 frames
+tools/profile.ps1 -Seconds 10               # headless Tracy capture of the dev build: zone and plot tables in text,
+                                            # CSVs + trace.tracy in build/profiles/<timestamp>/ (build msvc-dev first)
 ```
 
 Before calling work done: it builds warning-free (warnings are errors), tests pass, clang-format and clang-tidy are clean.
@@ -30,6 +32,8 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 - Engine headers use quotes relative to `engine/` (`#include "core/version.h"`); third-party and std use angle brackets.
 - No platform `#ifdef` outside `engine/platform/` and RHI backends. No Vulkan types above the RHI. No SDL or OS headers outside `engine/platform/` (RHI backends may use `Window::native_handle()`).
 - Input: game code reads actions (`Input::state(action)`), never device codes; bindings are text.
+- Profiling: put `DE_PROFILE_ZONE("name")` at the top of every system's per-frame entry point. Tracy viewer 0.14.1 must match the client in vcpkg.
+- Threads: parallel work goes through `JobSystem` (`submit` + `JobCounter`, or `parallel_for`); don't create threads for work.
 
 ## Git
 
