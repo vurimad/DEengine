@@ -2,6 +2,15 @@ find_package(doctest CONFIG REQUIRED)
 
 add_executable(de_tests
     main.cpp
+    core/allocator_test.cpp
+    core/array_test.cpp
+    core/function_ref_test.cpp
+    core/hash_map_test.cpp
+    core/inline_array_test.cpp
+    core/result_test.cpp
+    core/slot_map_test.cpp
+    core/string_id_test.cpp
+    core/test_support.h
     core/version_test.cpp)
 
 target_link_libraries(de_tests PRIVATE de::core de::compile_options doctest::doctest)
