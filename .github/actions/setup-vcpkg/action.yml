@@ -1,0 +1,36 @@
+name: Set up vcpkg
+description: >
+  Clone vcpkg at the manifest's builtin-baseline, bootstrap it, and restore the
+  binary cache so dependencies are only built when vcpkg.json changes.
+
+inputs:
+  cache-key:
+    description: Prefix for the binary cache key (one per compiler/preset)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Clone and bootstrap vcpkg
+      shell: pwsh
+      run: |
+        $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+        $root = Join-Path $env:RUNNER_TEMP 'vcpkg'
+        $cache = Join-Path $env:RUNNER_TEMP 'vcpkg-cache'
+
+        git clone --quiet https://github.com/microsoft/vcpkg.git $root
+        git -C $root checkout --quiet $baseline
+        if ($IsWindows) { & "$root/bootstrap-vcpkg.bat" -disableMetrics } else { & "$root/bootstrap-vcpkg.sh" -disableMetrics }
+        New-Item -ItemType Directory -Force $cache | Out-Null
+
+        # Written after any MSVC setup step, so this VCPKG_ROOT wins over Visual Studio's bundled copy.
+        "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+        "VCPKG_CACHE_DIR=$cache" >> $env:GITHUB_ENV
+        "VCPKG_BINARY_SOURCES=clear;files,$cache,readwrite" >> $env:GITHUB_ENV
+
+    - name: Restore vcpkg binary cache
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.VCPKG_CACHE_DIR }}
+        key: vcpkg-${{ inputs.cache-key }}-${{ hashFiles('vcpkg.json') }}
+        restore-keys: vcpkg-${{ inputs.cache-key }}-

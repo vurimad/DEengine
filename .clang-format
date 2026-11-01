@@ -1,0 +1,38 @@
+# DEengine formatting (docs/design.md, Code conventions).
+# 4-space indent, 120 columns, braces on the same line, pointers bound to the type,
+# includes grouped: own header, engine, third-party, std.
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: c++20
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+AccessModifierOffset: -4
+NamespaceIndentation: None
+FixNamespaceComments: true
+InsertNewlineAtEOF: true
+
+BreakBeforeBraces: Attach
+BreakTemplateDeclarations: Yes
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+AllowShortLambdasOnASingleLine: All
+
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+
+# Engine headers use quotes ("core/array.h"); third-party and std use angle brackets.
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^"'
+    Priority: 2
+  - Regex: '^<[a-z0-9_]+>$'
+    Priority: 4
+  - Regex: '^<'
+    Priority: 3

@@ -1,0 +1,23 @@
+# Build output
+/build/
+/out/
+
+# Cooked data and ship layout: rebuilt by the cooker, never committed
+/cooked/
+/Archives/
+*.arc
+
+# vcpkg
+/vcpkg_installed/
+
+# IDE and per-user settings
+/.vs/
+/.vscode/
+/.idea/
+CMakeUserPresets.json
+*.user
+
+# Captures, profiles, logs
+*.rdc
+*.tracy
+*.log

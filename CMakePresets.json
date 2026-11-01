@@ -1,0 +1,90 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug;RelWithDebInfo;Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "windows-base",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" },
+      "architecture": { "value": "x64", "strategy": "external" },
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-windows" }
+    },
+    {
+      "name": "linux-base",
+      "hidden": true,
+      "inherits": "base",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "VCPKG_TARGET_TRIPLET": "x64-linux" }
+    },
+    {
+      "name": "msvc",
+      "displayName": "Windows · MSVC",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_C_COMPILER": "cl", "CMAKE_CXX_COMPILER": "cl" }
+    },
+    {
+      "name": "clang-cl",
+      "displayName": "Windows · clang-cl",
+      "inherits": "windows-base",
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang-cl", "CMAKE_CXX_COMPILER": "clang-cl" }
+    },
+    {
+      "name": "linux-clang",
+      "displayName": "Linux · clang",
+      "inherits": "linux-base",
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++" }
+    },
+    {
+      "name": "linux-gcc",
+      "displayName": "Linux · gcc",
+      "inherits": "linux-base",
+      "cacheVariables": { "CMAKE_C_COMPILER": "gcc", "CMAKE_CXX_COMPILER": "g++" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc-debug", "configurePreset": "msvc", "configuration": "Debug" },
+    { "name": "msvc-dev", "configurePreset": "msvc", "configuration": "RelWithDebInfo" },
+    { "name": "msvc-ship", "configurePreset": "msvc", "configuration": "Release" },
+    { "name": "clang-cl-debug", "configurePreset": "clang-cl", "configuration": "Debug" },
+    { "name": "clang-cl-dev", "configurePreset": "clang-cl", "configuration": "RelWithDebInfo" },
+    { "name": "clang-cl-ship", "configurePreset": "clang-cl", "configuration": "Release" },
+    { "name": "linux-clang-debug", "configurePreset": "linux-clang", "configuration": "Debug" },
+    { "name": "linux-clang-dev", "configurePreset": "linux-clang", "configuration": "RelWithDebInfo" },
+    { "name": "linux-clang-ship", "configurePreset": "linux-clang", "configuration": "Release" },
+    { "name": "linux-gcc-debug", "configurePreset": "linux-gcc", "configuration": "Debug" },
+    { "name": "linux-gcc-dev", "configurePreset": "linux-gcc", "configuration": "RelWithDebInfo" },
+    { "name": "linux-gcc-ship", "configurePreset": "linux-gcc", "configuration": "Release" }
+  ],
+  "testPresets": [
+    {
+      "name": "test-base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    { "name": "msvc-debug", "inherits": "test-base", "configurePreset": "msvc", "configuration": "Debug" },
+    { "name": "msvc-dev", "inherits": "test-base", "configurePreset": "msvc", "configuration": "RelWithDebInfo" },
+    { "name": "msvc-ship", "inherits": "test-base", "configurePreset": "msvc", "configuration": "Release" },
+    { "name": "clang-cl-debug", "inherits": "test-base", "configurePreset": "clang-cl", "configuration": "Debug" },
+    { "name": "clang-cl-dev", "inherits": "test-base", "configurePreset": "clang-cl", "configuration": "RelWithDebInfo" },
+    { "name": "clang-cl-ship", "inherits": "test-base", "configurePreset": "clang-cl", "configuration": "Release" },
+    { "name": "linux-clang-debug", "inherits": "test-base", "configurePreset": "linux-clang", "configuration": "Debug" },
+    { "name": "linux-clang-dev", "inherits": "test-base", "configurePreset": "linux-clang", "configuration": "RelWithDebInfo" },
+    { "name": "linux-clang-ship", "inherits": "test-base", "configurePreset": "linux-clang", "configuration": "Release" },
+    { "name": "linux-gcc-debug", "inherits": "test-base", "configurePreset": "linux-gcc", "configuration": "Debug" },
+    { "name": "linux-gcc-dev", "inherits": "test-base", "configurePreset": "linux-gcc", "configuration": "RelWithDebInfo" },
+    { "name": "linux-gcc-ship", "inherits": "test-base", "configurePreset": "linux-gcc", "configuration": "Release" }
+  ]
+}
