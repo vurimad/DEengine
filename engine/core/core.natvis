@@ -64,6 +64,22 @@
     </Expand>
   </Type>
 
+  <Type Name="de::core::Arena">
+    <DisplayString>{{ used={used_} reserved={reserved_} }}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::FrameAllocator">
+    <DisplayString>{{ frame={frame_index_} used={offset_} budget={bytes_per_frame_} }}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::Pool">
+    <DisplayString>{{ live={live_blocks_} capacity={capacity_blocks_} block={block_stride_} }}</DisplayString>
+  </Type>
+
+  <Type Name="de::core::MemoryStats">
+    <DisplayString>{{ live={live_bytes} peak={peak_bytes} allocations={live_allocations} }}</DisplayString>
+  </Type>
+
   <Type Name="de::core::FunctionRef&lt;*&gt;">
     <DisplayString>{{ trampoline={(void*)trampoline_} }}</DisplayString>
   </Type>
