@@ -398,6 +398,42 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 - Imported resources (swapchain, TAA history, persistent shadow cache) live outside the aliasing pool.
 - A debug view shows the graph, lifetimes and heap usage, and can display any intermediate texture.
 
+*What we take from other engines* (studied 2026-11-02; findings in our own words, nothing copied):
+
+- **Frostbite FrameGraph** (GDC 2017, Yuriy O'Donnell; the slides are members-only, so this is the talk's public outline): the shape above. Passes are declared every frame with setup and execute, resources are virtual until the graph compiles, passes are culled by counting references back from the outputs, transient memory is aliased, and outside resources are imported.
+- **Unreal's Render Dependency Graph** (public documentation only, "Render Dependency Graph in Unreal Engine", UE 5.8; Unreal source is for ideas only):
+  - A pass reaches a resource's GPU object only if it declared the resource, and only inside its execute; anything else is an error in dev builds, with the checks compiled out of ship.
+  - An *immediate mode* runs each pass as soon as it is added, without culling or reordering, to bisect graph bugs.
+  - Results that outlive the frame (TAA history) are *extracted* from one graph and *imported* into the next.
+  - Execute lambdas run later, so they never capture stack data by reference; their data lives in the frame's memory.
+  - A transition log, filtered by pass and resource, prints every barrier the graph emits.
+  - Transient contents are undefined: a debug fill of fresh transients exposes passes that read what they never wrote.
+- **Godot's RenderingDeviceGraph** (MIT, `servers/rendering/rendering_device_graph.cpp`). It sits a layer lower than ours: it infers dependencies from each recorded command's resource usage. We take three ideas:
+  - **Per-subresource state.** Each resource keeps one state for the whole resource; mip or layer ranges that diverge are tracked as slices, and they are folded back when the whole resource is used again.
+  - **Barriers per level.** Commands that don't depend on each other share a level, and each level gets one barrier command, with the stage and access masks of all its barriers merged.
+  - **When a barrier is needed.** Godot emits one when the usage changes or a write follows a write. Our read-combinable states refine that: a read after a read in the same layout needs no barrier at all.
+- **Granite** (Hans-Kristian Arntzen, "Render graphs and Vulkan — a deep dive", 2017; Granite is MIT):
+  - Culling walks back from the frame's output.
+  - A read is recorded even when nothing changes, so the next writer waits for it (write after read).
+  - Sizes are absolute, relative to the swapchain, or relative to another resource.
+  - History resources are never aliased.
+  - Reordering passes to put distance between producer and consumer is worthwhile, but a later step.
+
+*Render graph v1 (M0a)*. What we build first, from the above:
+
+- **Passes.** `add_pass(name, setup, execute)`. Setup declares every texture and buffer the pass touches, each with its `ResourceState` and shader stages (subresource ranges allowed), and can create transient resources. Execute records into a graphics `CommandList`, inside a debug label named after the pass. Its closure and data live in the frame allocator: no `std::function`, and no stack captures by reference.
+- **Resources.**
+  - Transient textures and buffers are declared by description, with absolute or swapchain-relative sizes.
+  - Imported resources (the swapchain image, anything persistent) come in with their current state and say the state they must leave in.
+  - Execute resolves a graph handle to its RHI handle only for resources the pass declared (asserted).
+- **Compile.**
+  - Passes are culled from the outputs: imported resources that must leave in a state, and passes marked never-cull.
+  - Passes run in declaration order; there is no reordering in v1.
+  - The state of every subresource range is tracked; before each pass, one barrier batch holds every transition it needs. Reads in a compatible state merge without a barrier.
+- **Memory.** Transient resources come from a pool keyed by description and reused across frames. Aliasing in shared heaps is v2, as is the debug view.
+- **Debug.** Immediate mode (dev builds) and a transition log. The graph can be dumped to the log as text.
+- **Queues.** Graphics only. Async compute passes come later, on top of the RHI's queue ownership transfers. Uploads stay with the uploader, which lands them at the start of the frame, before the graph's passes.
+
 **GPU-driven geometry.**
 
 - All meshes live in large shared vertex/index buffers; all materials and textures are bindless (descriptor indexing + buffer device address).
