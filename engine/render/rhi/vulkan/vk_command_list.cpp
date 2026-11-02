@@ -56,8 +56,9 @@ VkBufferImageCopy2 to_vk(const Texture& texture, const BufferTextureCopy& region
     const uint32_t mip_height = std::max(desc.height >> region.mip, 1U);
     const uint32_t mip_depth = std::max(desc.depth >> region.mip, 1U);
     // Copies move one aspect at a time: depth for depth-stencil formats (stencil copies aren't exposed yet).
-    const VkImageAspectFlags aspect =
-        (texture.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 ? VK_IMAGE_ASPECT_DEPTH_BIT : texture.aspects;
+    const VkImageAspectFlags aspect = (texture.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0
+                                          ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT)
+                                          : texture.aspects;
     return {
         .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
         .bufferOffset = region.buffer_offset,

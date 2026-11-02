@@ -82,7 +82,7 @@ VkImageAspectFlags format_aspects(Format format) {
     if (info.stencil) {
         aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
     }
-    return aspects != 0 ? aspects : VK_IMAGE_ASPECT_COLOR_BIT;
+    return aspects != 0 ? aspects : static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 // Each state as the stages and accesses it covers, plus the image layout it needs. A barrier from

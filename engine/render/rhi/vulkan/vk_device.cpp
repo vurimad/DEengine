@@ -377,8 +377,9 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
 
     // --- Memory ---
     VmaAllocatorCreateInfo allocator_info{
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
-                 (memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0U),
+        .flags =
+            VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+            (memory_budget ? static_cast<VmaAllocatorCreateFlags>(VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT) : 0U),
         .physicalDevice = physical_device,
         .device = device,
         .instance = instance,
@@ -676,7 +677,7 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
 
     const VkImageCreateInfo image_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .flags = cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0U,
+        .flags = cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0U,
         .imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
         .format = to_vk_format(desc.format),
         .extent = {.width = desc.width, .height = desc.height, .depth = desc.depth},
