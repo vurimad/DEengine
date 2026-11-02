@@ -1,0 +1,7 @@
+# The Vulkan backend: the repository rules, minus one check that fights Vulkan's C idioms.
+InheritParentConfig: true
+
+# Vulkan output structs are zero-initialized and then filled by the driver ({.sType = ...}), which
+# leaves enum fields at 0 even where 0 isn't a named value. That is the API's intended use.
+Checks: >
+  -bugprone-invalid-enum-default-initialization

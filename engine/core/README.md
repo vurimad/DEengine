@@ -24,6 +24,7 @@ The foundation every other system builds on: the core library (containers, strin
 | `function_ref.h` | `FunctionRef<R(Args...)>` | Own |
 | `result.h` | `Result<T, E>`, `Error`, `fail()` | Own |
 | `hash.h` | `Hash<T>`, `mix64`, `fnv1a_64` | Own |
+| `enum_flags.h` | `DE_ENUM_FLAGS(Enum)`, `has_any`, `has_all` | Own |
 | `assert.h` | `DE_ASSERT`, `DE_VERIFY`, fatal handler | Own: logs, then the fatal handler, then abort |
 | `compiler.h` | `DE_PRINTF_FORMAT` | Compiler differences only |
 
