@@ -321,7 +321,7 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
         },
         [](const PassData& data, PassContext& context) {
             const ImDrawData& draw = *data.draw_data;
-            const rhi::TextureDesc& target = context.desc(data.target);
+            const rhi::TextureDesc& target_desc = context.desc(data.target);
             const rhi::ColorAttachment color{.texture = context.texture(data.target), .load = rhi::LoadOp::Load};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
             context.list.bind_pipeline(data.pipeline);
@@ -346,9 +346,9 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                     const float left = std::max((command.ClipRect.x - origin.x) * scale.x, 0.0f);
                     const float top = std::max((command.ClipRect.y - origin.y) * scale.y, 0.0f);
                     const float right =
-                        std::min((command.ClipRect.z - origin.x) * scale.x, static_cast<float>(target.width));
+                        std::min((command.ClipRect.z - origin.x) * scale.x, static_cast<float>(target_desc.width));
                     const float bottom =
-                        std::min((command.ClipRect.w - origin.y) * scale.y, static_cast<float>(target.height));
+                        std::min((command.ClipRect.w - origin.y) * scale.y, static_cast<float>(target_desc.height));
                     const ImTextureID texture = command.GetTexID();
                     if (right <= left || bottom <= top || !data.state->drawable(texture)) {
                         continue;
