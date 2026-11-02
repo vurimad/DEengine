@@ -454,6 +454,8 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 **GPU memory accounting.** The device counts every texture and buffer it allocates, by category (render targets, storage textures, sampled textures, GPU, upload and readback buffers), at its real allocation size, plus what waits to be freed. `Device::memory_stats` is cheap enough to poll every frame (for the frame stats panel, M0a task 11), `largest_textures` and `log_memory_report` name what is big, and `begin_frame` warns when a GPU-local heap passes 90% of its budget (once, until it drops below 80% again). The budget is the OS's where the driver has `VK_EXT_memory_budget`, an estimate otherwise. The streaming budgets (M1) build on these counters.
 
+**Debug UI.** Dear ImGui (debug and editor tools only) is drawn by the engine's own renderer, not ImGui's Vulkan backend: vertices read through a buffer pointer, textures by bindless index, a render graph pass over the backbuffer, its font atlas through the uploader (ImGui's texture protocol). Its input comes from a small SDL3 feed inside `platform/`, so SDL stays there. Its memory is tagged Tools; it saves no ini file. The frame stats panel (F1) shows frame times, heap allocations per frame, GPU memory by category, the render graph, uploads and the device.
+
 **Hardware ray tracing (optional, RT-ready from day one).** The game must look right with RT off; RT features are passes that replace or improve a raster fallback when the GPU supports them.
 
 - Ready from the start: the RHI exposes acceleration structures (BLAS per mesh LOD0, TLAS rebuilt from the GPU instance buffer each frame), and the bindless setup lets ray shaders reach any material.
