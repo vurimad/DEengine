@@ -297,10 +297,7 @@ int main(int argc, char** argv) {
         }
 
         device->begin_frame();
-        if (!uploader->idle()) {
-            de::rhi::CommandList list = device->begin_command_list();
-            uploader->record(list);
-        }
+        uploader->record(); // uploads land at the start of the frame
 
         // Clear the window to a slowly breathing dusk color, then draw the triangle and the quad.
         const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();

@@ -96,8 +96,16 @@ bool same_bytes(std::span<const std::byte> a, std::span<const std::byte> b) {
 // One frame that records the uploader's next batch.
 void record_frame(Device& device, Uploader& uploader) {
     device.begin_frame();
+    uploader.record();
+    device.end_frame();
+}
+
+// One frame that copies the first 32 bytes of buffer to a readback buffer, not waited for.
+void copy_out(Device& device, BufferHandle buffer, BufferHandle readback) {
+    device.begin_frame();
     CommandList list = device.begin_command_list();
-    uploader.record(list);
+    list.copy_buffer(buffer, 0, readback, 0, 32);
+    list.barrier(BufferBarrier{.buffer = readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
     device.end_frame();
 }
 
@@ -188,6 +196,14 @@ TEST_CASE("uploads reject bad requests and queue nothing") {
                                {.after = ResourceState::RenderTarget | ResourceState::ShaderRead})
               .error()
               .code == de::core::ErrorCode::InvalidArgument);
+
+    // Depth comes from rendering (and a transfer queue can't copy it).
+    const auto depth = *device->create_texture({.width = 4,
+                                                .height = 4,
+                                                .format = Format::D32Float,
+                                                .usage = TextureUsage::DepthStencil | TextureUsage::CopyDst});
+    CHECK(uploader->upload_texture(depth, data.first(64)).error().code == de::core::ErrorCode::Unsupported);
+    device->destroy(depth);
 
     // Buffers: the range must fit.
     CHECK(uploader->upload_buffer(buffer, 0, data.first(257), ResourceState::ShaderRead).error().code ==
@@ -553,9 +569,7 @@ TEST_CASE("a buffer's ranges left in different read states are all waited for") 
     if (!device) {
         return;
     }
-    // Barrier tracking within one frame: the graphics path (on the transfer queue, uploads land
-    // before all of the frame's graphics work).
-    auto uploader = Uploader::create(*device, {.use_transfer_queue = false});
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth | BufferUsage::Storage});
     const auto readback =
@@ -568,16 +582,13 @@ TEST_CASE("a buffer's ranges left in different read states are all waited for") 
             .ok());
     uploader->flush_and_wait();
 
-    // A copy reads the first range, then an upload overwrites it in the same frame: its barrier must
-    // wait for the copy, though the buffer's last upload left a compute read state.
+    // A copy reads the first range in one frame, an upload overwrites it in the next, with no wait
+    // between: the overwrite must wait for the copy, though the buffer's last upload left a compute
+    // read state.
+    copy_out(*device, buffer, readback);
     const auto newer = pattern(32, 7);
     REQUIRE(uploader->upload_buffer(buffer, 0, as_span(newer), ResourceState::CopySrc).ok());
-    device->begin_frame();
-    CommandList list = device->begin_command_list();
-    list.copy_buffer(buffer, 0, readback, 0, 32);
-    uploader->record(list);
-    list.barrier(BufferBarrier{.buffer = readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
-    device->end_frame();
+    record_frame(*device, *uploader);
     device->wait_idle();
     device->invalidate_mapped(readback);
     CHECK(std::memcmp(device->mapped(readback).data(), bytes.data(), 32) == 0); // read before the overwrite
@@ -709,8 +720,7 @@ TEST_CASE("a buffer range left written doesn't hide readers of another range") {
     if (!device) {
         return;
     }
-    // The graphics path, as above.
-    auto uploader = Uploader::create(*device, {.use_transfer_queue = false});
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth | BufferUsage::Storage});
     const auto readback =
@@ -723,16 +733,12 @@ TEST_CASE("a buffer range left written doesn't hide readers of another range") {
             .ok());
     uploader->flush_and_wait();
 
-    // The first range is copied from, then overwritten in the same frame: the last upload left a
-    // write state, but the copy's read must still be waited for.
+    // The first range is copied from in one frame and overwritten in the next: the last upload left
+    // a write state, but the copy's read must still be waited for.
+    copy_out(*device, buffer, readback);
     const auto newer = pattern(32, 15);
     REQUIRE(uploader->upload_buffer(buffer, 0, as_span(newer), ResourceState::CopySrc).ok());
-    device->begin_frame();
-    CommandList list = device->begin_command_list();
-    list.copy_buffer(buffer, 0, readback, 0, 32);
-    uploader->record(list);
-    list.barrier(BufferBarrier{.buffer = readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
-    device->end_frame();
+    record_frame(*device, *uploader);
     device->wait_idle();
     device->invalidate_mapped(readback);
     CHECK(std::memcmp(device->mapped(readback).data(), bytes.data(), 32) == 0);
@@ -824,7 +830,6 @@ TEST_CASE("textures re-uploaded every frame while sampled every frame stay in sy
             wrong_frames += std::fabs(texel[0] - expected) > 1.0f / 512.0f ? 1 : 0;
         }
         CommandList list = device->begin_command_list();
-        uploader->record(list);
         list.bind_pipeline(kit.pipeline(program));
         list.push_constants(SampleTexturePush{.output = device->buffer_address(output),
                                               .texture = device->texture_index(texture),
@@ -836,6 +841,7 @@ TEST_CASE("textures re-uploaded every frame while sampled every frame stay in sy
                                    .before = ResourceState::ShaderWrite,
                                    .after = ResourceState::HostRead,
                                    .before_stages = ShaderStages::Compute});
+        uploader->record(); // after the sampling is recorded: the upload still lands before it
         device->end_frame();
     }
     device->wait_idle();

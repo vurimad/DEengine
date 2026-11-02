@@ -141,8 +141,9 @@ bool stages_named(ResourceState state, ShaderStages stages) {
 }
 
 // What a barrier waits for and makes wait, with queue ownership applied: a release doesn't make
-// anything on its queue wait (the acquire does), an acquire doesn't wait for anything on its
-// queue (the semaphore did).
+// anything on its queue wait (the acquire does); an acquire waits at every stage, with no access,
+// so its layout change chains after the semaphore wait that ordered it behind the release (the
+// device's semaphore waits are at all stages).
 struct BarrierSides {
     VkStateInfo before;
     VkStateInfo after;
@@ -166,13 +167,14 @@ BarrierSides barrier_sides(const CommandListImpl& list, ResourceState before, Sh
         } else {
             sides.src_family = other;
             sides.dst_family = own;
-            sides.before.stages = VK_PIPELINE_STAGE_2_NONE;
+            sides.before.stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
             sides.before.access = VK_ACCESS_2_NONE;
         }
     }
     // A transfer queue only runs copies: its barriers can't name graphics or compute stages.
-    constexpr VkPipelineStageFlags2 kTransferStages =
-        VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_HOST_BIT;
+    constexpr VkPipelineStageFlags2 kTransferStages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                                                      VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_HOST_BIT |
+                                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     DE_ASSERT_MSG(list.queue != QueueType::Transfer ||
                       ((sides.before.stages | sides.after.stages) & ~kTransferStages) == 0,
                   "a transfer list's barriers can only involve copy states (or a queue handover)");

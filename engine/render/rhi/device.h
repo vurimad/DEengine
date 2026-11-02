@@ -128,15 +128,15 @@ public:
     // A new command list for this frame, on the graphics queue or, when
     // Capabilities::transfer_queue, the transfer queue (copies and barriers only). Async compute
     // lists arrive with the render graph.
-    CommandList begin_command_list(QueueType queue = QueueType::Graphics);
-
+    //
     // Transfer lists of frame N run alongside the GPU's work on frame N-1, and all of frame N's
-    // graphics work waits for them. When they overwrite something frame N-1 (or earlier) may
-    // still read, call this: frame N's transfers then start after frame N-1 is done.
-    void transfer_after_previous_frame();
+    // graphics work waits for them. A transfer list that overwrites something frame N-1 (or
+    // earlier) may still read starts AfterPreviousFrame instead. FrameStart graphics lists are
+    // submitted before the frame's other graphics lists, wherever they were begun.
+    CommandList begin_command_list(QueueType queue = QueueType::Graphics, ListStart start = ListStart::InOrder);
 
-    // Submits this frame's command lists in the order they were begun, per queue (transfer lists
-    // first), then presents the swapchain texture if one was acquired.
+    // Submits this frame's command lists, per queue in the order they were begun (FrameStart lists
+    // first; transfer lists before graphics), then presents the swapchain texture if one was acquired.
     void end_frame();
 
     // Waits for all GPU work to finish and frees every pending destroy. For shutdown, tests and tools.

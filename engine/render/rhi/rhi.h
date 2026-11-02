@@ -115,6 +115,13 @@ enum class QueueType : uint8_t {
     Count,
 };
 
+// When a command list runs within its frame (Device::begin_command_list).
+enum class ListStart : uint8_t {
+    InOrder,            // after the frame's lists begun before it on its queue
+    FrameStart,         // graphics: before every other graphics list of the frame (uploads land first)
+    AfterPreviousFrame, // transfer: waits for the GPU to finish the previous frame (overwrites what it may read)
+};
+
 enum class Format : uint8_t {
     Unknown,
 
@@ -329,7 +336,7 @@ struct TextureRange {
 enum class QueueOwnership : uint8_t {
     None,
     Release, // after_stages are ignored: the acquiring queue's barrier waits instead
-    Acquire, // before_stages are ignored: the semaphore between the queues already waited
+    Acquire, // before_stages are ignored: it waits behind the semaphore between the queues
 };
 
 struct TextureBarrier {

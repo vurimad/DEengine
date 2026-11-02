@@ -64,14 +64,16 @@ struct UploaderStats {
 // and move only their mips. Don't transition those textures yourself until their uploads are
 // recorded.
 //
-// On the transfer queue, record() puts the copies on a transfer list of their own, which runs
-// alongside the GPU's previous frame, and hands what they wrote to the graphics queue: the list
-// given to record() gets the matching acquire barriers, and all of the frame's graphics work waits
-// for the copies. Uploads over something already uploaded wait for the previous frame first (it
-// may still read the old contents). On the graphics queue, the copies go on the given list.
-// Either way, call record() before the frame's commands that use the uploads.
+// Uploads land at the start of the frame that records them, before any of its other graphics
+// work, wherever record() is called in it: record() puts them on a FrameStart graphics list.
+// On the transfer queue, the copies go on transfer lists that run alongside the GPU's previous
+// frame and hand what they wrote to graphics (the frame-start list acquires it); uploads over
+// something already uploaded wait for the previous frame first, as it may still read the old
+// contents, and the frame's graphics work waits for them. Overwrites thus cost the graphics queue
+// the copy time; streaming new resources costs it nothing.
 //
-// The first upload to a texture or buffer assumes nothing else is using it.
+// The first upload to a texture or buffer assumes nothing else is using it, and one uploader
+// handles all uploads to a resource.
 //
 // Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
 // GPU in the order they were queued. Destroying a texture or buffer with uploads still queued is
@@ -87,7 +89,7 @@ public:
     Uploader& operator=(const Uploader&) = delete;
 
     // Fails, uploading nothing, if the texture is stale or lacks CopyDst usage, the mips are out of
-    // range, the format has a stencil aspect, or data isn't exactly texture_upload_size() bytes.
+    // range, the format is a depth format, or data isn't exactly texture_upload_size() bytes.
     // Every layer of the mips is uploaded at once.
     core::Result<void> upload_texture(TextureHandle texture, std::span<const std::byte> data,
                                       const TextureUpload& upload = {});
@@ -98,10 +100,9 @@ public:
     core::Result<void> upload_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data,
                                      ResourceState after, ShaderStages after_stages = ShaderStages::All);
 
-    // Once per frame, before the queued textures and buffers are used: records the queued copies,
-    // within the frame budget, and the barriers around them. Does nothing when idle(). list is a
-    // graphics list of this frame.
-    void record(CommandList& list);
+    // Once per frame, between begin_frame and end_frame: records the queued copies, within the
+    // frame budget, and the barriers around them, on lists of its own. Records nothing when idle().
+    void record();
 
     // For load time and tests, outside a frame: runs frames until everything queued is copied, and
     // waits for the GPU.
