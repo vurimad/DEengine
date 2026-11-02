@@ -2,6 +2,7 @@
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "support/gpu.h"
+#include "support/readback.h"
 #include "support/shader_kit.h"
 
 #include <doctest/doctest.h>
@@ -19,108 +20,17 @@ using de::test::make_device;
 using de::test::SampleTexturePush;
 using de::test::ShaderKit;
 
+using de::test::as_span;
+using de::test::copy_out;
+using de::test::pattern;
+using de::test::read_buffer;
+using de::test::read_texture;
+using de::test::record_frame;
+using de::test::same_bytes;
+using de::test::test_heap;
+using de::test::transfer_path;
+
 namespace {
-
-de::core::Allocator& test_heap() {
-    return de::core::heap_allocator(de::core::MemoryTag::Render);
-}
-
-// Bytes that differ per position and per seed, so a misplaced or stale copy shows.
-de::core::Array<std::byte> pattern(size_t size, uint32_t seed) {
-    de::core::Array<std::byte> bytes(test_heap());
-    bytes.resize(size);
-    for (size_t i = 0; i < size; ++i) {
-        bytes[i] = static_cast<std::byte>(((i * 31) + (size_t{seed} * 101) + (i >> 8U)) & 0xFFU);
-    }
-    return bytes;
-}
-
-std::span<const std::byte> as_span(const de::core::Array<std::byte>& bytes) {
-    return bytes.span();
-}
-
-// Every mip and layer of a texture in CopySrc state, read back in texture_upload_size() order.
-de::core::Array<std::byte> read_texture(Device& device, TextureHandle texture) {
-    const TextureDesc desc = *device.texture_desc(texture);
-    const uint64_t size = texture_upload_size(desc, {});
-    const auto readback =
-        device.create_buffer({.size = size, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
-    REQUIRE(readback.ok());
-    device.begin_frame();
-    CommandList list = device.begin_command_list();
-    uint64_t offset = 0;
-    for (uint32_t mip = 0; mip < desc.mip_count; ++mip) {
-        const uint64_t layer_bytes = texture_upload_size(desc, {.first_mip = mip, .mip_count = 1}) / desc.layer_count;
-        for (uint32_t layer = 0; layer < desc.layer_count; ++layer) {
-            list.copy_texture_to_buffer(texture, *readback, {.buffer_offset = offset, .mip = mip, .layer = layer});
-            offset += layer_bytes;
-        }
-    }
-    list.barrier(
-        BufferBarrier{.buffer = *readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
-    device.end_frame();
-    device.wait_idle();
-    device.invalidate_mapped(*readback);
-    de::core::Array<std::byte> bytes(test_heap());
-    bytes.resize(static_cast<size_t>(size));
-    std::memcpy(bytes.data(), device.mapped(*readback).data(), static_cast<size_t>(size));
-    device.destroy(*readback);
-    return bytes;
-}
-
-// A whole buffer in CopySrc state, read back.
-de::core::Array<std::byte> read_buffer(Device& device, BufferHandle buffer) {
-    const uint64_t size = device.buffer_desc(buffer)->size;
-    const auto readback =
-        device.create_buffer({.size = size, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
-    REQUIRE(readback.ok());
-    device.begin_frame();
-    CommandList list = device.begin_command_list();
-    list.copy_buffer(buffer, 0, *readback, 0, size);
-    list.barrier(
-        BufferBarrier{.buffer = *readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
-    device.end_frame();
-    device.wait_idle();
-    device.invalidate_mapped(*readback);
-    de::core::Array<std::byte> bytes(test_heap());
-    bytes.resize(static_cast<size_t>(size));
-    std::memcpy(bytes.data(), device.mapped(*readback).data(), static_cast<size_t>(size));
-    device.destroy(*readback);
-    return bytes;
-}
-
-bool same_bytes(std::span<const std::byte> a, std::span<const std::byte> b) {
-    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0;
-}
-
-// One frame that records the uploader's next batch.
-void record_frame(Device& device, Uploader& uploader) {
-    device.begin_frame();
-    uploader.record();
-    device.end_frame();
-}
-
-// One frame that copies the first 32 bytes of buffer to a readback buffer, not waited for.
-void copy_out(Device& device, BufferHandle buffer, BufferHandle readback) {
-    device.begin_frame();
-    CommandList list = device.begin_command_list();
-    list.copy_buffer(buffer, 0, readback, 0, 32);
-    list.barrier(BufferBarrier{.buffer = readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
-    device.end_frame();
-}
-
-// Runs the rest of the test case once per uploader path (doctest subcases): the graphics queue, and
-// the transfer queue when the device has one. Call it once per test case, unconditionally.
-bool transfer_path(const Device& device) {
-    bool transfer = false;
-    SUBCASE("graphics queue") {}
-    if (device.capabilities().transfer_queue) {
-        SUBCASE("transfer queue") {
-            transfer = true;
-        }
-    }
-    return transfer;
-}
 
 constexpr TextureUsage kCopyBoth = TextureUsage::CopyDst | TextureUsage::CopySrc;
 constexpr BufferUsage kBufferCopyBoth = BufferUsage::CopyDst | BufferUsage::CopySrc;

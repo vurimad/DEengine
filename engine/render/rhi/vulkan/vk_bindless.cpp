@@ -486,7 +486,7 @@ core::Result<void> DeviceImpl::register_bindless(Texture& texture) {
                 .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                 .image = texture.image,
                 .viewType = vk_view_type(desc, true),
-                .format = to_vk_format(desc.format),
+                .format = to_vk_format(storage_format(desc.format)),
                 .subresourceRange = {.aspectMask = texture.aspects,
                                      .baseMipLevel = mip,
                                      .levelCount = 1,

@@ -10,6 +10,8 @@ add_library(de_rhi STATIC
     device.h
     rhi.cpp
     rhi.h
+    mips.cpp
+    mips.h
     upload.cpp
     upload.h)
 add_library(de::rhi ALIAS de_rhi)

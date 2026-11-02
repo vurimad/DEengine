@@ -506,6 +506,60 @@ void CommandList::copy_buffer_to_texture(BufferHandle src, TextureHandle dst, co
     vkCmdCopyBufferToImage2(impl_->cmd, &info);
 }
 
+void CommandList::blit_texture(TextureHandle src, TextureHandle dst, const TextureBlit& blit) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "blits need a graphics list");
+    DE_ASSERT_MSG(!impl_->in_rendering, "copies inside begin_rendering/end_rendering");
+    DeviceImpl& device = *impl_->device;
+    const Texture& source = device.texture(src);
+    const Texture& target = device.texture(dst);
+    DE_ASSERT_MSG(blit.src_mip < source.desc.mip_count && blit.dst_mip < target.desc.mip_count,
+                  "blit mips outside the textures");
+    DE_ASSERT_MSG(src != dst || blit.src_mip != blit.dst_mip, "a blit from a mip into itself");
+    DE_ASSERT_MSG(core::has_any(source.desc.usage, TextureUsage::CopySrc) &&
+                      core::has_any(target.desc.usage, TextureUsage::CopyDst),
+                  "blits need CopySrc usage on the source and CopyDst on the destination");
+    DE_ASSERT_MSG(device.capabilities.supports(source.desc.format, FormatSupport::Blit | FormatSupport::LinearFilter) &&
+                      device.capabilities.supports(target.desc.format, FormatSupport::Blit),
+                  "the formats can't be blitted with a linear filter");
+    const uint32_t layers =
+        blit.layer_count == kAllLayers ? source.desc.layer_count - blit.first_layer : blit.layer_count;
+    DE_ASSERT_MSG(blit.first_layer + layers <= source.desc.layer_count &&
+                      blit.first_layer + layers <= target.desc.layer_count,
+                  "blit layers outside the textures");
+    const MipExtent from = mip_extent(source.desc, blit.src_mip);
+    const MipExtent to = mip_extent(target.desc, blit.dst_mip);
+    const auto corner = [](const MipExtent& extent) {
+        return VkOffset3D{.x = static_cast<int32_t>(extent.width),
+                          .y = static_cast<int32_t>(extent.height),
+                          .z = static_cast<int32_t>(extent.depth)};
+    };
+    const VkImageBlit2 region{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_BLIT_2,
+        .srcSubresource = {.aspectMask = source.aspects,
+                           .mipLevel = blit.src_mip,
+                           .baseArrayLayer = blit.first_layer,
+                           .layerCount = layers},
+        .srcOffsets = {VkOffset3D{}, corner(from)},
+        .dstSubresource = {.aspectMask = target.aspects,
+                           .mipLevel = blit.dst_mip,
+                           .baseArrayLayer = blit.first_layer,
+                           .layerCount = layers},
+        .dstOffsets = {VkOffset3D{}, corner(to)},
+    };
+    const VkBlitImageInfo2 info{
+        .sType = VK_STRUCTURE_TYPE_BLIT_IMAGE_INFO_2,
+        .srcImage = source.image,
+        .srcImageLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        .dstImage = target.image,
+        .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .regionCount = 1,
+        .pRegions = &region,
+        .filter = VK_FILTER_LINEAR,
+    };
+    vkCmdBlitImage2(impl_->cmd, &info);
+}
+
 void CommandList::copy_texture_to_buffer(TextureHandle src, BufferHandle dst, const BufferTextureCopy& region) {
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(!impl_->in_rendering, "copies inside begin_rendering/end_rendering");

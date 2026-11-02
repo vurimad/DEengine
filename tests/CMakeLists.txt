@@ -28,10 +28,12 @@ add_executable(de_tests
     platform/vfs_test.cpp
     render/barrier_test.cpp
     render/bindless_test.cpp
+    render/mips_test.cpp
     render/rhi_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
     support/gpu.h
+    support/readback.h
     support/sandbox.h
     support/shader_kit.h)
 
