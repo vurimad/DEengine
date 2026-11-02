@@ -373,7 +373,8 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
             {.name = slang::CompilerOptionName::DebugInformation,
              .value = {.kind = slang::CompilerOptionValueKind::Int, .intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD}});
     }
-    core::InlineArray<slang::PreprocessorMacroDesc, kMaxShaderDefines> macros(render_heap());
+    core::InlineArray<slang::PreprocessorMacroDesc, kMaxShaderDefines + 1> macros(render_heap());
+    macros.push({.name = "DE_SHADER_CHECKS", .value = state.desc.checks ? "1" : "0"});
     for (const ShaderDefine& define : request.defines) {
         macros.push({.name = define.name, .value = define.value != nullptr ? define.value : "1"});
     }

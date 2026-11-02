@@ -17,8 +17,9 @@ A module's name is its path with dots: `common.color` is `common/color.slang`. D
 
 - Entry points are marked with their stage: `[shader("vertex")] vertex_main`, `[shader("fragment")] fragment_main`, `[shader("compute")] compute_main` (the library's default names).
 - Push constants are one `[[vk::push_constant]] ConstantBuffer<T>`, at most 128 bytes, matched by a C++ struct where the program is used. Reflection reports each field's offset and size.
-- No descriptor slots of their own: buffers are reached through pointers in push constants (`uint* output`), textures and samplers through `import common.bindless;` and indices in push constants (`sample_texture(push.albedo, kSamplerAnisotropicWrap, uv)`). A shader that binds anything else to a slot compiles, but the library rejects it.
-- A texture's index works in the table of its shape only: `de_textures` for 2D, `de_cube_textures` for cubes...
+- No descriptor slots of their own: buffers are reached through pointers in push constants (`uint* output`), textures and samplers through `import common.bindless;` and indices in push constants. A shader that binds anything else to a slot compiles, but the library rejects it.
+- Reach textures through the accessors, never the raw tables: `texture_2d(index)`, `texture_cube(index)`, `storage_2d(index)`, `sampler_state(sampler)`..., or the shorthands (`sample_texture(push.albedo, kSamplerAnisotropicWrap, uv)`). They check the index's table in debug and dev builds (`DE_SHADER_CHECKS`) and clamp it in every build, so a wrong index draws the fallback instead of reading out of bounds.
+- A texture's index belongs to the table of its shape: `texture_2d` for 2D, `texture_cube` for cubes... Integer storage textures use `storage_2d_uint`.
 - Clip space is +Y up, depth 0..1, reverse Z (1 near, 0 far). Front faces are counter-clockwise.
 - Matrices are column-major: `mul(matrix, vector)`, the same layout as GLM.
 - Names: `snake_case` functions and variables, `PascalCase` structs (docs/design.md, Code conventions).

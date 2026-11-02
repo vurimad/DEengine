@@ -148,42 +148,6 @@ int main(int argc, char** argv) {
     de::shader::ProgramHandle quad;
     de::rhi::Format programs_format = de::rhi::Format::Unknown;
 
-    // The quad's texture, made here until the cooker brings real ones: a gold and stone checker
-    // darkening toward the bottom, uploaded on the first frame through a staging buffer.
-    constexpr uint32_t kQuadTextureSize = 256;
-    constexpr uint64_t kQuadTextureBytes = uint64_t{kQuadTextureSize} * kQuadTextureSize * 4;
-    const auto quad_texture =
-        device->create_texture({.width = kQuadTextureSize,
-                                .height = kQuadTextureSize,
-                                .format = de::rhi::Format::RGBA8Srgb,
-                                .usage = de::rhi::TextureUsage::Sampled | de::rhi::TextureUsage::CopyDst,
-                                .debug_name = "quad texture"});
-    const auto quad_staging = device->create_buffer({.size = kQuadTextureBytes,
-                                                     .usage = de::rhi::BufferUsage::CopySrc,
-                                                     .memory = de::rhi::MemoryLocation::Upload,
-                                                     .debug_name = "quad texture staging"});
-    if (!quad_texture || !quad_staging) {
-        return EXIT_FAILURE;
-    }
-    {
-        const std::span<std::byte> texels = device->mapped(*quad_staging);
-        for (uint32_t y = 0; y < kQuadTextureSize; ++y) {
-            for (uint32_t x = 0; x < kQuadTextureSize; ++x) {
-                const bool gold = ((x / 32) + (y / 32)) % 2 == 0;
-                const bool edge = x % 32 == 0 || y % 32 == 0;
-                const float shade = 1.0f - 0.5f * static_cast<float>(y) / kQuadTextureSize;
-                const float base[3] = {gold ? 0.85f : 0.20f, gold ? 0.65f : 0.17f, gold ? 0.30f : 0.15f};
-                std::byte* texel = &texels[(static_cast<size_t>(y) * kQuadTextureSize + x) * 4];
-                for (int c = 0; c < 3; ++c) {
-                    texel[c] = static_cast<std::byte>(edge ? 20 : static_cast<int>(base[c] * shade * 255.0f));
-                }
-                texel[3] = std::byte{255};
-            }
-        }
-        device->flush_mapped(*quad_staging);
-    }
-    bool quad_uploaded = false;
-
     Input input;
     const ActionId quit = input.add_action("quit"_sid, ActionKind::Button);
     const ActionId attack = input.add_action("attack_light"_sid, ActionKind::Button);
@@ -236,6 +200,43 @@ int main(int argc, char** argv) {
         input.set_stick_deadzone(value);
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
+
+    // The quad's texture, made here until the cooker brings real ones (after every early return,
+    // so nothing leaks): a gold and stone checker
+    // darkening toward the bottom, uploaded on the first frame through a staging buffer.
+    constexpr uint32_t kQuadTextureSize = 256;
+    constexpr uint64_t kQuadTextureBytes = uint64_t{kQuadTextureSize} * kQuadTextureSize * 4;
+    const auto quad_texture =
+        device->create_texture({.width = kQuadTextureSize,
+                                .height = kQuadTextureSize,
+                                .format = de::rhi::Format::RGBA8Srgb,
+                                .usage = de::rhi::TextureUsage::Sampled | de::rhi::TextureUsage::CopyDst,
+                                .debug_name = "quad texture"});
+    const auto quad_staging = device->create_buffer({.size = kQuadTextureBytes,
+                                                     .usage = de::rhi::BufferUsage::CopySrc,
+                                                     .memory = de::rhi::MemoryLocation::Upload,
+                                                     .debug_name = "quad texture staging"});
+    if (!quad_texture || !quad_staging) {
+        return EXIT_FAILURE;
+    }
+    {
+        const std::span<std::byte> texels = device->mapped(*quad_staging);
+        for (uint32_t y = 0; y < kQuadTextureSize; ++y) {
+            for (uint32_t x = 0; x < kQuadTextureSize; ++x) {
+                const bool gold = ((x / 32) + (y / 32)) % 2 == 0;
+                const bool edge = x % 32 == 0 || y % 32 == 0;
+                const float shade = 1.0f - 0.5f * static_cast<float>(y) / kQuadTextureSize;
+                const float base[3] = {gold ? 0.85f : 0.20f, gold ? 0.65f : 0.17f, gold ? 0.30f : 0.15f};
+                std::byte* texel = &texels[(static_cast<size_t>(y) * kQuadTextureSize + x) * 4];
+                for (int c = 0; c < 3; ++c) {
+                    texel[c] = static_cast<std::byte>(edge ? 20 : static_cast<int>(base[c] * shade * 255.0f));
+                }
+                texel[3] = std::byte{255};
+            }
+        }
+        device->flush_mapped(*quad_staging);
+    }
+    bool quad_uploaded = false;
 
     const char* frames_flag = flag_value(argc, argv, "--frames");
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
@@ -395,6 +396,9 @@ int main(int argc, char** argv) {
     }
 
     device->destroy(*quad_texture);
+    if (!quad_uploaded) {
+        device->destroy(*quad_staging); // quit before the first frame
+    }
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",

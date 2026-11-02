@@ -21,5 +21,5 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         return;
     }
     const float2 position = float2(thread.xy) / float2(push.width, push.height);
-    de_storage_textures[NonUniformResourceIndex(push.texture)][thread.xy] = float4(position, 0.25, 1.0);
+    storage_2d(push.texture)[thread.xy] = float4(position, 0.25, 1.0);
 }

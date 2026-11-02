@@ -94,6 +94,9 @@ struct CompileReport {
 struct ShaderCompilerDesc {
     // Source-level debug info, so RenderDoc and Nsight can step through Slang code.
     bool debug_info = DE_BUILD_DEV != 0;
+    // Defines DE_SHADER_CHECKS to 1 (0 otherwise): shaders check what they can afford to, such
+    // as bindless indices against their table (shaders/common/bindless.slang).
+    bool checks = DE_BUILD_DEV != 0;
 };
 
 // Compiles Slang shaders to the RHI backend's bytecode, with reflection (docs/design.md, Shaders,

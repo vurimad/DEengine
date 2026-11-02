@@ -17,8 +17,6 @@ using de::test::make_device;
 using de::test::read_u32;
 using de::test::ShaderKit;
 
-namespace {} // namespace
-
 TEST_CASE("resource states: one write, or reads that go together") {
     // Buffers combine any read states.
     CHECK(is_valid_state(ResourceState::Undefined, false));
