@@ -3,6 +3,7 @@
 #include "core/allocator.h"
 #include "core/arena.h"
 #include "core/array.h"
+#include "core/fixed_string.h"
 #include "core/hash.h"
 #include "core/hash_map.h"
 #include "core/log.h"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 #include <utility>
@@ -27,6 +29,10 @@ core::Allocator& render_heap() {
 }
 
 constexpr uint32_t kNone = UINT32_MAX;
+constexpr uint32_t kFailed = UINT32_MAX - 1; // a transient the device couldn't make this frame
+constexpr rhi::BufferUsage kAllBufferUsage =
+    rhi::BufferUsage::Vertex | rhi::BufferUsage::Index | rhi::BufferUsage::Uniform | rhi::BufferUsage::Storage |
+    rhi::BufferUsage::Indirect | rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst;
 
 // One subresource's state as the graph tracks it: the state and shader stages of its last uses
 // (reads in one layout accumulate), and whether its contents may be dropped at the next barrier.
@@ -69,6 +75,7 @@ struct TextureResource {
     uint32_t pool_entry = kNone;
     uint32_t first_state = kNone; // its subresources in RenderGraphState::states, mip-major
     bool needed = false;
+    bool used = false; // a pass that ran used it
 };
 
 struct BufferResource {
@@ -82,6 +89,7 @@ struct BufferResource {
     SubState state{};
     bool realized = false;
     bool needed = false;
+    bool used = false;
 };
 
 // A transient resource kept across frames, with the state its last frame left it in (the next
@@ -122,8 +130,7 @@ bool same_desc(const rhi::BufferDesc& a, const rhi::BufferDesc& b) {
 
 uint64_t desc_hash(const rhi::BufferDesc& desc) {
     return core::mix64(desc.size ^ (static_cast<uint64_t>(desc.usage) << 56U) ^
-                       (static_cast<uint64_t>(desc.memory) << 48U)) |
-           1U; // never 0
+                       (static_cast<uint64_t>(desc.memory) << 48U));
 }
 
 rhi::TextureUsage texture_usage_for(ResourceState state) {
@@ -180,20 +187,27 @@ struct Transition {
     SubState next;
 };
 
+// The shader stages a state's use involves: its stages for shader states, none for the others (a
+// copy or an indirect read says nothing about which shaders saw the data).
+ShaderStages shader_stages(ResourceState state, ShaderStages stages) {
+    return core::has_any(state, rhi::kShaderStates) ? stages : ShaderStages::None;
+}
+
 Transition transition(const SubState& from, ResourceState to, ShaderStages stages, bool texture) {
+    const ShaderStages to_stages = shader_stages(to, stages);
     const bool reads = from.state != ResourceState::Undefined && !core::has_any(from.state, rhi::kWriteStates) &&
                        !core::has_any(to, rhi::kWriteStates);
     if (reads) {
-        const bool stages_covered = !core::has_any(to, rhi::kShaderStates) || core::has_all(from.stages, stages);
+        const bool stages_covered = core::has_all(from.stages, to_stages);
         if (core::has_all(from.state, to) && stages_covered && !from.discard) {
             return {.barrier = false, .next = from};
         }
         const ResourceState joined = from.state | to;
         if (rhi::is_valid_state(joined, texture)) {
-            return {.barrier = true, .next = {.state = joined, .stages = from.stages | stages}};
+            return {.barrier = true, .next = {.state = joined, .stages = from.stages | to_stages}};
         }
     }
-    return {.barrier = true, .next = {.state = to, .stages = stages}};
+    return {.barrier = true, .next = {.state = to, .stages = to_stages}};
 }
 
 } // namespace
@@ -222,6 +236,8 @@ struct RenderGraphState {
     uint32_t open_pass = kNone; // in add_pass, between begin_pass and end_pass
     uint32_t barriers = 0;
     uint32_t pool_creations = 0;
+    uint32_t skipped_passes = 0;
+    uint32_t failed_creations = 0; // logged only the first few times
 
     const char* copy_name(const char* name) {
         const std::string_view text = name != nullptr ? std::string_view(name) : std::string_view();
@@ -291,10 +307,20 @@ struct RenderGraphState {
                 }
             }
         }
+        // Pooled textures serve whoever needs that description next, so they're named by it.
+        core::FixedString<63> pooled_name;
+        static_cast<void>(pooled_name.append("graph "));
+        char size[48];
+        std::snprintf(size, sizeof(size), "%ux%u %s", wanted.width, wanted.height,
+                      rhi::format_info(wanted.format).name);
+        static_cast<void>(pooled_name.append(size));
         rhi::TextureDesc create = wanted;
-        create.debug_name = name;
+        create.debug_name = pooled_name.c_str();
         const auto texture = device->create_texture(create);
-        DE_VERIFY_MSG(texture.ok(), "the render graph couldn't create a transient texture");
+        if (!texture) {
+            report_failure(name, texture.error().message);
+            return kNone;
+        }
         TexturePoolEntry entry{.desc = wanted, .handle = *texture, .last_frame = frame, .taken = true};
         entry.states.resize(subresource_count(wanted));
         const uint32_t* head = texture_buckets.find(hash);
@@ -318,9 +344,12 @@ struct RenderGraphState {
             }
         }
         rhi::BufferDesc create = wanted;
-        create.debug_name = name;
+        create.debug_name = "graph buffer";
         const auto buffer = device->create_buffer(create);
-        DE_VERIFY_MSG(buffer.ok(), "the render graph couldn't create a transient buffer");
+        if (!buffer) {
+            report_failure(name, buffer.error().message);
+            return kNone;
+        }
         const uint32_t* head = buffer_buckets.find(hash);
         buffer_pool.push(BufferPoolEntry{.desc = wanted,
                                          .handle = *buffer,
@@ -333,18 +362,33 @@ struct RenderGraphState {
         return index;
     }
 
+    void report_failure(const char* name, const char* message) {
+        if (++failed_creations <= 8) {
+            DE_LOG_ERROR("render", "render graph: transient '%s' couldn't be made (%s): its passes are skipped", name,
+                         message);
+        }
+    }
+
     // --- Resources ---
 
     // A transient texture gets its texture from the pool, sized and with every usage its passes
     // declared (in immediate mode, every usage its format allows: later uses aren't known yet).
-    void realize(TextureResource& texture) {
+    // False if the device couldn't make it.
+    bool realize(TextureResource& texture) {
         if (texture.imported || texture.handle.is_valid()) {
-            return;
+            return true;
+        }
+        if (texture.pool_entry == kFailed) {
+            return false;
         }
         if (desc.immediate) {
             texture.desc.usage |= broad_usage(texture.desc.format);
         }
         texture.pool_entry = acquire_texture(texture.desc, texture.name);
+        if (texture.pool_entry == kNone) {
+            texture.pool_entry = kFailed;
+            return false;
+        }
         const TexturePoolEntry& entry = texture_pool[texture.pool_entry];
         texture.handle = entry.handle;
         texture.first_state = static_cast<uint32_t>(states.size());
@@ -352,19 +396,28 @@ struct RenderGraphState {
             // Last frame's uses are waited for; their contents aren't kept.
             states.push(SubState{.state = previous.state, .stages = previous.stages, .discard = true});
         }
+        return true;
     }
 
-    void realize(BufferResource& buffer) {
+    bool realize(BufferResource& buffer) {
         if (buffer.imported || buffer.realized) {
-            return;
+            return true;
+        }
+        if (buffer.pool_entry == kFailed) {
+            return false;
         }
         if (desc.immediate) {
-            buffer.desc.usage |= rhi::BufferUsage::Storage | rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst;
+            buffer.desc.usage |= kAllBufferUsage;
         }
         buffer.pool_entry = acquire_buffer(buffer.desc, buffer.name);
+        if (buffer.pool_entry == kNone) {
+            buffer.pool_entry = kFailed;
+            return false;
+        }
         buffer.handle = buffer_pool[buffer.pool_entry].handle;
         buffer.state = buffer_pool[buffer.pool_entry].state;
         buffer.realized = true;
+        return true;
     }
 
     rhi::TextureUsage broad_usage(rhi::Format format) const {
@@ -470,17 +523,29 @@ struct RenderGraphState {
     // --- Passes ---
 
     void run(uint32_t pass_index) {
-        const Pass& pass = passes[pass_index];
+        Pass& pass = passes[pass_index];
+        // Every resource first: a pass whose transient couldn't be made doesn't run (nor do the
+        // passes after it that use that transient).
+        bool ready = true;
+        for (uint32_t i = pass.first_use; i < pass.first_use + pass.use_count; ++i) {
+            const Use& use = uses[i];
+            ready = (use.texture ? realize(textures[use.resource]) : realize(buffers[use.resource])) && ready;
+        }
+        if (!ready) {
+            pass.live = false;
+            ++skipped_passes;
+            return;
+        }
         rhi::BarrierBatch batch;
         for (uint32_t i = pass.first_use; i < pass.first_use + pass.use_count; ++i) {
             const Use& use = uses[i];
             if (use.texture) {
                 TextureResource& texture = textures[use.resource];
-                realize(texture);
+                texture.used = true;
                 transition_texture(pass.name, texture, use.range, use.state, use.stages, batch);
             } else {
                 BufferResource& buffer = buffers[use.resource];
-                realize(buffer);
+                buffer.used = true;
                 transition_buffer(pass.name, buffer, use.state, use.stages, batch);
             }
         }
@@ -525,13 +590,33 @@ struct RenderGraphState {
                 continue; // never used
             }
             if (texture.imported) {
+                const rhi::TextureRange whole{.first_mip = 0,
+                                              .mip_count = texture.desc.mip_count,
+                                              .first_layer = 0,
+                                              .layer_count = texture.desc.layer_count};
+                SubState* subresources = states.data() + texture.first_state;
+                const uint32_t count = subresource_count(texture.desc);
+                bool uniform = true;
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (!texture.used) {
+                        subresources[i].discard = false; // nothing touched it: its contents stay
+                    }
+                    uniform = uniform && subresources[i].state == subresources[0].state;
+                }
+                if (!texture.used && uniform &&
+                    (texture.final_state == ResourceState::Undefined || subresources[0].state == texture.final_state)) {
+                    continue; // untouched, and already where it must end
+                }
                 if (texture.final_state != ResourceState::Undefined) {
-                    transition_texture("graph end", texture,
-                                       {.first_mip = 0,
-                                        .mip_count = texture.desc.mip_count,
-                                        .first_layer = 0,
-                                        .layer_count = texture.desc.layer_count},
-                                       texture.final_state, texture.final_stages, batch);
+                    transition_texture("graph end", texture, whole, texture.final_state, texture.final_stages, batch);
+                } else if (!uniform) {
+                    // Left in different states per mip or layer, with no final state to agree on:
+                    // General works for anything (slowly). Import it with a final_state instead.
+                    DE_LOG_WARN("render",
+                                "render graph: '%s' ends in different states per subresource and has no final "
+                                "state: moved to General",
+                                texture.name);
+                    transition_texture("graph end", texture, whole, ResourceState::General, ShaderStages::All, batch);
                 }
             } else if (texture.pool_entry != kNone) {
                 TexturePoolEntry& entry = texture_pool[texture.pool_entry];
@@ -543,7 +628,8 @@ struct RenderGraphState {
         }
         for (BufferResource& buffer : buffers) {
             if (buffer.imported) {
-                if (buffer.final_state != ResourceState::Undefined) {
+                if (buffer.final_state != ResourceState::Undefined &&
+                    (buffer.used || buffer.state.state != buffer.final_state)) {
                     transition_buffer("graph end", buffer, buffer.final_state, buffer.final_stages, batch);
                 }
             } else if (buffer.realized) {
@@ -608,11 +694,13 @@ PassBuilder& PassBuilder::use(GraphTexture texture, ResourceState state_used, Sh
         const Use& other = state.uses[i];
         DE_ASSERT_MSG(!other.texture || other.resource != texture.index || !ranges_overlap(other.range, resolved),
                       "one pass uses the same subresources twice: declare them once, in one state");
-        static_cast<void>(other);
     }
-    if (!resource.imported) {
+    if (!resource.imported && !resource.handle.is_valid()) {
         resource.desc.usage |= texture_usage_for(state_used);
     }
+    DE_ASSERT_MSG(resource.imported || !resource.handle.is_valid() ||
+                      core::has_all(resource.desc.usage, texture_usage_for(state_used)),
+                  "immediate mode: the texture's format doesn't support this use");
     state.uses.push(
         Use{.resource = texture.index, .texture = true, .state = state_used, .stages = stages, .range = resolved});
     ++pass.use_count;
@@ -631,7 +719,7 @@ PassBuilder& PassBuilder::use(GraphBuffer buffer, ResourceState state_used, Shad
                       "one pass uses the same buffer twice: declare it once, in one state");
     }
     BufferResource& resource = state.buffers[buffer.index];
-    if (!resource.imported) {
+    if (!resource.imported && !resource.realized) {
         resource.desc.usage |= buffer_usage_for(state_used);
     }
     state.uses.push(Use{.resource = buffer.index, .texture = false, .state = state_used, .stages = stages});
@@ -729,6 +817,7 @@ void RenderGraph::begin(uint32_t reference_width, uint32_t reference_height) {
     state.buffers.clear();
     state.states.clear();
     state.barriers = 0;
+    state.skipped_passes = 0;
     state.reference_width = reference_width;
     state.reference_height = reference_height;
     state.evict();
@@ -745,6 +834,15 @@ void RenderGraph::begin(uint32_t reference_width, uint32_t reference_height) {
 GraphTexture RenderGraph::import_texture(const ImportedTexture& imported) {
     RenderGraphState& state = *state_;
     DE_ASSERT_MSG(state.in_frame, "import between begin() and execute()");
+    // The same texture imported twice in one frame (by two systems) is one graph resource.
+    for (uint32_t i = 0; i < state.textures.size(); ++i) {
+        const TextureResource& existing = state.textures[i];
+        if (existing.imported && existing.handle == imported.texture) {
+            DE_ASSERT_MSG(existing.final_state == imported.final_state,
+                          "a texture imported twice in one frame with different final states");
+            return GraphTexture{i};
+        }
+    }
     const rhi::TextureDesc* desc = state.device->texture_desc(imported.texture);
     DE_ASSERT_MSG(desc != nullptr, "importing a stale texture handle");
     TextureResource texture{.name = state.copy_name(imported.name),
@@ -755,7 +853,9 @@ GraphTexture RenderGraph::import_texture(const ImportedTexture& imported) {
                             .final_stages = imported.final_stages};
     texture.first_state = static_cast<uint32_t>(state.states.size());
     for (uint32_t i = 0; i < state.subresource_count(texture.desc); ++i) {
-        state.states.push(SubState{.state = imported.state, .stages = imported.stages, .discard = imported.discard});
+        state.states.push(SubState{.state = imported.state,
+                                   .stages = shader_stages(imported.state, imported.stages),
+                                   .discard = imported.discard});
     }
     state.textures.push(texture);
     return GraphTexture{static_cast<uint32_t>(state.textures.size() - 1)};
@@ -764,16 +864,25 @@ GraphTexture RenderGraph::import_texture(const ImportedTexture& imported) {
 GraphBuffer RenderGraph::import_buffer(const ImportedBuffer& imported) {
     RenderGraphState& state = *state_;
     DE_ASSERT_MSG(state.in_frame, "import between begin() and execute()");
+    for (uint32_t i = 0; i < state.buffers.size(); ++i) {
+        const BufferResource& existing = state.buffers[i];
+        if (existing.imported && existing.handle == imported.buffer) {
+            DE_ASSERT_MSG(existing.final_state == imported.final_state,
+                          "a buffer imported twice in one frame with different final states");
+            return GraphBuffer{i};
+        }
+    }
     const rhi::BufferDesc* desc = state.device->buffer_desc(imported.buffer);
     DE_ASSERT_MSG(desc != nullptr, "importing a stale buffer handle");
-    state.buffers.push(BufferResource{.name = state.copy_name(imported.name),
-                                      .desc = desc != nullptr ? *desc : rhi::BufferDesc{},
-                                      .imported = true,
-                                      .handle = imported.buffer,
-                                      .final_state = imported.final_state,
-                                      .final_stages = imported.final_stages,
-                                      .state = {.state = imported.state, .stages = imported.stages},
-                                      .realized = true});
+    state.buffers.push(
+        BufferResource{.name = state.copy_name(imported.name),
+                       .desc = desc != nullptr ? *desc : rhi::BufferDesc{},
+                       .imported = true,
+                       .handle = imported.buffer,
+                       .final_state = imported.final_state,
+                       .final_stages = imported.final_stages,
+                       .state = {.state = imported.state, .stages = shader_stages(imported.state, imported.stages)},
+                       .realized = true});
     return GraphBuffer{static_cast<uint32_t>(state.buffers.size() - 1)};
 }
 
@@ -833,6 +942,7 @@ RenderGraphStats RenderGraph::stats() const {
         .pooled_textures = static_cast<uint32_t>(state.texture_pool.size()),
         .pooled_buffers = static_cast<uint32_t>(state.buffer_pool.size()),
         .pool_creations = state.pool_creations,
+        .skipped_passes = state.skipped_passes,
     };
     for (const Pass& pass : state.passes) {
         stats.culled_passes += pass.live ? 0 : 1;

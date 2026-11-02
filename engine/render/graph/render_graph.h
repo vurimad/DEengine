@@ -100,8 +100,8 @@ public:
 
 private:
     friend struct RenderGraphState;
-    PassContext(rhi::CommandList& list, rhi::Device& device, const RenderGraphState& state, uint32_t pass)
-        : list(list), device(device), state_(state), pass_(pass) {}
+    PassContext(rhi::CommandList& command_list, rhi::Device& gpu, const RenderGraphState& state, uint32_t pass)
+        : list(command_list), device(gpu), state_(state), pass_(pass) {}
 
     const RenderGraphState& state_;
     uint32_t pass_;
@@ -123,6 +123,7 @@ struct RenderGraphStats {
     uint32_t pooled_textures = 0;
     uint32_t pooled_buffers = 0;
     uint32_t pool_creations = 0; // transient resources created since the graph was, in total
+    uint32_t skipped_passes = 0; // in the last frame: a transient they use couldn't be made (logged)
 };
 
 // The frame graph (docs/design.md, Rendering: render graph v1). Each frame:
@@ -143,8 +144,10 @@ struct RenderGraphStats {
 //
 // setup runs inside add_pass; execute runs in execute() (at once in immediate mode), in the order
 // the passes were added, unless culled: a pass runs only if it writes something an imported
-// resource or a later running pass needs, or never_cull() says so. The graph records the
-// barriers between passes from their declared uses, on its own graphics list.
+// resource or a later running pass uses, or never_cull() says so. Every earlier writer of such a
+// resource runs too: v1 can't tell a write that overwrites everything from one that loads. The
+// graph records the barriers between passes from their declared uses, on its own graphics list.
+// Importing one texture or buffer twice in a frame gives the same handle.
 //
 // A pass's data is where setup leaves the handles it creates for its execute (an execute lambda
 // is built before setup runs, so it can't capture them). Data and execute closures live in the
@@ -181,7 +184,8 @@ public:
     // transitions.
     void execute();
 
-    // The state an imported texture was left in by the last execute().
+    // The state an imported texture was left in by the last execute(): its final_state, or the
+    // state its last uses left (General if those differ per subresource, with a warning).
     rhi::ResourceState final_texture_state(GraphTexture texture) const;
 
     RenderGraphStats stats() const;

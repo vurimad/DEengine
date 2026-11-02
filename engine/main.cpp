@@ -322,78 +322,75 @@ int main(int argc, char** argv) {
             programs_format = device->swapchain_format();
         }
         if (backbuffer.is_valid()) {
-            // The frame as a graph: three passes on the backbuffer, which comes in from the display
-            // (its old contents dropped) and goes back to it.
+            // The frame as a graph: one pass on the backbuffer, which comes in from the display (its
+            // old contents dropped) and goes back to it. One render pass clears and draws both: a
+            // pass per draw would reload the image from memory each time.
             const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;
             const float glow = 0.5f + 0.5f * std::sin(seconds * 0.8f);
-            const float aspect =
-                static_cast<float>(device->swapchain_width()) / static_cast<float>(device->swapchain_height());
             graph->begin(device->swapchain_width(), device->swapchain_height());
             const de::render::GraphTexture back = graph->import_texture({.texture = backbuffer,
                                                                          .name = "backbuffer",
                                                                          .state = de::rhi::ResourceState::Present,
                                                                          .final_state = de::rhi::ResourceState::Present,
                                                                          .discard = true});
-            const auto draw_to_back = [back](de::render::PassBuilder& pass) {
-                pass.use(back, de::rhi::ResourceState::RenderTarget);
+            struct Scene {
+                de::render::GraphTexture back;
+                de::rhi::Color dusk; // a slowly breathing dusk color
+                de::rhi::PipelineHandle triangle;
+                de::rhi::PipelineHandle quad;
+                uint32_t quad_texture = 0;
+                float seconds = 0.0f;
+                float aspect = 1.0f;
             };
-
-            // A slowly breathing dusk color.
-            const de::rhi::Color dusk{.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f};
-            graph->add_pass("clear", draw_to_back, [back, dusk](de::render::PassContext& context) {
-                const de::rhi::ColorAttachment color{.texture = context.texture(back), .clear = dusk};
-                context.list.begin_rendering({.colors = std::span(&color, 1)});
-                context.list.end_rendering();
-            });
-
-            if (const de::rhi::PipelineHandle pipeline =
-                    shaders ? shaders->pipeline(triangle) : de::rhi::PipelineHandle{};
-                pipeline.is_valid()) {
-                graph->add_pass("triangle", draw_to_back,
-                                [back, pipeline, seconds, aspect](de::render::PassContext& context) {
-                                    // Matches TrianglePush in shaders/triangle.slang.
-                                    struct TrianglePush {
-                                        float time_s;
-                                        float aspect;
-                                    };
-                                    const de::rhi::ColorAttachment color{.texture = context.texture(back),
-                                                                         .load = de::rhi::LoadOp::Load};
-                                    context.list.begin_rendering({.colors = std::span(&color, 1)});
-                                    context.list.bind_pipeline(pipeline);
-                                    context.list.push_constants(TrianglePush{.time_s = seconds, .aspect = aspect});
-                                    context.list.draw(3);
-                                    context.list.end_rendering();
-                                });
-            }
-
-            if (const de::rhi::PipelineHandle pipeline = shaders ? shaders->pipeline(quad) : de::rhi::PipelineHandle{};
-                pipeline.is_valid()) {
-                const uint32_t texture = device->texture_index(*quad_texture);
-                graph->add_pass("textured quad", draw_to_back,
-                                [back, pipeline, seconds, aspect, texture](de::render::PassContext& context) {
-                                    // Matches TexturedQuadPush in shaders/textured_quad.slang.
-                                    struct TexturedQuadPush {
-                                        float center[2];
-                                        float size[2];
-                                        uint32_t texture;
-                                        uint32_t sampler;
-                                        float time_s;
-                                    };
-                                    const de::rhi::ColorAttachment color{.texture = context.texture(back),
-                                                                         .load = de::rhi::LoadOp::Load};
-                                    context.list.begin_rendering({.colors = std::span(&color, 1)});
-                                    context.list.bind_pipeline(pipeline);
-                                    context.list.push_constants(TexturedQuadPush{
-                                        .center = {0.62f, 0.0f},
-                                        .size = {0.7f / aspect, 0.7f},
-                                        .texture = texture,
-                                        .sampler = de::rhi::sampler_index(de::rhi::DefaultSampler::AnisotropicWrap),
-                                        .time_s = seconds,
-                                    });
-                                    context.list.draw(6);
-                                    context.list.end_rendering();
-                                });
-            }
+            graph->add_pass<Scene>(
+                "scene",
+                [&](de::render::PassBuilder& pass, Scene& scene) {
+                    pass.use(back, de::rhi::ResourceState::RenderTarget);
+                    scene = Scene{
+                        .back = back,
+                        .dusk = {.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f},
+                        .triangle = shaders ? shaders->pipeline(triangle) : de::rhi::PipelineHandle{},
+                        .quad = shaders ? shaders->pipeline(quad) : de::rhi::PipelineHandle{},
+                        .quad_texture = device->texture_index(*quad_texture),
+                        .seconds = seconds,
+                        .aspect = static_cast<float>(device->swapchain_width()) /
+                                  static_cast<float>(device->swapchain_height()),
+                    };
+                },
+                [](const Scene& scene, de::render::PassContext& context) {
+                    const de::rhi::ColorAttachment color{.texture = context.texture(scene.back), .clear = scene.dusk};
+                    context.list.begin_rendering({.colors = std::span(&color, 1)});
+                    if (scene.triangle.is_valid()) {
+                        // Matches TrianglePush in shaders/triangle.slang.
+                        struct TrianglePush {
+                            float time_s;
+                            float aspect;
+                        };
+                        context.list.bind_pipeline(scene.triangle);
+                        context.list.push_constants(TrianglePush{.time_s = scene.seconds, .aspect = scene.aspect});
+                        context.list.draw(3);
+                    }
+                    if (scene.quad.is_valid()) {
+                        // Matches TexturedQuadPush in shaders/textured_quad.slang.
+                        struct TexturedQuadPush {
+                            float center[2];
+                            float size[2];
+                            uint32_t texture;
+                            uint32_t sampler;
+                            float time_s;
+                        };
+                        context.list.bind_pipeline(scene.quad);
+                        context.list.push_constants(TexturedQuadPush{
+                            .center = {0.62f, 0.0f},
+                            .size = {0.7f / scene.aspect, 0.7f},
+                            .texture = scene.quad_texture,
+                            .sampler = de::rhi::sampler_index(de::rhi::DefaultSampler::AnisotropicWrap),
+                            .time_s = scene.seconds,
+                        });
+                        context.list.draw(6);
+                    }
+                    context.list.end_rendering();
+                });
             graph->execute();
         }
         device->end_frame();

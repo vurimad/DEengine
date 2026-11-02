@@ -512,3 +512,161 @@ TEST_CASE("imported textures come in from their state and leave in their final o
     device->wait_idle();
     check_clean(*device);
 }
+
+TEST_CASE("only shader states carry shader stages: a non-shader read doesn't cover later shader reads") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    device->begin_frame();
+    graph->begin(1, 1);
+    struct Made {
+        GraphBuffer buffer;
+    };
+    const GraphBuffer buffer = graph
+                                   ->add_pass<Made>(
+                                       "write",
+                                       [&](PassBuilder& pass, Made& data) {
+                                           data.buffer = pass.create_buffer({.size = 64, .debug_name = "args"});
+                                           pass.use(data.buffer, ResourceState::ShaderWrite, ShaderStages::Compute);
+                                       },
+                                       [](const Made&, PassContext&) {})
+                                   .buffer;
+    const auto read = [&](const char* name, ResourceState state, ShaderStages stages) {
+        graph->add_pass(
+            name, [&](PassBuilder& pass) { pass.use(buffer, state, stages).never_cull(); }, [](PassContext&) {});
+    };
+    read("indirect", ResourceState::IndirectArgument, ShaderStages::All);
+    read("indirect and compute", ResourceState::IndirectArgument | ResourceState::ShaderRead, ShaderStages::Compute);
+    read("fragment", ResourceState::ShaderRead, ShaderStages::Fragment); // a new stage: needs its barrier
+    graph->execute();
+    device->end_frame();
+    CHECK(graph->stats().barriers == 4);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("imports: twice is once, untouched ones stay put, mixed end states settle in General") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const TextureHandle target = *device->create_texture(
+        {.width = 4, .height = 4, .format = Format::RGBA8Unorm, .usage = TextureUsage::RenderTarget});
+    const TextureHandle mips = *device->create_texture(
+        {.width = 4, .height = 4, .mip_count = 2, .format = Format::RGBA8Unorm, .usage = TextureUsage::CopyDst});
+    const BufferHandle upload =
+        *device->create_buffer({.size = 64, .usage = BufferUsage::CopySrc, .memory = MemoryLocation::Upload});
+
+    device->begin_frame();
+    graph->begin(4, 4);
+    // Untouched, and already in its final state: no barrier, discard or not.
+    const GraphTexture untouched = graph->import_texture({.texture = target,
+                                                          .name = "target",
+                                                          .state = ResourceState::RenderTarget,
+                                                          .final_state = ResourceState::RenderTarget,
+                                                          .discard = true});
+    CHECK(graph->import_texture({.texture = target, .final_state = ResourceState::RenderTarget}).index ==
+          untouched.index);
+    // Only mip 0 written, no final state: mip 1 is still Undefined, so it all ends in General.
+    const GraphTexture half =
+        graph->import_texture({.texture = mips, .name = "half written", .state = ResourceState::Undefined});
+    const GraphBuffer source = graph->import_buffer({.buffer = upload, .name = "upload"});
+    graph->add_pass(
+        "write mip 0",
+        [&](PassBuilder& pass) {
+            pass.use(half, ResourceState::CopyDst, ShaderStages::All, {.first_mip = 0, .mip_count = 1});
+            pass.use(source, ResourceState::CopySrc);
+        },
+        [half, source](PassContext& context) {
+            context.list.copy_buffer_to_texture(context.buffer(source), context.texture(half));
+        });
+    graph->execute();
+    device->end_frame();
+    CHECK(graph->final_texture_state(untouched) == ResourceState::RenderTarget);
+    CHECK(graph->final_texture_state(half) == ResourceState::General);
+    CHECK(graph->stats().barriers == 2 + 2); // mip 0 to CopyDst, the upload; then both mips to General
+    device->destroy(target);
+    device->destroy(mips);
+    device->destroy(upload);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("a transient the device can't make skips its passes instead of crashing") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    device->begin_frame();
+    graph->begin(1, 1);
+    struct Ran {
+        bool* ran = nullptr;
+    };
+    bool ran = false;
+    graph->add_pass<Ran>(
+        "impossible",
+        [&](PassBuilder& pass, Ran& data) {
+            data.ran = &ran;
+            const TextureDesc huge{.width = 1U << 24U, .height = 1U << 24U, .format = Format::RGBA8Unorm};
+            pass.use(pass.create_texture({.desc = huge}), ResourceState::RenderTarget).never_cull();
+        },
+        [](const Ran& data, PassContext&) { *data.ran = true; });
+    graph->execute();
+    device->end_frame();
+    CHECK_FALSE(ran);
+    CHECK(graph->stats().skipped_passes == 1);
+    CHECK(graph->stats().pooled_textures == 0);
+    device->wait_idle();
+}
+
+TEST_CASE("immediate mode makes transients with every usage a later pass may need") {
+    if (DE_BUILD_DEV == 0) {
+        return;
+    }
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device, {.immediate = true});
+    REQUIRE(graph.ok());
+    device->begin_frame();
+    graph->begin(1, 1);
+    struct Made {
+        GraphBuffer buffer;
+    };
+    const GraphBuffer buffer = graph
+                                   ->add_pass<Made>(
+                                       "write",
+                                       [&](PassBuilder& pass, Made& data) {
+                                           data.buffer = pass.create_buffer({.size = 64});
+                                           pass.use(data.buffer, ResourceState::ShaderWrite, ShaderStages::Compute);
+                                       },
+                                       [](const Made&, PassContext&) {})
+                                   .buffer;
+    struct Usage {
+        GraphBuffer buffer;
+        BufferUsage* usage = nullptr;
+    };
+    BufferUsage usage = BufferUsage::None;
+    graph->add_pass<Usage>(
+        "indirect",
+        [&](PassBuilder& pass, Usage& data) {
+            data = {.buffer = buffer, .usage = &usage};
+            pass.use(buffer, ResourceState::IndirectArgument);
+        },
+        [](const Usage& data, PassContext& context) {
+            *data.usage = context.device.buffer_desc(context.buffer(data.buffer))->usage;
+        });
+    graph->execute();
+    device->end_frame();
+    CHECK(de::core::has_all(usage, BufferUsage::Indirect | BufferUsage::Storage));
+    device->wait_idle();
+    check_clean(*device);
+}
