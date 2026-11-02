@@ -899,9 +899,9 @@ void* RenderGraph::allocate_closure(size_t size, size_t alignment) {
     return state_->arena.allocate(std::max<size_t>(size, 1), alignment);
 }
 
-void RenderGraph::end_pass(uint32_t pass, ExecuteFn execute, const void* closure) {
+void RenderGraph::end_pass(uint32_t pass, ExecuteFn execute_fn, const void* closure) {
     RenderGraphState& state = *state_;
-    state.passes[pass].execute = execute;
+    state.passes[pass].execute = execute_fn;
     state.passes[pass].closure = closure;
     state.open_pass = kNone;
     if (state.desc.immediate) {

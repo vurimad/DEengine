@@ -199,7 +199,7 @@ private:
     uint32_t begin_pass(const char* name);
     PassBuilder builder(uint32_t pass) { return {state_, pass}; }
     void* allocate_closure(size_t size, size_t alignment);
-    void end_pass(uint32_t pass, ExecuteFn execute, const void* closure);
+    void end_pass(uint32_t pass, ExecuteFn execute_fn, const void* closure);
 
     RenderGraphState* state_ = nullptr;
 };
