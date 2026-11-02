@@ -8,7 +8,7 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 | --- | --- |
 | `rhi.h` | Formats and `format_info`, texture, buffer and pipeline descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` / `PipelineHandle` |
 | `device.h` | `Device`: creation (windowed or headless), resources, deferred destruction, frames, swapchain, stats |
-| `command_list.h` | `CommandList`: barriers, dynamic rendering, pipelines, push constants, draws, dispatches, copies, debug labels; `ScopedDebugLabel` |
+| `command_list.h` | `CommandList`: barriers, dynamic rendering, pipelines, push constants, draws, dispatches, copies, debug labels; `BarrierBatch`, `ScopedDebugLabel` |
 | `vulkan/` | The backend: volk, VMA, vk-bootstrap. Nothing outside this folder includes it. The window surface comes from `platform::create_vulkan_surface`, so no SDL here |
 
 ## How a frame runs
@@ -17,7 +17,7 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 device.begin_frame();                                    // waits for the frame kFramesInFlight ago, frees what it destroyed
 TextureHandle backbuffer = device.acquire_swapchain_texture(); // invalid while minimized
 CommandList list = device.begin_command_list();
-list.barrier(backbuffer, ResourceState::Undefined, ResourceState::RenderTarget);
+list.barrier({.texture = backbuffer, .before = ResourceState::Present, .after = ResourceState::RenderTarget, .discard = true});
 list.begin_rendering({.colors = std::span(&color, 1)});
 list.end_rendering();
 list.barrier(backbuffer, ResourceState::RenderTarget, ResourceState::Present);
@@ -29,7 +29,13 @@ device.end_frame();                                      // one submit for all l
 - No Vulkan type, enum or header above `vulkan/`. The public headers name no graphics API; a D3D12 or console backend would implement the same headers in its own folder, picked by CMake (no virtual calls).
 - One `Device` per process, used from one thread (the render thread). Command lists are recorded on that thread too, for now.
 - Clip space is +Y up with depth 0..1 on every backend; the Vulkan backend flips the viewport. Depth is reverse Z: clear to 0 (far), test greater.
-- Barriers name states (`RenderTarget`, `ShaderRead`, `CopyDst`...), not pipeline stages or layouts. The render graph will emit them from what passes declare. `Undefined` as the old state discards contents and waits for all earlier work on the queue: always safe, never cheap.
+- Barriers name states (`RenderTarget`, `ShaderRead`, `CopyDst`...), not pipeline stages or layouts. The render graph will emit them from what passes declare.
+  - States are flags: read states combine (`IndirectArgument | ShaderRead`), a write state stands alone; textures combine only reads that share a layout (`DepthRead | ShaderRead`). `is_valid_state()` checks, and barriers assert it.
+  - Shader states name the stages that use them (`ShaderStages::Compute`, `Fragment`...), so unrelated work overlaps the barrier. The default is every stage: correct, wider than needed.
+  - `Undefined` means nothing on the GPU still uses the resource (just created, or its frame was waited for); it waits for nothing. A resource that may still be in flight names its real previous state, with `discard` for a texture whose contents will be overwritten: the barrier waits for the previous use but skips preserving the contents. The swapchain goes `Present` -> `RenderTarget` with discard every frame.
+  - Buffer barriers can cover a range; a `GlobalBarrier` orders every buffer access at once, cheaper than many buffer barriers in GPU-driven passes.
+  - One barrier command per `barriers()` call. `BarrierBatch` collects them on the stack and flushes them as one; the render graph will flush one batch per pass boundary.
+  - Synchronization validation runs in the tests: a barrier that is too weak shows up as a `SYNC-HAZARD` error.
 - Destroying a resource invalidates its handle at once; the GPU memory is freed when the frames in flight that may use it are done (`kFramesInFlight` = 2). Using a stale handle is a `DE_VERIFY` failure in every build.
 - Frame pacing uses one timeline semaphore: frame N signals N. Swapchain present semaphores are per image, acquire semaphores per frame slot.
 - The swapchain is recreated on resize, vsync change, or when the driver reports it out of date; suboptimal triggers one rebuild, not one per frame. A lost surface is recreated. Recreation waits for the GPU to go idle (rare, keeps it simple). Present semaphores live as long as the device, since nothing tells when a retired swapchain's present stopped using them.

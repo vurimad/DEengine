@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/inline_array.h"
 #include "render/rhi/rhi.h"
 
 #include <cstdint>
@@ -20,9 +21,15 @@ public:
 
     bool is_valid() const { return impl_ != nullptr; }
 
-    // Resource state transitions. Batch them: one call with many barriers is cheaper than many calls.
-    void barriers(std::span<const TextureBarrier> textures, std::span<const BufferBarrier> buffers = {});
-    void barrier(TextureHandle texture, ResourceState before, ResourceState after, const TextureRange& range = {});
+    // Resource state transitions, recorded as one barrier command. Batch them: one call with many
+    // barriers is cheaper than many calls (BarrierBatch collects them).
+    void barriers(std::span<const TextureBarrier> textures, std::span<const BufferBarrier> buffers = {},
+                  std::span<const GlobalBarrier> globals = {});
+    void barrier(const TextureBarrier& barrier);
+    void barrier(const BufferBarrier& barrier);
+    void barrier(const GlobalBarrier& barrier);
+    // Whole resource, shader states in every shader stage.
+    void barrier(TextureHandle texture, ResourceState before, ResourceState after);
     void barrier(BufferHandle buffer, ResourceState before, ResourceState after);
 
     // Dynamic rendering: no render pass or framebuffer objects. Sets the viewport and scissor to the area.
@@ -67,6 +74,61 @@ private:
     explicit CommandList(CommandListImpl* impl) : impl_(impl) {}
 
     CommandListImpl* impl_ = nullptr;
+};
+
+// Collects barriers and records them as one command. Kept on the stack: the first 16 of each kind
+// stay inside the object; global barriers merge into one.
+//     BarrierBatch batch;
+//     batch.add({.texture = gbuffer, .before = RenderTarget, .after = ShaderRead, .after_stages = Fragment});
+//     batch.add({.buffer = instances, .before = ShaderWrite, .after = IndirectArgument});
+//     batch.flush(list);
+class BarrierBatch {
+public:
+    BarrierBatch() = default;
+    BarrierBatch(const BarrierBatch&) = delete;
+    BarrierBatch& operator=(const BarrierBatch&) = delete;
+    BarrierBatch(BarrierBatch&&) = delete;
+    BarrierBatch& operator=(BarrierBatch&&) = delete;
+    ~BarrierBatch() { DE_ASSERT_MSG(empty(), "BarrierBatch destroyed with barriers not flushed"); }
+
+    BarrierBatch& add(const TextureBarrier& barrier) {
+        textures_.push(barrier);
+        return *this;
+    }
+    BarrierBatch& add(const BufferBarrier& barrier) {
+        buffers_.push(barrier);
+        return *this;
+    }
+    // Merged with any global barrier already added: the union of both sides.
+    BarrierBatch& add(const GlobalBarrier& barrier) {
+        global_.before |= barrier.before;
+        global_.after |= barrier.after;
+        global_.before_stages = has_global_ ? global_.before_stages | barrier.before_stages : barrier.before_stages;
+        global_.after_stages = has_global_ ? global_.after_stages | barrier.after_stages : barrier.after_stages;
+        has_global_ = true;
+        return *this;
+    }
+
+    [[nodiscard]] bool empty() const { return textures_.empty() && buffers_.empty() && !has_global_; }
+
+    // Records everything as one barrier command and empties the batch. Does nothing when empty.
+    void flush(CommandList& list) {
+        if (empty()) {
+            return;
+        }
+        list.barriers(textures_.span(), buffers_.span(),
+                      has_global_ ? std::span<const GlobalBarrier>(&global_, 1) : std::span<const GlobalBarrier>());
+        textures_.clear();
+        buffers_.clear();
+        global_ = {};
+        has_global_ = false;
+    }
+
+private:
+    core::InlineArray<TextureBarrier, 16> textures_{core::heap_allocator(core::MemoryTag::Render)};
+    core::InlineArray<BufferBarrier, 16> buffers_{core::heap_allocator(core::MemoryTag::Render)};
+    GlobalBarrier global_{};
+    bool has_global_ = false;
 };
 
 // Opens a debug label for the rest of the scope.

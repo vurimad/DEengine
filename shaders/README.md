@@ -8,7 +8,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | --- | --- |
 | `triangle.slang` | The sandbox triangle (M0a) |
 | `common/` | Modules shared by shaders: `import common.color;` |
-| `tests/` | Shaders the unit tests run |
+| `tests/` | Shaders the unit tests run: a solid triangle, buffer fill and add through pointers |
 
 A module's name is its path with dots: `common.color` is `common/color.slang`. Declarations other modules import are `public`.
 

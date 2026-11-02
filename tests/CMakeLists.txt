@@ -26,6 +26,7 @@ add_executable(de_tests
     platform/input_test.cpp
     platform/thread_test.cpp
     platform/vfs_test.cpp
+    render/barrier_test.cpp
     render/rhi_test.cpp
     render/shader_test.cpp
     support/sandbox.h)

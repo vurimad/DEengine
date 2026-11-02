@@ -84,7 +84,8 @@ VkBufferImageCopy2 to_vk(const Texture& texture, const BufferTextureCopy& region
 
 } // namespace
 
-void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<const BufferBarrier> buffers) {
+void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<const BufferBarrier> buffers,
+                           std::span<const GlobalBarrier> globals) {
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(!impl_->in_rendering, "barriers inside begin_rendering/end_rendering");
     DeviceImpl& device = *impl_->device;
@@ -93,22 +94,28 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
         core::heap_allocator(core::MemoryTag::Render));
     core::InlineArray<VkBufferMemoryBarrier2, kInlineBarriers> buffer_barriers(
         core::heap_allocator(core::MemoryTag::Render));
+    core::InlineArray<VkMemoryBarrier2, 2> memory_barriers(core::heap_allocator(core::MemoryTag::Render));
     image_barriers.reserve(textures.size());
     buffer_barriers.reserve(buffers.size());
 
     for (const TextureBarrier& barrier : textures) {
         const Texture& texture = device.texture(barrier.texture);
-        const VkStateInfo before = vk_state_info(barrier.before);
-        const VkStateInfo after = vk_state_info(barrier.after);
+        DE_ASSERT_MSG(is_valid_state(barrier.before, true) && is_valid_state(barrier.after, true),
+                      "texture states: one write state, or read states that share a layout");
         DE_ASSERT_MSG(barrier.after != ResourceState::Undefined, "a texture can't move to the Undefined state");
-        DE_ASSERT_MSG(barrier.after != ResourceState::Present || texture.swapchain, "only swapchain textures present");
+        DE_ASSERT_MSG(!core::has_any(barrier.after, ResourceState::Present) || texture.swapchain,
+                      "only swapchain textures present");
+        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
+        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
         image_barriers.push({
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
             .srcStageMask = before.stages,
             .srcAccessMask = before.access,
             .dstStageMask = after.stages,
             .dstAccessMask = after.access,
-            .oldLayout = before.layout,
+            // Discarding still waits for the previous use (stages and accesses), it just doesn't
+            // keep the contents through the layout change.
+            .oldLayout = barrier.discard ? VK_IMAGE_LAYOUT_UNDEFINED : before.layout,
             .newLayout = after.layout,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -118,8 +125,13 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
     }
     for (const BufferBarrier& barrier : buffers) {
         const Buffer& buffer = device.buffer(barrier.buffer);
-        const VkStateInfo before = vk_state_info(barrier.before);
-        const VkStateInfo after = vk_state_info(barrier.after);
+        DE_ASSERT_MSG(is_valid_state(barrier.before, false) && is_valid_state(barrier.after, false),
+                      "buffer states: one write state, or buffer read states");
+        DE_ASSERT_MSG(barrier.offset < buffer.desc.size &&
+                          (barrier.size == kWholeBuffer || barrier.offset + barrier.size <= buffer.desc.size),
+                      "buffer barrier range outside the buffer");
+        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
+        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
         buffer_barriers.push({
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
             .srcStageMask = before.stages,
@@ -129,15 +141,28 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .buffer = buffer.buffer,
-            .offset = 0,
-            .size = VK_WHOLE_SIZE,
+            .offset = barrier.offset,
+            .size = barrier.size == kWholeBuffer ? VK_WHOLE_SIZE : barrier.size,
         });
     }
-    if (image_barriers.empty() && buffer_barriers.empty()) {
+    for (const GlobalBarrier& barrier : globals) {
+        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
+        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
+        memory_barriers.push({
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = before.stages,
+            .srcAccessMask = before.access,
+            .dstStageMask = after.stages,
+            .dstAccessMask = after.access,
+        });
+    }
+    if (image_barriers.empty() && buffer_barriers.empty() && memory_barriers.empty()) {
         return;
     }
     const VkDependencyInfo dependency{
         .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+        .memoryBarrierCount = static_cast<uint32_t>(memory_barriers.size()),
+        .pMemoryBarriers = memory_barriers.data(),
         .bufferMemoryBarrierCount = static_cast<uint32_t>(buffer_barriers.size()),
         .pBufferMemoryBarriers = buffer_barriers.data(),
         .imageMemoryBarrierCount = static_cast<uint32_t>(image_barriers.size()),
@@ -146,14 +171,24 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
     vkCmdPipelineBarrier2(impl_->cmd, &dependency);
 }
 
-void CommandList::barrier(TextureHandle texture, ResourceState before, ResourceState after, const TextureRange& range) {
-    const TextureBarrier barrier{.texture = texture, .before = before, .after = after, .range = range};
-    barriers(std::span(&barrier, 1), {});
+void CommandList::barrier(const TextureBarrier& barrier) {
+    barriers(std::span(&barrier, 1));
+}
+
+void CommandList::barrier(const BufferBarrier& barrier) {
+    barriers({}, std::span(&barrier, 1));
+}
+
+void CommandList::barrier(const GlobalBarrier& barrier) {
+    barriers({}, {}, std::span(&barrier, 1));
+}
+
+void CommandList::barrier(TextureHandle texture, ResourceState before, ResourceState after) {
+    barrier(TextureBarrier{.texture = texture, .before = before, .after = after});
 }
 
 void CommandList::barrier(BufferHandle buffer, ResourceState before, ResourceState after) {
-    const BufferBarrier barrier{.buffer = buffer, .before = before, .after = after};
-    barriers({}, std::span(&barrier, 1));
+    barrier(BufferBarrier{.buffer = buffer, .before = before, .after = after});
 }
 
 void CommandList::begin_rendering(const RenderingDesc& desc) {

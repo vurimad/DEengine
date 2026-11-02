@@ -36,7 +36,8 @@ struct VkStateInfo {
     VkAccessFlags2 access = VK_ACCESS_2_NONE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
 };
-VkStateInfo vk_state_info(ResourceState state);
+// shader_stages applies to the shader states (ShaderRead, ShaderWrite, UniformBuffer) in state.
+VkStateInfo vk_state_info(ResourceState state, ShaderStages shader_stages);
 
 // --- Resource records behind the handles ---
 
