@@ -42,6 +42,34 @@ core::Allocator& render_heap() {
     return core::heap_allocator(core::MemoryTag::Render);
 }
 
+// The bindless tables of shaders/common/bindless.slang: the only descriptor bindings a pipeline has.
+struct BindlessDeclaration {
+    const char* name;
+    uint32_t binding;
+};
+
+constexpr BindlessDeclaration kBindlessDeclarations[] = {
+    {.name = "de_textures", .binding = 0},
+    {.name = "de_texture_arrays", .binding = 1},
+    {.name = "de_cube_textures", .binding = 2},
+    {.name = "de_cube_texture_arrays", .binding = 3},
+    {.name = "de_textures_3d", .binding = 4},
+    {.name = "de_storage_textures", .binding = 5},
+    {.name = "de_storage_texture_arrays", .binding = 6},
+    {.name = "de_storage_textures_3d", .binding = 7},
+    {.name = "de_samplers", .binding = 8},
+    {.name = "de_comparison_samplers", .binding = 9},
+};
+
+bool is_bindless(const ResourceBinding& binding) {
+    for (const BindlessDeclaration& declaration : kBindlessDeclarations) {
+        if (binding.set == 0 && binding.binding == declaration.binding && binding.name == declaration.name) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool fits(const char* text) {
     return text != nullptr && text[0] != '\0' && std::strlen(text) <= kMaxShaderNameLength;
 }
@@ -138,12 +166,15 @@ core::Result<rhi::PipelineHandle> create_pipeline(LibraryState& state, Program& 
                                                   const CompiledProgram& compiled) {
     for (uint32_t i = 0; i < program.stage_count; ++i) {
         const ShaderReflection& reflection = compiled.stages[i].reflection;
-        if (!reflection.bindings.empty()) {
+        for (const ResourceBinding& binding : reflection.bindings) {
+            if (is_bindless(binding)) {
+                continue;
+            }
             DE_LOG_ERROR("shader",
-                         "%s:%s binds '%s' to a descriptor slot (set %u, binding %u): reach resources bindlessly, by "
-                         "index or pointer, through push constants",
-                         program.module.c_str(), program.entries[i].c_str(), reflection.bindings[0].name.c_str(),
-                         reflection.bindings[0].set, reflection.bindings[0].binding);
+                         "%s:%s binds '%s' to a descriptor slot (set %u, binding %u): reach textures through "
+                         "common.bindless and buffers through pointers, with indices and addresses in push constants",
+                         program.module.c_str(), program.entries[i].c_str(), binding.name.c_str(), binding.set,
+                         binding.binding);
             return core::fail(core::ErrorCode::Unsupported, "the shader binds resources to descriptor slots");
         }
         if (reflection.push_constant_bytes > rhi::kMaxPushConstantBytes) {

@@ -27,10 +27,12 @@ add_executable(de_tests
     platform/thread_test.cpp
     platform/vfs_test.cpp
     render/barrier_test.cpp
+    render/bindless_test.cpp
     render/rhi_test.cpp
     render/shader_test.cpp
     support/gpu.h
-    support/sandbox.h)
+    support/sandbox.h
+    support/shader_kit.h)
 
 # Shared test helpers: #include "support/sandbox.h".
 target_include_directories(de_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

@@ -34,7 +34,9 @@ struct DeviceStats {
     uint32_t live_textures = 0; // swapchain textures included
     uint32_t live_buffers = 0;
     uint32_t live_pipelines = 0;
-    uint32_t pending_destroys = 0; // destroyed resources waiting for the GPU to finish with them
+    uint32_t bindless_textures = 0;         // sampled texture table entries in use (the fallback included)
+    uint32_t bindless_storage_textures = 0; // storage texture table entries in use
+    uint32_t pending_destroys = 0;          // destroyed resources waiting for the GPU to finish with them
     uint32_t swapchain_recreations = 0;
     uint32_t validation_errors = 0;
     uint32_t validation_warnings = 0;
@@ -80,6 +82,15 @@ public:
     void destroy(TextureHandle texture);
     void destroy(BufferHandle buffer);
     void destroy(PipelineHandle pipeline);
+
+    // The texture's index in the bindless sampled texture table, for shaders (TextureUsage::Sampled);
+    // kInvalidBindlessIndex without that usage or for a stale handle. Sample it in ShaderRead state
+    // (DepthRead | ShaderRead for a depth buffer). The index stays the texture's until it is
+    // destroyed, and is reused only once the GPU is done with it.
+    uint32_t texture_index(TextureHandle texture) const;
+    // The index in the storage texture table (TextureUsage::Storage), for mip 0 of every layer.
+    // Read and write it in ShaderWrite state.
+    uint32_t storage_texture_index(TextureHandle texture) const;
 
     // The description the texture was created with (debug_name excluded), or null if the handle is stale.
     const TextureDesc* texture_desc(TextureHandle texture) const;

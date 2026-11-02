@@ -1,9 +1,6 @@
-#include "core/job_system.h"
 #include "render/rhi/device.h"
-#include "render/shader/shader_compiler.h"
-#include "render/shader/shader_library.h"
 #include "support/gpu.h"
-#include "support/sandbox.h"
+#include "support/shader_kit.h"
 
 #include <doctest/doctest.h>
 
@@ -18,44 +15,9 @@ using de::test::check_clean;
 using de::test::FillBufferPush;
 using de::test::make_device;
 using de::test::read_u32;
-using de::test::Sandbox;
+using de::test::ShaderKit;
 
-namespace {
-
-// Compute programs from the repository's shaders/tests/, for the GPU tests.
-struct ComputeKit {
-    explicit ComputeKit(Device& device)
-        : vfs(make_vfs()), compiler(std::move(de::shader::ShaderCompiler::create(vfs)).value()),
-          library(std::move(de::shader::ShaderLibrary::create(device, vfs, jobs, compiler, {.hot_reload = false}))
-                      .value()) {
-        fill = *library.create_compute({.module = "tests.fill_buffer"});
-        add = *library.create_compute({.module = "tests.add_buffers"});
-        REQUIRE(library.pipeline(fill).is_valid());
-        REQUIRE(library.pipeline(add).is_valid());
-    }
-
-    de::platform::Vfs make_vfs() const {
-        const de::platform::PathString game = sandbox.game();
-        const de::platform::PathString user = sandbox.folder("user");
-        const de::platform::PathString temp = sandbox.folder("temp");
-        auto created = de::platform::Vfs::create({.game_root = game.c_str(),
-                                                  .user_root = user.c_str(),
-                                                  .temp_root = temp.c_str(),
-                                                  .src_root = DE_SOURCE_DIR});
-        REQUIRE(created.ok());
-        return std::move(created).value();
-    }
-
-    Sandbox sandbox;
-    de::core::JobSystem jobs{de::core::JobSystemDesc{.worker_count = 1}};
-    de::platform::Vfs vfs;
-    de::shader::ShaderCompiler compiler;
-    de::shader::ShaderLibrary library;
-    de::shader::ProgramHandle fill;
-    de::shader::ProgramHandle add;
-};
-
-} // namespace
+namespace {} // namespace
 
 TEST_CASE("resource states: one write, or reads that go together") {
     // Buffers combine any read states.
@@ -114,7 +76,9 @@ TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges i
     if (!device) {
         return;
     }
-    const ComputeKit kit(*device);
+    ShaderKit kit(*device);
+    const auto fill = kit.compute("tests.fill_buffer");
+    const auto add = kit.compute("tests.add_buffers");
     constexpr uint32_t kCount = 256;
     const auto input = device->create_buffer({.size = uint64_t{kCount} * 4, .usage = BufferUsage::Storage});
     const auto output = device->create_buffer(
@@ -123,7 +87,7 @@ TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges i
 
     device->begin_frame();
     CommandList list = device->begin_command_list();
-    list.bind_pipeline(kit.library.pipeline(kit.fill));
+    list.bind_pipeline(kit.pipeline(fill));
     list.push_constants(FillBufferPush{.output = device->buffer_address(*input), .value = 100, .count = kCount});
     list.dispatch(kCount / 64);
     // Only compute wrote it and only compute reads it, and only the first half matters below.
@@ -137,7 +101,7 @@ TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges i
     CHECK_FALSE(batch.empty());
     batch.flush(list);
     CHECK(batch.empty());
-    list.bind_pipeline(kit.library.pipeline(kit.add));
+    list.bind_pipeline(kit.pipeline(add));
     list.push_constants(AddBuffersPush{.input = device->buffer_address(*input),
                                        .output = device->buffer_address(*output),
                                        .value = 5,
@@ -165,7 +129,9 @@ TEST_CASE("a global barrier orders every buffer at once") {
     if (!device) {
         return;
     }
-    const ComputeKit kit(*device);
+    ShaderKit kit(*device);
+    const auto fill = kit.compute("tests.fill_buffer");
+    const auto add = kit.compute("tests.add_buffers");
     constexpr uint32_t kCount = 64;
     BufferHandle inputs[3];
     BufferHandle outputs[3];
@@ -177,7 +143,7 @@ TEST_CASE("a global barrier orders every buffer at once") {
 
     device->begin_frame();
     CommandList list = device->begin_command_list();
-    list.bind_pipeline(kit.library.pipeline(kit.fill));
+    list.bind_pipeline(kit.pipeline(fill));
     for (uint32_t i = 0; i < 3; ++i) {
         list.push_constants(
             FillBufferPush{.output = device->buffer_address(inputs[i]), .value = i * 1000, .count = kCount});
@@ -188,7 +154,7 @@ TEST_CASE("a global barrier orders every buffer at once") {
     batch.add(GlobalBarrier{.before = ResourceState::ShaderWrite, .before_stages = ShaderStages::Compute});
     batch.add(GlobalBarrier{.after = ResourceState::ShaderRead, .after_stages = ShaderStages::Compute});
     batch.flush(list);
-    list.bind_pipeline(kit.library.pipeline(kit.add));
+    list.bind_pipeline(kit.pipeline(add));
     for (uint32_t i = 0; i < 3; ++i) {
         list.push_constants(AddBuffersPush{.input = device->buffer_address(inputs[i]),
                                            .output = device->buffer_address(outputs[i]),

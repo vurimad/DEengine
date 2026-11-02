@@ -51,9 +51,10 @@ bool has_flag(int argc, char** argv, const char* flag) {
 
 } // namespace
 
-// Placeholder loop until the frame loop lands (M0b): opens the window, draws a triangle through the
-// RHI with a hot-reloaded Slang shader, pumps events, samples input and logs actions, so the layers
-// below can be tried by hand. Edit shaders/triangle.slang while it runs.
+// Placeholder loop until the frame loop lands (M0b): opens the window, draws a triangle and a
+// textured quad (a bindless texture) through the RHI with hot-reloaded Slang shaders, pumps events,
+// samples input and logs actions, so the layers below can be tried by hand. Edit
+// shaders/triangle.slang or shaders/textured_quad.slang while it runs.
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --no-vsync       present without waiting for vertical blank (mailbox or immediate)
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
@@ -144,7 +145,44 @@ int main(int argc, char** argv) {
     // Built once the swapchain format is known, and again if it changes. If the shader has an
     // error at startup, the library keeps watching it, and the triangle appears once it's fixed.
     de::shader::ProgramHandle triangle;
-    de::rhi::Format triangle_format = de::rhi::Format::Unknown;
+    de::shader::ProgramHandle quad;
+    de::rhi::Format programs_format = de::rhi::Format::Unknown;
+
+    // The quad's texture, made here until the cooker brings real ones: a gold and stone checker
+    // darkening toward the bottom, uploaded on the first frame through a staging buffer.
+    constexpr uint32_t kQuadTextureSize = 256;
+    constexpr uint64_t kQuadTextureBytes = uint64_t{kQuadTextureSize} * kQuadTextureSize * 4;
+    const auto quad_texture =
+        device->create_texture({.width = kQuadTextureSize,
+                                .height = kQuadTextureSize,
+                                .format = de::rhi::Format::RGBA8Srgb,
+                                .usage = de::rhi::TextureUsage::Sampled | de::rhi::TextureUsage::CopyDst,
+                                .debug_name = "quad texture"});
+    const auto quad_staging = device->create_buffer({.size = kQuadTextureBytes,
+                                                     .usage = de::rhi::BufferUsage::CopySrc,
+                                                     .memory = de::rhi::MemoryLocation::Upload,
+                                                     .debug_name = "quad texture staging"});
+    if (!quad_texture || !quad_staging) {
+        return EXIT_FAILURE;
+    }
+    {
+        const std::span<std::byte> texels = device->mapped(*quad_staging);
+        for (uint32_t y = 0; y < kQuadTextureSize; ++y) {
+            for (uint32_t x = 0; x < kQuadTextureSize; ++x) {
+                const bool gold = ((x / 32) + (y / 32)) % 2 == 0;
+                const bool edge = x % 32 == 0 || y % 32 == 0;
+                const float shade = 1.0f - 0.5f * static_cast<float>(y) / kQuadTextureSize;
+                const float base[3] = {gold ? 0.85f : 0.20f, gold ? 0.65f : 0.17f, gold ? 0.30f : 0.15f};
+                std::byte* texel = &texels[(static_cast<size_t>(y) * kQuadTextureSize + x) * 4];
+                for (int c = 0; c < 3; ++c) {
+                    texel[c] = static_cast<std::byte>(edge ? 20 : static_cast<int>(base[c] * shade * 255.0f));
+                }
+                texel[3] = std::byte{255};
+            }
+        }
+        device->flush_mapped(*quad_staging);
+    }
+    bool quad_uploaded = false;
 
     Input input;
     const ActionId quit = input.add_action("quit"_sid, ActionKind::Button);
@@ -246,16 +284,33 @@ int main(int argc, char** argv) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
 
-        // Clear the window to a slowly breathing dusk color and draw the triangle over it.
         device->begin_frame();
+        if (!quad_uploaded) {
+            de::rhi::CommandList list = device->begin_command_list();
+            const de::rhi::ScopedDebugLabel label(list, "upload quad texture");
+            list.barrier(*quad_texture, de::rhi::ResourceState::Undefined, de::rhi::ResourceState::CopyDst);
+            list.copy_buffer_to_texture(*quad_staging, *quad_texture);
+            list.barrier({.texture = *quad_texture,
+                          .before = de::rhi::ResourceState::CopyDst,
+                          .after = de::rhi::ResourceState::ShaderRead,
+                          .after_stages = de::rhi::ShaderStages::Fragment});
+            device->destroy(*quad_staging); // freed once this frame is done on the GPU
+            quad_uploaded = true;
+        }
+
+        // Clear the window to a slowly breathing dusk color, then draw the triangle and the quad.
         const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
-        if (backbuffer.is_valid() && shaders && triangle_format != device->swapchain_format()) {
+        if (backbuffer.is_valid() && shaders && programs_format != device->swapchain_format()) {
             shaders->destroy(triangle);
+            shaders->destroy(quad);
             de::rhi::GraphicsPipelineDesc state{.color_count = 1, .debug_name = "triangle"};
             state.color_formats[0] = device->swapchain_format();
-            const auto created = shaders->create_graphics({.module = "triangle", .state = state});
-            triangle = created.ok() ? *created : de::shader::ProgramHandle{};
-            triangle_format = device->swapchain_format();
+            const auto created_triangle = shaders->create_graphics({.module = "triangle", .state = state});
+            triangle = created_triangle.ok() ? *created_triangle : de::shader::ProgramHandle{};
+            state.debug_name = "textured quad";
+            const auto created_quad = shaders->create_graphics({.module = "textured_quad", .state = state});
+            quad = created_quad.ok() ? *created_quad : de::shader::ProgramHandle{};
+            programs_format = device->swapchain_format();
         }
         if (backbuffer.is_valid()) {
             const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;
@@ -284,6 +339,28 @@ int main(int argc, char** argv) {
                                                  .aspect = static_cast<float>(device->swapchain_width()) /
                                                            static_cast<float>(device->swapchain_height())});
                 list.draw(3);
+            }
+            if (const de::rhi::PipelineHandle pipeline = shaders ? shaders->pipeline(quad) : de::rhi::PipelineHandle{};
+                pipeline.is_valid()) {
+                // Matches TexturedQuadPush in shaders/textured_quad.slang.
+                struct TexturedQuadPush {
+                    float center[2];
+                    float size[2];
+                    uint32_t texture;
+                    uint32_t sampler;
+                    float time_s;
+                };
+                const float aspect =
+                    static_cast<float>(device->swapchain_width()) / static_cast<float>(device->swapchain_height());
+                list.bind_pipeline(pipeline);
+                list.push_constants(TexturedQuadPush{
+                    .center = {0.62f, 0.0f},
+                    .size = {0.7f / aspect, 0.7f},
+                    .texture = device->texture_index(*quad_texture),
+                    .sampler = de::rhi::sampler_index(de::rhi::DefaultSampler::AnisotropicWrap),
+                    .time_s = seconds,
+                });
+                list.draw(6);
             }
             list.end_rendering();
             list.barrier(backbuffer, de::rhi::ResourceState::RenderTarget, de::rhi::ResourceState::Present);
@@ -317,6 +394,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    device->destroy(*quad_texture);
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",

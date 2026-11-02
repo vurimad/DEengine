@@ -356,11 +356,15 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
     } const clear_dependencies{state.file_system};
 
     // A fresh session per compile: sessions cache the modules they load, and a reload must see the edits.
+    core::InlineArray<slang::CompilerOptionEntry, 4> options(render_heap());
+    // 41012: Slang adds the SPIR-V capabilities texture sampling needs, which every Vulkan 1.3 GPU
+    // has. Expected, not news.
+    options.push({.name = slang::CompilerOptionName::DisableWarnings,
+                  .value = {.kind = slang::CompilerOptionValueKind::String, .stringValue0 = "41012"}});
     const slang::TargetDesc target{
         .format = SLANG_SPIRV,
         .profile = state.profile,
     };
-    core::InlineArray<slang::CompilerOptionEntry, 4> options(render_heap());
     options.push(
         {.name = slang::CompilerOptionName::Optimization,
          .value = {.kind = slang::CompilerOptionValueKind::Int, .intValue0 = SLANG_OPTIMIZATION_LEVEL_DEFAULT}});

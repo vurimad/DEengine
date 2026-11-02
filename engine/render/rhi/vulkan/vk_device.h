@@ -44,8 +44,14 @@ VkStateInfo vk_state_info(ResourceState state, ShaderStages shader_stages);
 struct Texture {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;         // all mips and layers; depth and stencil aspects together
+    VkImageView sampled_view = VK_NULL_HANDLE; // depth aspect only, for depth-stencil formats; else null
+    VkImageView storage_view = VK_NULL_HANDLE; // mip 0, every layer, for storage textures; else null
     VmaAllocation allocation = VK_NULL_HANDLE; // null for swapchain images
     VkImageAspectFlags aspects = 0;
+    uint32_t sampled_index = kInvalidBindlessIndex;
+    uint32_t storage_index = kInvalidBindlessIndex;
+    uint32_t sampled_binding = 0; // the table of its shape (vk_bindless.cpp)
+    uint32_t storage_binding = 0;
     TextureDesc desc;
     bool swapchain = false;
 };
@@ -67,9 +73,31 @@ struct Pipeline {
 struct PendingDestroy {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    VkImageView sampled_view = VK_NULL_HANDLE;
+    VkImageView storage_view = VK_NULL_HANDLE;
+    uint32_t sampled_index = kInvalidBindlessIndex;
+    uint32_t storage_index = kInvalidBindlessIndex;
+    uint32_t sampled_binding = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+};
+
+// Hands out entries of one bindless table. Freed entries are reused last-in first-out; a freed
+// entry is only returned once the GPU is done with its old texture (see PendingDestroy).
+class BindlessTable {
+public:
+    void init(uint32_t capacity, uint32_t reserved);
+    uint32_t allocate(); // kInvalidBindlessIndex when full
+    void release(uint32_t index);
+    uint32_t capacity() const { return capacity_; }
+    uint32_t used() const { return used_; }
+
+private:
+    core::Array<uint32_t> free_{core::heap_allocator(core::MemoryTag::Render)};
+    uint32_t next_ = 0;
+    uint32_t capacity_ = 0;
+    uint32_t used_ = 0;
 };
 
 struct CommandListImpl {
@@ -126,6 +154,16 @@ struct DeviceImpl {
     void destroy_swapchain();
     bool swapchain_needs_recreation() const;
 
+    // --- Bindless tables (vk_bindless.cpp) ---
+    core::Result<void> create_bindless();
+    void destroy_bindless();
+    // Gives a new texture its table entries and writes their descriptors.
+    core::Result<void> register_bindless(Texture& texture);
+    void write_sampled(uint32_t binding, uint32_t index, VkImageView view);
+    void write_storage(uint32_t binding, uint32_t index, VkImageView view);
+    // The 2D table, where the fallback lives and where freed 2D entries point again.
+    static constexpr uint32_t kFallbackBinding = 0;
+
     // --- Frames (vk_device.cpp) ---
     CommandList begin_command_list(QueueType queue);
 
@@ -157,9 +195,23 @@ struct DeviceImpl {
     core::SlotMap<Texture> textures;
     core::SlotMap<Buffer> buffers;
     core::SlotMap<Pipeline> pipelines;
-    // The one layout every pipeline uses: kMaxPushConstantBytes of push constants for all stages.
-    // Bindless descriptor sets join it in M0a task 9.
+    // The one layout every pipeline uses: kMaxPushConstantBytes of push constants for all stages,
+    // and the bindless set (set 0).
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
+
+    // The bindless set (shaders/common/bindless.slang): sampled textures by shape in bindings 0-4,
+    // storage textures by shape in 5-7, samplers in 8 and comparison samplers in 9. Bound once at
+    // the start of every command list, for graphics and compute.
+    VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
+    VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
+    VkDescriptorSet bindless_set = VK_NULL_HANDLE;
+    BindlessTable sampled_table;
+    BindlessTable storage_table;
+    VkSampler samplers[static_cast<size_t>(DefaultSampler::Count)] = {};
+    // kFallbackTextureIndex: a 1x1 magenta texture, owned here rather than in `textures`.
+    VkImage fallback_image = VK_NULL_HANDLE;
+    VkImageView fallback_view = VK_NULL_HANDLE;
+    VmaAllocation fallback_allocation = VK_NULL_HANDLE;
 
     // Frame pacing: frame N signals value N on the graphics queue when its work completes.
     VkSemaphore frame_timeline = VK_NULL_HANDLE;

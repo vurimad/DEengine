@@ -24,8 +24,35 @@ namespace de::rhi {
 inline constexpr uint32_t kFramesInFlight = 2;
 inline constexpr uint32_t kMaxColorAttachments = 8;
 // Every pipeline shares one layout: push constants of this size, visible to all stages (the
-// guaranteed minimum on every GPU). Resources are reached bindlessly, by index.
+// guaranteed minimum on every GPU), and the bindless tables. Resources are reached by index.
 inline constexpr uint32_t kMaxPushConstantBytes = 128;
+
+// Bindless (docs/design.md, Rendering): every sampled texture, storage texture and sampler has an
+// index into a global table that shaders read (shaders/common/bindless.slang). Push constants
+// carry the indices; buffers are reached by address instead.
+inline constexpr uint32_t kInvalidBindlessIndex = UINT32_MAX;
+
+// Entry 0 of the 2D texture table: a 1x1 magenta texture. Freed 2D entries point at it too, so a
+// missing or stale 2D index draws magenta instead of garbage.
+inline constexpr uint32_t kFallbackTextureIndex = 0;
+
+// The samplers every device has; the value is the sampler's index in the table. Anisotropic
+// samplers use up to 16x, as far as the GPU allows. ShadowCompare compares with GreaterEqual
+// (reverse Z) and clamps to the edge.
+enum class DefaultSampler : uint32_t {
+    LinearWrap,
+    LinearClamp,
+    PointWrap,
+    PointClamp,
+    AnisotropicWrap,
+    AnisotropicClamp,
+    ShadowCompare,
+    Count,
+};
+
+inline constexpr uint32_t sampler_index(DefaultSampler sampler) {
+    return static_cast<uint32_t>(sampler);
+}
 
 // Backend records behind the handles. Only the backend defines them.
 struct Texture;

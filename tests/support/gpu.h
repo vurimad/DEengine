@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 
 namespace de::test {
 
@@ -41,6 +42,26 @@ inline uint32_t read_u32(rhi::Device& device, rhi::BufferHandle buffer, size_t i
     return value;
 }
 
+// Uploads mip 0, layer 0 of a fresh texture (CopyDst usage) through a staging buffer, leaves it
+// in after state for after_stages, and waits for the GPU.
+inline void upload_texture(rhi::Device& device, rhi::TextureHandle texture, std::span<const std::byte> texels,
+                           rhi::ResourceState after, rhi::ShaderStages after_stages = rhi::ShaderStages::All) {
+    const auto staging = device.create_buffer(
+        {.size = texels.size(), .usage = rhi::BufferUsage::CopySrc, .memory = rhi::MemoryLocation::Upload});
+    REQUIRE(staging.ok());
+    std::memcpy(device.mapped(*staging).data(), texels.data(), texels.size());
+    device.flush_mapped(*staging);
+    device.begin_frame();
+    rhi::CommandList list = device.begin_command_list();
+    list.barrier(texture, rhi::ResourceState::Undefined, rhi::ResourceState::CopyDst);
+    list.copy_buffer_to_texture(*staging, texture);
+    list.barrier(rhi::TextureBarrier{
+        .texture = texture, .before = rhi::ResourceState::CopyDst, .after = after, .after_stages = after_stages});
+    device.end_frame();
+    device.wait_idle();
+    device.destroy(*staging);
+}
+
 // Push constants of shaders/tests/fill_buffer.slang (and the hot reload test shaders).
 struct FillBufferPush {
     uint64_t output = 0;
@@ -54,6 +75,22 @@ struct AddBuffersPush {
     uint64_t output = 0;
     uint32_t value = 0;
     uint32_t count = 0;
+};
+
+// Push constants of shaders/tests/sample_texture.slang.
+struct SampleTexturePush {
+    uint64_t output = 0; // float4 per texel
+    uint32_t texture = 0;
+    uint32_t sampler = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// Push constants of shaders/tests/write_storage.slang.
+struct WriteStoragePush {
+    uint32_t texture = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
 };
 
 } // namespace de::test
