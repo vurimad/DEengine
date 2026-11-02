@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/fixed_string.h"
 #include "core/result.h"
 #include "render/rhi/command_list.h"
 #include "render/rhi/rhi.h"
@@ -15,6 +16,49 @@ class Window;
 namespace de::rhi {
 
 struct DeviceImpl;
+
+// What GPU memory goes to, by how resources are used (Device::memory_stats). Swapchain images
+// aren't counted (the presentation engine owns them), nor the device's own small internals.
+enum class GpuMemoryCategory : uint8_t {
+    RenderTargets,   // textures with RenderTarget or DepthStencil usage
+    StorageTextures, // other textures with Storage usage
+    Textures,        // other textures: sampled assets
+    GpuBuffers,      // buffers in GPU-only memory
+    UploadBuffers,   // buffers the CPU writes: staging, per-frame data
+    ReadbackBuffers, // buffers the CPU reads back
+    Count,
+};
+const char* gpu_memory_category_name(GpuMemoryCategory category);
+
+struct GpuMemoryStats {
+    // Live resources per category: allocation sizes (alignment and padding included) and counts.
+    uint64_t bytes[static_cast<size_t>(GpuMemoryCategory::Count)] = {};
+    uint32_t counts[static_cast<size_t>(GpuMemoryCategory::Count)] = {};
+    uint64_t pending_destroy_bytes = 0; // destroyed, freed once the GPU is done with them
+    // From the driver, for this process across GPU-local heaps: everything it allocated (the
+    // categories, internals, other allocators), and what the OS lets it use before paging.
+    uint64_t device_local_used_bytes = 0;
+    uint64_t device_local_budget_bytes = 0;
+
+    uint64_t total_bytes() const {
+        uint64_t total = 0;
+        for (const uint64_t category : bytes) {
+            total += category;
+        }
+        return total;
+    }
+    uint64_t category_bytes(GpuMemoryCategory category) const { return bytes[static_cast<size_t>(category)]; }
+    uint32_t category_count(GpuMemoryCategory category) const { return counts[static_cast<size_t>(category)]; }
+};
+
+// One live texture's memory (Device::largest_textures).
+struct TextureMemory {
+    TextureHandle texture;
+    TextureDesc desc;           // debug_name is null: the name is below
+    core::FixedString<63> name; // the debug name, cut at 63 characters
+    uint64_t bytes = 0;
+    GpuMemoryCategory category = GpuMemoryCategory::Textures;
+};
 
 struct DeviceDesc {
     const char* app_name = "DEengine";
@@ -71,6 +115,14 @@ public:
 
     const Capabilities& capabilities() const;
     DeviceStats stats() const;
+
+    // GPU memory by category, kept as resources come and go (cheap: every frame is fine).
+    GpuMemoryStats memory_stats() const;
+    // The largest live textures, biggest first: fills out and returns how many it filled. Walks
+    // every texture: for reports and debug views, not every frame.
+    size_t largest_textures(std::span<TextureMemory> out) const;
+    // Logs memory_stats() and the largest textures ("render" channel).
+    void log_memory_report(size_t largest = 10) const;
     bool validation_enabled() const;
 
     // --- Resources ---

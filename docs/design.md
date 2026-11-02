@@ -416,6 +416,8 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 - sRGB textures with storage usage store through UNORM views of the same memory (GPUs don't write sRGB storage images); shaders encode sRGB themselves there and sample it decoded.
 - Planned for streaming (M1): a reserve/commit form, where a decompression job writes straight into staging memory instead of handing a buffer to copy.
 
+**GPU memory accounting.** The device counts every texture and buffer it allocates, by category (render targets, storage textures, sampled textures, GPU, upload and readback buffers), at its real allocation size, plus what waits to be freed. `Device::memory_stats` is cheap enough for every frame (the stats panel), `largest_textures` and `log_memory_report` name what is big, and the device warns once when GPU-local memory passes 90% of what the OS allows. The streaming budgets (M1) build on these counters.
+
 **Hardware ray tracing (optional, RT-ready from day one).** The game must look right with RT off; RT features are passes that replace or improve a raster fallback when the GPU supports them.
 
 - Ready from the start: the RHI exposes acceleration structures (BLAS per mesh LOD0, TLAS rebuilt from the GPU instance buffer each frame), and the bindless setup lets ray shaders reach any material.
