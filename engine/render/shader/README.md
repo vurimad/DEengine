@@ -6,20 +6,22 @@ Slang compilation, reflection and hot reload (docs/design.md, Shaders, materials
 
 | File | What it gives |
 | --- | --- |
-| `shader_compiler.h` | `ShaderCompiler`: one entry point of a Slang module to SPIR-V, with reflection (push constant fields, thread group size, descriptor slots) and the list of source files it read |
+| `shader_compiler.h` | `ShaderCompiler`: the entry points of a Slang module to SPIR-V in one compile, with reflection (push constant fields, thread group size, descriptor slots) and a report of the files it read and Slang's messages |
 | `shader_library.h` | `ShaderLibrary`: graphics and compute programs with stable handles, their RHI pipelines, and live rebuilds when sources change |
 
 ## How it works
 
 - Sources are read through the VFS from `src:/shaders/` (Slang's file system is our VFS), so every file a compile touches, imports included, is recorded as a dependency with its size and write time.
-- `ShaderLibrary::update()` (once per frame) checks those files every 250 ms. A changed program rebuilds on the job system while the game keeps rendering with the old pipeline; the new pipeline is swapped in on the render thread, and the old one is destroyed once the GPU is done with it.
-- A failed rebuild logs Slang's diagnostics (file, line, column) and keeps the last good version. It isn't retried until a file changes again.
+- `ShaderLibrary::update()` (once per frame) checks those files every 250 ms. Changed programs queue up and rebuild one at a time as background jobs (`JobSystem::submit_background`: only idle workers run them, never a thread waiting on a counter) while the game keeps rendering with the old pipeline; the new pipeline is swapped in on the render thread, and the old one is destroyed once the GPU is done with it.
+- A failed rebuild logs Slang's diagnostics (file, line, column) and keeps the last good version. It isn't retried until a file changes again; a file that was read mid-write or locked counts as changed, so it is.
+- A program whose first build fails is kept without a pipeline and watched like the others (its module file included, even if it doesn't exist yet): fixing the shader brings it to life. Check `pipeline()` before drawing.
+- Names (module, entries, defines) longer than 63 characters are refused, never cut short.
 - Programs are referenced by `ProgramHandle`, which stays valid across rebuilds: look up `pipeline(handle)` when binding.
 
 ## Rules and invariants
 
 - Compiles run one at a time (Slang's global session is single-threaded), off the render thread except for a program's first build.
-- A fresh Slang session per compile: sessions cache modules, and a rebuild must see the edits.
+- A fresh Slang session per compile (sessions cache modules, and a rebuild must see the edits), with every entry point of the program in it, so the module is parsed and checked once.
 - Every pipeline shares the device's one layout (128 bytes of push constants), so shaders don't need per-program layouts.
 - SPIR-V 1.6 for Vulkan 1.3. Debug info is on in debug and dev builds (step through Slang in RenderDoc).
 - On Windows, Slang's runtime (`slang*.dll` and `slang-standard-module-*`) is copied next to each executable by `de_deploy_slang_runtime()`; on Linux it's found through the rpath.

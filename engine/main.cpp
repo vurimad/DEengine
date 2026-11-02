@@ -84,6 +84,13 @@ int main(int argc, char** argv) {
     const char* src_root = DE_BUILD_DEV != 0 ? (src_dir != nullptr ? src_dir : DE_SOURCE_DIR) : nullptr;
     auto vfs =
         de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked", .src_root = src_root});
+    if (!vfs && src_root != nullptr) {
+        // A dev build away from its source tree (copied to another machine, the repo moved): run
+        // without src:/, and so without shaders, rather than not at all.
+        DE_LOG_WARN("engine", "source tree %s not found (pass --src-dir): running without src:/", src_root);
+        src_root = nullptr;
+        vfs = de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked"});
+    }
     if (!vfs) {
         return EXIT_FAILURE;
     }
@@ -125,21 +132,19 @@ int main(int argc, char** argv) {
 
     de::core::Result<de::shader::ShaderCompiler> compiler =
         de::core::fail(de::core::ErrorCode::Unsupported, "no src:/ to compile shaders from");
-    de::core::Result<de::shader::ShaderLibrary> shaders = de::core::fail(compiler.error());
     if (src_root != nullptr) {
         compiler = de::shader::ShaderCompiler::create(*vfs);
-        if (compiler) {
-            shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler);
-        }
     }
-    if (!shaders) {
-        DE_LOG_WARN("engine", "no shaders (%s): the window is only cleared", shaders.error().message);
+    de::core::Result<de::shader::ShaderLibrary> shaders = de::core::fail(de::core::ErrorCode::Unsupported, "");
+    if (compiler) {
+        shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler);
+    } else {
+        DE_LOG_WARN("engine", "no shaders (%s): the window is only cleared", compiler.error().message);
     }
-    // Built once the swapchain format is known; rebuilt if it changes. A failed first build (an
-    // error in the shader at startup) is retried every second until it compiles.
+    // Built once the swapchain format is known, and again if it changes. If the shader has an
+    // error at startup, the library keeps watching it, and the triangle appears once it's fixed.
     de::shader::ProgramHandle triangle;
     de::rhi::Format triangle_format = de::rhi::Format::Unknown;
-    uint64_t next_triangle_attempt_ns = 0;
 
     Input input;
     const ActionId quit = input.add_action("quit"_sid, ActionKind::Button);
@@ -244,16 +249,13 @@ int main(int argc, char** argv) {
         // Clear the window to a slowly breathing dusk color and draw the triangle over it.
         device->begin_frame();
         const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
-        if (backbuffer.is_valid() && shaders &&
-            (triangle_format != device->swapchain_format() || !triangle.is_valid()) &&
-            de::platform::time_ns() >= next_triangle_attempt_ns) {
+        if (backbuffer.is_valid() && shaders && triangle_format != device->swapchain_format()) {
             shaders->destroy(triangle);
             de::rhi::GraphicsPipelineDesc state{.color_count = 1, .debug_name = "triangle"};
             state.color_formats[0] = device->swapchain_format();
             const auto created = shaders->create_graphics({.module = "triangle", .state = state});
             triangle = created.ok() ? *created : de::shader::ProgramHandle{};
             triangle_format = device->swapchain_format();
-            next_triangle_attempt_ns = de::platform::time_ns() + de::platform::kNsPerSecond;
         }
         if (backbuffer.is_valid()) {
             const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;

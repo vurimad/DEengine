@@ -52,7 +52,7 @@ struct ShaderLibraryStats {
     uint32_t programs = 0;
     uint32_t reloads = 0;        // programs rebuilt and swapped in after a source change
     uint32_t failed_reloads = 0; // rebuilds that failed: the last good pipeline stayed
-    uint32_t compiling = 0;      // rebuilds running in the background right now
+    uint32_t compiling = 0;      // rebuilds queued or running in the background
 };
 
 // Shader programs with live reload (docs/design.md, Shaders, materials & VFX): edit a .slang file
@@ -60,7 +60,8 @@ struct ShaderLibraryStats {
 // version; errors are logged with file and line, and the old pipeline stays until a fix compiles.
 //
 // Create programs at load time (the first compile blocks). Call update() once per frame on the
-// render thread. Pipelines are created and destroyed on that thread only; compiles run as jobs.
+// render thread. Pipelines are created and destroyed on that thread only; rebuilds run one at a
+// time as background jobs, which only idle workers pick up, so they never stall a frame.
 // Move-only; the device, VFS, job system and compiler must outlive it.
 class ShaderLibrary {
 public:
@@ -73,15 +74,17 @@ public:
     ShaderLibrary(const ShaderLibrary&) = delete;
     ShaderLibrary& operator=(const ShaderLibrary&) = delete;
 
-    // Compile now and build the pipeline. Fails (with the errors logged) if either step fails;
-    // nothing is kept then, so fix the shader and create the program again.
+    // Compiles now and builds the pipeline. Fails only for a bad description (a missing or
+    // over-long name). If the shader doesn't compile, the errors are logged and the program is
+    // kept without a pipeline: it is watched like any other, and a fix to its sources brings it to
+    // life. Check pipeline() before drawing with it.
     core::Result<ProgramHandle> create_graphics(const GraphicsProgramDesc& desc);
     core::Result<ProgramHandle> create_compute(const ComputeProgramDesc& desc);
 
     // Destroys the program and its pipeline (once the GPU is done with it). Waits for a rebuild in flight.
     void destroy(ProgramHandle program);
 
-    // The program's current pipeline; invalid for a stale handle.
+    // The program's current pipeline; invalid for a stale handle or a program that has never built.
     rhi::PipelineHandle pipeline(ProgramHandle program) const;
 
     // The reflection of one stage of the current version; null for a stale handle or a missing stage.

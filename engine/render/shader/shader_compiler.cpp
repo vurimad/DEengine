@@ -22,6 +22,10 @@ namespace de::shader {
 
 namespace {
 
+core::Allocator& render_heap() {
+    return core::heap_allocator(core::MemoryTag::Render);
+}
+
 bool same_uuid(const SlangUUID& a, const SlangUUID& b) {
     return std::memcmp(&a, &b, sizeof(SlangUUID)) == 0;
 }
@@ -30,8 +34,7 @@ bool same_uuid(const SlangUUID& a, const SlangUUID& b) {
 class VfsBlob final : public ISlangBlob {
 public:
     static VfsBlob* create(size_t size) {
-        core::Allocator& allocator = core::heap_allocator(core::MemoryTag::Render);
-        auto* blob = ::new (allocator.allocate(sizeof(VfsBlob), alignof(VfsBlob))) VfsBlob(allocator);
+        auto* blob = ::new (render_heap().allocate(sizeof(VfsBlob), alignof(VfsBlob))) VfsBlob();
         blob->bytes_.resize(size);
         return blob;
     }
@@ -51,9 +54,8 @@ public:
     SLANG_NO_THROW uint32_t SLANG_MCALL release() override {
         const uint32_t refs = refs_.fetch_sub(1) - 1;
         if (refs == 0) {
-            core::Allocator& allocator = *allocator_;
             this->~VfsBlob();
-            allocator.deallocate(this, sizeof(VfsBlob), alignof(VfsBlob));
+            render_heap().deallocate(this, sizeof(VfsBlob), alignof(VfsBlob));
         }
         return refs;
     }
@@ -61,13 +63,47 @@ public:
     SLANG_NO_THROW size_t SLANG_MCALL getBufferSize() override { return bytes_.size(); }
 
 private:
-    explicit VfsBlob(core::Allocator& allocator) : allocator_(&allocator), bytes_(allocator) {}
+    VfsBlob() = default;
     ~VfsBlob() = default;
 
-    core::Allocator* allocator_;
     std::atomic<uint32_t> refs_{1};
-    core::Array<std::byte> bytes_;
+    core::Array<std::byte> bytes_{render_heap()};
 };
+
+// "shaders/x.slang", "./shaders/x.slang", "shaders\x.slang" or "shaders/tests/../x.slang" ->
+// "src:/shaders/x.slang". Absolute paths and paths that climb out of src:/ are refused.
+bool to_vfs_path(const char* path, platform::PathString& out) {
+    const std::string_view text(path != nullptr ? path : "");
+    if (text.empty() || text.find(':') != std::string_view::npos || text.front() == '/' || text.front() == '\\') {
+        return false;
+    }
+    constexpr std::string_view kPrefix = "src:/";
+    out.assign(kPrefix);
+    size_t start = 0;
+    while (start <= text.size()) {
+        size_t end = text.find_first_of("/\\", start);
+        if (end == std::string_view::npos) {
+            end = text.size();
+        }
+        const std::string_view segment = text.substr(start, end - start);
+        start = end + 1;
+        if (segment.empty() || segment == ".") {
+            continue;
+        }
+        if (segment == "..") {
+            if (out.size() == kPrefix.size()) {
+                return false; // above src:/
+            }
+            const size_t parent = out.view().find_last_of('/');
+            out.truncate(parent + 1 > kPrefix.size() ? parent : kPrefix.size());
+            continue;
+        }
+        if ((out.size() > kPrefix.size() && !out.append('/')) || !out.append(segment)) {
+            return false;
+        }
+    }
+    return out.size() > kPrefix.size();
+}
 
 // Slang's view of src:/: it asks for "shaders/common/color.slang", we read src:/shaders/common/color.slang
 // through the VFS and note the file as a dependency of the compile in progress.
@@ -112,41 +148,30 @@ public:
         }
         VfsBlob* blob = VfsBlob::create(static_cast<size_t>(info->size));
         const core::Result<size_t> read = vfs_->read_file(vfs_path.c_str(), blob->bytes());
-        if (!read || *read != info->size) {
+        const bool ok = read.ok() && *read == info->size;
+        // A file that exists but couldn't be read (locked, mid-write) is recorded with a zero info,
+        // so the next check sees it as changed and the compile is tried again.
+        record(vfs_path, ok ? *info : platform::FileInfo{});
+        if (!ok) {
             blob->release();
             return SLANG_FAIL;
-        }
-        if (dependencies_ != nullptr) {
-            bool known = false;
-            for (const ShaderDependency& dependency : *dependencies_) {
-                known = known || dependency.path == vfs_path.view();
-            }
-            if (!known) {
-                dependencies_->push(ShaderDependency{.path = vfs_path, .info = *info});
-            }
         }
         *out_blob = blob;
         return SLANG_OK;
     }
 
 private:
-    // "shaders/x.slang", "./shaders/x.slang" or "shaders\x.slang" -> "src:/shaders/x.slang".
-    // Anything absolute or outside src:/ is refused.
-    static bool to_vfs_path(const char* path, platform::PathString& out) {
-        std::string_view text(path != nullptr ? path : "");
-        while (text.starts_with("./") || text.starts_with(".\\")) {
-            text.remove_prefix(2);
+    void record(const platform::PathString& path, const platform::FileInfo& info) {
+        if (dependencies_ == nullptr) {
+            return;
         }
-        if (text.empty() || text.find(':') != std::string_view::npos || text.front() == '/' || text.front() == '\\') {
-            return false;
-        }
-        out.assign("src:/");
-        for (const char c : text) {
-            if (!out.append(c == '\\' ? '/' : c)) {
-                return false;
+        for (ShaderDependency& dependency : *dependencies_) {
+            if (dependency.path == path.view()) {
+                dependency.info = info;
+                return;
             }
         }
-        return true;
+        dependencies_->push(ShaderDependency{.path = path, .info = info});
     }
 
     platform::Vfs* vfs_;
@@ -168,7 +193,7 @@ SlangStage to_slang(rhi::ShaderStage stage) {
     return SLANG_STAGE_NONE;
 }
 
-// Collects Slang's diagnostics: logged as they come, and appended for the caller.
+// Collects Slang's diagnostics: logged as they come, and kept for the caller.
 class Diagnostics {
 public:
     explicit Diagnostics(core::Array<char>* out) : out_(out) {}
@@ -177,38 +202,30 @@ public:
         if (blob == nullptr || blob->getBufferSize() == 0) {
             return;
         }
-        const auto* text = static_cast<const char*>(blob->getBufferPointer());
+        const std::string_view whole(static_cast<const char*>(blob->getBufferPointer()), blob->getBufferSize());
         constexpr char kNul = 0;
-        const std::string_view whole(text, blob->getBufferSize());
-        const size_t length = std::min(whole.find(kNul), whole.size());
-        if (failed) {
-            DE_LOG_ERROR("shader", "%.*s", static_cast<int>(length), text);
-        } else {
-            DE_LOG_WARN("shader", "%.*s", static_cast<int>(length), text);
-        }
-        if (out_ != nullptr) {
-            if (!out_->empty() && out_->back() == '\0') {
-                out_->pop();
-            }
-            for (size_t i = 0; i < length; ++i) {
-                out_->push(text[i]);
-            }
-            out_->push('\0');
-        }
+        add_text(whole.substr(0, std::min(whole.find(kNul), whole.size())), failed);
     }
 
-    void add_text(const char* text) {
-        DE_LOG_ERROR("shader", "%s", text);
-        if (out_ != nullptr) {
-            if (!out_->empty() && out_->back() == '\0') {
-                out_->pop();
-            }
-            for (const char* c = text; *c != '\0'; ++c) {
-                out_->push(*c);
-            }
-            out_->push('\n');
-            out_->push('\0');
+    void add_text(std::string_view text, bool failed) {
+        if (failed) {
+            DE_LOG_ERROR("shader", "%.*s", static_cast<int>(text.size()), text.data());
+        } else {
+            DE_LOG_WARN("shader", "%.*s", static_cast<int>(text.size()), text.data());
         }
+        if (out_ == nullptr) {
+            return;
+        }
+        if (!out_->empty()) {
+            out_->pop(); // the terminator
+        }
+        for (const char c : text) {
+            out_->push(c);
+        }
+        if (!text.empty() && text.back() != '\n') {
+            out_->push('\n');
+        }
+        out_->push('\0');
     }
 
 private:
@@ -219,7 +236,11 @@ uint32_t to_u32(size_t value) {
     return static_cast<uint32_t>(value);
 }
 
-void reflect(slang::ProgramLayout* layout, ShaderReflection& reflection) {
+// The program's global parameters (push constants, descriptor slots) and one entry point's own.
+ShaderReflection reflect(slang::ProgramLayout* layout, uint32_t entry_index, rhi::ShaderStage stage) {
+    ShaderReflection reflection{.stage = stage,
+                                .push_constants = core::Array<PushConstantField>(render_heap()),
+                                .bindings = core::Array<ResourceBinding>(render_heap())};
     for (unsigned i = 0; i < layout->getParameterCount(); ++i) {
         slang::VariableLayoutReflection* parameter = layout->getParameterByIndex(i);
         const char* name = parameter->getName() != nullptr ? parameter->getName() : "";
@@ -242,14 +263,19 @@ void reflect(slang::ProgramLayout* layout, ShaderReflection& reflection) {
             });
         }
     }
-    slang::EntryPointReflection* entry = layout->getEntryPointByIndex(0);
-    if (entry != nullptr && reflection.stage == rhi::ShaderStage::Compute) {
+    slang::EntryPointReflection* entry = layout->getEntryPointByIndex(entry_index);
+    if (entry != nullptr && stage == rhi::ShaderStage::Compute) {
         SlangUInt sizes[3] = {};
         entry->getComputeThreadGroupSize(3, sizes);
         for (int axis = 0; axis < 3; ++axis) {
             reflection.thread_group_size[axis] = static_cast<uint32_t>(sizes[axis]);
         }
     }
+    return reflection;
+}
+
+bool fits(const char* text) {
+    return text != nullptr && std::strlen(text) <= kMaxShaderNameLength;
 }
 
 } // namespace
@@ -267,8 +293,7 @@ struct CompilerState {
 core::Result<ShaderCompiler> ShaderCompiler::create(platform::Vfs& vfs, const ShaderCompilerDesc& desc) {
     DE_PROFILE_ZONE("shader compiler create");
     const uint64_t start_ns = platform::time_ns();
-    core::Allocator& allocator = core::heap_allocator(core::MemoryTag::Render);
-    auto* state = ::new (allocator.allocate(sizeof(CompilerState), alignof(CompilerState))) CompilerState(vfs);
+    auto* state = ::new (render_heap().allocate(sizeof(CompilerState), alignof(CompilerState))) CompilerState(vfs);
     state->desc = desc;
     ShaderCompiler compiler(state); // frees the state on every early return below
     if (SLANG_FAILED(slang::createGlobalSession(state->global_session.writeRef()))) {
@@ -287,9 +312,8 @@ core::Result<ShaderCompiler> ShaderCompiler::create(platform::Vfs& vfs, const Sh
 
 ShaderCompiler::~ShaderCompiler() {
     if (state_ != nullptr) {
-        core::Allocator& allocator = core::heap_allocator(core::MemoryTag::Render);
         state_->~CompilerState();
-        allocator.deallocate(state_, sizeof(CompilerState), alignof(CompilerState));
+        render_heap().deallocate(state_, sizeof(CompilerState), alignof(CompilerState));
     }
 }
 
@@ -302,25 +326,30 @@ ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&& other) noexcept {
     return *this;
 }
 
-core::Result<CompiledShader> ShaderCompiler::compile(const CompileRequest& request, core::Array<char>* diagnostics) {
+core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& request, CompileReport* report) {
     DE_PROFILE_ZONE("shader compile");
-    if (request.module == nullptr || request.entry == nullptr || request.defines.size() > kMaxShaderDefines) {
-        return core::fail(core::ErrorCode::InvalidArgument,
-                          "a compile needs a module, an entry point and at most 16 defines");
+    if (!fits(request.module) || request.entries.empty() || request.entries.size() > kMaxShaderEntries ||
+        request.defines.size() > kMaxShaderDefines) {
+        return core::fail(
+            core::ErrorCode::InvalidArgument,
+            "a compile needs a module name of at most 63 characters, 1 to 4 entry points and at most 16 defines");
     }
+    for (const ShaderEntry& entry : request.entries) {
+        if (!fits(entry.name)) {
+            return core::fail(core::ErrorCode::InvalidArgument, "entry point names are 1 to 63 characters");
+        }
+    }
+    for (const ShaderDefine& define : request.defines) {
+        if (define.name == nullptr || define.name[0] == '\0') {
+            return core::fail(core::ErrorCode::InvalidArgument, "a define needs a name");
+        }
+    }
+
     CompilerState& state = *state_;
     const std::scoped_lock lock(state.mutex);
     const uint64_t start_ns = platform::time_ns();
-    Diagnostics messages(diagnostics);
-
-    CompiledShader result{
-        .code = core::Array<uint32_t>(core::heap_allocator(core::MemoryTag::Render)),
-        .reflection = {.stage = request.stage,
-                       .push_constants = core::Array<PushConstantField>(core::heap_allocator(core::MemoryTag::Render)),
-                       .bindings = core::Array<ResourceBinding>(core::heap_allocator(core::MemoryTag::Render))},
-        .dependencies = core::Array<ShaderDependency>(core::heap_allocator(core::MemoryTag::Render)),
-    };
-    state.file_system.set_dependencies(&result.dependencies);
+    Diagnostics messages(report != nullptr ? &report->diagnostics : nullptr);
+    state.file_system.set_dependencies(report != nullptr ? &report->dependencies : nullptr);
     struct ClearDependencies {
         VfsFileSystem& file_system;
         ~ClearDependencies() { file_system.set_dependencies(nullptr); }
@@ -331,7 +360,7 @@ core::Result<CompiledShader> ShaderCompiler::compile(const CompileRequest& reque
         .format = SLANG_SPIRV,
         .profile = state.profile,
     };
-    core::InlineArray<slang::CompilerOptionEntry, 4> options(core::heap_allocator(core::MemoryTag::Render));
+    core::InlineArray<slang::CompilerOptionEntry, 4> options(render_heap());
     options.push(
         {.name = slang::CompilerOptionName::Optimization,
          .value = {.kind = slang::CompilerOptionValueKind::Int, .intValue0 = SLANG_OPTIMIZATION_LEVEL_DEFAULT}});
@@ -340,8 +369,7 @@ core::Result<CompiledShader> ShaderCompiler::compile(const CompileRequest& reque
             {.name = slang::CompilerOptionName::DebugInformation,
              .value = {.kind = slang::CompilerOptionValueKind::Int, .intValue0 = SLANG_DEBUG_INFO_LEVEL_STANDARD}});
     }
-    core::InlineArray<slang::PreprocessorMacroDesc, kMaxShaderDefines> macros(
-        core::heap_allocator(core::MemoryTag::Render));
+    core::InlineArray<slang::PreprocessorMacroDesc, kMaxShaderDefines> macros(render_heap());
     for (const ShaderDefine& define : request.defines) {
         macros.push({.name = define.name, .value = define.value != nullptr ? define.value : "1"});
     }
@@ -375,28 +403,34 @@ core::Result<CompiledShader> ShaderCompiler::compile(const CompileRequest& reque
     messages.add(diagnostic, module == nullptr);
     if (module == nullptr) {
         if (diagnostic == nullptr) {
-            messages.add_text("shader module not found under src:/shaders/");
+            messages.add_text("shader module not found under src:/shaders/", true);
         }
         return core::fail(core::ErrorCode::NotFound, "the shader module failed to load or compile");
     }
 
-    Slang::ComPtr<slang::IEntryPoint> entry_point;
-    diagnostic = nullptr;
-    const SlangResult found = module->findAndCheckEntryPoint(request.entry, to_slang(request.stage),
-                                                             entry_point.writeRef(), diagnostic.writeRef());
-    messages.add(diagnostic, SLANG_FAILED(found));
-    if (SLANG_FAILED(found) || entry_point == nullptr) {
-        if (diagnostic == nullptr) {
-            messages.add_text("entry point not found in the module");
+    // The module and every entry point, linked into one program: the front end runs once.
+    core::InlineArray<Slang::ComPtr<slang::IEntryPoint>, kMaxShaderEntries> entry_points(render_heap());
+    core::InlineArray<slang::IComponentType*, kMaxShaderEntries + 1> components(render_heap());
+    components.push(module);
+    for (const ShaderEntry& entry : request.entries) {
+        Slang::ComPtr<slang::IEntryPoint>& entry_point = entry_points.emplace();
+        diagnostic = nullptr;
+        const SlangResult found = module->findAndCheckEntryPoint(entry.name, to_slang(entry.stage),
+                                                                 entry_point.writeRef(), diagnostic.writeRef());
+        messages.add(diagnostic, SLANG_FAILED(found));
+        if (SLANG_FAILED(found) || entry_point == nullptr) {
+            if (diagnostic == nullptr) {
+                messages.add_text("entry point not found in the module", true);
+            }
+            return core::fail(core::ErrorCode::NotFound, "a shader entry point is missing or invalid");
         }
-        return core::fail(core::ErrorCode::NotFound, "the shader entry point is missing or invalid");
+        components.push(entry_point);
     }
 
-    slang::IComponentType* const components[] = {module, entry_point};
     Slang::ComPtr<slang::IComponentType> program;
     diagnostic = nullptr;
-    SlangResult status =
-        session->createCompositeComponentType(components, 2, program.writeRef(), diagnostic.writeRef());
+    SlangResult status = session->createCompositeComponentType(
+        components.data(), static_cast<SlangInt>(components.size()), program.writeRef(), diagnostic.writeRef());
     messages.add(diagnostic, SLANG_FAILED(status));
     Slang::ComPtr<slang::IComponentType> linked;
     if (SLANG_SUCCEEDED(status)) {
@@ -404,28 +438,35 @@ core::Result<CompiledShader> ShaderCompiler::compile(const CompileRequest& reque
         status = program->link(linked.writeRef(), diagnostic.writeRef());
         messages.add(diagnostic, SLANG_FAILED(status));
     }
-    Slang::ComPtr<ISlangBlob> code;
+    slang::ProgramLayout* layout = nullptr;
     if (SLANG_SUCCEEDED(status)) {
         diagnostic = nullptr;
-        status = linked->getEntryPointCode(0, 0, code.writeRef(), diagnostic.writeRef());
+        layout = linked->getLayout(0, diagnostic.writeRef());
+        messages.add(diagnostic, layout == nullptr);
+    }
+    if (SLANG_FAILED(status) || layout == nullptr) {
+        return core::fail(core::ErrorCode::InvalidArgument, "the shader failed to link");
+    }
+
+    CompiledProgram result{.stages = core::Array<CompiledStage>(render_heap())};
+    result.stages.reserve(request.entries.size());
+    for (uint32_t i = 0; i < request.entries.size(); ++i) {
+        Slang::ComPtr<ISlangBlob> code;
+        diagnostic = nullptr;
+        status = linked->getEntryPointCode(i, 0, code.writeRef(), diagnostic.writeRef());
         messages.add(diagnostic, SLANG_FAILED(status));
+        if (SLANG_FAILED(status) || code == nullptr || code->getBufferSize() % 4 != 0) {
+            return core::fail(core::ErrorCode::InvalidArgument, "the shader failed to generate code");
+        }
+        CompiledStage& stage = result.stages.emplace(CompiledStage{
+            .code = core::Array<uint32_t>(render_heap()),
+            .reflection = reflect(layout, i, request.entries[i].stage),
+        });
+        stage.code.resize_uninit(code->getBufferSize() / 4);
+        std::memcpy(stage.code.data(), code->getBufferPointer(), code->getBufferSize());
     }
-    if (SLANG_FAILED(status) || code == nullptr || code->getBufferSize() % 4 != 0) {
-        return core::fail(core::ErrorCode::InvalidArgument, "the shader failed to link or generate code");
-    }
-
-    diagnostic = nullptr;
-    slang::ProgramLayout* layout = linked->getLayout(0, diagnostic.writeRef());
-    messages.add(diagnostic, layout == nullptr);
-    if (layout == nullptr) {
-        return core::fail(core::ErrorCode::Unknown, "the shader has no reflection");
-    }
-    reflect(layout, result.reflection);
-
-    result.code.resize_uninit(code->getBufferSize() / 4);
-    std::memcpy(result.code.data(), code->getBufferPointer(), code->getBufferSize());
-    DE_LOG_DEBUG("shader", "compiled %s:%s (%s) in %.1f ms", request.module, request.entry,
-                 rhi::shader_stage_name(request.stage), static_cast<double>(platform::time_ns() - start_ns) / 1e6);
+    DE_LOG_DEBUG("shader", "compiled %s (%zu entry points) in %.1f ms", request.module, request.entries.size(),
+                 static_cast<double>(platform::time_ns() - start_ns) / 1e6);
     return result;
 }
 

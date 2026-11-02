@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 using namespace de::shader;
@@ -40,8 +41,8 @@ ShaderCompiler make_compiler(Vfs& vfs) {
     return std::move(compiler).value();
 }
 
-bool has_dependency(const CompiledShader& shader, std::string_view path) {
-    for (const ShaderDependency& dependency : shader.dependencies) {
+bool has_dependency(const CompileReport& report, std::string_view path) {
+    for (const ShaderDependency& dependency : report.dependencies) {
         if (dependency.path == path) {
             return true;
         }
@@ -118,35 +119,40 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     Vfs vfs = make_repo_vfs(sandbox);
     ShaderCompiler compiler = make_compiler(vfs);
 
-    auto vertex = compiler.compile({.module = "triangle", .entry = "vertex_main", .stage = ShaderStage::Vertex});
-    REQUIRE(vertex.ok());
-    REQUIRE(vertex->code.size() > 5);
-    CHECK(vertex->code[0] == kSpirvMagic);
-    CHECK(vertex->reflection.stage == ShaderStage::Vertex);
-    CHECK(vertex->reflection.push_constant_bytes == 8);
-    REQUIRE(field(vertex->reflection, "time_s") != nullptr);
-    CHECK(field(vertex->reflection, "time_s")->offset == 0);
-    REQUIRE(field(vertex->reflection, "aspect") != nullptr);
-    CHECK(field(vertex->reflection, "aspect")->offset == 4);
-    CHECK(vertex->reflection.bindings.empty());
-    CHECK(has_dependency(*vertex, "src:/shaders/triangle.slang"));
-    CHECK(has_dependency(*vertex, "src:/shaders/common/color.slang"));
+    // Both stages of the triangle in one compile.
+    const ShaderEntry stages[] = {{.name = "vertex_main", .stage = ShaderStage::Vertex},
+                                  {.name = "fragment_main", .stage = ShaderStage::Fragment}};
+    CompileReport report;
+    auto triangle = compiler.compile({.module = "triangle", .entries = stages}, &report);
+    REQUIRE(triangle.ok());
+    REQUIRE(triangle->stages.size() == 2);
+    const CompiledStage& vertex = triangle->stages[0];
+    REQUIRE(vertex.code.size() > 5);
+    CHECK(vertex.code[0] == kSpirvMagic);
+    CHECK(vertex.reflection.stage == ShaderStage::Vertex);
+    CHECK(vertex.reflection.push_constant_bytes == 8);
+    REQUIRE(field(vertex.reflection, "time_s") != nullptr);
+    CHECK(field(vertex.reflection, "time_s")->offset == 0);
+    REQUIRE(field(vertex.reflection, "aspect") != nullptr);
+    CHECK(field(vertex.reflection, "aspect")->offset == 4);
+    CHECK(vertex.reflection.bindings.empty());
+    CHECK(triangle->stages[1].code[0] == kSpirvMagic);
+    CHECK(triangle->stages[1].reflection.stage == ShaderStage::Fragment);
+    CHECK(has_dependency(report, "src:/shaders/triangle.slang"));
+    CHECK(has_dependency(report, "src:/shaders/common/color.slang"));
 
-    auto fragment = compiler.compile({.module = "triangle", .entry = "fragment_main", .stage = ShaderStage::Fragment});
-    REQUIRE(fragment.ok());
-    CHECK(fragment->code[0] == kSpirvMagic);
-
-    auto compute =
-        compiler.compile({.module = "tests.fill_buffer", .entry = "compute_main", .stage = ShaderStage::Compute});
+    const ShaderEntry compute_entry[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
+    auto compute = compiler.compile({.module = "tests.fill_buffer", .entries = compute_entry});
     REQUIRE(compute.ok());
-    CHECK(compute->reflection.thread_group_size[0] == 64);
-    CHECK(compute->reflection.thread_group_size[1] == 1);
-    CHECK(compute->reflection.thread_group_size[2] == 1);
-    CHECK(compute->reflection.push_constant_bytes == 16);
-    REQUIRE(field(compute->reflection, "output") != nullptr);
-    CHECK(field(compute->reflection, "output")->size == 8);
-    REQUIRE(field(compute->reflection, "count") != nullptr);
-    CHECK(field(compute->reflection, "count")->offset == 12);
+    const ShaderReflection& reflection = compute->stages[0].reflection;
+    CHECK(reflection.thread_group_size[0] == 64);
+    CHECK(reflection.thread_group_size[1] == 1);
+    CHECK(reflection.thread_group_size[2] == 1);
+    CHECK(reflection.push_constant_bytes == 16);
+    REQUIRE(field(reflection, "output") != nullptr);
+    CHECK(field(reflection, "output")->size == 8);
+    REQUIRE(field(reflection, "count") != nullptr);
+    CHECK(field(reflection, "count")->offset == 12);
 }
 
 TEST_CASE("compile errors name the file and line, and missing pieces fail cleanly") {
@@ -161,37 +167,46 @@ TEST_CASE("compile errors name the file and line, and missing pieces fail cleanl
     write_source(vfs, "src:/shaders/slots.slang",
                  "RWStructuredBuffer<uint> output;\n"
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() { output[0] = 1; }\n");
+    // An include that climbs out of its folder: shaders/nested/../shared.slang.
+    write_source(vfs, "src:/shaders/shared.slang", "static const uint kShared = 7;\n");
+    write_source(vfs, "src:/shaders/nested/climb.slang",
+                 "#include \"../shared.slang\"\n"
+                 "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() { uint x = kShared; }\n");
+    const ShaderEntry compute_main[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
 
-    de::core::Array<char> diagnostics;
-    const auto broken =
-        compiler.compile({.module = "broken", .entry = "compute_main", .stage = ShaderStage::Compute}, &diagnostics);
+    CompileReport report;
+    const auto broken = compiler.compile({.module = "broken", .entries = compute_main}, &report);
     CHECK_FALSE(broken.ok());
-    CHECK(text_of(diagnostics).find("broken.slang:3:") != std::string_view::npos); // file:line:column
-    CHECK(text_of(diagnostics).find("error") != std::string_view::npos);
+    CHECK(text_of(report.diagnostics).find("broken.slang:3:") != std::string_view::npos); // file:line:column
+    CHECK(text_of(report.diagnostics).find("error") != std::string_view::npos);
+    CHECK(has_dependency(report, "src:/shaders/broken.slang")); // reported even though it failed
 
-    const auto missing_module = compiler.compile({.module = "nowhere", .entry = "main", .stage = ShaderStage::Compute});
+    const auto missing_module = compiler.compile({.module = "nowhere", .entries = compute_main});
     CHECK(missing_module.error().code == de::core::ErrorCode::NotFound);
-    const auto missing_entry =
-        compiler.compile({.module = "slots", .entry = "not_there", .stage = ShaderStage::Compute});
+    const ShaderEntry not_there[] = {{.name = "not_there", .stage = ShaderStage::Compute}};
+    const auto missing_entry = compiler.compile({.module = "slots", .entries = not_there});
     CHECK(missing_entry.error().code == de::core::ErrorCode::NotFound);
 
     const ShaderDefine wrong[] = {{.name = "FAST_PATH", .value = "1"}};
-    CHECK_FALSE(
-        compiler
-            .compile(
-                {.module = "permutation", .entry = "compute_main", .stage = ShaderStage::Compute, .defines = wrong})
-            .ok());
+    CHECK_FALSE(compiler.compile({.module = "permutation", .entries = compute_main, .defines = wrong}).ok());
     const ShaderDefine right[] = {{.name = "FAST_PATH", .value = "2"}};
-    CHECK(compiler
-              .compile(
-                  {.module = "permutation", .entry = "compute_main", .stage = ShaderStage::Compute, .defines = right})
-              .ok());
+    CHECK(compiler.compile({.module = "permutation", .entries = compute_main, .defines = right}).ok());
+
+    CompileReport climb_report;
+    CHECK(compiler.compile({.module = "nested.climb", .entries = compute_main}, &climb_report).ok());
+    CHECK(has_dependency(climb_report, "src:/shaders/shared.slang"));
+
+    // Names that don't fit are refused, not cut short into a different module.
+    const std::string_view long_name = "a_module_name_that_goes_on_and_on_well_past_the_sixty_three_character_limit";
+    const std::string long_module(long_name);
+    CHECK(compiler.compile({.module = long_module.c_str(), .entries = compute_main}).error().code ==
+          de::core::ErrorCode::InvalidArgument);
 
     // Compiles, but reflection shows the descriptor slot the engine's pipelines don't have.
-    const auto slots = compiler.compile({.module = "slots", .entry = "compute_main", .stage = ShaderStage::Compute});
+    const auto slots = compiler.compile({.module = "slots", .entries = compute_main});
     REQUIRE(slots.ok());
-    REQUIRE(slots->reflection.bindings.size() == 1);
-    CHECK((slots->reflection.bindings[0].name == std::string_view("output")));
+    REQUIRE(slots->stages[0].reflection.bindings.size() == 1);
+    CHECK((slots->stages[0].reflection.bindings[0].name == std::string_view("output")));
 }
 
 TEST_CASE("a graphics program draws through the RHI, culling by winding") {
@@ -366,6 +381,52 @@ TEST_CASE("editing a shader rebuilds it live, and a broken edit keeps the last g
     CHECK(library->stats().compiling == 0);
     run_fill(*device, library->pipeline(*program), *buffer, 0, 1);
     CHECK(read_u32(*device, *buffer, 0) == 122);
+
+    device->destroy(*buffer);
+    library->destroy(*program);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("a program whose first build fails is kept, and comes to life when fixed") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const Sandbox sandbox;
+    Vfs vfs = sandbox.make_vfs();
+    ShaderCompiler compiler = make_compiler(vfs);
+    de::core::JobSystem jobs({.worker_count = 1});
+    auto library = ShaderLibrary::create(*device, vfs, jobs, compiler, {.hot_reload = false});
+    REQUIRE(library.ok());
+
+    // Over-long names are a bad description: no program.
+    const std::string long_module(80, 'x');
+    CHECK(library->create_compute({.module = long_module.c_str()}).error().code ==
+          de::core::ErrorCode::InvalidArgument);
+
+    // The module doesn't exist yet: the program is created without a pipeline.
+    const auto program = library->create_compute({.module = "later"});
+    REQUIRE(program.ok());
+    CHECK_FALSE(library->pipeline(*program).is_valid());
+    CHECK(library->reflection(*program, ShaderStage::Compute) == nullptr);
+    library->reload_now(); // nothing changed: still nothing
+    CHECK_FALSE(library->pipeline(*program).is_valid());
+
+    write_source(vfs, "src:/shaders/later.slang",
+                 "struct Push { uint* output; uint value; uint count; };\n"
+                 "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
+                 "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\n"
+                 "void compute_main() { push.output[0] = 5; }\n");
+    library->reload_now();
+    REQUIRE(library->pipeline(*program).is_valid());
+    CHECK(library->reflection(*program, ShaderStage::Compute)->push_constant_bytes == 16);
+
+    const auto buffer = device->create_buffer(
+        {.size = 16, .usage = de::rhi::BufferUsage::Storage, .memory = de::rhi::MemoryLocation::Readback});
+    REQUIRE(buffer.ok());
+    run_fill(*device, library->pipeline(*program), *buffer, 0, 1);
+    CHECK(read_u32(*device, *buffer, 0) == 5);
 
     device->destroy(*buffer);
     library->destroy(*program);

@@ -21,20 +21,27 @@ struct CompilerState;
 inline constexpr size_t kMaxShaderNameLength = 63;
 using ShaderName = core::FixedString<kMaxShaderNameLength>;
 
-// A preprocessor define for one permutation ("SKINNED" = "1"). Both strings are copied.
+// A preprocessor define for one permutation ("SKINNED" = "1").
 struct ShaderDefine {
     const char* name = nullptr;
     const char* value = "1";
 };
 
 inline constexpr size_t kMaxShaderDefines = 16;
+inline constexpr size_t kMaxShaderEntries = 4;
 
+struct ShaderEntry {
+    const char* name = nullptr; // the entry point function, e.g. "vertex_main"
+    rhi::ShaderStage stage = rhi::ShaderStage::Vertex;
+};
+
+// One program: several entry points of one module, compiled together (the module and its
+// imports are parsed and checked once).
 struct CompileRequest {
     // A module under src:/shaders/, by Slang module name: "triangle" is shaders/triangle.slang,
     // "common.color" is shaders/common/color.slang.
     const char* module = nullptr;
-    const char* entry = nullptr; // the entry point function, e.g. "vertex_main"
-    rhi::ShaderStage stage = rhi::ShaderStage::Vertex;
+    std::span<const ShaderEntry> entries{};
     std::span<const ShaderDefine> defines{};
 };
 
@@ -61,17 +68,27 @@ struct ShaderReflection {
     core::Array<ResourceBinding> bindings;
 };
 
-// A source file a compile read, with its size and write time when it was read: if either
-// changes, the shader is stale.
-struct ShaderDependency {
-    platform::PathString path; // "src:/shaders/common/color.slang"
-    platform::FileInfo info;
-};
-
-struct CompiledShader {
+struct CompiledStage {
     core::Array<uint32_t> code; // the backend's bytecode (SPIR-V words)
     ShaderReflection reflection;
+};
+
+struct CompiledProgram {
+    core::Array<CompiledStage> stages; // in the order of CompileRequest::entries
+};
+
+// A source file a compile read, with its size and write time when it was read: if either
+// changes, the shader is stale. A file that couldn't be read has a zero info.
+struct ShaderDependency {
+    platform::PathString path{}; // "src:/shaders/common/color.slang"
+    platform::FileInfo info{};
+};
+
+// What a compile reports besides its result, failed compiles included: the files it read (so a
+// fix to any of them can be noticed) and Slang's messages, with file, line and column.
+struct CompileReport {
     core::Array<ShaderDependency> dependencies;
+    core::Array<char> diagnostics; // null-terminated text; empty without messages
 };
 
 struct ShaderCompilerDesc {
@@ -85,8 +102,8 @@ struct ShaderCompilerDesc {
 // Conventions for shaders: column-major matrices (mul(matrix, vector), like GLM), push constants
 // in one [[vk::push_constant]] ConstantBuffer, resources reached bindlessly (by index or pointer).
 //
-// Thread-safe: compiles run one at a time (Slang's global session is single-threaded), so call
-// it from jobs to keep long compiles off the render thread. Move-only.
+// Thread-safe: compiles run one at a time (Slang's global session is single-threaded), so run
+// them as background jobs to keep long compiles off the render thread. Move-only.
 class ShaderCompiler {
 public:
     // Fails if Slang can't start (its runtime library or standard modules are missing).
@@ -98,9 +115,8 @@ public:
     ShaderCompiler(const ShaderCompiler&) = delete;
     ShaderCompiler& operator=(const ShaderCompiler&) = delete;
 
-    // Compiles one entry point. Errors and warnings (with file and line) are logged under "shader"
-    // and, if diagnostics is given, appended to it as text (null-terminated).
-    core::Result<CompiledShader> compile(const CompileRequest& request, core::Array<char>* diagnostics = nullptr);
+    // Errors and warnings are logged under "shader" and, with a report, collected in it.
+    core::Result<CompiledProgram> compile(const CompileRequest& request, CompileReport* report = nullptr);
 
 private:
     explicit ShaderCompiler(CompilerState* state) : state_(state) {}

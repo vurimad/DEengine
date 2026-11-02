@@ -76,7 +76,9 @@ struct CommandListImpl {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint32_t label_depth = 0;
     bool in_rendering = false;
-    VkPipelineBindPoint bound = VK_PIPELINE_BIND_POINT_MAX_ENUM; // the bound pipeline's kind, if any
+    // Vulkan keeps a graphics and a compute binding side by side.
+    bool graphics_bound = false;
+    bool compute_bound = false;
 };
 
 inline constexpr uint32_t kMaxCommandListsPerFrame = 64;

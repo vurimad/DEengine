@@ -260,7 +260,11 @@ void CommandList::bind_pipeline(PipelineHandle handle) {
     DE_ASSERT_MSG(impl_->in_rendering == (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS),
                   "graphics pipelines bind inside begin_rendering, compute pipelines outside it");
     vkCmdBindPipeline(impl_->cmd, pipeline.bind_point, pipeline.pipeline);
-    impl_->bound = pipeline.bind_point;
+    if (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        impl_->graphics_bound = true;
+    } else {
+        impl_->compute_bound = true;
+    }
 }
 
 void CommandList::push_constants(std::span<const std::byte> data, uint32_t offset) {
@@ -273,8 +277,7 @@ void CommandList::push_constants(std::span<const std::byte> data, uint32_t offse
 
 void CommandList::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->bound == VK_PIPELINE_BIND_POINT_GRAPHICS,
-                  "draws need begin_rendering and a graphics pipeline");
+    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
     vkCmdDraw(impl_->cmd, vertex_count, instance_count, first_vertex, first_instance);
 }
 
@@ -287,14 +290,13 @@ void CommandList::bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexT
 void CommandList::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                                int32_t vertex_offset, uint32_t first_instance) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->bound == VK_PIPELINE_BIND_POINT_GRAPHICS,
-                  "draws need begin_rendering and a graphics pipeline");
+    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
     vkCmdDrawIndexed(impl_->cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
 void CommandList::dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(!impl_->in_rendering && impl_->bound == VK_PIPELINE_BIND_POINT_COMPUTE,
+    DE_ASSERT_MSG(!impl_->in_rendering && impl_->compute_bound,
                   "dispatches need a compute pipeline, outside begin_rendering");
     vkCmdDispatch(impl_->cmd, groups_x, groups_y, groups_z);
 }

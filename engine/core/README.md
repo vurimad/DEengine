@@ -13,7 +13,7 @@ The foundation every other system builds on: the core library (containers, strin
 | `frame_allocator.h` | `FrameAllocator` (per frame, lock-free, 1–3 frames in flight, default 2) | Own |
 | `pool.h` | `Pool` (fixed-size blocks, free list) | Own |
 | `log.h` | `DE_LOG_*`, `DE_FATAL`, `LogSink` | Own: printf-style, stderr sink by default |
-| `job_system.h` | `JobSystem`, `Job`, `JobCounter`, `parallel_for` | Own: work-stealing (Chase-Lev deques), workers sleep when idle |
+| `job_system.h` | `JobSystem`, `Job`, `JobCounter`, `parallel_for`, background jobs | Own: work-stealing (Chase-Lev deques), workers sleep when idle |
 | `profile.h` | `DE_PROFILE_ZONE`, `_FRAME`, `_PLOT`, `_THREAD_NAME` | Tracy in debug/dev builds; nothing in ship |
 | `array.h` | `Array<T>` | `std::vector` underneath |
 | `inline_array.h` | `InlineArray<T, N>` | Own |
@@ -43,4 +43,5 @@ The foundation every other system builds on: the core library (containers, strin
 - The heaps, memory stats, logging and the fatal handler are process-wide by design: they are needed everywhere, before any `EngineContext` exists. Platform specifics plug in through hooks (`set_fatal_handler`, `add_log_sink`); core itself has no OS code.
 - Hot paths stay off the heap: wrap them in `NoHeapAllocationScope` in tests and in the frame loop.
 - Jobs are a function pointer plus a context: give each job its own range of data to write, and join with a `JobCounter`. A waiting thread runs jobs instead of blocking, so jobs may wait on their own children.
+- Long jobs (shader compiles, cooking) go through `submit_background`: idle workers run them after all regular work, and a waiting thread never picks one up, so they can't stall a frame.
 - Every system gets a `DE_PROFILE_ZONE`. The Tracy client listens on localhost only and starts sampling when the viewer connects (built with our overlay triplet options).
