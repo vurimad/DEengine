@@ -32,8 +32,9 @@ VkDescriptorType table_type(BindlessTable table) {
     return is_sampler_table(table) ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
 }
 
+// One-channel only: the integer table is RWTexture2D<uint> (create_texture refuses the others).
 bool is_integer_format(Format format) {
-    return format == Format::R32Uint || format == Format::RG32Uint || format == Format::RGBA32Uint;
+    return format == Format::R32Uint;
 }
 
 BindlessTable sampled_table_for(const TextureDesc& desc) {
@@ -173,16 +174,20 @@ void BindlessSlots::init(const char* name, uint32_t capacity) {
     next_ = 1;
     used_ = 1;
     warned_ = false;
-    free_.clear();
+    freed_.clear();
+    freed_head_ = 0;
 }
 
 uint32_t BindlessSlots::allocate() {
     uint32_t entry = 0;
-    if (!free_.empty()) {
-        entry = free_.back();
-        free_.pop();
-    } else if (next_ < capacity_) {
+    if (next_ < capacity_) {
         entry = next_++;
+    } else if (freed_head_ < freed_.size()) {
+        entry = freed_[freed_head_++];
+        if (freed_head_ == freed_.size()) {
+            freed_.clear(); // drained: start the queue over, keeping its memory
+            freed_head_ = 0;
+        }
     } else {
         return 0;
     }
@@ -196,7 +201,7 @@ uint32_t BindlessSlots::allocate() {
 
 void BindlessSlots::release(uint32_t entry) {
     DE_ASSERT(entry > 0 && entry < next_ && used_ > 1);
-    free_.push(entry);
+    freed_.push(entry);
     --used_;
 }
 
@@ -388,8 +393,12 @@ core::Result<void> DeviceImpl::create_bindless() {
         infos.resize(table_capacity(table));
         for (uint32_t entry = 0; entry < infos.size(); ++entry) {
             if (is_sampler_table(table)) {
-                // Entries past the defaults repeat the first one, so a clamped index stays valid.
-                const uint32_t sampler = entry < static_cast<uint32_t>(DefaultSampler::Count) ? entry : 0;
+                // Entries past the defaults repeat a sampler that suits the table (a comparing one
+                // for the comparison table), so even a wrong index samples sensibly.
+                const auto padding = table == BindlessTable::ComparisonSampler ? DefaultSampler::ShadowCompare
+                                                                               : DefaultSampler::LinearWrap;
+                const uint32_t sampler =
+                    entry < static_cast<uint32_t>(DefaultSampler::Count) ? entry : static_cast<uint32_t>(padding);
                 infos[entry] = {.sampler = samplers[sampler]};
             } else {
                 infos[entry] = {.imageView = fallback_views[i],
@@ -442,18 +451,6 @@ core::Result<void> DeviceImpl::register_bindless(Texture& texture) {
     const TextureDesc& desc = texture.desc;
     TextureBindless& bindless = texture.bindless;
     const bool integer = is_integer_format(desc.format);
-    if (integer && core::has_any(desc.usage, TextureUsage::Sampled)) {
-        return core::fail(core::ErrorCode::Unsupported,
-                          "integer textures can't be sampled through the bindless tables");
-    }
-    if (integer && core::has_any(desc.usage, TextureUsage::Storage) &&
-        (desc.dimension != TextureDimension::Texture2D || desc.layer_count != 1)) {
-        return core::fail(core::ErrorCode::Unsupported, "integer storage textures are 2D, with one layer");
-    }
-    if (core::has_any(desc.usage, TextureUsage::Storage) && desc.mip_count > kMaxMips) {
-        return core::fail(core::ErrorCode::Unsupported, "storage textures have at most 16 mips");
-    }
-
     if (core::has_any(desc.usage, TextureUsage::Sampled)) {
         const uint32_t entry = sampled_slots.allocate();
         if (entry == 0) {
@@ -504,19 +501,41 @@ core::Result<void> DeviceImpl::register_bindless(Texture& texture) {
     return {};
 }
 
-void DeviceImpl::release_bindless(TextureBindless& bindless) {
+void DeviceImpl::release_bindless(TextureBindless& bindless, bool rewrite_descriptors) {
+    // Every entry back to its table's fallback, in one descriptor update.
+    VkDescriptorImageInfo images[kMaxMips + 1];
+    VkWriteDescriptorSet writes[kMaxMips + 1];
+    uint32_t write_count = 0;
+    const auto release = [&](uint32_t index, BindlessSlots& slots) {
+        const BindlessTable table = bindless_table(index);
+        const uint32_t entry = bindless_entry(index);
+        images[write_count] = {
+            .imageView = fallback_views[static_cast<size_t>(table)],
+            .imageLayout = is_sampled_table(table) ? VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+        };
+        writes[write_count] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = bindless_set,
+            .dstBinding = static_cast<uint32_t>(table),
+            .dstArrayElement = entry,
+            .descriptorCount = 1,
+            .descriptorType = table_type(table),
+            .pImageInfo = &images[write_count],
+        };
+        ++write_count;
+        slots.release(entry);
+    };
     if (bindless.sampled_index != kInvalidBindlessIndex) {
-        const BindlessTable table = bindless_table(bindless.sampled_index);
-        const uint32_t entry = bindless_entry(bindless.sampled_index);
-        write_descriptor(table, entry, fallback_views[static_cast<size_t>(table)]);
-        sampled_slots.release(entry);
+        release(bindless.sampled_index, sampled_slots);
+    }
+    for (uint32_t mip = 0; mip < bindless.storage_mips; ++mip) {
+        release(bindless.storage_indices[mip], storage_slots);
+    }
+    if (rewrite_descriptors && write_count > 0) {
+        vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);
     }
     vkDestroyImageView(device, bindless.sampled_view, nullptr);
     for (uint32_t mip = 0; mip < bindless.storage_mips; ++mip) {
-        const BindlessTable table = bindless_table(bindless.storage_indices[mip]);
-        const uint32_t entry = bindless_entry(bindless.storage_indices[mip]);
-        write_descriptor(table, entry, fallback_views[static_cast<size_t>(table)]);
-        storage_slots.release(entry);
         vkDestroyImageView(device, bindless.storage_views[mip], nullptr);
     }
     bindless = TextureBindless{};

@@ -217,6 +217,12 @@ int main(int argc, char** argv) {
                                                      .memory = de::rhi::MemoryLocation::Upload,
                                                      .debug_name = "quad texture staging"});
     if (!quad_texture || !quad_staging) {
+        if (quad_texture) {
+            device->destroy(*quad_texture);
+        }
+        if (quad_staging) {
+            device->destroy(*quad_staging);
+        }
         return EXIT_FAILURE;
     }
     {

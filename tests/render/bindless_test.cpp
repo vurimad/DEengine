@@ -95,18 +95,18 @@ TEST_CASE("texture indices: unique, kept until destroyed, reused once the GPU is
         device->destroy(storage);
     }
 
-    // A destroyed texture's entry isn't handed out again while its frame may still be running...
+    // A destroyed texture's entry isn't handed out while its frame may still be running, nor right
+    // after: fresh entries go first, so a stale index keeps reading the fallback.
     device->destroy(textures[1]);
     CHECK(device->texture_index(textures[1]) == kInvalidBindlessIndex);
     const auto early = *device->create_texture(sampled);
     CHECK(device->texture_index(early) != indices[1]);
-    // ...but once the GPU is done with it, it is.
     for (uint32_t i = 0; i < kFramesInFlight + 1; ++i) {
         device->begin_frame();
         device->end_frame();
     }
     const auto late = *device->create_texture(sampled);
-    CHECK(device->texture_index(late) == indices[1]);
+    CHECK(device->texture_index(late) != indices[1]);
 
     for (const TextureHandle texture : {textures[0], textures[2], target, early, late}) {
         device->destroy(texture);
@@ -327,7 +327,10 @@ TEST_CASE("indices carry their table: shapes and tags can't be mixed up") {
     CHECK(make_bindless_index(BindlessTable::TextureCube, 7) == ((2U << 24U) | 7U));
     CHECK(kFallbackTextureIndex == make_bindless_index(BindlessTable::Texture2D, 0));
 
-    // Integer formats: storage only, 2D only.
+    // Integer formats: storage only, R32Uint, 2D only.
+    CHECK(device->create_texture({.width = 4, .height = 4, .format = Format::RG32Uint, .usage = TextureUsage::Storage})
+              .error()
+              .code == de::core::ErrorCode::Unsupported);
     CHECK(device->create_texture({.width = 4, .height = 4, .format = Format::R32Uint, .usage = TextureUsage::Sampled})
               .error()
               .code == de::core::ErrorCode::Unsupported);
@@ -349,7 +352,7 @@ TEST_CASE("wrong, stale and unused indices all read the fallback") {
     if (!device) {
         return;
     }
-    ShaderKit kit(*device, {.checks = true}); // the table checks, whatever the build
+    ShaderKit kit(*device);
     const auto program = kit.compute("tests.sample_texture");
     const auto output = device->create_buffer(
         {.size = sizeof(Float4), .usage = BufferUsage::Storage, .memory = MemoryLocation::Readback});
@@ -396,7 +399,14 @@ TEST_CASE("wrong, stale and unused indices all read the fallback") {
                DefaultSampler::PointClamp, *output, 1, 1);
     CHECK(is_magenta());
 
+    // A stale index: its texture destroyed, the GPU done with it, another texture created since.
+    const uint32_t stale = device->texture_index(real);
     device->destroy(real);
+    device->wait_idle();
+    const auto newer = white(white_2d);
+    sample_all(*device, kit, program, stale, DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(is_magenta());
+    device->destroy(newer);
     device->destroy(cube);
     device->destroy(*output);
     device->wait_idle();
@@ -538,6 +548,7 @@ TEST_CASE("the shader module's tables and constants match the RHI's") {
     CHECK(read_u32(*device, output, 2) == kBindlessSamplerCapacity);
     CHECK(read_u32(*device, output, 3) == kBindlessEntryBits);
     CHECK(read_u32(*device, output, 4) == 9 + 1); // nine 1-texel-wide fallbacks, and magenta's red
+    CHECK(read_u32(*device, output, 5) == (DE_BUILD_DEV != 0 ? 1U : 0U)); // ShaderCompilerDesc::checks arrives
 
     device->destroy(output);
     device->wait_idle();

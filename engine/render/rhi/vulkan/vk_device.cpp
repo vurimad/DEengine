@@ -457,7 +457,7 @@ void DeviceImpl::shutdown() {
         vkDeviceWaitIdle(device);
         destroy_swapchain();
         for (FrameSlot& slot : frames) {
-            free_pending(slot.pending);
+            free_pending(slot);
         }
         if (!textures.empty() || !buffers.empty() || !pipelines.empty()) {
             DE_LOG_WARN("render", "%zu textures, %zu buffers and %zu pipelines still alive at device shutdown",
@@ -470,7 +470,7 @@ void DeviceImpl::shutdown() {
         vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
         pipeline_layout = VK_NULL_HANDLE;
         for (Texture& texture : textures) {
-            release_bindless(texture.bindless);
+            release_bindless(texture.bindless, false);
             vkDestroyImageView(device, texture.view, nullptr);
             vmaDestroyImage(allocator, texture.image, texture.allocation);
         }
@@ -543,11 +543,15 @@ void DeviceImpl::set_debug_name(VkObjectType type, uint64_t object, const char* 
     vkSetDebugUtilsObjectNameEXT(device, &info);
 }
 
-void DeviceImpl::free_pending(core::Array<PendingDestroy>& pending) {
-    for (PendingDestroy& entry : pending) {
-        // The GPU is done with the texture: its entries point at the fallbacks again and can be
-        // handed out.
-        release_bindless(entry.bindless);
+void DeviceImpl::free_pending(FrameSlot& slot) {
+    // The GPU is done with these textures: their entries point at the fallbacks again and can be
+    // handed out.
+    for (TextureBindless& bindless : slot.pending_bindless) {
+        release_bindless(bindless);
+    }
+    slot.pending_bindless.clear();
+    core::Array<PendingDestroy>& pending = slot.pending;
+    for (const PendingDestroy& entry : pending) {
         if (entry.view != VK_NULL_HANDLE) {
             vkDestroyImageView(device, entry.view, nullptr);
         }
@@ -702,6 +706,22 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::Unsupported, "texture is larger than the GPU allows");
     }
 
+    // Bindless rules (vk_bindless.cpp): integer textures are storage-only R32Uint 2D, and storage
+    // textures have an entry per mip.
+    const bool integer =
+        desc.format == Format::R32Uint || desc.format == Format::RG32Uint || desc.format == Format::RGBA32Uint;
+    if (integer && core::has_any(desc.usage, TextureUsage::Sampled)) {
+        return core::fail(core::ErrorCode::Unsupported,
+                          "integer textures can't be sampled through the bindless tables");
+    }
+    if (integer && core::has_any(desc.usage, TextureUsage::Storage) &&
+        (desc.format != Format::R32Uint || desc.dimension != TextureDimension::Texture2D || desc.layer_count != 1)) {
+        return core::fail(core::ErrorCode::Unsupported, "integer storage textures are R32Uint, 2D, with one layer");
+    }
+    if (core::has_any(desc.usage, TextureUsage::Storage) && desc.mip_count > kMaxMips) {
+        return core::fail(core::ErrorCode::Unsupported, "storage textures have at most 16 mips");
+    }
+
     FormatSupport needed = FormatSupport::None;
     VkImageUsageFlags usage = 0;
     const auto use = [&](TextureUsage flag, VkImageUsageFlags vk_flag, FormatSupport support) {
@@ -849,10 +869,9 @@ void Device::destroy(TextureHandle handle) {
     if (texture->swapchain) {
         return;
     }
-    impl_->current_slot().pending.push(PendingDestroy{.image = texture->image,
-                                                      .view = texture->view,
-                                                      .bindless = texture->bindless,
-                                                      .allocation = texture->allocation});
+    impl_->current_slot().pending.push(
+        PendingDestroy{.image = texture->image, .view = texture->view, .allocation = texture->allocation});
+    impl_->current_slot().pending_bindless.push(texture->bindless);
     impl_->textures.remove(handle);
 }
 
@@ -931,7 +950,7 @@ void Device::begin_frame() {
         };
         DE_VK_CHECK(vkWaitSemaphores(impl.device, &wait, UINT64_MAX));
     }
-    impl.free_pending(slot.pending);
+    impl.free_pending(slot);
     DE_VK_CHECK(vkResetCommandPool(impl.device, slot.command_pool, 0));
     slot.list_count = 0;
 }
@@ -1016,7 +1035,7 @@ void Device::wait_idle() {
     for (FrameSlot& slot : impl.frames) {
         // Inside a frame, the current slot's resources may still be used by unsubmitted commands.
         if (!impl.in_frame || &slot != &impl.current_slot()) {
-            impl.free_pending(slot.pending);
+            impl.free_pending(slot);
         }
     }
 }

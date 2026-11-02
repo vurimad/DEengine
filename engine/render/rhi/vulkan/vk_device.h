@@ -83,15 +83,15 @@ struct Pipeline {
 struct PendingDestroy {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    TextureBindless bindless;
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
 // Hands out the entries of one kind of table (sampled or storage): an entry is the same position
-// in each table of that kind. Entry 0 is the fallback. Freed entries are reused last-in first-out,
-// and only once the GPU is done with their old texture (see PendingDestroy).
+// in each table of that kind. Entry 0 is the fallback. Never-used entries go first; freed ones
+// (only once the GPU is done with their old texture) are reused oldest first, and only when no
+// fresh entry is left. A stale index so keeps reading the fallback for as long as possible.
 class BindlessSlots {
 public:
     void init(const char* name, uint32_t capacity);
@@ -100,7 +100,8 @@ public:
     uint32_t used() const { return used_; } // the fallback included
 
 private:
-    core::Array<uint32_t> free_{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> freed_{core::heap_allocator(core::MemoryTag::Render)}; // a queue from freed_head_
+    size_t freed_head_ = 0;
     const char* name_ = "";
     uint32_t next_ = 1;
     uint32_t capacity_ = 0;
@@ -131,6 +132,7 @@ struct FrameSlot {
     VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
     uint64_t timeline_value = 0; // the frame timeline value that marks this slot's last frame done
     core::Array<PendingDestroy> pending{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<TextureBindless> pending_bindless{core::heap_allocator(core::MemoryTag::Render)};
 };
 
 struct Swapchain {
@@ -168,9 +170,10 @@ struct DeviceImpl {
     // Gives a new texture its table entries and writes their descriptors. On failure nothing is
     // left to release.
     core::Result<void> register_bindless(Texture& texture);
-    // Points the entries back at the fallbacks, frees them and destroys the views. Only once the
-    // GPU is done with the texture.
-    void release_bindless(TextureBindless& bindless);
+    // Points the entries back at the fallbacks (one batched descriptor update), frees them and
+    // destroys the views. Only once the GPU is done with the texture. At shutdown the descriptors
+    // aren't rewritten: the set is about to go.
+    void release_bindless(TextureBindless& bindless, bool rewrite_descriptors = true);
     void write_descriptor(BindlessTable table, uint32_t entry, VkImageView view);
 
     // --- Frames (vk_device.cpp) ---
@@ -181,7 +184,7 @@ struct DeviceImpl {
     Buffer& buffer(BufferHandle handle);
     Pipeline& pipeline(PipelineHandle handle);
     void set_debug_name(VkObjectType type, uint64_t object, const char* name) const;
-    void free_pending(core::Array<PendingDestroy>& pending);
+    void free_pending(FrameSlot& slot);
     FrameSlot& current_slot() { return frames[frame_index % kFramesInFlight]; }
 
     platform::Window* window = nullptr;

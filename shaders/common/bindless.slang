@@ -5,11 +5,11 @@
 //
 // Each texture shape has its own table (rhi::BindlessTable gives the same binding numbers), and a
 // texture's index belongs to the table of its shape. Reach textures through the accessors below,
-// never the raw arrays: they keep a wrong index from reading outside a table.
-//   - The index carries its table in its top bits. In debug and dev builds (DE_SHADER_CHECKS) a
-//     mismatch reads the table's fallback: magenta for sampled textures.
-//   - In every build the entry is masked and clamped to the table, and every entry not in use is
-//     the fallback, so even a garbage index reads something defined.
+// never the raw arrays: they keep a wrong index from reaching any texture but the fallback.
+//   - The index carries its table in its top bits. An index of another table, or past the end of
+//     this one, reads entry 0: the fallback (magenta for sampled tables). One compare, every build.
+//   - Every entry not in use is the fallback too, and freed entries are reused last, so a stale
+//     index reads the fallback until its table has been used all the way round.
 
 // Sampled textures. Sample them in ShaderRead state.
 [[vk::binding(0, 0)]]
@@ -70,21 +70,12 @@ public static const uint kSamplerShadowCompare = 6;
 // Entry 0 of de_textures: 1x1 magenta, where missing and freed 2D indices point.
 public static const uint kFallbackTexture = 0;
 
-#ifndef DE_SHADER_CHECKS
-#define DE_SHADER_CHECKS 0
-#endif
-
-// The entry an index names in a table: the fallback (0) when the index belongs to another table
-// (checked builds), otherwise masked and clamped to the table.
+// The entry an index names in a table, or 0 (the fallback) for an index of another table or past
+// the end of this one.
 public uint bindless_entry(uint index, uint table, uint capacity)
 {
-#if DE_SHADER_CHECKS
-    if ((index >> kEntryBits) != table)
-    {
-        return 0;
-    }
-#endif
-    return min(index & kEntryMask, capacity - 1u);
+    const uint entry = index & kEntryMask;
+    return ((index >> kEntryBits) == table && entry < capacity) ? entry : 0u;
 }
 
 // Indices may differ between neighboring pixels or threads (per material, per instance), so
@@ -137,14 +128,15 @@ public RWTexture2D<uint> storage_2d_uint(uint index)
         bindless_entry(index, kTableStorage2DUint, kStorageCapacity))];
 }
 
+// Samplers past the end read entry 0: LinearWrap, or ShadowCompare's padding in the comparison table.
 public SamplerState sampler_state(uint sampler)
 {
-    return de_samplers[NonUniformResourceIndex(min(sampler, kSamplerCapacity - 1u))];
+    return de_samplers[NonUniformResourceIndex(sampler < kSamplerCapacity ? sampler : 0u)];
 }
 
 public SamplerComparisonState comparison_sampler(uint sampler)
 {
-    return de_comparison_samplers[NonUniformResourceIndex(min(sampler, kSamplerCapacity - 1u))];
+    return de_comparison_samplers[NonUniformResourceIndex(sampler < kSamplerCapacity ? sampler : kSamplerShadowCompare)];
 }
 
 // Shorthands for the common 2D cases.

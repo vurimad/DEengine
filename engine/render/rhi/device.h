@@ -26,9 +26,9 @@ struct DeviceDesc {
     bool validation = DE_BUILD_DEV != 0;
     // Adds synchronization validation (missing or wrong barriers). Slow: for tests and hunting hazards.
     bool sync_validation = false;
-    // Adds GPU-assisted validation: shaders check their own bindless accesses (stale or
-    // uninitialized entries, wrong image layouts) as they run. Very slow: for tests and hunting
-    // texture bugs the CPU-side layer can't see.
+    // Adds GPU-assisted validation: shaders check their pointer accesses (out of bounds) and more
+    // as they run. Very slow. It doesn't check image layouts in the bindless tables: a texture
+    // sampled in the wrong state goes unreported (see render/rhi/README.md).
     bool gpu_validation = false;
     bool vsync = true;
 };
