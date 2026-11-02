@@ -246,12 +246,6 @@ void purge_states(UploaderState& state) {
     state.purge_at = std::max<size_t>(256, 2 * (state.texture_states.size() + state.buffer_states.size()));
 }
 
-// The barriers that take an upload's target to CopyDst. Every byte of the target is overwritten
-// (all layers of the mips, or the buffer range), so old contents are discarded.
-//
-// On the transfer queue they start from Undefined: earlier graphics use is waited for by the
-// semaphore between the queues (Device::transfer_after_previous_frame), and discarded contents
-// need no queue handover.
 // Barriers to CopyDst, one per run of mips in the same state (contents discarded).
 void add_mip_runs(const MipStates& mips, TextureHandle texture, uint32_t first, uint32_t end, BarrierBatch& batch) {
     uint32_t run = first;
@@ -334,9 +328,10 @@ void add_copy_barriers(const UploaderState& state, const PendingUpload& upload, 
 // on the transfer list (release), acquired on the graphics list (acquire). What follows on the
 // graphics list goes in finish, after any mip generation.
 //
-// Mip generation (graphics only): on the transfer queue the uploaded mips are handed over in
-// CopyDst and acquire also prepares the generated ones (CopyDst, contents discarded); then
-// record_mip_chain runs, and finish moves every mip to the requested state.
+// Mip generation (graphics only): the uploaded mips stay in CopyDst but the last, the chain's
+// source, which goes to CopySrc (on the transfer queue, during the handover); acquire also
+// prepares the generated mips (CopyDst, contents discarded); then record_mip_chain runs, and
+// finish moves every mip to the requested state.
 void add_use_barriers(UploaderState& state, const PendingUpload& upload, BarrierBatch& release, BarrierBatch& acquire,
                       BarrierBatch& finish) {
     const auto hand_over = [&](auto barrier) {
@@ -374,13 +369,23 @@ void add_use_barriers(UploaderState& state, const PendingUpload& upload, Barrier
     const uint32_t mip_count = upload.desc->mip_count;
     const uint32_t uploaded_end = upload.range.first_mip + upload.range.mip_count;
     if (upload.generate) {
-        // The uploaded mips start at 0 (upload_texture checks it); the chain's source is the last.
+        // The uploaded mips start at 0 (upload_texture checks it); the chain's source is the last,
+        // and goes to CopySrc for it (record_mip_chain).
         const uint32_t source = uploaded_end - 1;
-        if (state.transfer) {
-            hand_over(TextureBarrier{.texture = upload.texture_handle,
-                                     .before = ResourceState::CopyDst,
-                                     .after = ResourceState::CopyDst,
-                                     .range = {.first_mip = 0, .mip_count = uploaded_end}});
+        const TextureBarrier to_source{.texture = upload.texture_handle,
+                                       .before = ResourceState::CopyDst,
+                                       .after = ResourceState::CopySrc,
+                                       .range = {.first_mip = source, .mip_count = 1}};
+        if (!state.transfer) {
+            acquire.add(to_source);
+        } else {
+            if (source > 0) {
+                hand_over(TextureBarrier{.texture = upload.texture_handle,
+                                         .before = ResourceState::CopyDst,
+                                         .after = ResourceState::CopyDst,
+                                         .range = {.first_mip = 0, .mip_count = source}});
+            }
+            hand_over(to_source);
             if (mips.initialized) {
                 add_mip_runs(mips, upload.texture_handle, uploaded_end, mip_count, acquire);
             } else {
@@ -699,10 +704,19 @@ void Uploader::record() {
                 return !upload.dropped && (!state.transfer || upload.overwrite == overwrite_group);
             };
             const auto fullest = [&] {
-                const auto count = [](const BarrierBatch& batch) {
-                    return batch.texture_count() + batch.buffer_count();
+                const auto count = [](const BarrierBatch& barriers) {
+                    return barriers.texture_count() + barriers.buffer_count();
                 };
                 return std::max({count(to_copy), count(release), count(acquire), count(finish)});
+            };
+            // The most barriers one upload adds to any of the batches: a buffer one (and maybe
+            // a global barrier, merged); a texture's first upload a few; a later one a run per
+            // mip, plus the handover of a generating upload's source mip and the rest.
+            const auto upload_bound = [&](const PendingUpload& upload) -> size_t {
+                if (!upload.texture) {
+                    return 1;
+                }
+                return state.texture_states.find(upload.texture_handle)->initialized ? upload.desc->mip_count + 2 : 3;
             };
             size_t chunk_first = first;
             while (chunk_first < last) {
@@ -712,7 +726,7 @@ void Uploader::record() {
                     if (!in_group(upload)) {
                         continue;
                     }
-                    if (fullest() > 0 && fullest() + kMaxTrackedMips + 1 > kInlineBarriers) {
+                    if (fullest() > 0 && fullest() + upload_bound(upload) > kInlineBarriers) {
                         break;
                     }
                     add_copy_barriers(state, upload, to_copy);

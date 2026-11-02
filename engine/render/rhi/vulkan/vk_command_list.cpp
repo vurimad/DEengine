@@ -522,10 +522,20 @@ void CommandList::blit_texture(TextureHandle src, TextureHandle dst, const Textu
     DE_ASSERT_MSG(device.capabilities.supports(source.desc.format, FormatSupport::Blit | FormatSupport::LinearFilter) &&
                       device.capabilities.supports(target.desc.format, FormatSupport::Blit),
                   "the formats can't be blitted with a linear filter");
+    // Filtered blits are for color: depth can't be filtered, and integer formats only blit to
+    // integer formats (unfiltered).
+    const auto integer = [](Format format) {
+        return format == Format::R32Uint || format == Format::RG32Uint || format == Format::RGBA32Uint;
+    };
+    DE_ASSERT_MSG(!format_info(source.desc.format).depth && !format_info(target.desc.format).depth &&
+                      !integer(source.desc.format) && !integer(target.desc.format),
+                  "filtered blits are for float and normalized color formats");
+    DE_ASSERT_MSG(blit.first_layer < source.desc.layer_count && blit.first_layer < target.desc.layer_count,
+                  "blit layers outside the textures");
     const uint32_t layers =
         blit.layer_count == kAllLayers ? source.desc.layer_count - blit.first_layer : blit.layer_count;
-    DE_ASSERT_MSG(blit.first_layer + layers <= source.desc.layer_count &&
-                      blit.first_layer + layers <= target.desc.layer_count,
+    DE_ASSERT_MSG(layers > 0 && layers <= source.desc.layer_count - blit.first_layer &&
+                      layers <= target.desc.layer_count - blit.first_layer,
                   "blit layers outside the textures");
     const MipExtent from = mip_extent(source.desc, blit.src_mip);
     const MipExtent to = mip_extent(target.desc, blit.dst_mip);

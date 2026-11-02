@@ -6,20 +6,31 @@
 namespace de::rhi {
 
 bool can_generate_mips(const Device& device, const TextureDesc& desc) {
-    return device.capabilities().supports(desc.format, FormatSupport::Blit | FormatSupport::LinearFilter) &&
+    return !format_info(desc.format).depth &&
+           device.capabilities().supports(desc.format, FormatSupport::Blit | FormatSupport::LinearFilter) &&
            core::has_all(desc.usage, TextureUsage::CopySrc | TextureUsage::CopyDst);
 }
 
 void record_mip_chain(CommandList& list, TextureHandle texture, const TextureDesc& desc, uint32_t source_mip) {
     for (uint32_t mip = source_mip + 1; mip < desc.mip_count; ++mip) {
-        // The mip above is complete: read it, write this one.
-        list.barrier(TextureBarrier{.texture = texture,
-                                    .before = ResourceState::CopyDst,
-                                    .after = ResourceState::CopySrc,
-                                    .range = {.first_mip = mip - 1, .mip_count = 1}});
+        if (mip > source_mip + 1) {
+            // The mip above is complete: read it, write this one.
+            list.barrier(TextureBarrier{.texture = texture,
+                                        .before = ResourceState::CopyDst,
+                                        .after = ResourceState::CopySrc,
+                                        .range = {.first_mip = mip - 1, .mip_count = 1}});
+        }
         list.blit_texture(texture, texture, {.src_mip = mip - 1, .dst_mip = mip});
     }
 }
+
+namespace {
+
+bool stages_named(ResourceState state, ShaderStages stages) {
+    return !core::has_any(state, kShaderStates) || stages != ShaderStages::None;
+}
+
+} // namespace
 
 core::Result<void> generate_mips(Device& device, CommandList& list, TextureHandle texture,
                                  const MipGeneration& generation) {
@@ -35,19 +46,22 @@ core::Result<void> generate_mips(Device& device, CommandList& list, TextureHandl
     if (generation.source_mip + 1 >= desc->mip_count) {
         return core::fail(core::ErrorCode::OutOfRange, "no mips after the source to generate");
     }
-    if (!is_valid_state(generation.before, true) || generation.after == ResourceState::Undefined ||
-        !is_valid_state(generation.after, true)) {
-        return core::fail(core::ErrorCode::InvalidArgument, "mip generation needs valid states");
+    if (generation.before == ResourceState::Undefined || !is_valid_state(generation.before, true) ||
+        generation.after == ResourceState::Undefined || !is_valid_state(generation.after, true) ||
+        !stages_named(generation.before, generation.before_stages) ||
+        !stages_named(generation.after, generation.after_stages)) {
+        return core::fail(core::ErrorCode::InvalidArgument,
+                          "mip generation needs valid states (the source's not Undefined, shader states with stages)");
     }
 
     const ScopedDebugLabel label(list, "generate mips");
     const uint32_t first = generation.source_mip;
     const uint32_t last = desc->mip_count - 1;
-    // Everything in CopyDst (the generated mips' old contents discarded), then the chain.
+    // The source to CopySrc, the generated mips to CopyDst (old contents discarded), the chain.
     BarrierBatch prepare;
     prepare.add(TextureBarrier{.texture = texture,
                                .before = generation.before,
-                               .after = ResourceState::CopyDst,
+                               .after = ResourceState::CopySrc,
                                .before_stages = generation.before_stages,
                                .range = {.first_mip = first, .mip_count = 1}});
     prepare.add(TextureBarrier{.texture = texture,

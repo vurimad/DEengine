@@ -274,6 +274,13 @@ TEST_CASE("generate_mips regenerates a texture's mips from any mip, between any 
     list = device->begin_command_list();
     CHECK(generate_mips(*device, list, texture, {.source_mip = 3}).error().code == de::core::ErrorCode::OutOfRange);
     CHECK(generate_mips(*device, list, TextureHandle{}, {}).error().code == de::core::ErrorCode::InvalidArgument);
+    // The source must keep its contents; shader states need stages; depth can't be filtered.
+    CHECK(generate_mips(*device, list, texture, {.before = ResourceState::Undefined}).error().code ==
+          de::core::ErrorCode::InvalidArgument);
+    CHECK(generate_mips(*device, list, texture, {.after_stages = ShaderStages::None}).error().code ==
+          de::core::ErrorCode::InvalidArgument);
+    CHECK_FALSE(can_generate_mips(
+        *device, {.width = 4, .height = 4, .mip_count = 3, .format = Format::D32Float, .usage = kMipUsage}));
     device->end_frame();
     device->destroy(texture);
     device->wait_idle();
