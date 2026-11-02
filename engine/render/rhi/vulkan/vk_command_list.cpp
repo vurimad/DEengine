@@ -55,6 +55,11 @@ VkBufferImageCopy2 to_vk(const Texture& texture, const BufferTextureCopy& region
     const uint32_t mip_width = std::max(desc.width >> region.mip, 1U);
     const uint32_t mip_height = std::max(desc.height >> region.mip, 1U);
     const uint32_t mip_depth = std::max(desc.depth >> region.mip, 1U);
+    DE_ASSERT_MSG(region.x < mip_width && region.y < mip_height && region.z < mip_depth,
+                  "copy region starts outside the mip");
+    DE_ASSERT_MSG(region.x + region.width <= mip_width && region.y + region.height <= mip_height &&
+                      region.z + region.depth <= mip_depth,
+                  "copy region ends outside the mip");
     // Copies move one aspect at a time: depth for depth-stencil formats (stencil copies aren't exposed yet).
     const VkImageAspectFlags aspect = (texture.aspects & VK_IMAGE_ASPECT_DEPTH_BIT) != 0
                                           ? static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_DEPTH_BIT)
@@ -195,6 +200,8 @@ void CommandList::begin_rendering(const RenderingDesc& desc) {
         if (area.width == 0) {
             area = {.width = texture.desc.width, .height = texture.desc.height};
         }
+        DE_ASSERT_MSG(!attachment.read_only || attachment.load != LoadOp::Clear,
+                      "a read-only depth attachment can't be cleared: use LoadOp::Load");
         has_depth = true;
         has_stencil = (texture.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0;
         depth = {
@@ -202,7 +209,7 @@ void CommandList::begin_rendering(const RenderingDesc& desc) {
             .imageView = texture.view,
             .imageLayout =
                 attachment.read_only ? VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
-            .loadOp = to_vk(attachment.load),
+            .loadOp = attachment.read_only ? VK_ATTACHMENT_LOAD_OP_LOAD : to_vk(attachment.load),
             .storeOp = attachment.read_only ? VK_ATTACHMENT_STORE_OP_NONE : to_vk(attachment.store),
             .clearValue = {.depthStencil = {.depth = attachment.clear_depth, .stencil = attachment.clear_stencil}},
         };

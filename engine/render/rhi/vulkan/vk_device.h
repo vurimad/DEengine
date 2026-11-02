@@ -72,7 +72,7 @@ struct CommandListImpl {
 };
 
 inline constexpr uint32_t kMaxCommandListsPerFrame = 64;
-inline constexpr uint32_t kMaxSwapchainImages = 8;
+inline constexpr uint32_t kMaxSwapchainImages = 16;
 
 struct FrameSlot {
     VkCommandPool command_pool = VK_NULL_HANDLE;
@@ -97,9 +97,6 @@ struct Swapchain {
     bool vsync = true;
     uint32_t image_count = 0;
     TextureHandle textures[kMaxSwapchainImages];
-    // Signaled by the frame's submission, waited on by the present of that image. One per image:
-    // the image's next acquire proves the present is done with it.
-    VkSemaphore present_semaphores[kMaxSwapchainImages] = {};
 };
 
 struct DeviceImpl {
@@ -109,7 +106,11 @@ struct DeviceImpl {
     core::Result<void> init(const DeviceDesc& desc);
     void shutdown();
 
-    // --- Swapchain (vk_swapchain.cpp) ---
+    // --- Surface and swapchain (vk_swapchain.cpp) ---
+    core::Result<void> create_surface();
+    // After VK_ERROR_SURFACE_LOST_KHR: waits for the GPU, drops the swapchain and makes a new surface.
+    core::Result<void> recreate_surface();
+    bool graphics_queue_can_present() const;
     core::Result<void> create_swapchain();
     void destroy_swapchain();
     bool swapchain_needs_recreation() const;
@@ -151,8 +152,18 @@ struct DeviceImpl {
     FrameSlot frames[kFramesInFlight];
 
     Swapchain swapchain;
+    // Signaled by a frame's submission, waited on by the present of that image: one per image
+    // index, so the image's next acquire proves the present is done with it. They outlive
+    // swapchain recreations (only shutdown destroys them): without VK_EXT_swapchain_maintenance1
+    // nothing tells when a present from a retired swapchain has stopped using its semaphore.
+    VkSemaphore present_semaphores[kMaxSwapchainImages] = {};
     bool want_vsync = true;
-    bool swapchain_out_of_date = false;
+    bool swapchain_out_of_date = false; // must be rebuilt before the next acquire
+    bool swapchain_suboptimal = false;  // works, but a rebuild would match the surface better
+    // Some surfaces keep reporting suboptimal with the best swapchain they allow: after one
+    // rebuild for suboptimal alone, only a real change (size, vsync, out of date) rebuilds again.
+    bool ignore_suboptimal = false;
+    bool surface_lost = false;
     bool acquired = false; // a swapchain image was acquired this frame
     uint32_t acquired_image = 0;
     uint32_t swapchain_recreations = 0;

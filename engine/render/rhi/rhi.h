@@ -241,7 +241,7 @@ struct DepthAttachment {
     StoreOp store = StoreOp::Store;
     float clear_depth = 0.0f; // reverse Z: 0 is the far plane
     uint8_t clear_stencil = 0;
-    bool read_only = false;
+    bool read_only = false; // tested, never written: load must be Load
 };
 
 // A rectangle in pixels, from the top-left corner.

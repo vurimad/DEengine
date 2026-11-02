@@ -25,40 +25,52 @@ const char* present_mode_name(VkPresentModeKHR mode) {
     }
 }
 
-VkSurfaceFormatKHR choose_surface_format(VkPhysicalDevice physical_device, VkSurfaceKHR surface) {
+// Picks the swapchain format. Returns the query's result (fails only when the surface is lost);
+// format stays UNDEFINED when the surface offers nothing usable.
+VkResult choose_surface_format(VkPhysicalDevice physical_device, VkSurfaceKHR surface, VkSurfaceFormatKHR& format) {
+    format = {.format = VK_FORMAT_UNDEFINED, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
     uint32_t count = 0;
-    DE_VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, nullptr));
+    VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, nullptr);
+    if (result != VK_SUCCESS) {
+        return result;
+    }
     core::Array<VkSurfaceFormatKHR> formats(core::heap_allocator(core::MemoryTag::Render));
     formats.resize(count);
-    DE_VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, formats.data()));
+    result = vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, formats.data());
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        return result;
+    }
     // sRGB targets, so shaders write linear color and the hardware encodes it.
     for (const VkFormat wanted : {VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB}) {
-        for (const VkSurfaceFormatKHR& format : formats) {
-            if (format.format == wanted && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-                return format;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (formats[i].format == wanted && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                format = formats[i];
+                return VK_SUCCESS;
             }
         }
     }
-    for (const VkSurfaceFormatKHR& format : formats) {
-        if (from_vk_format(format.format) != Format::Unknown &&
-            format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
-            return format;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (from_vk_format(formats[i].format) != Format::Unknown &&
+            formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            format = formats[i];
+            DE_LOG_WARN("render", "the window offers no sRGB format: presenting %s, colors will look too dark",
+                        format_info(from_vk_format(format.format)).name);
+            return VK_SUCCESS;
         }
     }
-    return {.format = VK_FORMAT_UNDEFINED, .colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    return VK_SUCCESS;
 }
 
 VkPresentModeKHR choose_present_mode(VkPhysicalDevice physical_device, VkSurfaceKHR surface, bool vsync) {
     if (vsync) {
         return VK_PRESENT_MODE_FIFO_KHR; // always supported
     }
-    uint32_t count = 0;
-    DE_VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, nullptr));
     VkPresentModeKHR modes[16] = {};
-    count = std::min<uint32_t>(count, 16);
+    uint32_t count = 16;
     const VkResult result = vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, modes);
-    DE_ASSERT(result == VK_SUCCESS || result == VK_INCOMPLETE);
-    static_cast<void>(result);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        return VK_PRESENT_MODE_FIFO_KHR;
+    }
     // Mailbox: no tearing and no waiting. Immediate tears but never waits either.
     for (const VkPresentModeKHR wanted : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
         if (std::find(modes, modes + count, wanted) != modes + count) {
@@ -70,30 +82,76 @@ VkPresentModeKHR choose_present_mode(VkPhysicalDevice physical_device, VkSurface
 
 } // namespace
 
+core::Result<void> DeviceImpl::create_surface() {
+    auto created = platform::create_vulkan_surface(*window, instance);
+    if (!created) {
+        return core::fail(created.error());
+    }
+    surface = reinterpret_cast<VkSurfaceKHR>(*created); // NOLINT(performance-no-int-to-ptr): a Vulkan handle
+    return {};
+}
+
+core::Result<void> DeviceImpl::recreate_surface() {
+    DE_PROFILE_ZONE("rhi recreate surface");
+    DE_LOG_WARN("render", "the window surface was lost: recreating it");
+    DE_VK_CHECK(vkDeviceWaitIdle(device));
+    destroy_swapchain();
+    vkDestroySurfaceKHR(instance, surface, nullptr);
+    surface = VK_NULL_HANDLE;
+    if (auto created = create_surface(); !created) {
+        return created; // still lost: try again next frame
+    }
+    surface_lost = false;
+    if (!graphics_queue_can_present()) {
+        DE_FATAL("render", "the new window surface can't be presented from the graphics queue");
+    }
+    return {};
+}
+
+bool DeviceImpl::graphics_queue_can_present() const {
+    VkBool32 supported = VK_FALSE;
+    const VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(
+        physical_device, queue_families[static_cast<size_t>(QueueType::Graphics)], surface, &supported);
+    return result == VK_SUCCESS && supported == VK_TRUE;
+}
+
 bool DeviceImpl::swapchain_needs_recreation() const {
-    return swapchain.swapchain == VK_NULL_HANDLE || swapchain_out_of_date || swapchain.vsync != want_vsync ||
+    return swapchain.swapchain == VK_NULL_HANDLE || swapchain_out_of_date ||
+           (swapchain_suboptimal && !ignore_suboptimal) || swapchain.vsync != want_vsync ||
            swapchain.requested_width != window->pixel_width() || swapchain.requested_height != window->pixel_height();
 }
 
 core::Result<void> DeviceImpl::create_swapchain() {
     DE_PROFILE_ZONE("rhi create swapchain");
     const bool recreating = swapchain.swapchain != VK_NULL_HANDLE;
+    const uint32_t window_width = window->pixel_width();
+    const uint32_t window_height = window->pixel_height();
+    // Rebuilt for being suboptimal and nothing else: if the new one is suboptimal too, keep it.
+    const bool only_suboptimal = recreating && swapchain_suboptimal && !swapchain_out_of_date &&
+                                 swapchain.vsync == want_vsync && swapchain.requested_width == window_width &&
+                                 swapchain.requested_height == window_height;
     if (recreating) {
         // Rare (resizes, mode changes): a full stall keeps it simple and safe.
         DE_VK_CHECK(vkDeviceWaitIdle(device));
     }
 
     VkSurfaceCapabilitiesKHR caps{};
-    DE_VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &caps));
-    const VkSurfaceFormatKHR surface_format = choose_surface_format(physical_device, surface);
+    VkSurfaceFormatKHR surface_format{};
+    VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &caps);
+    if (result == VK_SUCCESS) {
+        result = choose_surface_format(physical_device, surface, surface_format);
+    }
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        surface_lost = true;
+        return core::fail(core::ErrorCode::Unsupported, "the window surface was lost");
+    }
+    DE_VK_CHECK(result);
     if (surface_format.format == VK_FORMAT_UNDEFINED) {
         return core::fail(core::ErrorCode::Unsupported, "the window surface offers no usable format");
     }
     const VkPresentModeKHR present_mode = choose_present_mode(physical_device, surface, want_vsync);
 
     // The surface decides the size when it knows it; otherwise (Wayland) the window does.
-    const uint32_t window_width = window->pixel_width();
-    const uint32_t window_height = window->pixel_height();
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
         extent.width = std::clamp(window_width, caps.minImageExtent.width, caps.maxImageExtent.width);
@@ -103,6 +161,10 @@ core::Result<void> DeviceImpl::create_swapchain() {
         return core::fail(core::ErrorCode::Unsupported, "the window has no area to present to");
     }
 
+    // One more than the minimum, so the CPU rarely waits for an image.
+    if (caps.minImageCount > kMaxSwapchainImages) {
+        return core::fail(core::ErrorCode::Unsupported, "the window needs more swapchain images than supported");
+    }
     uint32_t image_count = caps.minImageCount + 1;
     if (caps.maxImageCount != 0) {
         image_count = std::min(image_count, caps.maxImageCount);
@@ -145,13 +207,28 @@ core::Result<void> DeviceImpl::create_swapchain() {
         .oldSwapchain = old_swapchain,
     };
     VkSwapchainKHR new_swapchain = VK_NULL_HANDLE;
-    const VkResult result = vkCreateSwapchainKHR(device, &info, nullptr, &new_swapchain);
+    result = vkCreateSwapchainKHR(device, &info, nullptr, &new_swapchain);
     // The old swapchain is retired either way: release it and its images now.
     destroy_swapchain();
+    if (result == VK_ERROR_SURFACE_LOST_KHR) {
+        surface_lost = true;
+    }
     if (result != VK_SUCCESS) {
         DE_LOG_ERROR("render", "swapchain creation failed: %s", vk_result_name(result));
         return core::fail(core::ErrorCode::Unsupported, "the swapchain could not be created");
     }
+
+    // Drivers may make more images than asked for.
+    uint32_t count = 0;
+    DE_VK_CHECK(vkGetSwapchainImagesKHR(device, new_swapchain, &count, nullptr));
+    if (count > kMaxSwapchainImages) {
+        vkDestroySwapchainKHR(device, new_swapchain, nullptr);
+        DE_LOG_ERROR("render", "the driver made %u swapchain images; at most %u are supported", count,
+                     kMaxSwapchainImages);
+        return core::fail(core::ErrorCode::Unsupported, "the swapchain has too many images");
+    }
+    VkImage images[kMaxSwapchainImages] = {};
+    DE_VK_CHECK(vkGetSwapchainImagesKHR(device, new_swapchain, &count, images));
 
     swapchain.swapchain = new_swapchain;
     swapchain.format = from_vk_format(surface_format.format);
@@ -161,14 +238,10 @@ core::Result<void> DeviceImpl::create_swapchain() {
     swapchain.requested_width = window_width;
     swapchain.requested_height = window_height;
     swapchain.vsync = want_vsync;
-    swapchain_out_of_date = false;
-
-    uint32_t count = 0;
-    DE_VK_CHECK(vkGetSwapchainImagesKHR(device, new_swapchain, &count, nullptr));
-    DE_VERIFY_MSG(count <= kMaxSwapchainImages, "the swapchain has more images than kMaxSwapchainImages");
-    VkImage images[kMaxSwapchainImages] = {};
-    DE_VK_CHECK(vkGetSwapchainImagesKHR(device, new_swapchain, &count, images));
     swapchain.image_count = count;
+    swapchain_out_of_date = false;
+    swapchain_suboptimal = false;
+    ignore_suboptimal = only_suboptimal;
 
     const VkSemaphoreCreateInfo semaphore_info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < count; ++i) {
@@ -198,7 +271,9 @@ core::Result<void> DeviceImpl::create_swapchain() {
         set_debug_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(texture.image), name);
         set_debug_name(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(texture.view), name);
         swapchain.textures[i] = textures.insert(texture);
-        DE_VK_CHECK(vkCreateSemaphore(device, &semaphore_info, nullptr, &swapchain.present_semaphores[i]));
+        if (present_semaphores[i] == VK_NULL_HANDLE) {
+            DE_VK_CHECK(vkCreateSemaphore(device, &semaphore_info, nullptr, &present_semaphores[i]));
+        }
     }
 
     if (recreating) {
@@ -209,13 +284,13 @@ core::Result<void> DeviceImpl::create_swapchain() {
     return {};
 }
 
+// Only once the GPU is idle. The present semaphores stay: see DeviceImpl::present_semaphores.
 void DeviceImpl::destroy_swapchain() {
     for (uint32_t i = 0; i < swapchain.image_count; ++i) {
         if (const Texture* texture = textures.get(swapchain.textures[i])) {
             vkDestroyImageView(device, texture->view, nullptr);
             textures.remove(swapchain.textures[i]);
         }
-        vkDestroySemaphore(device, swapchain.present_semaphores[i], nullptr);
     }
     if (swapchain.swapchain != VK_NULL_HANDLE) {
         vkDestroySwapchainKHR(device, swapchain.swapchain, nullptr);
@@ -235,7 +310,13 @@ TextureHandle Device::acquire_swapchain_texture() {
 
     const FrameSlot& slot = impl.current_slot();
     for (int attempt = 0; attempt < 2; ++attempt) {
+        if (impl.surface_lost && !impl.recreate_surface()) {
+            return {};
+        }
         if (impl.swapchain_needs_recreation() && !impl.create_swapchain()) {
+            if (impl.surface_lost) {
+                continue; // recreate the surface and try once more
+            }
             return {};
         }
         uint32_t index = 0;
@@ -246,14 +327,18 @@ TextureHandle Device::acquire_swapchain_texture() {
                                            VK_NULL_HANDLE, &index);
         }
         if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR) {
-            // Suboptimal still signals the semaphore: use the image, recreate next frame.
-            impl.swapchain_out_of_date = result == VK_SUBOPTIMAL_KHR;
+            // Suboptimal still signals the semaphore: use the image, rebuild next frame.
+            impl.swapchain_suboptimal = impl.swapchain_suboptimal || result == VK_SUBOPTIMAL_KHR;
             impl.acquired = true;
             impl.acquired_image = index;
             return impl.swapchain.textures[index];
         }
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_ERROR_SURFACE_LOST_KHR) {
-            impl.swapchain_out_of_date = true; // recreate and try once more
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            impl.swapchain_out_of_date = true; // rebuild and try once more
+            continue;
+        }
+        if (result == VK_ERROR_SURFACE_LOST_KHR) {
+            impl.surface_lost = true;
             continue;
         }
         DE_VK_CHECK(result);

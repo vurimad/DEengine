@@ -1,4 +1,3 @@
-find_package(SDL3 CONFIG REQUIRED)
 find_package(VulkanHeaders CONFIG REQUIRED)
 find_package(VulkanMemoryAllocator CONFIG REQUIRED)
 find_package(vk-bootstrap CONFIG REQUIRED)
@@ -40,5 +39,4 @@ target_link_libraries(de_rhi
         volk::volk
         Vulkan::Headers
         GPUOpen::VulkanMemoryAllocator
-        vk-bootstrap::vk-bootstrap
-        SDL3::SDL3)
+        vk-bootstrap::vk-bootstrap)

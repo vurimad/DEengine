@@ -3,6 +3,7 @@
 #include "core/result.h"
 
 #include <cstdint>
+#include <span>
 
 struct SDL_Window;
 
@@ -47,7 +48,8 @@ public:
 
     void set_title(const char* title);
 
-    // The SDL window, for the RHI backend's surface creation only.
+    // The SDL window. Engine code doesn't need it: the RHI backend creates its surface through
+    // create_vulkan_surface below.
     SDL_Window* native_handle() const { return window_; }
 
 private:
@@ -65,5 +67,17 @@ private:
     bool focused_ = true;
     bool resized_ = false;
 };
+
+// --- Vulkan surface support, for the RHI's Vulkan backend ---
+// Vulkan handles cross this boundary as plain pointers and integers, so neither side includes the
+// other's headers: SDL stays in platform/, Vulkan in render/rhi/vulkan/.
+
+// The instance extensions windows need for presentation (VK_KHR_surface plus the OS one).
+// Empty if video isn't initialized or Vulkan isn't available.
+std::span<const char* const> vulkan_instance_extensions();
+
+// Creates a VkSurfaceKHR for the window on the given VkInstance and returns it as an integer.
+// The caller destroys it with vkDestroySurfaceKHR before the window goes away.
+core::Result<uint64_t> create_vulkan_surface(const Window& window, void* vk_instance);
 
 } // namespace de::platform

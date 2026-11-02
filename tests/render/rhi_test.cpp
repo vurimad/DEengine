@@ -118,6 +118,58 @@ TEST_CASE("invalid resource descriptions are rejected") {
     check_clean(*device);
 }
 
+TEST_CASE("every texture shape can be created") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const TextureDesc descs[] = {
+        {.width = 64, .height = 32, .mip_count = 7, .format = Format::RGBA8Srgb, .usage = TextureUsage::Sampled},
+        {.width = 32,
+         .height = 32,
+         .layer_count = 4,
+         .format = Format::RGBA16Float,
+         .usage = TextureUsage::Sampled | TextureUsage::Storage},
+        {.width = 16,
+         .height = 16,
+         .layer_count = 6,
+         .format = Format::RGBA16Float,
+         .usage = TextureUsage::Sampled,
+         .dimension = TextureDimension::Cube},
+        {.width = 16,
+         .height = 16,
+         .mip_count = 5,
+         .layer_count = 12,
+         .format = Format::RGBA16Float,
+         .usage = TextureUsage::Sampled,
+         .dimension = TextureDimension::Cube},
+        {.width = 32,
+         .height = 32,
+         .depth = 16,
+         .mip_count = 6,
+         .format = Format::R16Float,
+         .usage = TextureUsage::Sampled | TextureUsage::Storage,
+         .dimension = TextureDimension::Texture3D},
+        {.width = 128, .height = 128, .format = Format::D32Float, .usage = TextureUsage::DepthStencil},
+        {.width = 64,
+         .height = 64,
+         .mip_count = 7,
+         .format = Format::BC7Srgb,
+         .usage = TextureUsage::Sampled | TextureUsage::CopyDst},
+    };
+    for (const TextureDesc& desc : descs) {
+        const auto texture = device->create_texture(desc);
+        CHECK(texture.ok());
+        if (texture.ok()) {
+            CHECK(device->texture_desc(*texture)->layer_count == desc.layer_count);
+            device->destroy(*texture);
+        }
+    }
+    device->wait_idle();
+    CHECK(device->stats().pending_destroys == 0);
+    check_clean(*device);
+}
+
 TEST_CASE("clear a render target and read it back") {
     auto device = make_device();
     if (!device) {

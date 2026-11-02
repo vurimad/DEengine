@@ -5,12 +5,11 @@
 #include "core/profile.h"
 #include "platform/window.h"
 
-#include <SDL3/SDL_error.h>
-#include <SDL3/SDL_vulkan.h>
 #include <VkBootstrap.h>
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -36,27 +35,6 @@ VKAPI_ATTR VkBool32 VKAPI_CALL debug_callback(VkDebugUtilsMessageSeverityFlagBit
         DE_LOG_WARN("vulkan", "[%s] %s", id, message);
     }
     return VK_FALSE; // never abort the call
-}
-
-bool instance_layer_available(const char* name) {
-    uint32_t count = 0;
-    vkEnumerateInstanceLayerProperties(&count, nullptr);
-    core::Array<VkLayerProperties> layers(core::heap_allocator(core::MemoryTag::Render));
-    layers.resize(count);
-    vkEnumerateInstanceLayerProperties(&count, layers.data());
-    return std::any_of(layers.begin(), layers.begin() + count,
-                       [name](const VkLayerProperties& layer) { return std::strcmp(layer.layerName, name) == 0; });
-}
-
-bool instance_extension_available(const char* name) {
-    uint32_t count = 0;
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr);
-    core::Array<VkExtensionProperties> extensions(core::heap_allocator(core::MemoryTag::Render));
-    extensions.resize(count);
-    vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data());
-    return std::any_of(extensions.begin(), extensions.begin() + count, [name](const VkExtensionProperties& extension) {
-        return std::strcmp(extension.extensionName, name) == 0;
-    });
 }
 
 void copy_text(char (&dest)[256], const char* src) {
@@ -218,19 +196,21 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
         .require_api_version(1, 3, 0)
         .set_headless(window == nullptr);
     if (window != nullptr) {
-        uint32_t count = 0;
-        const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
-        if (extensions == nullptr) {
-            DE_LOG_ERROR("vulkan", "SDL_Vulkan_GetInstanceExtensions failed: %s", SDL_GetError());
+        const std::span<const char* const> extensions = platform::vulkan_instance_extensions();
+        if (extensions.empty()) {
             return core::fail(core::ErrorCode::Unsupported, "no Vulkan surface support for the window");
         }
-        instance_builder.enable_extensions(count, extensions);
+        instance_builder.enable_extensions(extensions.size(), extensions.data());
     }
-    validation = desc.validation && instance_layer_available("VK_LAYER_KHRONOS_validation");
+    const auto system = vkb::SystemInfo::get_system_info(vkGetInstanceProcAddr);
+    if (!system) {
+        return core::fail(core::ErrorCode::Unsupported, "the Vulkan loader could not list its layers");
+    }
+    validation = desc.validation && system->validation_layers_available;
     if (desc.validation && !validation) {
         DE_LOG_WARN("vulkan", "validation requested but VK_LAYER_KHRONOS_validation is not installed");
     }
-    debug_utils = instance_extension_available(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    debug_utils = system->debug_utils_available;
     if (validation) {
         instance_builder.enable_validation_layers(true)
             .set_debug_callback(debug_callback)
@@ -260,13 +240,15 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
     volkLoadInstanceOnly(instance);
 
     // --- Surface ---
-    if (window != nullptr && !SDL_Vulkan_CreateSurface(window->native_handle(), instance, nullptr, &surface)) {
-        DE_LOG_ERROR("vulkan", "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
-        return core::fail(core::ErrorCode::Unsupported, "the window surface could not be created");
+    if (window != nullptr) {
+        if (auto created = create_surface(); !created) {
+            return created;
+        }
     }
 
     // --- Physical device: Vulkan 1.3 with the features docs/design.md requires ---
     const VkPhysicalDeviceFeatures features10{
+        .imageCubeArray = VK_TRUE,
         .multiDrawIndirect = VK_TRUE,
         .drawIndirectFirstInstance = VK_TRUE,
         .samplerAnisotropy = VK_TRUE,
@@ -374,6 +356,11 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
         queues[i] = queue_list[i].first;
         queue_families[i] = queue_list[i].second;
     }
+    // Frames present from the graphics queue. GPUs whose graphics family can't present to the
+    // window would need a separate present queue; none of our targets do that.
+    if (surface != VK_NULL_HANDLE && !graphics_queue_can_present()) {
+        return core::fail(core::ErrorCode::Unsupported, "the GPU's graphics queue can't present to the window");
+    }
 
     // --- Memory ---
     VmaAllocatorCreateInfo allocator_info{
@@ -453,6 +440,10 @@ void DeviceImpl::shutdown() {
             vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
         }
         buffers.clear();
+        for (VkSemaphore& semaphore : present_semaphores) {
+            vkDestroySemaphore(device, semaphore, nullptr);
+            semaphore = VK_NULL_HANDLE;
+        }
         for (FrameSlot& slot : frames) {
             vkDestroyCommandPool(device, slot.command_pool, nullptr);
             vkDestroySemaphore(device, slot.acquire_semaphore, nullptr);
@@ -642,10 +633,7 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::InvalidArgument, "texture dimension doesn't match its sizes");
     }
     const uint32_t largest = std::max({desc.width, desc.height, desc.depth});
-    uint32_t max_mips = 1;
-    while ((largest >> max_mips) != 0) {
-        ++max_mips;
-    }
+    const auto max_mips = static_cast<uint32_t>(std::bit_width(largest)); // a full chain down to 1x1
     if (desc.mip_count > max_mips) {
         return core::fail(core::ErrorCode::InvalidArgument, "more mips than the texture size allows");
     }
@@ -895,7 +883,7 @@ void Device::end_frame() {
          .value = impl.frame_index,
          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
         {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-         .semaphore = impl.acquired ? impl.swapchain.present_semaphores[impl.acquired_image] : VK_NULL_HANDLE,
+         .semaphore = impl.acquired ? impl.present_semaphores[impl.acquired_image] : VK_NULL_HANDLE,
          .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
     };
     const VkSubmitInfo2 submit{
@@ -918,17 +906,18 @@ void Device::end_frame() {
         const VkPresentInfoKHR present{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .waitSemaphoreCount = 1,
-            .pWaitSemaphores = &impl.swapchain.present_semaphores[impl.acquired_image],
+            .pWaitSemaphores = &impl.present_semaphores[impl.acquired_image],
             .swapchainCount = 1,
             .pSwapchains = &impl.swapchain.swapchain,
             .pImageIndices = &impl.acquired_image,
         };
         const VkResult result = vkQueuePresentKHR(impl.queues[static_cast<size_t>(QueueType::Graphics)], &present);
-        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
             impl.swapchain_out_of_date = true;
+        } else if (result == VK_SUBOPTIMAL_KHR) {
+            impl.swapchain_suboptimal = true;
         } else if (result == VK_ERROR_SURFACE_LOST_KHR) {
-            DE_LOG_ERROR("render", "the window surface was lost");
-            impl.swapchain_out_of_date = true;
+            impl.surface_lost = true;
         } else {
             DE_VK_CHECK(result);
         }
