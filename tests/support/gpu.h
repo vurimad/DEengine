@@ -93,4 +93,12 @@ struct WriteStoragePush {
     uint32_t height = 0;
 };
 
+// Push constants of shaders/tests/write_storage_uint.slang.
+struct WriteStorageUintPush {
+    uint32_t texture = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t value = 0;
+};
+
 } // namespace de::test

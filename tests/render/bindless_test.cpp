@@ -16,6 +16,7 @@ using de::test::SampleTexturePush;
 using de::test::ShaderKit;
 using de::test::upload_texture;
 using de::test::WriteStoragePush;
+using de::test::WriteStorageUintPush;
 
 namespace {
 
@@ -76,6 +77,7 @@ TEST_CASE("texture indices: unique, kept until destroyed, reused once the GPU is
     }
     CHECK(indices[0] != indices[1]);
     CHECK(indices[1] != indices[2]);
+    CHECK(bindless_table(indices[0]) == BindlessTable::Texture2D);
     CHECK(device->stats().bindless_textures == 4);
 
     // Only textures with the usage get entries.
@@ -88,29 +90,30 @@ TEST_CASE("texture indices: unique, kept until destroyed, reused once the GPU is
             {.width = 4, .height = 4, .format = Format::RGBA8Unorm, .usage = TextureUsage::Storage});
         CHECK(device->storage_texture_index(storage) != kInvalidBindlessIndex);
         CHECK(device->texture_index(storage) == kInvalidBindlessIndex);
-        CHECK(device->stats().bindless_storage_textures == 1);
+        CHECK(device->stats().bindless_storage_textures == 2); // the fallback and mip 0
+        CHECK(bindless_table(device->storage_texture_index(storage)) == BindlessTable::Storage2D);
         device->destroy(storage);
     }
 
-    // A destroyed texture's entry isn't handed out again while its frame may still be running...
+    // A destroyed texture's entry isn't handed out while its frame may still be running, nor right
+    // after: fresh entries go first, so a stale index keeps reading the fallback.
     device->destroy(textures[1]);
     CHECK(device->texture_index(textures[1]) == kInvalidBindlessIndex);
     const auto early = *device->create_texture(sampled);
     CHECK(device->texture_index(early) != indices[1]);
-    // ...but once the GPU is done with it, it is.
     for (uint32_t i = 0; i < kFramesInFlight + 1; ++i) {
         device->begin_frame();
         device->end_frame();
     }
     const auto late = *device->create_texture(sampled);
-    CHECK(device->texture_index(late) == indices[1]);
+    CHECK(device->texture_index(late) != indices[1]);
 
     for (const TextureHandle texture : {textures[0], textures[2], target, early, late}) {
         device->destroy(texture);
     }
     device->wait_idle();
     CHECK(device->stats().bindless_textures == 1);
-    CHECK(device->stats().bindless_storage_textures == 0);
+    CHECK(device->stats().bindless_storage_textures == 1);
     check_clean(*device);
 }
 
@@ -294,4 +297,303 @@ TEST_CASE("the library accepts the bindless tables and refuses other descriptor 
     REQUIRE(slots.ok());
     CHECK_FALSE(kit.pipeline(*slots).is_valid());
     check_clean(*device);
+}
+
+TEST_CASE("indices carry their table: shapes and tags can't be mixed up") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const auto cube = *device->create_texture({.width = 4,
+                                               .height = 4,
+                                               .layer_count = 6,
+                                               .format = Format::RGBA8Unorm,
+                                               .usage = TextureUsage::Sampled,
+                                               .dimension = TextureDimension::Cube});
+    const auto array = *device->create_texture(
+        {.width = 4, .height = 4, .layer_count = 3, .format = Format::RGBA8Unorm, .usage = TextureUsage::Sampled});
+    const auto volume = *device->create_texture({.width = 4,
+                                                 .height = 4,
+                                                 .depth = 4,
+                                                 .format = Format::RGBA8Unorm,
+                                                 .usage = TextureUsage::Sampled,
+                                                 .dimension = TextureDimension::Texture3D});
+    CHECK(bindless_table(device->texture_index(cube)) == BindlessTable::TextureCube);
+    CHECK(bindless_table(device->texture_index(array)) == BindlessTable::Texture2DArray);
+    CHECK(bindless_table(device->texture_index(volume)) == BindlessTable::Texture3D);
+    // Entries are unique across the shapes of one kind.
+    CHECK(bindless_entry(device->texture_index(cube)) != bindless_entry(device->texture_index(array)));
+    CHECK(bindless_entry(device->texture_index(array)) != bindless_entry(device->texture_index(volume)));
+    CHECK(make_bindless_index(BindlessTable::TextureCube, 7) == ((2U << 24U) | 7U));
+    CHECK(kFallbackTextureIndex == make_bindless_index(BindlessTable::Texture2D, 0));
+
+    // Integer formats: storage only, R32Uint, 2D only.
+    CHECK(device->create_texture({.width = 4, .height = 4, .format = Format::RG32Uint, .usage = TextureUsage::Storage})
+              .error()
+              .code == de::core::ErrorCode::Unsupported);
+    CHECK(device->create_texture({.width = 4, .height = 4, .format = Format::R32Uint, .usage = TextureUsage::Sampled})
+              .error()
+              .code == de::core::ErrorCode::Unsupported);
+    CHECK(
+        device
+            ->create_texture(
+                {.width = 4, .height = 4, .layer_count = 2, .format = Format::R32Uint, .usage = TextureUsage::Storage})
+            .error()
+            .code == de::core::ErrorCode::Unsupported);
+    for (const TextureHandle texture : {cube, array, volume}) {
+        device->destroy(texture);
+    }
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("wrong, stale and unused indices all read the fallback") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    ShaderKit kit(*device);
+    const auto program = kit.compute("tests.sample_texture");
+    const auto output = device->create_buffer(
+        {.size = sizeof(Float4), .usage = BufferUsage::Storage, .memory = MemoryLocation::Readback});
+    REQUIRE(output.ok());
+    const auto is_magenta = [&] {
+        const Float4 texel = read_float4(*device, *output, 0);
+        return near(texel.r, 1.0f) && near(texel.g, 0.0f) && near(texel.b, 1.0f);
+    };
+    const auto white = [&](TextureDesc desc) {
+        const auto texture = *device->create_texture(desc);
+        const uint8_t texel[4] = {255, 255, 255, 255};
+        upload_texture(*device, texture, std::as_bytes(std::span(texel)), ResourceState::ShaderRead,
+                       ShaderStages::Compute);
+        return texture;
+    };
+    const TextureDesc white_2d{
+        .width = 1, .height = 1, .format = Format::RGBA8Unorm, .usage = TextureUsage::Sampled | TextureUsage::CopyDst};
+    const auto real = white(white_2d);
+
+    // The real one reads white...
+    sample_all(*device, kit, program, device->texture_index(real), DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(near(read_float4(*device, *output, 0).g, 1.0f));
+    // ...through another table's tag it doesn't,
+    const uint32_t mistagged =
+        make_bindless_index(BindlessTable::Texture2DArray, bindless_entry(device->texture_index(real)));
+    sample_all(*device, kit, program, mistagged, DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(is_magenta());
+    // nor does an entry nobody holds, nor kInvalidBindlessIndex.
+    sample_all(*device, kit, program, make_bindless_index(BindlessTable::Texture2D, 1234), DefaultSampler::PointClamp,
+               *output, 1, 1);
+    CHECK(is_magenta());
+    sample_all(*device, kit, program, kInvalidBindlessIndex, DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(is_magenta());
+
+    // A cube's entry, read as 2D (properly tagged even), is the 2D table's fallback: shapes never mix.
+    const auto cube = *device->create_texture({.width = 1,
+                                               .height = 1,
+                                               .layer_count = 6,
+                                               .format = Format::RGBA8Unorm,
+                                               .usage = TextureUsage::Sampled,
+                                               .dimension = TextureDimension::Cube});
+    sample_all(*device, kit, program,
+               make_bindless_index(BindlessTable::Texture2D, bindless_entry(device->texture_index(cube))),
+               DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(is_magenta());
+
+    // A stale index: its texture destroyed, the GPU done with it, another texture created since.
+    const uint32_t stale = device->texture_index(real);
+    device->destroy(real);
+    device->wait_idle();
+    const auto newer = white(white_2d);
+    sample_all(*device, kit, program, stale, DefaultSampler::PointClamp, *output, 1, 1);
+    CHECK(is_magenta());
+    device->destroy(newer);
+    device->destroy(cube);
+    device->destroy(*output);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("each mip is its own storage texture, and integer formats have their table") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    ShaderKit kit(*device);
+    const auto write_float = kit.compute("tests.write_storage");
+    const auto write_uint = kit.compute("tests.write_storage_uint");
+
+    // Mip 1 (8x8) of a 16x16 float texture.
+    const auto texture = *device->create_texture({.width = 16,
+                                                  .height = 16,
+                                                  .mip_count = 3,
+                                                  .format = Format::RGBA8Unorm,
+                                                  .usage = TextureUsage::Storage | TextureUsage::CopySrc});
+    CHECK(device->storage_texture_index(texture, 2) != kInvalidBindlessIndex);
+    CHECK(device->storage_texture_index(texture, 3) == kInvalidBindlessIndex);
+    CHECK(device->storage_texture_index(texture, 0) != device->storage_texture_index(texture, 1));
+    const auto integer = *device->create_texture(
+        {.width = 8, .height = 8, .format = Format::R32Uint, .usage = TextureUsage::Storage | TextureUsage::CopySrc});
+    CHECK(bindless_table(device->storage_texture_index(integer)) == BindlessTable::Storage2DUint);
+    const auto readback = *device->create_buffer(
+        {.size = uint64_t{8} * 8 * 4 * 2, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
+
+    device->begin_frame();
+    CommandList list = device->begin_command_list();
+    BarrierBatch batch;
+    batch.add(TextureBarrier{.texture = texture,
+                             .before = ResourceState::Undefined,
+                             .after = ResourceState::ShaderWrite,
+                             .after_stages = ShaderStages::Compute});
+    batch.add(TextureBarrier{.texture = integer,
+                             .before = ResourceState::Undefined,
+                             .after = ResourceState::ShaderWrite,
+                             .after_stages = ShaderStages::Compute});
+    batch.flush(list);
+    list.bind_pipeline(kit.pipeline(write_float));
+    list.push_constants(
+        WriteStoragePush{.texture = device->storage_texture_index(texture, 1), .width = 8, .height = 8});
+    list.dispatch(1, 1);
+    list.bind_pipeline(kit.pipeline(write_uint));
+    list.push_constants(WriteStorageUintPush{
+        .texture = device->storage_texture_index(integer), .width = 8, .height = 8, .value = 1000});
+    list.dispatch(1, 1);
+    batch.add(TextureBarrier{.texture = texture,
+                             .before = ResourceState::ShaderWrite,
+                             .after = ResourceState::CopySrc,
+                             .before_stages = ShaderStages::Compute});
+    batch.add(TextureBarrier{.texture = integer,
+                             .before = ResourceState::ShaderWrite,
+                             .after = ResourceState::CopySrc,
+                             .before_stages = ShaderStages::Compute});
+    batch.flush(list);
+    list.copy_texture_to_buffer(texture, readback, {.mip = 1});
+    list.copy_texture_to_buffer(integer, readback, {.buffer_offset = uint64_t{8} * 8 * 4});
+    list.barrier(readback, ResourceState::CopyDst, ResourceState::HostRead);
+    device->end_frame();
+    device->wait_idle();
+    device->invalidate_mapped(readback);
+
+    // Mip 1 texel (x, y) = (x / 8, y / 8, 0.25, 1) in unorm8.
+    const auto channel = [](float value) { return static_cast<uint32_t>(std::lround(value * 255.0f)); };
+    CHECK(read_u32(*device, readback, (3 * 8) + 5) ==
+          (channel(5.0f / 8) | (channel(3.0f / 8) << 8U) | (channel(0.25f) << 16U) | (255U << 24U)));
+    CHECK(read_u32(*device, readback, 64 + (3 * 8) + 5) == 5 + (3 * 8) + 1000);
+
+    device->destroy(texture);
+    device->destroy(integer);
+    device->destroy(readback);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("the shader module's tables and constants match the RHI's") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    ShaderKit kit(*device);
+
+    // Binding numbers, from reflection.
+    const de::shader::ShaderEntry entry[] = {{.name = "compute_main", .stage = de::rhi::ShaderStage::Compute}};
+    const auto compiled = kit.compiler().compile({.module = "tests.bindless_layout", .entries = entry});
+    REQUIRE(compiled.ok());
+    struct Expected {
+        const char* name;
+        BindlessTable table;
+    };
+    const Expected expected[] = {
+        {.name = "de_textures", .table = BindlessTable::Texture2D},
+        {.name = "de_texture_arrays", .table = BindlessTable::Texture2DArray},
+        {.name = "de_cube_textures", .table = BindlessTable::TextureCube},
+        {.name = "de_cube_texture_arrays", .table = BindlessTable::TextureCubeArray},
+        {.name = "de_textures_3d", .table = BindlessTable::Texture3D},
+        {.name = "de_storage_textures", .table = BindlessTable::Storage2D},
+        {.name = "de_storage_texture_arrays", .table = BindlessTable::Storage2DArray},
+        {.name = "de_storage_textures_3d", .table = BindlessTable::Storage3D},
+        {.name = "de_storage_textures_uint", .table = BindlessTable::Storage2DUint},
+        {.name = "de_samplers", .table = BindlessTable::Sampler},
+        {.name = "de_comparison_samplers", .table = BindlessTable::ComparisonSampler},
+    };
+    for (const Expected& table : expected) {
+        CAPTURE(table.name);
+        bool found = false;
+        for (const de::shader::ResourceBinding& binding : compiled->stages[0].reflection.bindings) {
+            if (binding.name == std::string_view(table.name)) {
+                found = true;
+                CHECK(binding.set == 0);
+                CHECK(binding.binding == static_cast<uint32_t>(table.table));
+            }
+        }
+        CHECK(found);
+    }
+
+    // Constants, from the GPU; every table bound and read without a validation message.
+    const auto program = kit.compute("tests.bindless_layout");
+    const auto output = *device->create_buffer(
+        {.size = 6 * sizeof(uint32_t), .usage = BufferUsage::Storage, .memory = MemoryLocation::Readback});
+    device->begin_frame();
+    CommandList list = device->begin_command_list();
+    list.bind_pipeline(kit.pipeline(program));
+    list.push_constants(de::test::FillBufferPush{.output = device->buffer_address(output)});
+    list.dispatch(1);
+    list.barrier(BufferBarrier{.buffer = output,
+                               .before = ResourceState::ShaderWrite,
+                               .after = ResourceState::HostRead,
+                               .before_stages = ShaderStages::Compute});
+    device->end_frame();
+    device->wait_idle();
+    device->invalidate_mapped(output);
+    CHECK(read_u32(*device, output, 0) == kBindlessTextureCapacity);
+    CHECK(read_u32(*device, output, 1) == kBindlessStorageCapacity);
+    CHECK(read_u32(*device, output, 2) == kBindlessSamplerCapacity);
+    CHECK(read_u32(*device, output, 3) == kBindlessEntryBits);
+    CHECK(read_u32(*device, output, 4) == 9 + 1); // nine 1-texel-wide fallbacks, and magenta's red
+    CHECK(read_u32(*device, output, 5) == (DE_BUILD_DEV != 0 ? 1U : 0U)); // ShaderCompilerDesc::checks arrives
+
+    device->destroy(output);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("GPU-assisted validation catches out-of-bounds writes through buffer pointers") {
+    auto device = de::rhi::Device::create(
+        {.app_name = "de_tests", .validation = true, .sync_validation = false, .gpu_validation = true});
+    if (!device) {
+        MESSAGE("skipped: no Vulkan 1.3 device");
+        return;
+    }
+    if (!device->validation_enabled()) {
+        MESSAGE("skipped: no validation layer");
+        return;
+    }
+    // CI's CPU driver (lavapipe) runs with an older validation layer whose GPU-assisted mode
+    // doesn't check pointer accesses there; the check is meant for real GPUs.
+    if (device->capabilities().type == GpuType::Cpu) {
+        MESSAGE("skipped: GPU-assisted pointer checks need a real GPU");
+        return;
+    }
+    ShaderKit kit(*device);
+    const auto fill = kit.compute("tests.fill_buffer");
+    const auto buffer = *device->create_buffer(
+        {.size = 64 * sizeof(uint32_t), .usage = BufferUsage::Storage, .memory = MemoryLocation::Readback});
+    const auto run = [&](uint32_t count) {
+        device->begin_frame();
+        CommandList list = device->begin_command_list();
+        list.bind_pipeline(kit.pipeline(fill));
+        list.push_constants(
+            de::test::FillBufferPush{.output = device->buffer_address(buffer), .value = 7, .count = count});
+        list.dispatch((count + 63) / 64);
+        list.barrier(BufferBarrier{.buffer = buffer,
+                                   .before = ResourceState::ShaderWrite,
+                                   .after = ResourceState::HostRead,
+                                   .before_stages = ShaderStages::Compute});
+        device->end_frame();
+        device->wait_idle();
+    };
+    run(64); // in bounds: clean, with every pointer access checked
+    CHECK(device->stats().validation_errors == 0);
+    run(128); // half of it past the end
+    CHECK(device->stats().validation_errors > 0);
+    device->destroy(buffer);
+    device->wait_idle();
 }

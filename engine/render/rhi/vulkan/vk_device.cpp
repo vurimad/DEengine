@@ -224,6 +224,9 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
         if (desc.sync_validation) {
             instance_builder.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT);
         }
+        if (desc.gpu_validation) {
+            instance_builder.add_validation_feature_enable(VK_VALIDATION_FEATURE_ENABLE_GPU_ASSISTED_EXT);
+        }
         debug_utils = true; // the layer provides it
     } else if (debug_utils) {
         // Object names and labels for RenderDoc and Nsight, even without validation.
@@ -254,7 +257,6 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
         .drawIndirectFirstInstance = VK_TRUE,
         .samplerAnisotropy = VK_TRUE,
         .textureCompressionBC = VK_TRUE,
-        .shaderImageGatherExtended = VK_TRUE,
         // Bindless storage textures are declared without a format.
         .shaderStorageImageReadWithoutFormat = VK_TRUE,
         .shaderStorageImageWriteWithoutFormat = VK_TRUE,
@@ -434,7 +436,10 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
                 caps.api_version_major, caps.api_version_minor,
                 static_cast<double>(caps.device_local_memory_bytes) / (1024.0 * 1024.0 * 1024.0));
     DE_LOG_INFO("render", "validation %s, async compute %s, dedicated transfer %s, ray query %s",
-                validation ? (desc.sync_validation ? "on (with sync)" : "on") : "off",
+                !validation           ? "off"
+                : desc.gpu_validation ? (desc.sync_validation ? "on (with sync and GPU-assisted)" : "on (GPU-assisted)")
+                : desc.sync_validation ? "on (with sync)"
+                                       : "on",
                 caps.async_compute ? "yes" : "no", caps.dedicated_transfer ? "yes" : "no",
                 caps.ray_query ? "yes" : "no");
 
@@ -452,7 +457,7 @@ void DeviceImpl::shutdown() {
         vkDeviceWaitIdle(device);
         destroy_swapchain();
         for (FrameSlot& slot : frames) {
-            free_pending(slot.pending);
+            free_pending(slot);
         }
         if (!textures.empty() || !buffers.empty() || !pipelines.empty()) {
             DE_LOG_WARN("render", "%zu textures, %zu buffers and %zu pipelines still alive at device shutdown",
@@ -464,9 +469,8 @@ void DeviceImpl::shutdown() {
         pipelines.clear();
         vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
         pipeline_layout = VK_NULL_HANDLE;
-        for (const Texture& texture : textures) {
-            vkDestroyImageView(device, texture.sampled_view, nullptr);
-            vkDestroyImageView(device, texture.storage_view, nullptr);
+        for (Texture& texture : textures) {
+            release_bindless(texture.bindless, false);
             vkDestroyImageView(device, texture.view, nullptr);
             vmaDestroyImage(allocator, texture.image, texture.allocation);
         }
@@ -539,25 +543,15 @@ void DeviceImpl::set_debug_name(VkObjectType type, uint64_t object, const char* 
     vkSetDebugUtilsObjectNameEXT(device, &info);
 }
 
-void DeviceImpl::free_pending(core::Array<PendingDestroy>& pending) {
+void DeviceImpl::free_pending(FrameSlot& slot) {
+    // The GPU is done with these textures: their entries point at the fallbacks again and can be
+    // handed out.
+    for (TextureBindless& bindless : slot.pending_bindless) {
+        release_bindless(bindless);
+    }
+    slot.pending_bindless.clear();
+    core::Array<PendingDestroy>& pending = slot.pending;
     for (const PendingDestroy& entry : pending) {
-        // The GPU is done with the texture: its table entries point at the fallback again and
-        // can be handed out.
-        if (entry.sampled_index != kInvalidBindlessIndex) {
-            if (entry.sampled_binding == kFallbackBinding) {
-                write_sampled(kFallbackBinding, entry.sampled_index, fallback_view);
-            }
-            sampled_table.release(entry.sampled_index); // other shapes: partially bound, never read
-        }
-        if (entry.storage_index != kInvalidBindlessIndex) {
-            storage_table.release(entry.storage_index); // partially bound: a stale entry is never read
-        }
-        if (entry.sampled_view != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, entry.sampled_view, nullptr);
-        }
-        if (entry.storage_view != VK_NULL_HANDLE) {
-            vkDestroyImageView(device, entry.storage_view, nullptr);
-        }
         if (entry.view != VK_NULL_HANDLE) {
             vkDestroyImageView(device, entry.view, nullptr);
         }
@@ -662,8 +656,8 @@ DeviceStats Device::stats() const {
         .live_textures = static_cast<uint32_t>(impl_->textures.size()),
         .live_buffers = static_cast<uint32_t>(impl_->buffers.size()),
         .live_pipelines = static_cast<uint32_t>(impl_->pipelines.size()),
-        .bindless_textures = impl_->sampled_table.used(),
-        .bindless_storage_textures = impl_->storage_table.used(),
+        .bindless_textures = impl_->sampled_slots.used(),
+        .bindless_storage_textures = impl_->storage_slots.used(),
         .swapchain_recreations = impl_->swapchain_recreations,
         .validation_errors = impl_->validation_errors.load(std::memory_order_relaxed),
         .validation_warnings = impl_->validation_warnings.load(std::memory_order_relaxed),
@@ -712,6 +706,22 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::Unsupported, "texture is larger than the GPU allows");
     }
 
+    // Bindless rules (vk_bindless.cpp): integer textures are storage-only R32Uint 2D, and storage
+    // textures have an entry per mip.
+    const bool integer =
+        desc.format == Format::R32Uint || desc.format == Format::RG32Uint || desc.format == Format::RGBA32Uint;
+    if (integer && core::has_any(desc.usage, TextureUsage::Sampled)) {
+        return core::fail(core::ErrorCode::Unsupported,
+                          "integer textures can't be sampled through the bindless tables");
+    }
+    if (integer && core::has_any(desc.usage, TextureUsage::Storage) &&
+        (desc.format != Format::R32Uint || desc.dimension != TextureDimension::Texture2D || desc.layer_count != 1)) {
+        return core::fail(core::ErrorCode::Unsupported, "integer storage textures are R32Uint, 2D, with one layer");
+    }
+    if (core::has_any(desc.usage, TextureUsage::Storage) && desc.mip_count > kMaxMips) {
+        return core::fail(core::ErrorCode::Unsupported, "storage textures have at most 16 mips");
+    }
+
     FormatSupport needed = FormatSupport::None;
     VkImageUsageFlags usage = 0;
     const auto use = [&](TextureUsage flag, VkImageUsageFlags vk_flag, FormatSupport support) {
@@ -757,18 +767,10 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::OutOfMemory, "GPU memory for the texture could not be allocated");
     }
 
-    VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
-    if (volume) {
-        view_type = VK_IMAGE_VIEW_TYPE_3D;
-    } else if (cube) {
-        view_type = desc.layer_count > 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
-    } else if (desc.layer_count > 1) {
-        view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    }
     const VkImageViewCreateInfo view_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image = texture.image,
-        .viewType = view_type,
+        .viewType = vk_view_type(desc, false),
         .format = image_info.format,
         .subresourceRange = {.aspectMask = texture.aspects,
                              .baseMipLevel = 0,
@@ -784,18 +786,7 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         vmaSetAllocationName(impl_->allocator, texture.allocation, desc.debug_name);
     }
     if (auto registered = impl_->register_bindless(texture); !registered) {
-        // Nothing has used the texture yet: free it now, entries included.
-        if (texture.sampled_index != kInvalidBindlessIndex) {
-            if (texture.sampled_binding == DeviceImpl::kFallbackBinding) {
-                impl_->write_sampled(DeviceImpl::kFallbackBinding, texture.sampled_index, impl_->fallback_view);
-            }
-            impl_->sampled_table.release(texture.sampled_index);
-        }
-        if (texture.storage_index != kInvalidBindlessIndex) {
-            impl_->storage_table.release(texture.storage_index);
-        }
-        vkDestroyImageView(impl_->device, texture.sampled_view, nullptr);
-        vkDestroyImageView(impl_->device, texture.storage_view, nullptr);
+        // register_bindless leaves nothing behind on failure; nothing has used the texture yet.
         vkDestroyImageView(impl_->device, texture.view, nullptr);
         vmaDestroyImage(impl_->allocator, texture.image, texture.allocation);
         DE_LOG_ERROR("render", "texture '%s': %s", desc.debug_name != nullptr ? desc.debug_name : "",
@@ -878,14 +869,9 @@ void Device::destroy(TextureHandle handle) {
     if (texture->swapchain) {
         return;
     }
-    impl_->current_slot().pending.push(PendingDestroy{.image = texture->image,
-                                                      .view = texture->view,
-                                                      .sampled_view = texture->sampled_view,
-                                                      .storage_view = texture->storage_view,
-                                                      .sampled_index = texture->sampled_index,
-                                                      .storage_index = texture->storage_index,
-                                                      .sampled_binding = texture->sampled_binding,
-                                                      .allocation = texture->allocation});
+    impl_->current_slot().pending.push(
+        PendingDestroy{.image = texture->image, .view = texture->view, .allocation = texture->allocation});
+    impl_->current_slot().pending_bindless.push(texture->bindless);
     impl_->textures.remove(handle);
 }
 
@@ -964,7 +950,7 @@ void Device::begin_frame() {
         };
         DE_VK_CHECK(vkWaitSemaphores(impl.device, &wait, UINT64_MAX));
     }
-    impl.free_pending(slot.pending);
+    impl.free_pending(slot);
     DE_VK_CHECK(vkResetCommandPool(impl.device, slot.command_pool, 0));
     slot.list_count = 0;
 }
@@ -1049,7 +1035,7 @@ void Device::wait_idle() {
     for (FrameSlot& slot : impl.frames) {
         // Inside a frame, the current slot's resources may still be used by unsubmitted commands.
         if (!impl.in_frame || &slot != &impl.current_slot()) {
-            impl.free_pending(slot.pending);
+            impl.free_pending(slot);
         }
     }
 }

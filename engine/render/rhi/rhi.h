@@ -30,10 +30,54 @@ inline constexpr uint32_t kMaxPushConstantBytes = 128;
 // Bindless (docs/design.md, Rendering): every sampled texture, storage texture and sampler has an
 // index into a global table that shaders read (shaders/common/bindless.slang). Push constants
 // carry the indices; buffers are reached by address instead.
+//
+// One table per texture shape, so a texture is only ever read as the shape it is. The value is
+// the table's binding in the bindless set; shaders/common/bindless.slang declares the same numbers
+// (a test checks they agree).
+enum class BindlessTable : uint32_t {
+    Texture2D,
+    Texture2DArray,
+    TextureCube,
+    TextureCubeArray,
+    Texture3D,
+    Storage2D,      // float formats, one entry per mip
+    Storage2DArray, // float formats; cubes as arrays of faces
+    Storage3D,      // float formats
+    Storage2DUint,  // R32Uint, RG32Uint, RGBA32Uint
+    Sampler,
+    ComparisonSampler,
+    Count,
+};
+
+// Entries per table. Fixed, so shaders know them: every Vulkan 1.3 GPU with descriptor indexing
+// allows far more (the spec's minimum is 500,000 per stage).
+inline constexpr uint32_t kBindlessTextureCapacity = 16384; // per sampled table
+inline constexpr uint32_t kBindlessStorageCapacity = 4096;  // per storage table
+inline constexpr uint32_t kBindlessSamplerCapacity = 64;
+
+// A bindless texture index: the entry in the low 24 bits, the table above them. Shader helpers
+// check the table in debug and dev builds (a mismatch draws the fallback) and mask and clamp the
+// entry in every build, so a wrong index never reads outside a table.
+inline constexpr uint32_t kBindlessEntryBits = 24;
+inline constexpr uint32_t kBindlessEntryMask = (1U << kBindlessEntryBits) - 1;
+
+constexpr uint32_t make_bindless_index(BindlessTable table, uint32_t entry) {
+    return (static_cast<uint32_t>(table) << kBindlessEntryBits) | (entry & kBindlessEntryMask);
+}
+constexpr BindlessTable bindless_table(uint32_t index) {
+    return static_cast<BindlessTable>(index >> kBindlessEntryBits);
+}
+constexpr uint32_t bindless_entry(uint32_t index) {
+    return index & kBindlessEntryMask;
+}
+
+// What texture_index() returns without the usage or for a stale handle. Its table is invalid, so
+// shaders in debug and dev builds draw the fallback for it.
 inline constexpr uint32_t kInvalidBindlessIndex = UINT32_MAX;
 
-// Entry 0 of the 2D texture table: a 1x1 magenta texture. Freed 2D entries point at it too, so a
-// missing or stale 2D index draws magenta instead of garbage.
+// Entry 0 of every texture table is a fallback: 1x1 magenta for sampled tables, a scratch texel
+// for storage tables. Every entry not in use points at it, freed ones included, so even a stale
+// index reads something defined. This one is the 2D fallback.
 inline constexpr uint32_t kFallbackTextureIndex = 0;
 
 // The samplers every device has; the value is the sampler's index in the table. Anisotropic

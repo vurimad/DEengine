@@ -145,6 +145,16 @@ VkStateInfo vk_state_info(ResourceState state, ShaderStages shader_stages) {
     return info; // Undefined: no stages, no access, UNDEFINED layout
 }
 
+VkImageViewType vk_view_type(const TextureDesc& desc, bool storage) {
+    if (desc.dimension == TextureDimension::Texture3D) {
+        return VK_IMAGE_VIEW_TYPE_3D;
+    }
+    if (desc.dimension == TextureDimension::Cube && !storage) {
+        return desc.layer_count > 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
+    }
+    return desc.layer_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+}
+
 const char* vk_result_name(VkResult result) {
     switch (result) {
     case VK_SUCCESS:

@@ -19,8 +19,8 @@ namespace de::test {
 //     list.bind_pipeline(kit.pipeline(kit.compute("tests.fill_buffer")));
 class ShaderKit {
 public:
-    explicit ShaderKit(rhi::Device& device)
-        : vfs_(make_vfs()), compiler_(std::move(shader::ShaderCompiler::create(vfs_)).value()),
+    explicit ShaderKit(rhi::Device& device, const shader::ShaderCompilerDesc& compiler_desc = {})
+        : vfs_(make_vfs()), compiler_(std::move(shader::ShaderCompiler::create(vfs_, compiler_desc)).value()),
           library_(
               std::move(shader::ShaderLibrary::create(device, vfs_, jobs_, compiler_, {.hot_reload = false})).value()) {
     }
@@ -35,6 +35,7 @@ public:
 
     rhi::PipelineHandle pipeline(shader::ProgramHandle program) const { return library_.pipeline(program); }
     shader::ShaderLibrary& library() { return library_; }
+    shader::ShaderCompiler& compiler() { return compiler_; }
 
 private:
     platform::Vfs make_vfs() const {

@@ -26,6 +26,10 @@ struct DeviceDesc {
     bool validation = DE_BUILD_DEV != 0;
     // Adds synchronization validation (missing or wrong barriers). Slow: for tests and hunting hazards.
     bool sync_validation = false;
+    // Adds GPU-assisted validation: shaders check their pointer accesses (out of bounds) and more
+    // as they run. Very slow. It doesn't check image layouts in the bindless tables: a texture
+    // sampled in the wrong state goes unreported (see render/rhi/README.md).
+    bool gpu_validation = false;
     bool vsync = true;
 };
 
@@ -34,8 +38,8 @@ struct DeviceStats {
     uint32_t live_textures = 0; // swapchain textures included
     uint32_t live_buffers = 0;
     uint32_t live_pipelines = 0;
-    uint32_t bindless_textures = 0;         // sampled texture table entries in use (the fallback included)
-    uint32_t bindless_storage_textures = 0; // storage texture table entries in use
+    uint32_t bindless_textures = 0;         // sampled texture entries in use (the fallback included)
+    uint32_t bindless_storage_textures = 0; // storage texture entries in use (one per mip, the fallback included)
     uint32_t pending_destroys = 0;          // destroyed resources waiting for the GPU to finish with them
     uint32_t swapchain_recreations = 0;
     uint32_t validation_errors = 0;
@@ -83,14 +87,14 @@ public:
     void destroy(BufferHandle buffer);
     void destroy(PipelineHandle pipeline);
 
-    // The texture's index in the bindless sampled texture table, for shaders (TextureUsage::Sampled);
-    // kInvalidBindlessIndex without that usage or for a stale handle. Sample it in ShaderRead state
-    // (DepthRead | ShaderRead for a depth buffer). The index stays the texture's until it is
-    // destroyed, and is reused only once the GPU is done with it.
+    // The texture's bindless index, for shaders (TextureUsage::Sampled): its entry in the table of
+    // its shape (BindlessTable). kInvalidBindlessIndex without that usage or for a stale handle.
+    // Sample it in ShaderRead state (DepthRead | ShaderRead for a depth buffer). The index stays
+    // the texture's until it is destroyed, and is reused only once the GPU is done with it.
     uint32_t texture_index(TextureHandle texture) const;
-    // The index in the storage texture table (TextureUsage::Storage), for mip 0 of every layer.
-    // Read and write it in ShaderWrite state.
-    uint32_t storage_texture_index(TextureHandle texture) const;
+    // The bindless index of one mip as a storage texture (TextureUsage::Storage), every layer.
+    // Read and write it in ShaderWrite state. Integer formats use the Storage2DUint table (2D only).
+    uint32_t storage_texture_index(TextureHandle texture, uint32_t mip = 0) const;
 
     // The description the texture was created with (debug_name excluded), or null if the handle is stale.
     const TextureDesc* texture_desc(TextureHandle texture) const;

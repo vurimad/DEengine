@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <iterator>
 #include <new>
 #include <utility>
 
@@ -42,28 +43,33 @@ core::Allocator& render_heap() {
     return core::heap_allocator(core::MemoryTag::Render);
 }
 
-// The bindless tables of shaders/common/bindless.slang: the only descriptor bindings a pipeline has.
+// The bindless tables of shaders/common/bindless.slang: the only descriptor bindings a pipeline
+// has. The numbers come from the RHI; the names from the Slang module (a test checks they agree).
 struct BindlessDeclaration {
     const char* name;
-    uint32_t binding;
+    rhi::BindlessTable table;
 };
 
 constexpr BindlessDeclaration kBindlessDeclarations[] = {
-    {.name = "de_textures", .binding = 0},
-    {.name = "de_texture_arrays", .binding = 1},
-    {.name = "de_cube_textures", .binding = 2},
-    {.name = "de_cube_texture_arrays", .binding = 3},
-    {.name = "de_textures_3d", .binding = 4},
-    {.name = "de_storage_textures", .binding = 5},
-    {.name = "de_storage_texture_arrays", .binding = 6},
-    {.name = "de_storage_textures_3d", .binding = 7},
-    {.name = "de_samplers", .binding = 8},
-    {.name = "de_comparison_samplers", .binding = 9},
+    {.name = "de_textures", .table = rhi::BindlessTable::Texture2D},
+    {.name = "de_texture_arrays", .table = rhi::BindlessTable::Texture2DArray},
+    {.name = "de_cube_textures", .table = rhi::BindlessTable::TextureCube},
+    {.name = "de_cube_texture_arrays", .table = rhi::BindlessTable::TextureCubeArray},
+    {.name = "de_textures_3d", .table = rhi::BindlessTable::Texture3D},
+    {.name = "de_storage_textures", .table = rhi::BindlessTable::Storage2D},
+    {.name = "de_storage_texture_arrays", .table = rhi::BindlessTable::Storage2DArray},
+    {.name = "de_storage_textures_3d", .table = rhi::BindlessTable::Storage3D},
+    {.name = "de_storage_textures_uint", .table = rhi::BindlessTable::Storage2DUint},
+    {.name = "de_samplers", .table = rhi::BindlessTable::Sampler},
+    {.name = "de_comparison_samplers", .table = rhi::BindlessTable::ComparisonSampler},
 };
+static_assert(std::size(kBindlessDeclarations) == static_cast<size_t>(rhi::BindlessTable::Count),
+              "one declaration per bindless table");
 
 bool is_bindless(const ResourceBinding& binding) {
     for (const BindlessDeclaration& declaration : kBindlessDeclarations) {
-        if (binding.set == 0 && binding.binding == declaration.binding && binding.name == declaration.name) {
+        if (binding.set == 0 && binding.binding == static_cast<uint32_t>(declaration.table) &&
+            binding.name == declaration.name) {
             return true;
         }
     }

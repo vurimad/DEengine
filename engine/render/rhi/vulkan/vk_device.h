@@ -39,19 +39,29 @@ struct VkStateInfo {
 // shader_stages applies to the shader states (ShaderRead, ShaderWrite, UniformBuffer) in state.
 VkStateInfo vk_state_info(ResourceState state, ShaderStages shader_stages);
 
+// The view type of a texture: as it is sampled (cubes as cubes), or for storage (cubes as arrays of faces).
+VkImageViewType vk_view_type(const TextureDesc& desc, bool storage);
+
 // --- Resource records behind the handles ---
+
+inline constexpr uint32_t kMaxMips = 16; // a 32768-texel texture's full chain
+
+// A texture's bindless entries and the views behind them, set up and released together
+// (DeviceImpl::register_bindless / release_bindless).
+struct TextureBindless {
+    VkImageView sampled_view = VK_NULL_HANDLE; // depth aspect only, for depth-stencil formats; else null
+    uint32_t sampled_index = kInvalidBindlessIndex;
+    uint32_t storage_mips = 0;
+    uint32_t storage_indices[kMaxMips] = {};
+    VkImageView storage_views[kMaxMips] = {}; // one mip, every layer
+};
 
 struct Texture {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;         // all mips and layers; depth and stencil aspects together
-    VkImageView sampled_view = VK_NULL_HANDLE; // depth aspect only, for depth-stencil formats; else null
-    VkImageView storage_view = VK_NULL_HANDLE; // mip 0, every layer, for storage textures; else null
     VmaAllocation allocation = VK_NULL_HANDLE; // null for swapchain images
     VkImageAspectFlags aspects = 0;
-    uint32_t sampled_index = kInvalidBindlessIndex;
-    uint32_t storage_index = kInvalidBindlessIndex;
-    uint32_t sampled_binding = 0; // the table of its shape (vk_bindless.cpp)
-    uint32_t storage_binding = 0;
+    TextureBindless bindless;
     TextureDesc desc;
     bool swapchain = false;
 };
@@ -73,31 +83,30 @@ struct Pipeline {
 struct PendingDestroy {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
-    VkImageView sampled_view = VK_NULL_HANDLE;
-    VkImageView storage_view = VK_NULL_HANDLE;
-    uint32_t sampled_index = kInvalidBindlessIndex;
-    uint32_t storage_index = kInvalidBindlessIndex;
-    uint32_t sampled_binding = 0;
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
-// Hands out entries of one bindless table. Freed entries are reused last-in first-out; a freed
-// entry is only returned once the GPU is done with its old texture (see PendingDestroy).
-class BindlessTable {
+// Hands out the entries of one kind of table (sampled or storage): an entry is the same position
+// in each table of that kind. Entry 0 is the fallback. Never-used entries go first; freed ones
+// (only once the GPU is done with their old texture) are reused oldest first, and only when no
+// fresh entry is left. A stale index so keeps reading the fallback for as long as possible.
+class BindlessSlots {
 public:
-    void init(uint32_t capacity, uint32_t reserved);
-    uint32_t allocate(); // kInvalidBindlessIndex when full
-    void release(uint32_t index);
-    uint32_t capacity() const { return capacity_; }
-    uint32_t used() const { return used_; }
+    void init(const char* name, uint32_t capacity);
+    uint32_t allocate(); // 0 when full (0 is never handed out)
+    void release(uint32_t entry);
+    uint32_t used() const { return used_; } // the fallback included
 
 private:
-    core::Array<uint32_t> free_{core::heap_allocator(core::MemoryTag::Render)};
-    uint32_t next_ = 0;
+    core::Array<uint32_t> freed_{core::heap_allocator(core::MemoryTag::Render)}; // a queue from freed_head_
+    size_t freed_head_ = 0;
+    const char* name_ = "";
+    uint32_t next_ = 1;
     uint32_t capacity_ = 0;
-    uint32_t used_ = 0;
+    uint32_t used_ = 1;
+    bool warned_ = false;
 };
 
 struct CommandListImpl {
@@ -123,6 +132,7 @@ struct FrameSlot {
     VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
     uint64_t timeline_value = 0; // the frame timeline value that marks this slot's last frame done
     core::Array<PendingDestroy> pending{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<TextureBindless> pending_bindless{core::heap_allocator(core::MemoryTag::Render)};
 };
 
 struct Swapchain {
@@ -157,12 +167,14 @@ struct DeviceImpl {
     // --- Bindless tables (vk_bindless.cpp) ---
     core::Result<void> create_bindless();
     void destroy_bindless();
-    // Gives a new texture its table entries and writes their descriptors.
+    // Gives a new texture its table entries and writes their descriptors. On failure nothing is
+    // left to release.
     core::Result<void> register_bindless(Texture& texture);
-    void write_sampled(uint32_t binding, uint32_t index, VkImageView view);
-    void write_storage(uint32_t binding, uint32_t index, VkImageView view);
-    // The 2D table, where the fallback lives and where freed 2D entries point again.
-    static constexpr uint32_t kFallbackBinding = 0;
+    // Points the entries back at the fallbacks (one batched descriptor update), frees them and
+    // destroys the views. Only once the GPU is done with the texture. At shutdown the descriptors
+    // aren't rewritten: the set is about to go.
+    void release_bindless(TextureBindless& bindless, bool rewrite_descriptors = true);
+    void write_descriptor(BindlessTable table, uint32_t entry, VkImageView view);
 
     // --- Frames (vk_device.cpp) ---
     CommandList begin_command_list(QueueType queue);
@@ -172,7 +184,7 @@ struct DeviceImpl {
     Buffer& buffer(BufferHandle handle);
     Pipeline& pipeline(PipelineHandle handle);
     void set_debug_name(VkObjectType type, uint64_t object, const char* name) const;
-    void free_pending(core::Array<PendingDestroy>& pending);
+    void free_pending(FrameSlot& slot);
     FrameSlot& current_slot() { return frames[frame_index % kFramesInFlight]; }
 
     platform::Window* window = nullptr;
@@ -199,19 +211,20 @@ struct DeviceImpl {
     // and the bindless set (set 0).
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 
-    // The bindless set (shaders/common/bindless.slang): sampled textures by shape in bindings 0-4,
-    // storage textures by shape in 5-7, samplers in 8 and comparison samplers in 9. Bound once at
-    // the start of every command list, for graphics and compute.
+    // The bindless set: one binding per BindlessTable (shaders/common/bindless.slang). Bound once
+    // at the start of every command list, for graphics and compute.
     VkDescriptorSetLayout bindless_layout = VK_NULL_HANDLE;
     VkDescriptorPool bindless_pool = VK_NULL_HANDLE;
     VkDescriptorSet bindless_set = VK_NULL_HANDLE;
-    BindlessTable sampled_table;
-    BindlessTable storage_table;
+    BindlessSlots sampled_slots;
+    BindlessSlots storage_slots;
     VkSampler samplers[static_cast<size_t>(DefaultSampler::Count)] = {};
-    // kFallbackTextureIndex: a 1x1 magenta texture, owned here rather than in `textures`.
-    VkImage fallback_image = VK_NULL_HANDLE;
-    VkImageView fallback_view = VK_NULL_HANDLE;
-    VmaAllocation fallback_allocation = VK_NULL_HANDLE;
+    // Entry 0 of every texture table, and what free entries point at: tiny textures owned here
+    // rather than in `textures`. Sampled ones are magenta; storage ones are scratch texels.
+    static constexpr uint32_t kFallbackImages = 5;
+    VkImage fallback_images[kFallbackImages] = {};
+    VmaAllocation fallback_allocations[kFallbackImages] = {};
+    VkImageView fallback_views[static_cast<size_t>(BindlessTable::Count)] = {};
 
     // Frame pacing: frame N signals value N on the graphics queue when its work completes.
     VkSemaphore frame_timeline = VK_NULL_HANDLE;

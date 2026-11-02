@@ -3,42 +3,56 @@
 #include "render/rhi/vulkan/vk_device.h"
 
 #include <algorithm>
-#include <cstring>
 
 namespace de::rhi {
 
 namespace {
 
-// Table sizes: plenty for an open world's streamed materials, far below what GPUs allow.
-constexpr uint32_t kWantedSampledTextures = 16384;
-constexpr uint32_t kWantedStorageTextures = 4096;
-constexpr uint32_t kWantedSamplers = 64;
+constexpr uint32_t kTableCount = static_cast<uint32_t>(BindlessTable::Count);
 
-// One binding per texture shape (shaders/common/bindless.slang), so a shader can only read a
-// texture as the shape it is. A texture's one index is written into its shape's binding.
-constexpr uint32_t kSampledBindings = 5; // 2D, 2D array, cube, cube array, 3D
-constexpr uint32_t kStorageBindings = 3; // 2D, 2D array, 3D
-constexpr uint32_t kStorageBindingBase = kSampledBindings;
-constexpr uint32_t kSamplerBinding = kSampledBindings + kStorageBindings;
-constexpr uint32_t kComparisonSamplerBinding = kSamplerBinding + 1;
-constexpr uint32_t kBindingCount = kComparisonSamplerBinding + 1;
-
-uint32_t sampled_binding(const TextureDesc& desc) {
-    if (desc.dimension == TextureDimension::Texture3D) {
-        return 4;
-    }
-    if (desc.dimension == TextureDimension::Cube) {
-        return desc.layer_count > 6 ? 3 : 2;
-    }
-    return desc.layer_count > 1 ? 1 : 0;
+bool is_sampled_table(BindlessTable table) {
+    return table <= BindlessTable::Texture3D;
 }
 
-// Storage views of cubes are arrays of faces.
-uint32_t storage_binding(const TextureDesc& desc) {
-    if (desc.dimension == TextureDimension::Texture3D) {
-        return kStorageBindingBase + 2;
+bool is_sampler_table(BindlessTable table) {
+    return table == BindlessTable::Sampler || table == BindlessTable::ComparisonSampler;
+}
+
+uint32_t table_capacity(BindlessTable table) {
+    if (is_sampled_table(table)) {
+        return kBindlessTextureCapacity;
     }
-    return kStorageBindingBase + (desc.layer_count > 1 ? 1 : 0);
+    return is_sampler_table(table) ? kBindlessSamplerCapacity : kBindlessStorageCapacity;
+}
+
+VkDescriptorType table_type(BindlessTable table) {
+    if (is_sampled_table(table)) {
+        return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    }
+    return is_sampler_table(table) ? VK_DESCRIPTOR_TYPE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+}
+
+// One-channel only: the integer table is RWTexture2D<uint> (create_texture refuses the others).
+bool is_integer_format(Format format) {
+    return format == Format::R32Uint;
+}
+
+BindlessTable sampled_table_for(const TextureDesc& desc) {
+    if (desc.dimension == TextureDimension::Texture3D) {
+        return BindlessTable::Texture3D;
+    }
+    if (desc.dimension == TextureDimension::Cube) {
+        return desc.layer_count > 6 ? BindlessTable::TextureCubeArray : BindlessTable::TextureCube;
+    }
+    return desc.layer_count > 1 ? BindlessTable::Texture2DArray : BindlessTable::Texture2D;
+}
+
+// Storage views of cubes are arrays of faces (vk_view_type(desc, true)).
+BindlessTable storage_table_for(const TextureDesc& desc) {
+    if (desc.dimension == TextureDimension::Texture3D) {
+        return BindlessTable::Storage3D;
+    }
+    return desc.layer_count > 1 ? BindlessTable::Storage2DArray : BindlessTable::Storage2D;
 }
 
 VkSamplerCreateInfo sampler_info(DefaultSampler sampler, float max_anisotropy) {
@@ -88,43 +102,106 @@ const char* sampler_name(DefaultSampler sampler) {
     return "sampler";
 }
 
-VkImageViewType view_type(const TextureDesc& desc, bool storage) {
-    if (desc.dimension == TextureDimension::Texture3D) {
-        return VK_IMAGE_VIEW_TYPE_3D;
-    }
-    // Storage views of cubes are plain arrays of six faces.
-    if (desc.dimension == TextureDimension::Cube && !storage) {
-        return desc.layer_count > 6 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
-    }
-    return desc.layer_count > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-}
+// The fallback images: what each table's entry 0, and every free entry, points at.
+struct FallbackImage {
+    const char* name;
+    VkFormat format;
+    VkImageType type;
+    uint32_t layers;
+    bool cube;
+    bool storage; // GENERAL layout and zeroed; otherwise sampled (read-only layout) and magenta
+};
+
+constexpr FallbackImage kFallbackImageDescs[DeviceImpl::kFallbackImages] = {
+    {.name = "fallback texture",
+     .format = VK_FORMAT_R8G8B8A8_UNORM,
+     .type = VK_IMAGE_TYPE_2D,
+     .layers = 6,
+     .cube = true,
+     .storage = false},
+    {.name = "fallback texture 3d",
+     .format = VK_FORMAT_R8G8B8A8_UNORM,
+     .type = VK_IMAGE_TYPE_3D,
+     .layers = 1,
+     .cube = false,
+     .storage = false},
+    {.name = "fallback storage",
+     .format = VK_FORMAT_R8G8B8A8_UNORM,
+     .type = VK_IMAGE_TYPE_2D,
+     .layers = 1,
+     .cube = false,
+     .storage = true},
+    {.name = "fallback storage 3d",
+     .format = VK_FORMAT_R8G8B8A8_UNORM,
+     .type = VK_IMAGE_TYPE_3D,
+     .layers = 1,
+     .cube = false,
+     .storage = true},
+    {.name = "fallback storage uint",
+     .format = VK_FORMAT_R32_UINT,
+     .type = VK_IMAGE_TYPE_2D,
+     .layers = 1,
+     .cube = false,
+     .storage = true},
+};
+
+// Which fallback image each texture table views, and how.
+struct FallbackView {
+    uint32_t image;
+    VkImageViewType type;
+    uint32_t layers;
+};
+
+constexpr FallbackView kFallbackViews[] = {
+    {.image = 0, .type = VK_IMAGE_VIEW_TYPE_2D, .layers = 1},         // Texture2D
+    {.image = 0, .type = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .layers = 1},   // Texture2DArray
+    {.image = 0, .type = VK_IMAGE_VIEW_TYPE_CUBE, .layers = 6},       // TextureCube
+    {.image = 0, .type = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY, .layers = 6}, // TextureCubeArray
+    {.image = 1, .type = VK_IMAGE_VIEW_TYPE_3D, .layers = 1},         // Texture3D
+    {.image = 2, .type = VK_IMAGE_VIEW_TYPE_2D, .layers = 1},         // Storage2D
+    {.image = 2, .type = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .layers = 1},   // Storage2DArray
+    {.image = 3, .type = VK_IMAGE_VIEW_TYPE_3D, .layers = 1},         // Storage3D
+    {.image = 4, .type = VK_IMAGE_VIEW_TYPE_2D, .layers = 1},         // Storage2DUint
+};
+static_assert(std::size(kFallbackViews) == static_cast<size_t>(BindlessTable::Sampler),
+              "one fallback view per texture table");
 
 } // namespace
 
-void BindlessTable::init(uint32_t capacity, uint32_t reserved) {
+void BindlessSlots::init(const char* name, uint32_t capacity) {
+    name_ = name;
     capacity_ = capacity;
-    next_ = reserved;
-    used_ = reserved;
-    free_.clear();
+    next_ = 1;
+    used_ = 1;
+    warned_ = false;
+    freed_.clear();
+    freed_head_ = 0;
 }
 
-uint32_t BindlessTable::allocate() {
-    if (!free_.empty()) {
-        const uint32_t index = free_.back();
-        free_.pop();
-        ++used_;
-        return index;
-    }
-    if (next_ == capacity_) {
-        return kInvalidBindlessIndex;
+uint32_t BindlessSlots::allocate() {
+    uint32_t entry = 0;
+    if (next_ < capacity_) {
+        entry = next_++;
+    } else if (freed_head_ < freed_.size()) {
+        entry = freed_[freed_head_++];
+        if (freed_head_ == freed_.size()) {
+            freed_.clear(); // drained: start the queue over, keeping its memory
+            freed_head_ = 0;
+        }
+    } else {
+        return 0;
     }
     ++used_;
-    return next_++;
+    if (!warned_ && uint64_t{used_} * 5 >= uint64_t{capacity_} * 4) {
+        warned_ = true;
+        DE_LOG_WARN("render", "bindless %s tables are 80%% full: %u of %u entries in use", name_, used_, capacity_);
+    }
+    return entry;
 }
 
-void BindlessTable::release(uint32_t index) {
-    DE_ASSERT(index < next_ && used_ > 0);
-    free_.push(index);
+void BindlessSlots::release(uint32_t entry) {
+    DE_ASSERT(entry > 0 && entry < next_ && used_ > 1);
+    freed_.push(entry);
     --used_;
 }
 
@@ -134,57 +211,45 @@ core::Result<void> DeviceImpl::create_bindless() {
     VkPhysicalDeviceProperties2 props{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &props12};
     vkGetPhysicalDeviceProperties2(physical_device, &props);
 
-    // Each binding counts against the GPU's limits for its descriptor type, per set and per stage.
-    const auto fit = [](uint32_t wanted, uint32_t bindings, uint32_t set_limit, uint32_t stage_limit) {
-        return std::min({wanted, set_limit / bindings, stage_limit / bindings});
-    };
-    const uint32_t samplers_count = fit(kWantedSamplers, 2, props12.maxDescriptorSetUpdateAfterBindSamplers,
-                                        props12.maxPerStageDescriptorUpdateAfterBindSamplers);
-    const uint32_t storage_count =
-        fit(kWantedStorageTextures, kStorageBindings, props12.maxDescriptorSetUpdateAfterBindStorageImages,
-            props12.maxPerStageDescriptorUpdateAfterBindStorageImages);
-    uint32_t sampled_count =
-        fit(kWantedSampledTextures, kSampledBindings, props12.maxDescriptorSetUpdateAfterBindSampledImages,
-            props12.maxPerStageDescriptorUpdateAfterBindSampledImages);
-    // Every stage sees the whole set, and some GPUs cap the total per stage.
-    const uint64_t others = (uint64_t{2} * samplers_count) + (uint64_t{kStorageBindings} * storage_count);
-    const uint64_t per_stage = props12.maxPerStageUpdateAfterBindResources;
-    if (per_stage < others + (uint64_t{kSampledBindings} * sampled_count)) {
-        sampled_count = per_stage > others ? static_cast<uint32_t>((per_stage - others) / kSampledBindings) : 0;
-    }
-    if (sampled_count < 1024 || storage_count < 64 || samplers_count < static_cast<uint32_t>(DefaultSampler::Count)) {
+    // Fixed sizes, far below the spec's minimums for descriptor indexing; checked anyway.
+    constexpr uint32_t kSampled = 5 * kBindlessTextureCapacity;
+    constexpr uint32_t kStorage = 4 * kBindlessStorageCapacity;
+    constexpr uint32_t kSamplers = 2 * kBindlessSamplerCapacity;
+    if (props12.maxDescriptorSetUpdateAfterBindSampledImages < kSampled ||
+        props12.maxPerStageDescriptorUpdateAfterBindSampledImages < kSampled ||
+        props12.maxDescriptorSetUpdateAfterBindStorageImages < kStorage ||
+        props12.maxPerStageDescriptorUpdateAfterBindStorageImages < kStorage ||
+        props12.maxDescriptorSetUpdateAfterBindSamplers < kSamplers ||
+        props12.maxPerStageDescriptorUpdateAfterBindSamplers < kSamplers ||
+        props12.maxPerStageUpdateAfterBindResources < kSampled + kStorage + kSamplers) {
+        DE_LOG_ERROR("render", "the GPU's bindless limits are below %u sampled, %u storage textures and %u samplers",
+                     kSampled, kStorage, kSamplers);
         return core::fail(core::ErrorCode::Unsupported, "the GPU's bindless tables are too small");
     }
 
     const VkDescriptorBindingFlags flags = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
                                            VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
                                            VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
-    VkDescriptorBindingFlags binding_flags[kBindingCount];
-    VkDescriptorSetLayoutBinding bindings[kBindingCount];
-    for (uint32_t i = 0; i < kBindingCount; ++i) {
+    VkDescriptorBindingFlags binding_flags[kTableCount];
+    VkDescriptorSetLayoutBinding bindings[kTableCount];
+    for (uint32_t i = 0; i < kTableCount; ++i) {
+        const auto table = static_cast<BindlessTable>(i);
         binding_flags[i] = flags;
-        VkDescriptorType type = VK_DESCRIPTOR_TYPE_SAMPLER;
-        uint32_t count = samplers_count;
-        if (i < kSampledBindings) {
-            type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            count = sampled_count;
-        } else if (i < kSamplerBinding) {
-            type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            count = storage_count;
-        }
-        bindings[i] = {
-            .binding = i, .descriptorType = type, .descriptorCount = count, .stageFlags = VK_SHADER_STAGE_ALL};
+        bindings[i] = {.binding = i,
+                       .descriptorType = table_type(table),
+                       .descriptorCount = table_capacity(table),
+                       .stageFlags = VK_SHADER_STAGE_ALL};
     }
     const VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
-        .bindingCount = kBindingCount,
+        .bindingCount = kTableCount,
         .pBindingFlags = binding_flags,
     };
     const VkDescriptorSetLayoutCreateInfo layout_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = &flags_info,
         .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT,
-        .bindingCount = kBindingCount,
+        .bindingCount = kTableCount,
         .pBindings = bindings,
     };
     DE_VK_CHECK(vkCreateDescriptorSetLayout(device, &layout_info, nullptr, &bindless_layout));
@@ -192,9 +257,9 @@ core::Result<void> DeviceImpl::create_bindless() {
                    "bindless layout");
 
     const VkDescriptorPoolSize pool_sizes[] = {
-        {.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = kSampledBindings * sampled_count},
-        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = kStorageBindings * storage_count},
-        {.type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = 2 * samplers_count},
+        {.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, .descriptorCount = kSampled},
+        {.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, .descriptorCount = kStorage},
+        {.type = VK_DESCRIPTOR_TYPE_SAMPLER, .descriptorCount = kSamplers},
     };
     const VkDescriptorPoolCreateInfo pool_info{
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -213,72 +278,41 @@ core::Result<void> DeviceImpl::create_bindless() {
     DE_VK_CHECK(vkAllocateDescriptorSets(device, &set_info, &bindless_set));
     set_debug_name(VK_OBJECT_TYPE_DESCRIPTOR_SET, reinterpret_cast<uint64_t>(bindless_set), "bindless set");
 
-    // The default samplers, at their DefaultSampler values.
-    for (uint32_t i = 0; i < static_cast<uint32_t>(DefaultSampler::Count); ++i) {
-        const VkSamplerCreateInfo info = sampler_info(static_cast<DefaultSampler>(i), capabilities.max_anisotropy);
-        DE_VK_CHECK(vkCreateSampler(device, &info, nullptr, &samplers[i]));
-        set_debug_name(VK_OBJECT_TYPE_SAMPLER, reinterpret_cast<uint64_t>(samplers[i]),
-                       sampler_name(static_cast<DefaultSampler>(i)));
-        // In both sampler tables at the same index; only ShadowCompare is meant for comparisons.
-        const VkDescriptorImageInfo image{.sampler = samplers[i]};
-        for (const uint32_t binding : {kSamplerBinding, kComparisonSamplerBinding}) {
-            const VkWriteDescriptorSet write{
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .dstSet = bindless_set,
-                .dstBinding = binding,
-                .dstArrayElement = i,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER,
-                .pImageInfo = &image,
-            };
-            vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
-        }
+    // --- The fallbacks: created, cleared on the GPU and left in the layout their tables expect ---
+    for (uint32_t i = 0; i < kFallbackImages; ++i) {
+        const FallbackImage& fallback = kFallbackImageDescs[i];
+        const VkImageCreateInfo image_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .flags = fallback.cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0U,
+            .imageType = fallback.type,
+            .format = fallback.format,
+            .extent = {.width = 1, .height = 1, .depth = 1},
+            .mipLevels = 1,
+            .arrayLayers = fallback.layers,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = (fallback.storage ? static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_STORAGE_BIT)
+                                       : static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_SAMPLED_BIT)) |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        const VmaAllocationCreateInfo allocation{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        DE_VK_CHECK(vmaCreateImage(allocator, &image_info, &allocation, &fallback_images[i], &fallback_allocations[i],
+                                   nullptr));
+        set_debug_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(fallback_images[i]), fallback.name);
     }
-
-    // The fallback texture: 1x1 magenta, uploaded once and left in the read-only layout.
-    const VkImageCreateInfo image_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .extent = {.width = 1, .height = 1, .depth = 1},
-        .mipLevels = 1,
-        .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT,
-        .tiling = VK_IMAGE_TILING_OPTIMAL,
-        .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-    };
-    const VmaAllocationCreateInfo image_allocation{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
-    DE_VK_CHECK(
-        vmaCreateImage(allocator, &image_info, &image_allocation, &fallback_image, &fallback_allocation, nullptr));
-    const VkImageViewCreateInfo view_info{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-        .image = fallback_image,
-        .viewType = VK_IMAGE_VIEW_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_UNORM,
-        .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1},
-    };
-    DE_VK_CHECK(vkCreateImageView(device, &view_info, nullptr, &fallback_view));
-    set_debug_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(fallback_image), "fallback texture");
-
-    const VkBufferCreateInfo staging_info{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = 4,
-        .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-    };
-    const VmaAllocationCreateInfo staging_allocation{
-        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
-        .usage = VMA_MEMORY_USAGE_AUTO,
-    };
-    VkBuffer staging = VK_NULL_HANDLE;
-    VmaAllocation staging_memory = VK_NULL_HANDLE;
-    VmaAllocationInfo staging_mapped{};
-    DE_VK_CHECK(
-        vmaCreateBuffer(allocator, &staging_info, &staging_allocation, &staging, &staging_memory, &staging_mapped));
-    const uint8_t magenta[4] = {255, 0, 255, 255};
-    std::memcpy(staging_mapped.pMappedData, magenta, sizeof(magenta));
-    DE_VK_CHECK(vmaFlushAllocation(allocator, staging_memory, 0, VK_WHOLE_SIZE));
+    for (uint32_t table = 0; table < std::size(kFallbackViews); ++table) {
+        const FallbackView& view = kFallbackViews[table];
+        const VkImageViewCreateInfo view_info{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image = fallback_images[view.image],
+            .viewType = view.type,
+            .format = kFallbackImageDescs[view.image].format,
+            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = view.layers},
+        };
+        DE_VK_CHECK(vkCreateImageView(device, &view_info, nullptr, &fallback_views[table]));
+    }
 
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     const VkCommandBufferAllocateInfo cmd_info{
@@ -293,47 +327,48 @@ core::Result<void> DeviceImpl::create_bindless() {
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
     };
     DE_VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
-    const VkImageSubresourceRange range{.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .levelCount = 1, .layerCount = 1};
-    const VkImageMemoryBarrier2 to_copy{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-        .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
-        .srcAccessMask = VK_ACCESS_2_NONE,
-        .dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
-        .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = fallback_image,
-        .subresourceRange = range,
-    };
-    const VkDependencyInfo to_copy_dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_copy};
-    vkCmdPipelineBarrier2(cmd, &to_copy_dependency);
-    const VkBufferImageCopy2 region{
-        .sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
-        .imageSubresource = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .layerCount = 1},
-        .imageExtent = {.width = 1, .height = 1, .depth = 1},
-    };
-    const VkCopyBufferToImageInfo2 copy{
-        .sType = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
-        .srcBuffer = staging,
-        .dstImage = fallback_image,
-        .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        .regionCount = 1,
-        .pRegions = &region,
-    };
-    vkCmdCopyBufferToImage2(cmd, &copy);
-    VkImageMemoryBarrier2 to_read = to_copy;
-    to_read.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
-    to_read.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-    to_read.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
-    to_read.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    to_read.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_read.newLayout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
-    const VkDependencyInfo to_read_dependency{
-        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read};
-    vkCmdPipelineBarrier2(cmd, &to_read_dependency);
+    VkImageMemoryBarrier2 barriers[kFallbackImages];
+    for (uint32_t i = 0; i < kFallbackImages; ++i) {
+        barriers[i] = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+            .srcStageMask = VK_PIPELINE_STAGE_2_NONE,
+            .srcAccessMask = VK_ACCESS_2_NONE,
+            .dstStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+            .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = fallback_images[i],
+            .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .levelCount = 1,
+                                 .layerCount = kFallbackImageDescs[i].layers},
+        };
+    }
+    const VkDependencyInfo to_clear{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                    .imageMemoryBarrierCount = kFallbackImages,
+                                    .pImageMemoryBarriers = barriers};
+    vkCmdPipelineBarrier2(cmd, &to_clear);
+    for (uint32_t i = 0; i < kFallbackImages; ++i) {
+        const VkClearColorValue magenta{.float32 = {1.0f, 0.0f, 1.0f, 1.0f}};
+        const VkClearColorValue zero{.uint32 = {0, 0, 0, 0}};
+        const VkImageSubresourceRange range = barriers[i].subresourceRange;
+        vkCmdClearColorImage(cmd, fallback_images[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             kFallbackImageDescs[i].storage ? &zero : &magenta, 1, &range);
+        barriers[i].srcStageMask = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+        barriers[i].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        barriers[i].dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barriers[i].dstAccessMask = kFallbackImageDescs[i].storage
+                                        ? VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                                        : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barriers[i].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[i].newLayout =
+            kFallbackImageDescs[i].storage ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL;
+    }
+    const VkDependencyInfo to_use{.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+                                  .imageMemoryBarrierCount = kFallbackImages,
+                                  .pImageMemoryBarriers = barriers};
+    vkCmdPipelineBarrier2(cmd, &to_use);
     DE_VK_CHECK(vkEndCommandBuffer(cmd));
     const VkCommandBufferSubmitInfo cmd_submit{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
                                                .commandBuffer = cmd};
@@ -343,14 +378,49 @@ core::Result<void> DeviceImpl::create_bindless() {
     DE_VK_CHECK(vkQueueSubmit2(queue, 1, &submit, VK_NULL_HANDLE));
     DE_VK_CHECK(vkQueueWaitIdle(queue)); // once, at startup
     vkFreeCommandBuffers(device, frames[0].command_pool, 1, &cmd);
-    vmaDestroyBuffer(allocator, staging, staging_memory);
 
-    sampled_table.init(sampled_count, 1);
-    storage_table.init(storage_count, 0);
-    write_sampled(kFallbackBinding, kFallbackTextureIndex, fallback_view);
+    // --- Every entry of every table starts valid: the fallback, or a default sampler ---
+    for (uint32_t i = 0; i < static_cast<uint32_t>(DefaultSampler::Count); ++i) {
+        const VkSamplerCreateInfo info = sampler_info(static_cast<DefaultSampler>(i), capabilities.max_anisotropy);
+        DE_VK_CHECK(vkCreateSampler(device, &info, nullptr, &samplers[i]));
+        set_debug_name(VK_OBJECT_TYPE_SAMPLER, reinterpret_cast<uint64_t>(samplers[i]),
+                       sampler_name(static_cast<DefaultSampler>(i)));
+    }
+    core::Array<VkDescriptorImageInfo> infos(core::heap_allocator(core::MemoryTag::Render));
+    for (uint32_t i = 0; i < kTableCount; ++i) {
+        const auto table = static_cast<BindlessTable>(i);
+        infos.clear();
+        infos.resize(table_capacity(table));
+        for (uint32_t entry = 0; entry < infos.size(); ++entry) {
+            if (is_sampler_table(table)) {
+                // Entries past the defaults repeat a sampler that suits the table (a comparing one
+                // for the comparison table), so even a wrong index samples sensibly.
+                const auto padding = table == BindlessTable::ComparisonSampler ? DefaultSampler::ShadowCompare
+                                                                               : DefaultSampler::LinearWrap;
+                const uint32_t sampler =
+                    entry < static_cast<uint32_t>(DefaultSampler::Count) ? entry : static_cast<uint32_t>(padding);
+                infos[entry] = {.sampler = samplers[sampler]};
+            } else {
+                infos[entry] = {.imageView = fallback_views[i],
+                                .imageLayout = is_sampled_table(table) ? VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL
+                                                                       : VK_IMAGE_LAYOUT_GENERAL};
+            }
+        }
+        const VkWriteDescriptorSet write{
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = bindless_set,
+            .dstBinding = i,
+            .descriptorCount = static_cast<uint32_t>(infos.size()),
+            .descriptorType = table_type(table),
+            .pImageInfo = infos.data(),
+        };
+        vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    }
 
-    DE_LOG_INFO("render", "bindless tables: %u sampled and %u storage textures per shape, %u samplers", sampled_count,
-                storage_count, samplers_count);
+    sampled_slots.init("sampled texture", kBindlessTextureCapacity);
+    storage_slots.init("storage texture", kBindlessStorageCapacity);
+    DE_LOG_INFO("render", "bindless tables: %u sampled and %u storage textures per table, %u samplers",
+                kBindlessTextureCapacity, kBindlessStorageCapacity, kBindlessSamplerCapacity);
     return {};
 }
 
@@ -359,14 +429,16 @@ void DeviceImpl::destroy_bindless() {
         vkDestroySampler(device, sampler, nullptr);
         sampler = VK_NULL_HANDLE;
     }
-    if (fallback_view != VK_NULL_HANDLE) {
-        vkDestroyImageView(device, fallback_view, nullptr);
-        fallback_view = VK_NULL_HANDLE;
+    for (VkImageView& view : fallback_views) {
+        vkDestroyImageView(device, view, nullptr);
+        view = VK_NULL_HANDLE;
     }
-    if (fallback_image != VK_NULL_HANDLE) {
-        vmaDestroyImage(allocator, fallback_image, fallback_allocation);
-        fallback_image = VK_NULL_HANDLE;
-        fallback_allocation = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < kFallbackImages; ++i) {
+        if (fallback_images[i] != VK_NULL_HANDLE) {
+            vmaDestroyImage(allocator, fallback_images[i], fallback_allocations[i]);
+            fallback_images[i] = VK_NULL_HANDLE;
+            fallback_allocations[i] = VK_NULL_HANDLE;
+        }
     }
     vkDestroyDescriptorPool(device, bindless_pool, nullptr); // frees the set
     bindless_pool = VK_NULL_HANDLE;
@@ -377,72 +449,111 @@ void DeviceImpl::destroy_bindless() {
 
 core::Result<void> DeviceImpl::register_bindless(Texture& texture) {
     const TextureDesc& desc = texture.desc;
+    TextureBindless& bindless = texture.bindless;
+    const bool integer = is_integer_format(desc.format);
     if (core::has_any(desc.usage, TextureUsage::Sampled)) {
-        texture.sampled_index = sampled_table.allocate();
-        if (texture.sampled_index == kInvalidBindlessIndex) {
-            return core::fail(core::ErrorCode::OutOfMemory, "the bindless sampled texture table is full");
+        const uint32_t entry = sampled_slots.allocate();
+        if (entry == 0) {
+            return core::fail(core::ErrorCode::OutOfMemory, "the bindless sampled texture tables are full");
         }
+        const BindlessTable table = sampled_table_for(desc);
+        bindless.sampled_index = make_bindless_index(table, entry);
         // Shaders sample one aspect: the depth of a depth-stencil texture.
         if ((texture.aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
             const VkImageViewCreateInfo info{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
                 .image = texture.image,
-                .viewType = view_type(desc, false),
+                .viewType = vk_view_type(desc, false),
                 .format = to_vk_format(desc.format),
                 .subresourceRange = {.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
                                      .levelCount = VK_REMAINING_MIP_LEVELS,
                                      .layerCount = VK_REMAINING_ARRAY_LAYERS},
             };
-            DE_VK_CHECK(vkCreateImageView(device, &info, nullptr, &texture.sampled_view));
+            DE_VK_CHECK(vkCreateImageView(device, &info, nullptr, &bindless.sampled_view));
         }
-        texture.sampled_binding = sampled_binding(desc);
-        write_sampled(texture.sampled_binding, texture.sampled_index,
-                      texture.sampled_view != VK_NULL_HANDLE ? texture.sampled_view : texture.view);
+        write_descriptor(table, entry, bindless.sampled_view != VK_NULL_HANDLE ? bindless.sampled_view : texture.view);
     }
+
     if (core::has_any(desc.usage, TextureUsage::Storage)) {
-        texture.storage_index = storage_table.allocate();
-        if (texture.storage_index == kInvalidBindlessIndex) {
-            return core::fail(core::ErrorCode::OutOfMemory, "the bindless storage texture table is full");
+        const BindlessTable table = integer ? BindlessTable::Storage2DUint : storage_table_for(desc);
+        for (uint32_t mip = 0; mip < desc.mip_count; ++mip) {
+            const uint32_t entry = storage_slots.allocate();
+            if (entry == 0) {
+                release_bindless(bindless);
+                return core::fail(core::ErrorCode::OutOfMemory, "the bindless storage texture tables are full");
+            }
+            const VkImageViewCreateInfo info{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = texture.image,
+                .viewType = vk_view_type(desc, true),
+                .format = to_vk_format(desc.format),
+                .subresourceRange = {.aspectMask = texture.aspects,
+                                     .baseMipLevel = mip,
+                                     .levelCount = 1,
+                                     .layerCount = VK_REMAINING_ARRAY_LAYERS},
+            };
+            DE_VK_CHECK(vkCreateImageView(device, &info, nullptr, &bindless.storage_views[mip]));
+            bindless.storage_indices[mip] = make_bindless_index(table, entry);
+            ++bindless.storage_mips;
+            write_descriptor(table, entry, bindless.storage_views[mip]);
         }
-        const VkImageViewCreateInfo info{
-            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-            .image = texture.image,
-            .viewType = view_type(desc, true),
-            .format = to_vk_format(desc.format),
-            .subresourceRange = {.aspectMask = texture.aspects,
-                                 .levelCount = 1,
-                                 .layerCount = VK_REMAINING_ARRAY_LAYERS},
-        };
-        DE_VK_CHECK(vkCreateImageView(device, &info, nullptr, &texture.storage_view));
-        texture.storage_binding = storage_binding(desc);
-        write_storage(texture.storage_binding, texture.storage_index, texture.storage_view);
     }
     return {};
 }
 
-void DeviceImpl::write_sampled(uint32_t binding, uint32_t index, VkImageView view) {
-    const VkDescriptorImageInfo image{.imageView = view, .imageLayout = VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL};
-    const VkWriteDescriptorSet write{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet = bindless_set,
-        .dstBinding = binding,
-        .dstArrayElement = index,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
-        .pImageInfo = &image,
+void DeviceImpl::release_bindless(TextureBindless& bindless, bool rewrite_descriptors) {
+    // Every entry back to its table's fallback, in one descriptor update.
+    VkDescriptorImageInfo images[kMaxMips + 1];
+    VkWriteDescriptorSet writes[kMaxMips + 1];
+    uint32_t write_count = 0;
+    const auto release = [&](uint32_t index, BindlessSlots& slots) {
+        const BindlessTable table = bindless_table(index);
+        const uint32_t entry = bindless_entry(index);
+        images[write_count] = {
+            .imageView = fallback_views[static_cast<size_t>(table)],
+            .imageLayout = is_sampled_table(table) ? VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+        };
+        writes[write_count] = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = bindless_set,
+            .dstBinding = static_cast<uint32_t>(table),
+            .dstArrayElement = entry,
+            .descriptorCount = 1,
+            .descriptorType = table_type(table),
+            .pImageInfo = &images[write_count],
+        };
+        ++write_count;
+        slots.release(entry);
     };
-    vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+    if (bindless.sampled_index != kInvalidBindlessIndex) {
+        release(bindless.sampled_index, sampled_slots);
+    }
+    for (uint32_t mip = 0; mip < bindless.storage_mips; ++mip) {
+        release(bindless.storage_indices[mip], storage_slots);
+    }
+    if (rewrite_descriptors && write_count > 0) {
+        vkUpdateDescriptorSets(device, write_count, writes, 0, nullptr);
+    }
+    vkDestroyImageView(device, bindless.sampled_view, nullptr);
+    for (uint32_t mip = 0; mip < bindless.storage_mips; ++mip) {
+        vkDestroyImageView(device, bindless.storage_views[mip], nullptr);
+    }
+    bindless = TextureBindless{};
 }
 
-void DeviceImpl::write_storage(uint32_t binding, uint32_t index, VkImageView view) {
-    const VkDescriptorImageInfo image{.imageView = view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+void DeviceImpl::write_descriptor(BindlessTable table, uint32_t entry, VkImageView view) {
+    DE_ASSERT(!is_sampler_table(table) && entry < table_capacity(table));
+    const VkDescriptorImageInfo image{
+        .imageView = view,
+        .imageLayout = is_sampled_table(table) ? VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+    };
     const VkWriteDescriptorSet write{
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = bindless_set,
-        .dstBinding = binding,
-        .dstArrayElement = index,
+        .dstBinding = static_cast<uint32_t>(table),
+        .dstArrayElement = entry,
         .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        .descriptorType = table_type(table),
         .pImageInfo = &image,
     };
     vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
@@ -450,12 +561,15 @@ void DeviceImpl::write_storage(uint32_t binding, uint32_t index, VkImageView vie
 
 uint32_t Device::texture_index(TextureHandle handle) const {
     const Texture* texture = impl_->textures.get(handle);
-    return texture != nullptr ? texture->sampled_index : kInvalidBindlessIndex;
+    return texture != nullptr ? texture->bindless.sampled_index : kInvalidBindlessIndex;
 }
 
-uint32_t Device::storage_texture_index(TextureHandle handle) const {
+uint32_t Device::storage_texture_index(TextureHandle handle, uint32_t mip) const {
     const Texture* texture = impl_->textures.get(handle);
-    return texture != nullptr ? texture->storage_index : kInvalidBindlessIndex;
+    if (texture == nullptr || mip >= texture->bindless.storage_mips) {
+        return kInvalidBindlessIndex;
+    }
+    return texture->bindless.storage_indices[mip];
 }
 
 } // namespace de::rhi
