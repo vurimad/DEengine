@@ -175,7 +175,8 @@ void destroy_impl(DeviceImpl* impl) {
 } // namespace
 
 DeviceImpl::DeviceImpl()
-    : textures(core::heap_allocator(core::MemoryTag::Render)), buffers(core::heap_allocator(core::MemoryTag::Render)) {}
+    : textures(core::heap_allocator(core::MemoryTag::Render)), buffers(core::heap_allocator(core::MemoryTag::Render)),
+      pipelines(core::heap_allocator(core::MemoryTag::Render)) {}
 
 core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
     DE_PROFILE_ZONE("rhi create device");
@@ -378,6 +379,22 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
     DE_VK_CHECK(vmaCreateAllocator(&allocator_info, &allocator));
 
     fill_capabilities(*this, ray_query);
+    if (capabilities.max_push_constant_bytes < kMaxPushConstantBytes) {
+        return core::fail(core::ErrorCode::Unsupported, "the GPU has fewer push constant bytes than the engine needs");
+    }
+
+    const VkPushConstantRange push_constants{
+        .stageFlags = VK_SHADER_STAGE_ALL,
+        .offset = 0,
+        .size = kMaxPushConstantBytes,
+    };
+    const VkPipelineLayoutCreateInfo layout_info{
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_constants,
+    };
+    DE_VK_CHECK(vkCreatePipelineLayout(device, &layout_info, nullptr, &pipeline_layout));
+    set_debug_name(VK_OBJECT_TYPE_PIPELINE_LAYOUT, reinterpret_cast<uint64_t>(pipeline_layout), "global layout");
 
     // --- Frame pacing ---
     VkSemaphoreTypeCreateInfo timeline_type{
@@ -427,10 +444,16 @@ void DeviceImpl::shutdown() {
         for (FrameSlot& slot : frames) {
             free_pending(slot.pending);
         }
-        if (!textures.empty() || !buffers.empty()) {
-            DE_LOG_WARN("render", "%zu textures and %zu buffers still alive at device shutdown", textures.size(),
-                        buffers.size());
+        if (!textures.empty() || !buffers.empty() || !pipelines.empty()) {
+            DE_LOG_WARN("render", "%zu textures, %zu buffers and %zu pipelines still alive at device shutdown",
+                        textures.size(), buffers.size(), pipelines.size());
         }
+        for (const Pipeline& pipeline : pipelines) {
+            vkDestroyPipeline(device, pipeline.pipeline, nullptr);
+        }
+        pipelines.clear();
+        vkDestroyPipelineLayout(device, pipeline_layout, nullptr);
+        pipeline_layout = VK_NULL_HANDLE;
         for (const Texture& texture : textures) {
             vkDestroyImageView(device, texture.view, nullptr);
             vmaDestroyImage(allocator, texture.image, texture.allocation);
@@ -478,6 +501,12 @@ Texture& DeviceImpl::texture(TextureHandle handle) {
     return *texture;
 }
 
+Pipeline& DeviceImpl::pipeline(PipelineHandle handle) {
+    Pipeline* pipeline = pipelines.get(handle);
+    DE_VERIFY_MSG(pipeline != nullptr, "stale or invalid PipelineHandle");
+    return *pipeline;
+}
+
 Buffer& DeviceImpl::buffer(BufferHandle handle) {
     Buffer* buffer = buffers.get(handle);
     DE_VERIFY_MSG(buffer != nullptr, "stale or invalid BufferHandle");
@@ -507,6 +536,9 @@ void DeviceImpl::free_pending(core::Array<PendingDestroy>& pending) {
         }
         if (entry.buffer != VK_NULL_HANDLE) {
             vmaDestroyBuffer(allocator, entry.buffer, entry.allocation);
+        }
+        if (entry.pipeline != VK_NULL_HANDLE) {
+            vkDestroyPipeline(device, entry.pipeline, nullptr);
         }
     }
     pending.clear();
@@ -595,6 +627,7 @@ DeviceStats Device::stats() const {
         .frame_index = impl_->frame_index,
         .live_textures = static_cast<uint32_t>(impl_->textures.size()),
         .live_buffers = static_cast<uint32_t>(impl_->buffers.size()),
+        .live_pipelines = static_cast<uint32_t>(impl_->pipelines.size()),
         .swapchain_recreations = impl_->swapchain_recreations,
         .validation_errors = impl_->validation_errors.load(std::memory_order_relaxed),
         .validation_warnings = impl_->validation_warnings.load(std::memory_order_relaxed),
@@ -767,6 +800,13 @@ core::Result<BufferHandle> Device::create_buffer(const BufferDesc& desc) {
         return core::fail(core::ErrorCode::OutOfMemory, "GPU memory for the buffer could not be allocated");
     }
     buffer.mapped = static_cast<std::byte*>(allocated.pMappedData);
+    if ((usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+        const VkBufferDeviceAddressInfo address_info{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+            .buffer = buffer.buffer,
+        };
+        buffer.address = vkGetBufferDeviceAddress(impl_->device, &address_info);
+    }
     impl_->set_debug_name(VK_OBJECT_TYPE_BUFFER, reinterpret_cast<uint64_t>(buffer.buffer), desc.debug_name);
     if (desc.debug_name != nullptr) {
         vmaSetAllocationName(impl_->allocator, buffer.allocation, desc.debug_name);
@@ -797,6 +837,15 @@ void Device::destroy(BufferHandle handle) {
     impl_->buffers.remove(handle);
 }
 
+void Device::destroy(PipelineHandle handle) {
+    const Pipeline* pipeline = impl_->pipelines.get(handle);
+    if (pipeline == nullptr) {
+        return;
+    }
+    impl_->current_slot().pending.push(PendingDestroy{.pipeline = pipeline->pipeline});
+    impl_->pipelines.remove(handle);
+}
+
 const TextureDesc* Device::texture_desc(TextureHandle handle) const {
     const Texture* texture = impl_->textures.get(handle);
     return texture != nullptr ? &texture->desc : nullptr;
@@ -805,6 +854,12 @@ const TextureDesc* Device::texture_desc(TextureHandle handle) const {
 const BufferDesc* Device::buffer_desc(BufferHandle handle) const {
     const Buffer* buffer = impl_->buffers.get(handle);
     return buffer != nullptr ? &buffer->desc : nullptr;
+}
+
+uint64_t Device::buffer_address(BufferHandle handle) const {
+    const Buffer& buffer = impl_->buffer(handle);
+    DE_ASSERT_MSG(buffer.address != 0, "the buffer has no shader-visible usage, so no device address");
+    return buffer.address;
 }
 
 std::span<std::byte> Device::mapped(BufferHandle handle) {

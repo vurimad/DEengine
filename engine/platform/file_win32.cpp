@@ -201,6 +201,27 @@ bool path_exists(const char* path) {
     return to_wide(path, wide) && GetFileAttributesW(wide.text) != INVALID_FILE_ATTRIBUTES;
 }
 
+core::Result<FileInfo> file_info(const char* path) {
+    WidePath wide;
+    if (!to_wide(path, wide)) {
+        return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data = {};
+    if (GetFileAttributesExW(wide.text, GetFileExInfoStandard, &data) == 0) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            return fail(ErrorCode::NotFound, "no file at this path");
+        }
+        return fail(ErrorCode::IoError, "file attributes could not be read");
+    }
+    return FileInfo{
+        .size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32U) | data.nFileSizeLow,
+        .modified_time =
+            (static_cast<uint64_t>(data.ftLastWriteTime.dwHighDateTime) << 32U) | data.ftLastWriteTime.dwLowDateTime,
+        .is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0,
+    };
+}
+
 core::Result<void> create_directories(const char* path) {
     WidePath wide;
     if (!to_wide(path, wide)) {

@@ -34,7 +34,8 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 - Input: game code reads actions (`Input::state(action)`), never device codes; bindings are text.
 - Profiling: put `DE_PROFILE_ZONE("name")` at the top of every system's per-frame entry point. Tracy viewer 0.14.1 must match the client in vcpkg.
 - Threads: parallel work goes through `JobSystem` (`submit` + `JobCounter`, or `parallel_for`); don't create threads for work.
-- Files: only through `platform::Vfs` with `game:/`, `user:/`, `temp:/` paths (lowercase, forward slashes). No `fopen`, `std::filesystem` or OS file calls outside `engine/platform/`.
+- Shaders: Slang in `shaders/` (module `common.color` is `shaders/common/color.slang`). One `[[vk::push_constant]]` block of at most 128 bytes, no descriptor slots (buffers by pointer, textures by bindless index), clip space +Y up with reverse Z. See `shaders/README.md`.
+- Files: only through `platform::Vfs` with `game:/`, `user:/`, `temp:/`, `src:/` paths (lowercase, forward slashes). No `fopen`, `std::filesystem` or OS file calls outside `engine/platform/`.
 
 ## Git
 

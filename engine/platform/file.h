@@ -52,6 +52,15 @@ core::Result<void> write_file_atomic(const char* path, std::span<const std::byte
 
 bool path_exists(const char* path);
 
+struct FileInfo {
+    uint64_t size = 0;
+    uint64_t modified_time = 0; // OS file clock: compare two values, don't read meaning into one
+    bool is_directory = false;
+};
+
+// Size and last write time of a file or folder. NotFound if nothing is there.
+core::Result<FileInfo> file_info(const char* path);
+
 // Creates path and any missing parents. Succeeds if it already exists.
 core::Result<void> create_directories(const char* path);
 

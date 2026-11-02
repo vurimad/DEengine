@@ -4,6 +4,7 @@
 #include "platform/file.h"
 #include "platform/time.h"
 #include "platform/vfs.h"
+#include "support/sandbox.h"
 
 #include <doctest/doctest.h>
 
@@ -26,75 +27,14 @@ using de::platform::ReadRequest;
 using de::platform::ReadStatus;
 using de::platform::Vfs;
 using de::platform::VfsDesc;
+using de::test::bytes_of;
+using de::test::Sandbox;
 
 namespace {
-
-std::span<const std::byte> bytes_of(std::string_view text) {
-    return std::as_bytes(std::span<const char>(text.data(), text.size()));
-}
 
 std::string_view text_of(std::span<const std::byte> bytes) {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
-
-// A scratch folder per test: game/, user/ and temp/ roots under the OS temp folder, deleted at the end.
-class Sandbox {
-public:
-    Sandbox() {
-        static std::atomic<int> counter{0};
-        root_ = *de::platform::system_temp_folder();
-        REQUIRE(root_.append("/deengine_tests/"));
-        char id[32];
-        const unsigned long long stamp =
-            de::platform::time_ns() + static_cast<unsigned long long>(counter.fetch_add(1));
-        size_t length = 0;
-        for (unsigned long long value = stamp; value != 0 || length == 0; value /= 10) {
-            id[length++] = static_cast<char>('0' + value % 10);
-        }
-        while (length > 0) {
-            REQUIRE(root_.append(id[--length]));
-        }
-        REQUIRE(de::platform::create_directories(game().c_str()).ok());
-    }
-    ~Sandbox() { static_cast<void>(de::platform::delete_tree(root_.c_str())); }
-    Sandbox(const Sandbox&) = delete;
-    Sandbox& operator=(const Sandbox&) = delete;
-    Sandbox(Sandbox&&) = delete;
-    Sandbox& operator=(Sandbox&&) = delete;
-
-    PathString folder(std::string_view name) const {
-        PathString path = root_;
-        REQUIRE(path.append('/'));
-        REQUIRE(path.append(name));
-        return path;
-    }
-    PathString game() const { return folder("game"); }
-
-    // Puts a file into the game data folder, as the cooker would.
-    void add_game_file(std::string_view relative, std::string_view contents) const {
-        PathString path = game();
-        REQUIRE(path.append('/'));
-        REQUIRE(path.append(relative));
-        const PathString parent(path.view().substr(0, path.view().find_last_of('/')));
-        REQUIRE(de::platform::create_directories(parent.c_str()).ok());
-        REQUIRE(de::platform::write_file_atomic(path.c_str(), bytes_of(contents)).ok());
-    }
-
-    Vfs make_vfs(VfsDesc desc = {}) const {
-        const PathString game_root = game();
-        const PathString user_root = folder("user");
-        const PathString temp_root = folder("temp");
-        desc.game_root = game_root.c_str();
-        desc.user_root = user_root.c_str();
-        desc.temp_root = temp_root.c_str();
-        auto vfs = Vfs::create(desc);
-        REQUIRE(vfs.ok());
-        return std::move(vfs).value();
-    }
-
-private:
-    PathString root_;
-};
 
 // Polls until the read leaves Pending / InFlight. False on timeout.
 bool wait_for(const Vfs& vfs, ReadHandle handle) {
@@ -136,7 +76,7 @@ TEST_CASE("paths follow the rules: mount prefix, lowercase, forward slashes, no 
 
     for (const char* bad :
          {"characters/knight.demesh", "game:/", "game://a", "game:/a//b", "game:/a/", "game:/../x", "game:/a/./b",
-          "game:/Knight.demesh", "game:/a\\b", "src:/a", "game:/a b", "user:/logs/con.txt", "game:/nul",
+          "game:/Knight.demesh", "game:/a\\b", "source:/a", "game:/a b", "user:/logs/con.txt", "game:/nul",
           "game:/a/aux.bin", "game:/com1.bin", "game:/lpt9", "game:/mesh.", "game:/dir./x"}) {
         CAPTURE(bad);
         CHECK_FALSE(vfs.resolve(bad).ok());
@@ -147,6 +87,48 @@ TEST_CASE("paths follow the rules: mount prefix, lowercase, forward slashes, no 
         CHECK(vfs.resolve(good).ok());
     }
     CHECK_FALSE(vfs.resolve(nullptr).ok());
+}
+
+TEST_CASE("src:/ is the source tree: mounted on request, readable and writable") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    const Vfs vfs = sandbox.make_vfs();
+    REQUIRE(vfs.write_file("src:/shaders/test.slang", bytes_of("float4 x;")).ok());
+    std::byte buffer[16];
+    const auto read = vfs.read_file("src:/shaders/test.slang", buffer);
+    REQUIRE(read.ok());
+    CHECK(text_of(std::span(buffer, *read)) == "float4 x;");
+
+    const auto file = vfs.file_info("src:/shaders/test.slang");
+    REQUIRE(file.ok());
+    CHECK(file->size == 9);
+    CHECK(file->modified_time != 0);
+    CHECK_FALSE(file->is_directory);
+    const auto folder = vfs.file_info("src:/shaders");
+    REQUIRE(folder.ok());
+    CHECK(folder->is_directory);
+    CHECK(vfs.file_info("src:/shaders/missing.slang").error().code == de::core::ErrorCode::NotFound);
+
+    // A rewrite shows in the info (what hot reload watches).
+    REQUIRE(vfs.write_file("src:/shaders/test.slang", bytes_of("float4 longer;")).ok());
+    CHECK(vfs.file_info("src:/shaders/test.slang")->size == 14);
+
+    // Without a src_root there is no src:/, and a src_root that doesn't exist is an error.
+    const PathString game_root = sandbox.game();
+    const PathString user_root = sandbox.folder("user");
+    const PathString temp_root = sandbox.folder("temp");
+    const PathString missing_root = sandbox.folder("not_there");
+    auto no_src =
+        Vfs::create({.game_root = game_root.c_str(), .user_root = user_root.c_str(), .temp_root = temp_root.c_str()});
+    REQUIRE(no_src.ok());
+    CHECK(no_src->resolve("src:/shaders/test.slang").error().code == de::core::ErrorCode::NotFound);
+    CHECK(no_src->mount_root(de::platform::Mount::Src)[0] == '\0');
+    CHECK_FALSE(no_src->write_file("src:/x.txt", bytes_of("x")).ok());
+    CHECK_FALSE(Vfs::create({.game_root = game_root.c_str(),
+                             .user_root = user_root.c_str(),
+                             .temp_root = temp_root.c_str(),
+                             .src_root = missing_root.c_str()})
+                    .ok());
 }
 
 TEST_CASE("write then read back on user:/ and temp:/, creating folders") {

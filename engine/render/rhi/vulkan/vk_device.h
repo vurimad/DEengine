@@ -53,7 +53,13 @@ struct Buffer {
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     std::byte* mapped = nullptr;
+    uint64_t address = 0; // 0 when no shader-visible usage
     BufferDesc desc;
+};
+
+struct Pipeline {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
 };
 
 // GPU objects waiting for the frames that may use them to finish.
@@ -62,6 +68,7 @@ struct PendingDestroy {
     VkImageView view = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
 };
 
 struct CommandListImpl {
@@ -69,6 +76,7 @@ struct CommandListImpl {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     uint32_t label_depth = 0;
     bool in_rendering = false;
+    VkPipelineBindPoint bound = VK_PIPELINE_BIND_POINT_MAX_ENUM; // the bound pipeline's kind, if any
 };
 
 inline constexpr uint32_t kMaxCommandListsPerFrame = 64;
@@ -121,6 +129,7 @@ struct DeviceImpl {
     // --- Helpers ---
     Texture& texture(TextureHandle handle);
     Buffer& buffer(BufferHandle handle);
+    Pipeline& pipeline(PipelineHandle handle);
     void set_debug_name(VkObjectType type, uint64_t object, const char* name) const;
     void free_pending(core::Array<PendingDestroy>& pending);
     FrameSlot& current_slot() { return frames[frame_index % kFramesInFlight]; }
@@ -144,6 +153,10 @@ struct DeviceImpl {
 
     core::SlotMap<Texture> textures;
     core::SlotMap<Buffer> buffers;
+    core::SlotMap<Pipeline> pipelines;
+    // The one layout every pipeline uses: kMaxPushConstantBytes of push constants for all stages.
+    // Bindless descriptor sets join it in M0a task 9.
+    VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
 
     // Frame pacing: frame N signals value N on the graphics queue when its work completes.
     VkSemaphore frame_timeline = VK_NULL_HANDLE;

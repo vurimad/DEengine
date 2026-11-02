@@ -32,6 +32,25 @@ public:
     void set_viewport(const Viewport& viewport);
     void set_scissor(const Rect& rect);
 
+    // Graphics pipelines bind inside begin_rendering, compute pipelines outside it.
+    void bind_pipeline(PipelineHandle pipeline);
+    // Push constants for the bound pipeline: offset + data.size() <= kMaxPushConstantBytes,
+    // both multiples of 4. They stay set across pipeline binds within the list.
+    void push_constants(std::span<const std::byte> data, uint32_t offset = 0);
+    template <typename T>
+    void push_constants(const T& data, uint32_t offset = 0) {
+        static_assert(sizeof(T) <= kMaxPushConstantBytes, "push constants are limited to kMaxPushConstantBytes");
+        push_constants(std::as_bytes(std::span(&data, 1)), offset);
+    }
+
+    void draw(uint32_t vertex_count, uint32_t instance_count = 1, uint32_t first_vertex = 0,
+              uint32_t first_instance = 0);
+    // The index buffer must be in IndexBuffer state.
+    void bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexType type);
+    void draw_indexed(uint32_t index_count, uint32_t instance_count = 1, uint32_t first_index = 0,
+                      int32_t vertex_offset = 0, uint32_t first_instance = 0);
+    void dispatch(uint32_t groups_x, uint32_t groups_y = 1, uint32_t groups_z = 1);
+
     // Buffers must be in CopySrc / CopyDst state.
     void copy_buffer(BufferHandle src, uint64_t src_offset, BufferHandle dst, uint64_t dst_offset, uint64_t size);
     // Fills size bytes (a multiple of 4) with a repeated 32-bit value. The buffer must be in CopyDst state.

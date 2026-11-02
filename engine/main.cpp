@@ -12,6 +12,8 @@
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/rhi/device.h"
+#include "render/shader/shader_compiler.h"
+#include "render/shader/shader_library.h"
 
 #include <cmath>
 #include <cstdint>
@@ -49,12 +51,14 @@ bool has_flag(int argc, char** argv, const char* flag) {
 
 } // namespace
 
-// Placeholder loop until the frame loop lands (M0b): opens the window, clears it through the RHI,
-// pumps events, samples input and logs actions, so the layers below can be tried by hand.
+// Placeholder loop until the frame loop lands (M0b): opens the window, draws a triangle through the
+// RHI with a hot-reloaded Slang shader, pumps events, samples input and logs actions, so the layers
+// below can be tried by hand. Edit shaders/triangle.slang while it runs.
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --no-vsync       present without waiting for vertical blank (mailbox or immediate)
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked)
+//   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.15)
 //   --show-sticks    deadzone off; log raw stick values twice a second, to measure drift
 int main(int argc, char** argv) {
@@ -68,13 +72,18 @@ int main(int argc, char** argv) {
     DE_PROFILE_THREAD_NAME("main");
 
     // Workers get OS names too, so debuggers and crash dumps show "worker 3" like the profiler does.
-    const de::core::JobSystem jobs(de::core::JobSystemDesc{
+    de::core::JobSystem jobs(de::core::JobSystemDesc{
         .on_worker_start = [](uint32_t /*index*/, const char* name) { de::platform::set_current_thread_name(name); }});
     DE_LOG_INFO("engine", "job system: %u workers", jobs.worker_count());
 
     // game:/ is the cooked data folder (the cooker arrives in M0b): ./cooked unless --game-dir says otherwise.
     const char* game_dir = flag_value(argc, argv, "--game-dir");
-    auto vfs = de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked"});
+    // src:/ is the source tree, in dev builds only: shaders compile from it and hot reload. Ship
+    // builds will load the cooker's .deshader files (M0b) instead.
+    const char* src_dir = flag_value(argc, argv, "--src-dir");
+    const char* src_root = DE_BUILD_DEV != 0 ? (src_dir != nullptr ? src_dir : DE_SOURCE_DIR) : nullptr;
+    auto vfs =
+        de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked", .src_root = src_root});
     if (!vfs) {
         return EXIT_FAILURE;
     }
@@ -113,6 +122,24 @@ int main(int argc, char** argv) {
         DE_LOG_ERROR("engine", "no usable GPU: %s", device.error().message);
         return EXIT_FAILURE;
     }
+
+    de::core::Result<de::shader::ShaderCompiler> compiler =
+        de::core::fail(de::core::ErrorCode::Unsupported, "no src:/ to compile shaders from");
+    de::core::Result<de::shader::ShaderLibrary> shaders = de::core::fail(compiler.error());
+    if (src_root != nullptr) {
+        compiler = de::shader::ShaderCompiler::create(*vfs);
+        if (compiler) {
+            shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler);
+        }
+    }
+    if (!shaders) {
+        DE_LOG_WARN("engine", "no shaders (%s): the window is only cleared", shaders.error().message);
+    }
+    // Built once the swapchain format is known; rebuilt if it changes. A failed first build (an
+    // error in the shader at startup) is retried every second until it compiles.
+    de::shader::ProgramHandle triangle;
+    de::rhi::Format triangle_format = de::rhi::Format::Unknown;
+    uint64_t next_triangle_attempt_ns = 0;
 
     Input input;
     const ActionId quit = input.add_action("quit"_sid, ActionKind::Button);
@@ -210,9 +237,24 @@ int main(int argc, char** argv) {
                 static_cast<double>(input.state(sticks[3]).value));
         }
 
-        // Clear the window to a slowly breathing dusk color: proof that every frame reaches the screen.
+        if (shaders) {
+            shaders->update(); // hot reload: picks up edits to shaders/*.slang
+        }
+
+        // Clear the window to a slowly breathing dusk color and draw the triangle over it.
         device->begin_frame();
         const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
+        if (backbuffer.is_valid() && shaders &&
+            (triangle_format != device->swapchain_format() || !triangle.is_valid()) &&
+            de::platform::time_ns() >= next_triangle_attempt_ns) {
+            shaders->destroy(triangle);
+            de::rhi::GraphicsPipelineDesc state{.color_count = 1, .debug_name = "triangle"};
+            state.color_formats[0] = device->swapchain_format();
+            const auto created = shaders->create_graphics({.module = "triangle", .state = state});
+            triangle = created.ok() ? *created : de::shader::ProgramHandle{};
+            triangle_format = device->swapchain_format();
+            next_triangle_attempt_ns = de::platform::time_ns() + de::platform::kNsPerSecond;
+        }
         if (backbuffer.is_valid()) {
             const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;
             const float glow = 0.5f + 0.5f * std::sin(seconds * 0.8f);
@@ -223,6 +265,20 @@ int main(int argc, char** argv) {
                 .texture = backbuffer,
                 .clear = {.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f}};
             list.begin_rendering({.colors = std::span(&color, 1)});
+            if (const de::rhi::PipelineHandle pipeline =
+                    shaders ? shaders->pipeline(triangle) : de::rhi::PipelineHandle{};
+                pipeline.is_valid()) {
+                // Matches TrianglePush in shaders/triangle.slang.
+                struct TrianglePush {
+                    float time_s;
+                    float aspect;
+                };
+                list.bind_pipeline(pipeline);
+                list.push_constants(TrianglePush{.time_s = seconds,
+                                                 .aspect = static_cast<float>(device->swapchain_width()) /
+                                                           static_cast<float>(device->swapchain_height())});
+                list.draw(3);
+            }
             list.end_rendering();
             list.barrier(backbuffer, de::rhi::ResourceState::RenderTarget, de::rhi::ResourceState::Present);
         }

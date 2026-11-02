@@ -61,6 +61,7 @@ core::Result<ParsedPath> parse_path(const char* path) {
         {.text = "game:/", .mount = Mount::Game},
         {.text = "user:/", .mount = Mount::User},
         {.text = "temp:/", .mount = Mount::Temp},
+        {.text = "src:/", .mount = Mount::Src},
     };
     for (const Prefix& prefix : kPrefixes) {
         if (!text.starts_with(prefix.text)) {
@@ -92,7 +93,7 @@ core::Result<ParsedPath> parse_path(const char* path) {
         }
         return ParsedPath{.mount = prefix.mount, .relative = relative};
     }
-    return fail(ErrorCode::InvalidArgument, "path must start with game:/, user:/ or temp:/");
+    return fail(ErrorCode::InvalidArgument, "path must start with game:/, user:/, temp:/ or src:/");
 }
 
 core::Result<PathString> join(const PathString& root, std::string_view relative) {
@@ -169,7 +170,7 @@ struct Queue {
 
 struct VfsState {
     core::Allocator* allocator = nullptr;
-    PathString roots[3];
+    PathString roots[kMountCount]; // empty: not mounted
     core::JobSystem* jobs = nullptr;
 
     RequestSlot* slots = nullptr;
@@ -413,6 +414,11 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     if (!path_exists(game_root.c_str())) {
         DE_LOG_WARN("vfs", "game:/ folder %s doesn't exist yet: reads from game:/ will fail", game_root.c_str());
     }
+    const PathString src_root = desc.src_root != nullptr ? normalized(PathString(desc.src_root)) : PathString();
+    if (desc.src_root != nullptr && (src_root.empty() || !path_exists(src_root.c_str()))) {
+        DE_LOG_ERROR("vfs", "src:/ folder %s doesn't exist", src_root.c_str());
+        return fail(ErrorCode::NotFound, "the src:/ folder doesn't exist");
+    }
 
     core::Allocator& allocator =
         desc.allocator != nullptr ? *desc.allocator : core::heap_allocator(core::MemoryTag::Platform);
@@ -421,6 +427,7 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     state->roots[static_cast<size_t>(Mount::Game)] = game_root;
     state->roots[static_cast<size_t>(Mount::User)] = *user_root;
     state->roots[static_cast<size_t>(Mount::Temp)] = *temp_root;
+    state->roots[static_cast<size_t>(Mount::Src)] = src_root;
     state->jobs = desc.jobs;
 
     state->slot_count = desc.max_reads;
@@ -441,6 +448,9 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     DE_LOG_INFO("vfs", "game:/ = %s", game_root.c_str());
     DE_LOG_INFO("vfs", "user:/ = %s", user_root->c_str());
     DE_LOG_INFO("vfs", "temp:/ = %s", temp_root->c_str());
+    if (!src_root.empty()) {
+        DE_LOG_INFO("vfs", "src:/ = %s", src_root.c_str());
+    }
 
     Vfs vfs;
     vfs.state_ = state;
@@ -485,7 +495,11 @@ core::Result<PathString> Vfs::resolve(const char* path) const {
     if (!parsed) {
         return fail(parsed.error());
     }
-    return join(state_->roots[static_cast<size_t>(parsed->mount)], parsed->relative);
+    const PathString& root = state_->roots[static_cast<size_t>(parsed->mount)];
+    if (root.empty()) {
+        return fail(ErrorCode::NotFound, "src:/ isn't mounted");
+    }
+    return join(root, parsed->relative);
 }
 
 const char* Vfs::mount_root(Mount mount) const {
@@ -507,6 +521,14 @@ core::Result<uint64_t> Vfs::file_size(const char* path) const {
         return fail(file.error());
     }
     return file->size();
+}
+
+core::Result<FileInfo> Vfs::file_info(const char* path) const {
+    const core::Result<PathString> native = resolve(path);
+    if (!native) {
+        return fail(native.error());
+    }
+    return platform::file_info(native->c_str());
 }
 
 core::Result<size_t> Vfs::read_file(const char* path, std::span<std::byte> dest) const {
@@ -538,7 +560,7 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
     if (parsed->mount == Mount::Game) {
         return fail(ErrorCode::Unsupported, "game:/ is read only");
     }
-    const core::Result<PathString> native = join(state_->roots[static_cast<size_t>(parsed->mount)], parsed->relative);
+    const core::Result<PathString> native = resolve(path);
     if (!native) {
         return fail(native.error());
     }

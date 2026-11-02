@@ -287,7 +287,7 @@ All file access goes through one small virtual file system (VFS) with mount poin
 | Mount | Dev build | Ship build | Access |
 | --- | --- | --- | --- |
 | `game:/` | Loose cooked files (overriding archives) | `Archives/DATA_*.arc` | Read only |
-| `src:/` | Source assets in the repo | Not present | Editor and cooker only |
+| `src:/` | The repo's source tree: `content/`, `meta/`, `shaders/` | Not present | Editor, cooker and dev builds (shader hot reload) |
 | `user:/` | Saved Games / AppData folder | Same | Read/write: saves, settings, logs, caches |
 | `temp:/` | Temp folder | Same | Scratch, cleared on start |
 

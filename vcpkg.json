@@ -20,6 +20,7 @@
         }
       ]
     },
+    "shader-slang",
     {
       "name": "tracy",
       "default-features": false,
