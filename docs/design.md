@@ -421,7 +421,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 *Render graph v1 (M0a)*. What we build first, from the above:
 
-- **Passes.** `add_pass(name, setup, execute)`. Setup declares every texture and buffer the pass touches, each with its `ResourceState` and shader stages (subresource ranges allowed), and can create transient resources. Execute records into a graphics `CommandList`, inside a debug label named after the pass. Its closure and data live in the frame allocator: no `std::function`, and no stack captures by reference.
+- **Passes.** `add_pass(name, setup, execute)`. Setup declares every texture and buffer the pass touches, each with its `ResourceState` and shader stages (subresource ranges allowed), and can create transient resources. Execute records into a graphics `CommandList`, inside a debug label named after the pass. A pass can carry a data struct (`add_pass<Data>`): setup fills it with the handles it creates, execute reads it, and later passes reach those handles through the returned reference (Frostbite's pass data, needed because an execute lambda is built before its setup runs). Closures and data live in the graph's frame arena: no `std::function`, and no stack captures by reference.
 - **Resources.**
   - Transient textures and buffers are declared by description, with absolute or swapchain-relative sizes.
   - Imported resources (the swapchain image, anything persistent) come in with their current state and say the state they must leave in.
@@ -1049,7 +1049,8 @@ M0 is split in two so something runs early. Tasks are ordered: each builds on th
 - [ ] Asset registry: load by ID through VFS and jobs, reference counting, hot reload of cooked assets
 - [ ] Deferred renderer v1: G-buffer, sun light, placeholder IBL, tonemapping, free camera
 - [ ] GPU-driven v1: shared vertex/index buffers, compute instance culling, indirect draws
-- [ ] Render graph v2: transient memory aliasing, graph and lifetime debug view
+- [ ] Render graph v2: transient memory aliasing, graph and lifetime debug view, a `discard` declaration on uses (so passes whose output is fully overwritten get culled), parallel pass recording (passes split into chunks recorded by jobs on command lists of their own, submitted in order)
+- [ ] Render graph v3, before M1 content: async compute passes (a queue per pass, queue ownership transfers and semaphores between queues), barrier grouping by dependency level, then pass reordering where profiling shows bubbles
 - [ ] LuaJIT + sol2: bindings for entities, components and commands, script hot reload
 - [ ] Command API v1: `entity.create`, `component.set`, undo/redo, local JSON-RPC socket
 - [ ] Editor mode v1: outliner, reflection-driven inspector, gizmos, save to text cell files
