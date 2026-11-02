@@ -997,3 +997,4 @@ Decisions so far:
 | 2026-11-01 | Windows + Linux first-class; consoles later via a clean RHI and platform layer | Ship on desktop now, keep PS5/Xbox ports a backend job, not a rewrite |
 | 2026-11-01 | miniaudio + own audio layer; Steam Audio optional; FMOD as exit path | Free, cross-platform, text-authored sound data for humans and AI |
 | 2026-11-01 | Own cooked formats (.demesh, .detex...); source + mirrored meta tree with GUIDs | Load-in-place speed, clean source folders, rename-safe references |
+| 2026-11-02 | Clip space +Y up with depth 0..1 and reverse Z on every backend | One convention for Vulkan, D3D12 and consoles; depth precision for long view distances |

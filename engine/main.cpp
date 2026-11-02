@@ -11,8 +11,11 @@
 #include "platform/time.h"
 #include "platform/vfs.h"
 #include "platform/window.h"
+#include "render/rhi/device.h"
 
+#include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -46,9 +49,11 @@ bool has_flag(int argc, char** argv, const char* flag) {
 
 } // namespace
 
-// Placeholder loop until the frame loop lands (M0b): opens the window, pumps events, samples input
-// and logs actions, so the platform layer can be tried by hand.
-//   --frames N       exit after N frames (smoke runs)
+// Placeholder loop until the frame loop lands (M0b): opens the window, clears it through the RHI,
+// pumps events, samples input and logs actions, so the layers below can be tried by hand.
+//   --frames N       exit after N frames (smoke runs; validation errors fail the run)
+//   --no-vsync       present without waiting for vertical blank (mailbox or immediate)
+//   --no-validation  skip the Vulkan validation layer in debug and dev builds
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.15)
 //   --show-sticks    deadzone off; log raw stick values twice a second, to measure drift
@@ -96,6 +101,16 @@ int main(int argc, char** argv) {
 
     auto window = de::platform::Window::create({.title = "DEengine"});
     if (!window) {
+        return EXIT_FAILURE;
+    }
+
+    auto device = de::rhi::Device::create({
+        .window = &*window,
+        .validation = DE_BUILD_DEV != 0 && !has_flag(argc, argv, "--no-validation"),
+        .vsync = !has_flag(argc, argv, "--no-vsync"),
+    });
+    if (!device) {
+        DE_LOG_ERROR("engine", "no usable GPU: %s", device.error().message);
         return EXIT_FAILURE;
     }
 
@@ -156,6 +171,9 @@ int main(int argc, char** argv) {
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
     uint64_t next_stick_report_ns = 0;
     uint64_t frame = 0;
+    const uint64_t start_ns = de::platform::time_ns();
+    uint64_t title_start_ns = start_ns;
+    uint32_t title_frames = 0;
     bool was_moving = false;
     bool was_minimized = false;
     while (!window->close_requested()) {
@@ -192,6 +210,40 @@ int main(int argc, char** argv) {
                 static_cast<double>(input.state(sticks[3]).value));
         }
 
+        // Clear the window to a slowly breathing dusk color: proof that every frame reaches the screen.
+        device->begin_frame();
+        const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
+        if (backbuffer.is_valid()) {
+            const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;
+            const float glow = 0.5f + 0.5f * std::sin(seconds * 0.8f);
+            de::rhi::CommandList list = device->begin_command_list();
+            const de::rhi::ScopedDebugLabel label(list, "clear backbuffer");
+            list.barrier(backbuffer, de::rhi::ResourceState::Undefined, de::rhi::ResourceState::RenderTarget);
+            const de::rhi::ColorAttachment color{
+                .texture = backbuffer,
+                .clear = {.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f}};
+            list.begin_rendering({.colors = std::span(&color, 1)});
+            list.end_rendering();
+            list.barrier(backbuffer, de::rhi::ResourceState::RenderTarget, de::rhi::ResourceState::Present);
+        }
+        device->end_frame();
+        if (!backbuffer.is_valid()) {
+            de::platform::sleep_ns(5 * de::platform::kNsPerMs); // minimized: nothing to show, don't spin a core
+        }
+
+        // Frame rate in the title, once a second.
+        ++title_frames;
+        if (const uint64_t now = de::platform::time_ns(); now - title_start_ns >= de::platform::kNsPerSecond) {
+            const double seconds = static_cast<double>(now - title_start_ns) * 1e-9;
+            char title[96];
+            std::snprintf(title, sizeof(title), "DEengine  |  %.0f fps  %.2f ms",
+                          static_cast<double>(title_frames) / seconds,
+                          seconds * 1000.0 / static_cast<double>(title_frames));
+            window->set_title(title);
+            title_frames = 0;
+            title_start_ns = now;
+        }
+
         // The "zero heap allocations per frame" rule, made visible in the profiler.
         DE_PROFILE_PLOT("heap allocations/frame",
                         static_cast<int64_t>(de::core::heap_allocation_count() - frame_start_allocations));
@@ -201,9 +253,11 @@ int main(int argc, char** argv) {
         if (max_frames != 0 && frame >= max_frames) {
             break;
         }
-        de::platform::sleep_ns(de::platform::kNsPerMs); // nothing renders yet: don't spin a core
     }
 
-    DE_LOG_INFO("engine", "shutting down after %llu frames", static_cast<unsigned long long>(frame));
-    return EXIT_SUCCESS;
+    device->wait_idle();
+    const de::rhi::DeviceStats stats = device->stats();
+    DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",
+                static_cast<unsigned long long>(frame), stats.validation_errors, stats.validation_warnings);
+    return stats.validation_errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

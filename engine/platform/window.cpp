@@ -4,6 +4,7 @@
 
 #include <SDL3/SDL_error.h>
 #include <SDL3/SDL_video.h>
+#include <SDL3/SDL_vulkan.h>
 
 #include <utility>
 
@@ -79,6 +80,26 @@ void Window::refresh_pixel_size() {
     resized_ = resized_ || new_width != pixel_width_ || new_height != pixel_height_;
     pixel_width_ = new_width;
     pixel_height_ = new_height;
+}
+
+std::span<const char* const> vulkan_instance_extensions() {
+    uint32_t count = 0;
+    const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&count);
+    if (extensions == nullptr) {
+        DE_LOG_ERROR("platform", "SDL_Vulkan_GetInstanceExtensions failed: %s", SDL_GetError());
+        return {};
+    }
+    return {extensions, count};
+}
+
+core::Result<uint64_t> create_vulkan_surface(const Window& window, void* vk_instance) {
+    VkSurfaceKHR surface{}; // SDL declares the handle type without Vulkan's headers (no VK_NULL_HANDLE)
+    if (!SDL_Vulkan_CreateSurface(window.native_handle(), static_cast<VkInstance>(vk_instance), nullptr, &surface)) {
+        DE_LOG_ERROR("platform", "SDL_Vulkan_CreateSurface failed: %s", SDL_GetError());
+        return core::fail(core::ErrorCode::Unsupported, "the window's Vulkan surface could not be created");
+    }
+    static_assert(sizeof(VkSurfaceKHR) <= sizeof(uint64_t));
+    return reinterpret_cast<uint64_t>(surface);
 }
 
 } // namespace de::platform

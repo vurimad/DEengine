@@ -17,6 +17,10 @@ env:
   # Ninja, plus the X11 and Wayland headers SDL3 builds its Linux window backends against.
   LINUX_PACKAGES: >-
     ninja-build libx11-dev libxft-dev libxext-dev libwayland-dev libxkbcommon-dev libegl1-mesa-dev
+  # The Vulkan loader, Mesa's lavapipe (a CPU Vulkan 1.3 driver) and the Khronos validation layer:
+  # the RHI tests run for real on Linux CI, with validation on.
+  LINUX_TEST_PACKAGES: >-
+    libvulkan1 mesa-vulkan-drivers vulkan-validationlayers
 
 jobs:
   build:
@@ -36,7 +40,12 @@ jobs:
 
       - name: Install Linux build tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y $LINUX_PACKAGES
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_PACKAGES $LINUX_TEST_PACKAGES
+
+      # The GPU tests skip without a Vulkan device; on Linux lavapipe is one, so they must run.
+      - name: Require a Vulkan device for the tests
+        if: runner.os == 'Linux'
+        run: echo "DE_REQUIRE_GPU=1" >> "$GITHUB_ENV"
 
       - name: Set up MSVC x64 environment
         if: runner.os == 'Windows'

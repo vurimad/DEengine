@@ -7,7 +7,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | Header | What it gives |
 | --- | --- |
 | `platform.h` | `Platform`: SDL init; routes core's fatal errors and logs to the debugger |
-| `window.h` | `Window`: Vulkan-capable window, drawable size in pixels, resize / minimize / focus / close |
+| `window.h` | `Window`: Vulkan-capable window, drawable size in pixels, resize / minimize / focus / close; Vulkan surface creation for the RHI |
 | `events.h` | `pump_events(window, input)`: once per rendered frame |
 | `input.h` | `Input`: named actions bound by text, sampled once per tick |
 | `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` mounts, path rules, blocking and async reads by priority, atomic writes |
@@ -18,7 +18,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 
 ## Rules and invariants
 
-- Engine and game code never include OS or SDL headers; only this folder (and RHI backends, for surface creation through `Window::native_handle()`) does.
+- Engine and game code never include OS or SDL headers; only this folder does. The Vulkan RHI backend gets its instance extensions and window surface from `vulkan_instance_extensions()` and `create_vulkan_surface()`, with Vulkan handles passed as plain pointers and integers.
 - No platform `#ifdef`: OS-specific code lives in `*_win32.cpp` / `*_linux.cpp`, picked by CMake.
 - Game code reads actions, never device codes. Bindings are text (`"key:Space"`, `"gamepad:righttrigger"`, `"mouse:x"`) so they can live in data files; key names are SDL scancode names, gamepad names SDL gamepad button and axis names.
 - Input never loses a tap: presses and releases between two samples both show up in the next sample, with the first press's timestamp for the combat input buffer.
