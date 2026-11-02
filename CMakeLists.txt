@@ -26,6 +26,7 @@ option(DE_BUILD_TESTS "Build the unit test suite" ON)
 include(cmake/compile_options.cmake)
 
 add_subdirectory(engine)
+add_subdirectory(tools/cooker)
 
 if(DE_BUILD_TESTS)
     enable_testing()

@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "builtin-baseline": "9a5dfef5d1a0438a7d24856a85bd60f309d355e9",
   "dependencies": [
+    "bc7enc-rdo",
+    "cgltf",
     "doctest",
     "flecs",
     "glm",
@@ -13,6 +15,7 @@
         "docking-experimental"
       ]
     },
+    "meshoptimizer",
     {
       "name": "sdl3",
       "default-features": false,
@@ -29,6 +32,7 @@
       ]
     },
     "shader-slang",
+    "stb",
     {
       "name": "tracy",
       "default-features": false,
@@ -36,9 +40,12 @@
         "on-demand"
       ]
     },
+    "ufbx",
     "vk-bootstrap",
     "volk",
     "vulkan-headers",
-    "vulkan-memory-allocator"
+    "vulkan-memory-allocator",
+    "xxhash",
+    "yyjson"
   ]
 }

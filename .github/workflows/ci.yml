@@ -67,6 +67,10 @@ jobs:
       - name: Test (debug)
         run: ctest --preset ${{ matrix.preset }}-debug
 
+      # Names, metas and folder rules of content/ and meta/: what a cook would change, as errors.
+      - name: Check assets
+        run: build/${{ matrix.preset }}/bin/Debug/cooker --check
+
       - name: Build (ship)
         run: cmake --build --preset ${{ matrix.preset }}-ship
 

@@ -7,7 +7,9 @@
 #include "platform/time.h"
 #include "platform/vfs.h"
 #include "render/rhi/device.h"
+#include "render/shader/shader_asset.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <iterator>
@@ -66,16 +68,6 @@ constexpr BindlessDeclaration kBindlessDeclarations[] = {
 static_assert(std::size(kBindlessDeclarations) == static_cast<size_t>(rhi::BindlessTable::Count),
               "one declaration per bindless table");
 
-bool is_bindless(const ResourceBinding& binding) {
-    for (const BindlessDeclaration& declaration : kBindlessDeclarations) {
-        if (binding.set == 0 && binding.binding == static_cast<uint32_t>(declaration.table) &&
-            binding.name == declaration.name) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool fits(const char* text) {
     return text != nullptr && text[0] != '\0' && std::strlen(text) <= kMaxShaderNameLength;
 }
@@ -112,7 +104,7 @@ struct LibraryState {
     rhi::Device* device = nullptr;
     platform::Vfs* vfs = nullptr;
     core::JobSystem* jobs = nullptr;
-    ShaderCompiler* compiler = nullptr;
+    ShaderCompiler* compiler = nullptr; // null: programs load from cooked .deshader files
     ShaderLibraryDesc desc;
     core::SlotMap<Program*> programs{render_heap()};
     Program* building = nullptr; // the one rebuild in flight
@@ -137,7 +129,96 @@ Program* find(const LibraryState& state, ProgramHandle handle) {
     return program != nullptr ? *program : nullptr;
 }
 
-// Compiles every stage of the program in one go. Runs on the creating thread or as a job.
+// The cooked file of the program's module (create_cooked).
+platform::PathString cooked_file(const Program& program) {
+    return platform::PathString(
+        asset::cooked_path(asset::shader_asset_id(program.module.view()), asset::AssetType::Shader).view());
+}
+
+// A cooked file in memory, 16-byte aligned as load_in_place needs.
+class CookedBuffer {
+public:
+    explicit CookedBuffer(size_t size)
+        : size_(size),
+          data_(static_cast<std::byte*>(render_heap().allocate(std::max<size_t>(size, 1), asset::kAssetAlignment))) {}
+    ~CookedBuffer() { render_heap().deallocate(data_, std::max<size_t>(size_, 1), asset::kAssetAlignment); }
+    CookedBuffer(const CookedBuffer&) = delete;
+    CookedBuffer& operator=(const CookedBuffer&) = delete;
+    CookedBuffer(CookedBuffer&&) = delete;
+    CookedBuffer& operator=(CookedBuffer&&) = delete;
+
+    std::span<std::byte> bytes() { return {data_, size_}; }
+
+private:
+    size_t size_;
+    std::byte* data_;
+};
+
+// The program's stages from its module's .deshader, as if just compiled: the cooker ran the
+// compiler with every entry point of the module, once per permutation.
+core::Result<CompiledProgram> load_cooked(const LibraryState& state, const Program& program, CompileReport& report,
+                                          std::span<const ShaderDefine> defines) {
+    const platform::PathString path = cooked_file(program);
+    ShaderDependency& dependency = report.dependencies.push(ShaderDependency{.path = path});
+    const core::Result<platform::FileInfo> info = state.vfs->file_info(path.c_str());
+    if (!info || info->is_directory) {
+        DE_LOG_ERROR("shader", "%s: no cooked shader at %s (run the cooker)", program.module.c_str(), path.c_str());
+        return core::fail(core::ErrorCode::NotFound, "the shader module isn't cooked");
+    }
+    dependency.info = *info;
+    CookedBuffer buffer(static_cast<size_t>(info->size));
+    const core::Result<size_t> read = state.vfs->read_file(path.c_str(), buffer.bytes());
+    if (!read || *read != buffer.bytes().size()) {
+        DE_LOG_ERROR("shader", "%s: %s could not be read", program.module.c_str(), path.c_str());
+        return core::fail(core::ErrorCode::IoError, "the cooked shader could not be read");
+    }
+    const std::span<const std::byte> file = buffer.bytes();
+    const core::Result<const asset::ShaderAsset*> loaded = asset::load_in_place<asset::ShaderAsset>(file);
+    if (!loaded) {
+        DE_LOG_ERROR("shader", "%s: %s: %s", program.module.c_str(), path.c_str(), loaded.error().message);
+        return core::fail(loaded.error());
+    }
+    const asset::ShaderAsset& shader = **loaded;
+    const asset::ShaderPermutation* permutation = shader.find_permutation(file.data(), defines_hash(defines));
+    if (permutation == nullptr) {
+        DE_LOG_ERROR("shader", "%s: cooked without this program's defines (%u of them)", program.module.c_str(),
+                     program.define_count);
+        return core::fail(core::ErrorCode::NotFound, "the shader permutation isn't cooked");
+    }
+    CompiledProgram result{.stages = core::Array<CompiledStage>(render_heap())};
+    for (uint32_t i = 0; i < program.stage_count; ++i) {
+        const asset::ShaderEntryCode* entry =
+            asset::ShaderAsset::find_entry(file.data(), *permutation, program.entries[i].view());
+        if (entry == nullptr || from_asset_stage(entry->stage) != program.stages[i]) {
+            DE_LOG_ERROR("shader", "%s: the cooked module has no %s entry point '%s'", program.module.c_str(),
+                         program.stages[i] == rhi::ShaderStage::Compute    ? "compute"
+                         : program.stages[i] == rhi::ShaderStage::Fragment ? "fragment"
+                                                                           : "vertex",
+                         program.entries[i].c_str());
+            return core::fail(core::ErrorCode::NotFound, "a shader entry point is missing");
+        }
+        CompiledStage& stage = result.stages.emplace(CompiledStage{
+            .entry = ShaderName(program.entries[i].view()),
+            .code = core::Array<uint32_t>(render_heap()),
+            .reflection = ShaderReflection{.stage = program.stages[i],
+                                           .push_constant_bytes = entry->push_constant_bytes,
+                                           .push_constants = core::Array<PushConstantField>(render_heap()),
+                                           .bindings = core::Array<ResourceBinding>(render_heap())},
+        });
+        stage.code.assign(entry->code.get(file.data()));
+        for (uint32_t axis = 0; axis < 3; ++axis) {
+            stage.reflection.thread_group_size[axis] = entry->thread_group_size[axis];
+        }
+        for (const asset::ShaderPushConstant& field : entry->push_constants.get(file.data())) {
+            stage.reflection.push_constants.push(
+                PushConstantField{.name = ShaderName(field.name), .offset = field.offset, .size = field.size});
+        }
+    }
+    return result;
+}
+
+// Compiles every stage of the program in one go, or loads it cooked. Runs on the creating thread
+// or as a job.
 void compile(Program& program, PendingBuild& out) {
     ShaderDefine defines[kMaxShaderDefines];
     for (uint32_t i = 0; i < program.define_count; ++i) {
@@ -149,11 +230,14 @@ void compile(Program& program, PendingBuild& out) {
     }
     out.report = CompileReport{.dependencies = core::Array<ShaderDependency>(render_heap()),
                                .diagnostics = core::Array<char>(render_heap())};
+    const std::span<const ShaderDefine> define_span(defines, program.define_count);
     core::Result<CompiledProgram> compiled =
-        program.library->compiler->compile({.module = program.module.c_str(),
-                                            .entries = std::span(entries, program.stage_count),
-                                            .defines = std::span(defines, program.define_count)},
-                                           &out.report);
+        program.library->compiler == nullptr
+            ? load_cooked(*program.library, program, out.report, define_span)
+            : program.library->compiler->compile({.module = program.module.c_str(),
+                                                  .entries = std::span(entries, program.stage_count),
+                                                  .defines = define_span},
+                                                 &out.report);
     out.ok = compiled.ok();
     if (compiled) {
         out.program = std::move(*compiled);
@@ -173,7 +257,7 @@ core::Result<rhi::PipelineHandle> create_pipeline(LibraryState& state, Program& 
     for (uint32_t i = 0; i < program.stage_count; ++i) {
         const ShaderReflection& reflection = compiled.stages[i].reflection;
         for (const ResourceBinding& binding : reflection.bindings) {
-            if (is_bindless(binding)) {
+            if (is_bindless_binding(binding)) {
                 continue;
             }
             DE_LOG_ERROR("shader",
@@ -204,8 +288,14 @@ core::Result<rhi::PipelineHandle> create_pipeline(LibraryState& state, Program& 
 }
 
 // The file of the program's own module, watched even when a build failed before reading it, so
-// creating or fixing it is noticed.
+// creating or fixing it is noticed: the source, or the cooked file.
 ShaderDependency module_file(const LibraryState& state, const Program& program) {
+    if (state.compiler == nullptr) {
+        ShaderDependency cooked{.path = cooked_file(program)};
+        const core::Result<platform::FileInfo> info = state.vfs->file_info(cooked.path.c_str());
+        cooked.info = info.ok() ? *info : platform::FileInfo{};
+        return cooked;
+    }
     // Always fits: module names are at most 63 characters.
     ShaderDependency file{.path = platform::PathString("src:/shaders/")};
     bool fits_path = true;
@@ -415,15 +505,45 @@ bool valid_names(const char* module, std::span<const ShaderDefine> defines, cons
 
 } // namespace
 
-core::Result<ShaderLibrary> ShaderLibrary::create(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
-                                                  ShaderCompiler& compiler, const ShaderLibraryDesc& desc) {
+bool is_bindless_binding(const ResourceBinding& binding) {
+    for (const BindlessDeclaration& declaration : kBindlessDeclarations) {
+        if (binding.set == 0 && binding.binding == static_cast<uint32_t>(declaration.table) &&
+            binding.name == declaration.name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+uint64_t defines_hash(std::span<const ShaderDefine> defines) {
+    asset::ShaderDefineText texts[kMaxShaderDefines];
+    const size_t count = std::min(defines.size(), kMaxShaderDefines);
+    for (size_t i = 0; i < count; ++i) {
+        texts[i] = {.name = defines[i].name != nullptr ? defines[i].name : "",
+                    .value = defines[i].value != nullptr ? defines[i].value : "1"};
+    }
+    return asset::shader_defines_hash(std::span(texts, count));
+}
+
+ShaderLibrary ShaderLibrary::make(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
+                                  ShaderCompiler* compiler, const ShaderLibraryDesc& desc) {
     auto* state = ::new (render_heap().allocate(sizeof(LibraryState), alignof(LibraryState))) LibraryState();
     state->device = &device;
     state->vfs = &vfs;
     state->jobs = &jobs;
-    state->compiler = &compiler;
+    state->compiler = compiler;
     state->desc = desc;
     return ShaderLibrary(state);
+}
+
+core::Result<ShaderLibrary> ShaderLibrary::create(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
+                                                  ShaderCompiler& compiler, const ShaderLibraryDesc& desc) {
+    return make(device, vfs, jobs, &compiler, desc);
+}
+
+core::Result<ShaderLibrary> ShaderLibrary::create_cooked(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
+                                                         const ShaderLibraryDesc& desc) {
+    return make(device, vfs, jobs, nullptr, desc);
 }
 
 ShaderLibrary::~ShaderLibrary() {

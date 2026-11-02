@@ -1,6 +1,7 @@
 find_package(slang CONFIG REQUIRED)
 
 add_library(de_shader STATIC
+    shader_asset.h
     shader_compiler.cpp
     shader_compiler.h
     shader_library.cpp
@@ -8,7 +9,7 @@ add_library(de_shader STATIC
 add_library(de::shader ALIAS de_shader)
 
 target_link_libraries(de_shader
-    PUBLIC de::core de::platform de::rhi de::compile_options
+    PUBLIC de::asset de::core de::platform de::rhi de::compile_options
     PRIVATE slang::slang)
 
 # Slang's interfaces are COM-style: objects free themselves in release() and are never deleted

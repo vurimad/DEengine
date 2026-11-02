@@ -2,7 +2,10 @@
 
 #include "core/memory_stats.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstring>
 #include <new>
 #include <utility>
 
@@ -96,6 +99,47 @@ constinit TaggedHeaps<std::make_index_sequence<kMemoryTagCount>> tagged_heaps;
 
 Allocator& heap_allocator(MemoryTag tag) {
     return tagged_heaps.heaps[tag_index(tag)];
+}
+
+namespace {
+
+constexpr size_t kMallocHeader = 16;
+
+size_t malloc_block_size(void* pointer) {
+    size_t size = 0;
+    std::memcpy(&size, static_cast<std::byte*>(pointer) - kMallocHeader, sizeof(size));
+    return size;
+}
+
+} // namespace
+
+void* tagged_malloc(MemoryTag tag, size_t size) {
+    DE_VERIFY_MSG(size <= SIZE_MAX - kMallocHeader, "allocation size overflows size_t");
+    auto* block = static_cast<std::byte*>(heap_allocator(tag).allocate(size + kMallocHeader, kMallocHeader));
+    std::memcpy(block, &size, sizeof(size));
+    return block + kMallocHeader;
+}
+
+void tagged_free(MemoryTag tag, void* pointer) {
+    if (pointer == nullptr) {
+        return;
+    }
+    heap_allocator(tag).deallocate(static_cast<std::byte*>(pointer) - kMallocHeader,
+                                   malloc_block_size(pointer) + kMallocHeader, kMallocHeader);
+}
+
+void* tagged_realloc(MemoryTag tag, void* pointer, size_t size) {
+    if (pointer == nullptr) {
+        return tagged_malloc(tag, size);
+    }
+    if (size == 0) {
+        tagged_free(tag, pointer);
+        return nullptr;
+    }
+    void* grown = tagged_malloc(tag, size);
+    std::memcpy(grown, pointer, std::min(malloc_block_size(pointer), size));
+    tagged_free(tag, pointer);
+    return grown;
 }
 
 MemoryStats memory_stats(MemoryTag tag) {

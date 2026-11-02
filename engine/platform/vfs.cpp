@@ -48,7 +48,8 @@ bool is_reserved_name(std::string_view segment) {
 // "game:/characters/knight.demesh" -> Game + "characters/knight.demesh", enforcing the path rules
 // (docs/design.md, File system & IO): lowercase, forward slashes, no empty, "." or ".." segments,
 // and nothing that means something else on another OS (device names, a trailing dot).
-core::Result<ParsedPath> parse_path(const char* path) {
+// allow_root: "src:/" alone names the mount's root folder (for listing).
+core::Result<ParsedPath> parse_path(const char* path, bool allow_root = false) {
     if (path == nullptr) {
         return fail(ErrorCode::InvalidArgument, "null path");
     }
@@ -68,6 +69,9 @@ core::Result<ParsedPath> parse_path(const char* path) {
             continue;
         }
         const std::string_view relative = text.substr(prefix.text.size());
+        if (relative.empty() && allow_root) {
+            return ParsedPath{.mount = prefix.mount, .relative = relative};
+        }
         if (relative.empty()) {
             return fail(ErrorCode::InvalidArgument, "path names no file");
         }
@@ -171,6 +175,7 @@ struct Queue {
 struct VfsState {
     core::Allocator* allocator = nullptr;
     PathString roots[kMountCount]; // empty: not mounted
+    bool game_writable = false;
     core::JobSystem* jobs = nullptr;
 
     RequestSlot* slots = nullptr;
@@ -428,6 +433,7 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     state->roots[static_cast<size_t>(Mount::User)] = *user_root;
     state->roots[static_cast<size_t>(Mount::Temp)] = *temp_root;
     state->roots[static_cast<size_t>(Mount::Src)] = src_root;
+    state->game_writable = desc.game_writable;
     state->jobs = desc.jobs;
 
     state->slot_count = desc.max_reads;
@@ -557,7 +563,7 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
     if (!parsed) {
         return fail(parsed.error());
     }
-    if (parsed->mount == Mount::Game) {
+    if (parsed->mount == Mount::Game && !state_->game_writable) {
         return fail(ErrorCode::Unsupported, "game:/ is read only");
     }
     const core::Result<PathString> native = resolve(path);
@@ -570,6 +576,48 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
         return created;
     }
     return write_file_atomic(native->c_str(), data);
+}
+
+core::Result<void> Vfs::remove_file(const char* path) const {
+    const core::Result<ParsedPath> parsed = parse_path(path);
+    if (!parsed) {
+        return fail(parsed.error());
+    }
+    if (parsed->mount == Mount::Game && !state_->game_writable) {
+        return fail(ErrorCode::Unsupported, "game:/ is read only");
+    }
+    const core::Result<PathString> native = resolve(path);
+    if (!native) {
+        return fail(native.error());
+    }
+    const core::Result<FileInfo> info = platform::file_info(native->c_str());
+    if (!info) {
+        return info.error().code == ErrorCode::NotFound ? core::Result<void>() : fail(info.error());
+    }
+    if (info->is_directory) {
+        return fail(ErrorCode::InvalidArgument, "remove_file() removes files, not folders");
+    }
+    return delete_tree(native->c_str());
+}
+
+core::Result<void> Vfs::list(const char* folder,
+                             core::FunctionRef<void(const char* name, bool is_directory)> visit) const {
+    const core::Result<ParsedPath> parsed = parse_path(folder, true);
+    if (!parsed) {
+        return fail(parsed.error());
+    }
+    const PathString& root = state_->roots[static_cast<size_t>(parsed->mount)];
+    if (root.empty()) {
+        return fail(ErrorCode::NotFound, "src:/ isn't mounted");
+    }
+    if (parsed->relative.empty()) {
+        return list_directory(root.c_str(), visit);
+    }
+    const core::Result<PathString> native = join(root, parsed->relative);
+    if (!native) {
+        return fail(native.error());
+    }
+    return list_directory(native->c_str(), visit);
 }
 
 core::Result<ReadHandle> Vfs::read(const ReadRequest& request) {

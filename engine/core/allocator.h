@@ -47,6 +47,15 @@ protected:
 // system (memory_stats.h). Thread-safe. Phase 1: global operator new/delete.
 Allocator& heap_allocator(MemoryTag tag = MemoryTag::General);
 
+// malloc, realloc and free on a tagged heap, for third-party libraries whose allocator hooks free
+// without a size (cgltf, stb, yyjson, meshoptimizer...). Each block starts with a 16-byte header
+// holding its size; blocks are 16-byte aligned, as malloc's are. tagged_realloc(tag, null, n) is
+// tagged_malloc; tagged_realloc(tag, p, 0) frees p and returns null. tagged_free(tag, null) does
+// nothing. A block must be freed with the tag it was allocated with.
+void* tagged_malloc(MemoryTag tag, size_t size);
+void* tagged_realloc(MemoryTag tag, void* pointer, size_t size);
+void tagged_free(MemoryTag tag, void* pointer);
+
 template <typename T>
 T* allocate_array(Allocator& allocator, size_t count) {
     // Checked in every build: a wrapped size would return a block too small for count elements.

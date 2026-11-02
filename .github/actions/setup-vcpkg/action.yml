@@ -32,5 +32,5 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ env.VCPKG_CACHE_DIR }}
-        key: vcpkg-${{ inputs.cache-key }}-${{ hashFiles('vcpkg.json', 'cmake/vcpkg-triplets/**') }}
+        key: vcpkg-${{ inputs.cache-key }}-${{ hashFiles('vcpkg.json', 'cmake/vcpkg-triplets/**', 'cmake/vcpkg-ports/**') }}
         restore-keys: vcpkg-${{ inputs.cache-key }}-

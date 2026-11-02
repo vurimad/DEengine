@@ -1,0 +1,11 @@
+{
+  "rules": [
+    {"match": "*_normal.*", "texture": {"compression": "bc5", "srgb": false, "normal_map": true}},
+    {"match": "*_orm.*", "texture": {"compression": "bc7", "srgb": false}},
+    {"match": "*_roughness.*", "texture": {"compression": "bc4", "srgb": false}},
+    {"match": "*_metallic.*", "texture": {"compression": "bc4", "srgb": false}},
+    {"match": "*_ao.*", "texture": {"compression": "bc4", "srgb": false}},
+    {"match": "*_height.*", "texture": {"compression": "bc4", "srgb": false}},
+    {"match": "*_mask.*", "texture": {"compression": "bc4", "srgb": false}}
+  ]
+}

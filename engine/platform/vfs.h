@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/allocator.h"
+#include "core/function_ref.h"
 #include "core/job_system.h"
 #include "core/result.h"
 #include "platform/file.h"
@@ -89,6 +90,7 @@ struct VfsDesc {
     uint32_t max_reads = 1024;            // reads in flight at once
     core::JobSystem* jobs = nullptr;      // where ReadRequest::on_complete callbacks run
     core::Allocator* allocator = nullptr; // null: heap_allocator(MemoryTag::Platform)
+    bool game_writable = false;           // the cooker writes game:/; the game never does
 };
 
 struct IoStats {
@@ -129,8 +131,18 @@ public:
     // Blocking: the whole file into dest (which must be large enough). Returns the bytes read.
     core::Result<size_t> read_file(const char* path, std::span<std::byte> dest) const;
 
-    // Blocking and atomic (temp file, then rename); creates missing folders. user:/ and temp:/ only.
+    // Blocking and atomic (temp file, then rename); creates missing folders. user:/, temp:/ and
+    // src:/, and game:/ for the cooker (VfsDesc::game_writable).
     core::Result<void> write_file(const char* path, std::span<const std::byte> data) const;
+
+    // Blocking: deletes a file (never a folder) where write_file() may write. Succeeds if it isn't there.
+    core::Result<void> remove_file(const char* path) const;
+
+    // Calls visit(name, is_directory) for each entry of a folder ("src:/content/rocks"; "src:/" is
+    // the mount's root). Names are as the OS spells them, so they may break the path rules
+    // (uppercase, spaces): tools report those. For tools; not for per-frame code.
+    core::Result<void> list(const char* folder,
+                            core::FunctionRef<void(const char* name, bool is_directory)> visit) const;
 
     // Queues a read. dest must stay valid until finish() returns, or until cancel() returns
     // anything but InFlight.

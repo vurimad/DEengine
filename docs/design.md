@@ -397,6 +397,15 @@ meta/characters/knight/
 
 The editor browses source assets but always loads their cooked versions, so previews show exactly what ships.
 
+**Cooker v1** (`tools/cooker/`, formats in `engine/asset/`; details in their READMEs).
+
+- Cooked files live in `game:/` named by asset ID (`game:/3f/3f8a0c1e5b2d4e61.demesh`), since runtime code loads by ID. A source's main asset takes its GUID's ID; others it makes take an ID derived from it and a local name (`material/stone`, `image/0`); shaders take one from their module name, which code already uses.
+- A glTF or FBX cooks to one mesh (its default scene flattened, a part per material), a material per material, and a texture per embedded image. Scenes as prefabs and cells come with the prefab and cell formats.
+- Texture defaults follow from use: a texture a material samples as a normal map compresses to BC5, color to sRGB BC7, other maps to linear BC7. Folder rules and metas override them (JSON merge patches, root to leaf).
+- Our text material source is `.material` (JSON): a template, named parameters and textures by relative path.
+- The cooker keeps its state in `game:/cook_state.json`: per source, the hash of every input (bytes, settings, files it reads, versions) and what it made. Unchanged sources are skipped, outputs of deleted sources removed, and metas of files moved outside the tools re-linked by the last content hash.
+- `cooker --check` validates the source and meta trees and writes nothing, for CI.
+
 ## Rendering
 
 The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aimed at the Elden Ring look: wide vistas, dense grass, strong atmospheric depth, golden backlight, heavy VFX. Deferred is the right fit here because the open world has huge material variety, many local lights from VFX, and decals everywhere.
@@ -962,6 +971,7 @@ One style everywhere, enforced by clang-format and clang-tidy in CI, so humans a
 ```
 engine/
   core/       # core library, allocators, jobs, logging, math
+  asset/      # cooked formats (load in place), asset IDs
   platform/   # SDL3, file IO, threads, OS glue
   render/     # RHI, render graph, passes, materials
   world/      # streaming, terrain, vegetation, cells
@@ -1107,3 +1117,5 @@ Decisions so far:
 | 2026-11-01 | Own cooked formats (.demesh, .detex...); source + mirrored meta tree with GUIDs | Load-in-place speed, clean source folders, rename-safe references |
 | 2026-11-02 | Clip space +Y up with depth 0..1 and reverse Z on every backend | One convention for Vulkan, D3D12 and consoles; depth precision for long view distances |
 | 2026-11-02 | Cloth is a primary system: XPBD character cloth (Jolt soft bodies first), GPU environment cloth, spring bones | Moving capes, robes and banners are central to the look; cosmetic only, so determinism is untouched |
+| 2026-11-02 | Cooker libraries: yyjson (JSON), cgltf, ufbx, stb_image(_resize2), meshoptimizer, bc7enc_rdo (BC1-BC7), xxHash; ufbx and bc7enc_rdo through overlay vcpkg ports | Small, fast, permissive, with allocator hooks; no Assimp, no closed encoders |
+| 2026-11-02 | Cooked files named by asset ID in game:/, not by source path | Runtime loads by ID; one source makes several assets; the archive packer works by ID anyway |
