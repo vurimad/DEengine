@@ -322,6 +322,24 @@ void JobSystem::submit(std::span<const Job> jobs) {
     enqueue(*state_, jobs);
 }
 
+void JobSystem::reserve(JobCounter& counter, uint32_t count) {
+    JobSystemState::add(counter, count);
+}
+
+void JobSystem::submit_reserved(const Job& job) {
+    DE_ASSERT(job.entry != nullptr);
+    DE_ASSERT(job.name != nullptr);
+    enqueue(*state_, std::span<const Job>(&job, 1));
+}
+
+void JobSystem::release_reserved(JobCounter& counter, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+        if (JobSystemState::finish(counter)) {
+            wake(*state_, true); // someone may be asleep in wait() on this counter
+        }
+    }
+}
+
 void JobSystem::wait(JobCounter& counter) {
     DE_PROFILE_ZONE("wait");
     JobSystemState& state = *state_;
