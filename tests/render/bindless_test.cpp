@@ -555,6 +555,12 @@ TEST_CASE("GPU-assisted validation catches out-of-bounds writes through buffer p
         MESSAGE("skipped: no validation layer");
         return;
     }
+    // CI's CPU driver (lavapipe) runs with an older validation layer whose GPU-assisted mode
+    // doesn't check pointer accesses there; the check is meant for real GPUs.
+    if (device->capabilities().type == GpuType::Cpu) {
+        MESSAGE("skipped: GPU-assisted pointer checks need a real GPU");
+        return;
+    }
     ShaderKit kit(*device);
     const auto fill = kit.compute("tests.fill_buffer");
     const auto buffer = *device->create_buffer(
