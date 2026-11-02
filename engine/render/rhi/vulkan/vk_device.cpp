@@ -132,6 +132,7 @@ void fill_capabilities(DeviceImpl& impl, bool ray_query) {
     caps.async_compute = family(QueueType::Compute) != family(QueueType::Graphics);
     caps.dedicated_transfer = family(QueueType::Transfer) != family(QueueType::Graphics) &&
                               family(QueueType::Transfer) != family(QueueType::Compute);
+    caps.transfer_queue = family(QueueType::Transfer) != family(QueueType::Graphics);
     caps.ray_query = ray_query;
 
     uint32_t family_count = 0;
@@ -399,6 +400,10 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
                                               .pNext = &timeline_type};
     DE_VK_CHECK(vkCreateSemaphore(device, &timeline_info, nullptr, &frame_timeline));
     set_debug_name(VK_OBJECT_TYPE_SEMAPHORE, reinterpret_cast<uint64_t>(frame_timeline), "frame timeline");
+    if (capabilities.transfer_queue) {
+        DE_VK_CHECK(vkCreateSemaphore(device, &timeline_info, nullptr, &transfer_timeline));
+        set_debug_name(VK_OBJECT_TYPE_SEMAPHORE, reinterpret_cast<uint64_t>(transfer_timeline), "transfer timeline");
+    }
 
     const VkSemaphoreCreateInfo binary_info{.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     const VkCommandPoolCreateInfo pool_info{
@@ -406,8 +411,16 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
         .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
         .queueFamilyIndex = queue_families[static_cast<size_t>(QueueType::Graphics)],
     };
+    const VkCommandPoolCreateInfo transfer_pool_info{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+        .queueFamilyIndex = queue_families[static_cast<size_t>(QueueType::Transfer)],
+    };
     for (FrameSlot& slot : frames) {
         DE_VK_CHECK(vkCreateCommandPool(device, &pool_info, nullptr, &slot.command_pool));
+        if (capabilities.transfer_queue) {
+            DE_VK_CHECK(vkCreateCommandPool(device, &transfer_pool_info, nullptr, &slot.transfer_pool));
+        }
         DE_VK_CHECK(vkCreateSemaphore(device, &binary_info, nullptr, &slot.acquire_semaphore));
     }
 
@@ -486,11 +499,14 @@ void DeviceImpl::shutdown() {
         }
         for (FrameSlot& slot : frames) {
             vkDestroyCommandPool(device, slot.command_pool, nullptr);
+            vkDestroyCommandPool(device, slot.transfer_pool, nullptr);
             vkDestroySemaphore(device, slot.acquire_semaphore, nullptr);
             slot = {};
         }
         vkDestroySemaphore(device, frame_timeline, nullptr);
         frame_timeline = VK_NULL_HANDLE;
+        vkDestroySemaphore(device, transfer_timeline, nullptr);
+        transfer_timeline = VK_NULL_HANDLE;
         if (allocator != VK_NULL_HANDLE) {
             vmaDestroyAllocator(allocator);
             allocator = VK_NULL_HANDLE;
@@ -570,25 +586,49 @@ void DeviceImpl::free_pending(FrameSlot& slot) {
 
 CommandList DeviceImpl::begin_command_list(QueueType queue) {
     DE_ASSERT_MSG(in_frame, "begin_command_list outside begin_frame/end_frame");
-    DE_ASSERT_MSG(queue == QueueType::Graphics, "only graphics command lists for now");
-    static_cast<void>(queue);
+    DE_ASSERT_MSG(queue != QueueType::Compute, "no async compute lists yet");
+    DE_VERIFY_MSG(queue != QueueType::Transfer || capabilities.transfer_queue,
+                  "transfer lists need a transfer queue of its own (Capabilities::transfer_queue)");
 
     FrameSlot& slot = current_slot();
     DE_VERIFY_MSG(slot.list_count < kMaxCommandListsPerFrame, "too many command lists in one frame");
     const uint32_t index = slot.list_count++;
-    if (index == slot.allocated_count) {
+    if (queue == QueueType::Transfer) {
+        DE_VERIFY_MSG(slot.transfer_count < kMaxTransferListsPerFrame, "too many transfer lists in one frame");
+        const uint32_t transfer_index = slot.transfer_count++;
+        if (transfer_index == slot.transfer_allocated) {
+            const VkCommandBufferAllocateInfo info{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                .commandPool = slot.transfer_pool,
+                .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                .commandBufferCount = 1,
+            };
+            DE_VK_CHECK(vkAllocateCommandBuffers(device, &info, &slot.transfer_buffers[transfer_index]));
+            ++slot.transfer_allocated;
+        }
+        CommandListImpl& list = slot.lists[index];
+        list = CommandListImpl{.device = this, .cmd = slot.transfer_buffers[transfer_index], .queue = queue};
+        const VkCommandBufferBeginInfo begin{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        };
+        DE_VK_CHECK(vkBeginCommandBuffer(list.cmd, &begin));
+        return CommandList(&list); // copies only: no bindless set
+    }
+    const uint32_t graphics_index = index - slot.transfer_count;
+    if (graphics_index == slot.allocated_count) {
         const VkCommandBufferAllocateInfo info{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
             .commandPool = slot.command_pool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1,
         };
-        DE_VK_CHECK(vkAllocateCommandBuffers(device, &info, &slot.command_buffers[index]));
+        DE_VK_CHECK(vkAllocateCommandBuffers(device, &info, &slot.command_buffers[graphics_index]));
         ++slot.allocated_count;
     }
 
     CommandListImpl& list = slot.lists[index];
-    list = CommandListImpl{.device = this, .cmd = slot.command_buffers[index]};
+    list = CommandListImpl{.device = this, .cmd = slot.command_buffers[graphics_index], .queue = queue};
     const VkCommandBufferBeginInfo begin{
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -956,7 +996,17 @@ void Device::begin_frame() {
     }
     impl.free_pending(slot);
     DE_VK_CHECK(vkResetCommandPool(impl.device, slot.command_pool, 0));
+    if (slot.transfer_pool != VK_NULL_HANDLE) {
+        DE_VK_CHECK(vkResetCommandPool(impl.device, slot.transfer_pool, 0));
+    }
     slot.list_count = 0;
+    slot.transfer_count = 0;
+    impl.transfer_after_previous_frame = false;
+}
+
+void Device::transfer_after_previous_frame() {
+    DE_ASSERT_MSG(impl_->in_frame, "transfer_after_previous_frame outside begin_frame/end_frame");
+    impl_->transfer_after_previous_frame = true;
 }
 
 CommandList Device::begin_command_list(QueueType queue) {
@@ -969,20 +1019,73 @@ void Device::end_frame() {
     DE_ASSERT_MSG(impl.in_frame, "end_frame without begin_frame");
     FrameSlot& slot = impl.current_slot();
 
+    // Lists in the order they were begun, per queue.
     VkCommandBufferSubmitInfo command_buffers[kMaxCommandListsPerFrame];
+    VkCommandBufferSubmitInfo transfer_buffers[kMaxTransferListsPerFrame];
+    uint32_t graphics_count = 0;
+    uint32_t transfer_count = 0;
     for (uint32_t i = 0; i < slot.list_count; ++i) {
         const CommandListImpl& list = slot.lists[i];
         DE_ASSERT_MSG(!list.in_rendering, "command list ended inside begin_rendering");
         DE_ASSERT_MSG(list.label_depth == 0, "command list ended with an open debug label");
         DE_VK_CHECK(vkEndCommandBuffer(list.cmd));
-        command_buffers[i] = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, .commandBuffer = list.cmd};
+        const VkCommandBufferSubmitInfo info{.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+                                             .commandBuffer = list.cmd};
+        if (list.queue == QueueType::Transfer) {
+            transfer_buffers[transfer_count++] = info;
+        } else {
+            command_buffers[graphics_count++] = info;
+        }
     }
 
-    const VkSemaphoreSubmitInfo wait{
-        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-        .semaphore = slot.acquire_semaphore,
-        .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-    };
+    // Transfers first, on their queue; the graphics submission waits for them.
+    if (transfer_count > 0) {
+        const VkSemaphoreSubmitInfo previous_frame{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = impl.frame_timeline,
+            .value = impl.frame_index - 1,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+        const VkSemaphoreSubmitInfo transfer_done{
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = impl.transfer_timeline,
+            .value = impl.frame_index,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+        const bool wait_previous = impl.transfer_after_previous_frame && impl.frame_index > 1;
+        const VkSubmitInfo2 transfer_submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
+            .waitSemaphoreInfoCount = wait_previous ? 1U : 0U,
+            .pWaitSemaphoreInfos = &previous_frame,
+            .commandBufferInfoCount = transfer_count,
+            .pCommandBufferInfos = transfer_buffers,
+            .signalSemaphoreInfoCount = 1,
+            .pSignalSemaphoreInfos = &transfer_done,
+        };
+        DE_PROFILE_ZONE("transfer submit");
+        DE_VK_CHECK(
+            vkQueueSubmit2(impl.queues[static_cast<size_t>(QueueType::Transfer)], 1, &transfer_submit, VK_NULL_HANDLE));
+    }
+
+    VkSemaphoreSubmitInfo waits[2];
+    uint32_t wait_count = 0;
+    if (impl.acquired) {
+        waits[wait_count++] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = slot.acquire_semaphore,
+            .stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        };
+    }
+    if (transfer_count > 0) {
+        // Every graphics command may use what the transfers wrote (their acquire barriers sit
+        // anywhere in the frame's lists).
+        waits[wait_count++] = {
+            .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+            .semaphore = impl.transfer_timeline,
+            .value = impl.frame_index,
+            .stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        };
+    }
     const VkSemaphoreSubmitInfo signals[] = {
         {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
          .semaphore = impl.frame_timeline,
@@ -994,9 +1097,9 @@ void Device::end_frame() {
     };
     const VkSubmitInfo2 submit{
         .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
-        .waitSemaphoreInfoCount = impl.acquired ? 1U : 0U,
-        .pWaitSemaphoreInfos = &wait,
-        .commandBufferInfoCount = slot.list_count,
+        .waitSemaphoreInfoCount = wait_count,
+        .pWaitSemaphoreInfos = waits,
+        .commandBufferInfoCount = graphics_count,
         .pCommandBufferInfos = command_buffers,
         .signalSemaphoreInfoCount = impl.acquired ? 2U : 1U,
         .pSignalSemaphoreInfos = signals,

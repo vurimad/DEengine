@@ -21,6 +21,9 @@ struct UploaderDesc {
     // instead of stalling one. A single upload bigger than this still goes, alone.
     // record() keeps each barrier command within kInlineBarriers, splitting big batches.
     uint64_t frame_budget_bytes = uint64_t{16} << 20U;
+    // Copy on the transfer queue when the device has one (Capabilities::transfer_queue), so
+    // uploads run alongside rendering; false keeps them on the graphics queue.
+    bool use_transfer_queue = true;
 };
 
 // Which mips of a texture an upload fills, and the state it leaves them in.
@@ -44,6 +47,7 @@ struct UploaderStats {
     uint64_t uploaded_bytes = 0;    // copied to the GPU so far, in total
     uint32_t dedicated_staging = 0; // uploads that didn't fit the ring and got their own buffer
     uint32_t dropped_uploads = 0;   // uploads whose texture or buffer was destroyed before they were recorded
+    bool transfer_queue = false;    // copies run on the transfer queue
 };
 
 // Moves data from the CPU into GPU textures and buffers (docs/design.md, File system & IO: GPU
@@ -59,6 +63,15 @@ struct UploaderStats {
 // Later uploads (more mips streamed in, or new contents) start from the state the last one left
 // and move only their mips. Don't transition those textures yourself until their uploads are
 // recorded.
+//
+// On the transfer queue, record() puts the copies on a transfer list of their own, which runs
+// alongside the GPU's previous frame, and hands what they wrote to the graphics queue: the list
+// given to record() gets the matching acquire barriers, and all of the frame's graphics work waits
+// for the copies. Uploads over something already uploaded wait for the previous frame first (it
+// may still read the old contents). On the graphics queue, the copies go on the given list.
+// Either way, call record() before the frame's commands that use the uploads.
+//
+// The first upload to a texture or buffer assumes nothing else is using it.
 //
 // Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
 // GPU in the order they were queued. Destroying a texture or buffer with uploads still queued is
@@ -86,7 +99,8 @@ public:
                                      ResourceState after, ShaderStages after_stages = ShaderStages::All);
 
     // Once per frame, before the queued textures and buffers are used: records the queued copies,
-    // within the frame budget, and the barriers around them. Does nothing when idle().
+    // within the frame budget, and the barriers around them. Does nothing when idle(). list is a
+    // graphics list of this frame.
     void record(CommandList& list);
 
     // For load time and tests, outside a frame: runs frames until everything queued is copied, and

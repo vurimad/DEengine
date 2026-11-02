@@ -320,6 +320,18 @@ struct TextureRange {
     uint32_t layer_count = kAllLayers; // kAllLayers: from first_layer to the last layer
 };
 
+// Handing a resource from one queue family to another (the transfer queue to graphics, say). The
+// queue giving it up records a Release on its list; the queue taking it records the matching
+// Acquire (same resource, range, before and after states) in a submission that waits for the
+// first. The state change happens once, between the two. other_queue names the queue on the other
+// side; the two queues must be different families (Capabilities::transfer_queue for Transfer).
+// Contents that aren't kept (discard, or from Undefined) need no handover: just transition there.
+enum class QueueOwnership : uint8_t {
+    None,
+    Release, // after_stages are ignored: the acquiring queue's barrier waits instead
+    Acquire, // before_stages are ignored: the semaphore between the queues already waited
+};
+
 struct TextureBarrier {
     TextureHandle texture{};
     ResourceState before = ResourceState::Undefined;
@@ -330,6 +342,8 @@ struct TextureBarrier {
     // The old contents aren't needed: skip preserving them through the layout change (cheaper),
     // while still waiting for the previous use to finish. For targets overwritten every frame.
     bool discard = false;
+    QueueOwnership ownership = QueueOwnership::None;
+    QueueType other_queue = QueueType::Graphics;
 };
 
 struct BufferBarrier {
@@ -340,6 +354,8 @@ struct BufferBarrier {
     ShaderStages after_stages = ShaderStages::All;
     uint64_t offset = 0;
     uint64_t size = kWholeBuffer; // kWholeBuffer: from offset to the end
+    QueueOwnership ownership = QueueOwnership::None;
+    QueueType other_queue = QueueType::Graphics;
 };
 
 // Orders every buffer access matching before against every one matching after, with no handle:
@@ -535,8 +551,11 @@ struct Capabilities {
 
     bool async_compute = false;      // the compute queue runs alongside graphics (its own queue family)
     bool dedicated_transfer = false; // the transfer queue is a copy-only queue family
-    bool ray_query = false;          // inline ray tracing from any shader, with acceleration structures
-    bool timestamps = false;         // GPU timestamps on the graphics and compute queues
+    // Transfer command lists run on a queue of their own family, alongside graphics. Without it,
+    // there are no transfer lists: copies go on graphics lists.
+    bool transfer_queue = false;
+    bool ray_query = false;  // inline ray tracing from any shader, with acceleration structures
+    bool timestamps = false; // GPU timestamps on the graphics and compute queues
     float timestamp_period_ns = 0.0f;
 
     uint32_t max_texture_size_2d = 0;

@@ -101,6 +101,19 @@ void record_frame(Device& device, Uploader& uploader) {
     device.end_frame();
 }
 
+// Runs the rest of the test case once per uploader path (doctest subcases): the graphics queue, and
+// the transfer queue when the device has one. Call it once per test case, unconditionally.
+bool transfer_path(const Device& device) {
+    bool transfer = false;
+    SUBCASE("graphics queue") {}
+    if (device.capabilities().transfer_queue) {
+        SUBCASE("transfer queue") {
+            transfer = true;
+        }
+    }
+    return transfer;
+}
+
 constexpr TextureUsage kCopyBoth = TextureUsage::CopyDst | TextureUsage::CopySrc;
 constexpr BufferUsage kBufferCopyBoth = BufferUsage::CopyDst | BufferUsage::CopySrc;
 
@@ -209,8 +222,10 @@ TEST_CASE("every mip and layer arrives where it belongs") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    const bool transfer = transfer_path(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer});
     REQUIRE(uploader.ok());
+    CHECK(uploader->stats().transfer_queue == transfer);
     const TextureDesc descs[] = {
         {.width = 16, .height = 8, .mip_count = 5, .format = Format::RGBA8Unorm, .usage = kCopyBoth},
         {.width = 8, .height = 8, .mip_count = 4, .layer_count = 3, .format = Format::RGBA8Unorm, .usage = kCopyBoth},
@@ -256,7 +271,7 @@ TEST_CASE("mips stream in separately, and again, from the state they were left i
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const TextureDesc desc{.width = 16,
                            .height = 16,
@@ -297,7 +312,7 @@ TEST_CASE("block-compressed uploads sample as their colors") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     ShaderKit kit(*device);
     const auto program = kit.compute("tests.sample_texture");
@@ -377,7 +392,8 @@ TEST_CASE("the frame budget spreads uploads over frames, in order") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 2048});
+    auto uploader =
+        Uploader::create(*device, {.frame_budget_bytes = 2048, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     // Four 1 KiB textures: two per frame.
     const TextureDesc desc{.width = 16, .height = 16, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
@@ -427,7 +443,7 @@ TEST_CASE("uploads to one resource are recorded in order, a batch apart") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth});
     const auto first = pattern(64, 1);
@@ -453,7 +469,8 @@ TEST_CASE("the staging ring wraps and reuses memory the GPU is done with") {
         return;
     }
     // Room for four uploads of 1000 bytes; forty go through it, one per frame.
-    auto uploader = Uploader::create(*device, {.staging_bytes = 4096, .frame_budget_bytes = 4096});
+    auto uploader = Uploader::create(
+        *device, {.staging_bytes = 4096, .frame_budget_bytes = 4096, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     constexpr uint32_t kUploads = 40;
     constexpr size_t kChunk = 1000;
@@ -484,7 +501,7 @@ TEST_CASE("an upload too big for the ring, or one that finds it full, gets stagi
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device, {.staging_bytes = 4096});
+    auto uploader = Uploader::create(*device, {.staging_bytes = 4096, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const uint32_t buffers_before = device->stats().live_buffers;
     const auto buffer = *device->create_buffer({.size = 16384, .usage = kBufferCopyBoth});
@@ -516,7 +533,8 @@ TEST_CASE("uploads queued but never recorded don't leak") {
     const uint32_t buffers_before = device->stats().live_buffers;
     const auto buffer = *device->create_buffer({.size = 8192, .usage = kBufferCopyBoth});
     {
-        auto uploader = Uploader::create(*device, {.staging_bytes = 4096});
+        auto uploader =
+            Uploader::create(*device, {.staging_bytes = 4096, .use_transfer_queue = transfer_path(*device)});
         REQUIRE(uploader.ok());
         const auto bytes = pattern(8192, 5);
         REQUIRE(uploader->upload_buffer(buffer, 0, as_span(bytes), ResourceState::CopySrc).ok()); // dedicated
@@ -535,7 +553,9 @@ TEST_CASE("a buffer's ranges left in different read states are all waited for") 
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    // Barrier tracking within one frame: the graphics path (on the transfer queue, uploads land
+    // before all of the frame's graphics work).
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = false});
     REQUIRE(uploader.ok());
     const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth | BufferUsage::Storage});
     const auto readback =
@@ -573,7 +593,7 @@ TEST_CASE("uploads to resources destroyed before they are recorded are dropped")
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device, {.staging_bytes = 4096});
+    auto uploader = Uploader::create(*device, {.staging_bytes = 4096, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const uint32_t buffers_before = device->stats().live_buffers;
     const TextureDesc desc{.width = 16, .height = 16, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
@@ -605,7 +625,7 @@ TEST_CASE("long streams of uploads keep their order and bookkeeping") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     // Rounds of 100 small uploads to one buffer, recorded one per frame (each waits for the last):
     // the queue and the ring's region list fill up, drain and compact many times over.
@@ -642,7 +662,7 @@ TEST_CASE("a first upload of some mips leaves every mip usable") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const TextureDesc desc{.width = 16, .height = 16, .mip_count = 5, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
     const auto texture = *device->create_texture(desc);
@@ -666,7 +686,8 @@ TEST_CASE("an upload bigger than the budget isn't held back by a dropped one ahe
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 1024});
+    auto uploader =
+        Uploader::create(*device, {.frame_budget_bytes = 1024, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     const auto doomed = *device->create_buffer({.size = 256, .usage = kBufferCopyBoth});
     const auto buffer = *device->create_buffer({.size = 4096, .usage = kBufferCopyBoth});
@@ -688,7 +709,8 @@ TEST_CASE("a buffer range left written doesn't hide readers of another range") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    // The graphics path, as above.
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = false});
     REQUIRE(uploader.ok());
     const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth | BufferUsage::Storage});
     const auto readback =
@@ -726,7 +748,7 @@ TEST_CASE("big batches split their barriers, and shader states need stages") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
     // Forty textures in one batch: more first-upload barriers than one command holds inline.
     const TextureDesc desc{.width = 4, .height = 4, .mip_count = 3, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
@@ -750,6 +772,78 @@ TEST_CASE("big batches split their barriers, and shader states need stages") {
               .error()
               .code == de::core::ErrorCode::InvalidArgument);
     device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("textures re-uploaded every frame while sampled every frame stay in sync") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    // On the transfer queue, each re-upload must wait for the previous frame's sampling, and hand
+    // the texture back to graphics; on the graphics queue, barriers alone order it.
+    const bool transfer = transfer_path(*device);
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer});
+    REQUIRE(uploader.ok());
+    ShaderKit kit(*device);
+    const auto program = kit.compute("tests.sample_texture");
+    constexpr uint32_t kSize = 8;
+    constexpr uint32_t kFrames = 12;
+    const TextureDesc desc{.width = kSize,
+                           .height = kSize,
+                           .format = Format::RGBA8Unorm,
+                           .usage = TextureUsage::Sampled | TextureUsage::CopyDst};
+    const auto texture = *device->create_texture(desc);
+    // One output per frame in flight, read back once its frame is done.
+    BufferHandle outputs[kFramesInFlight];
+    for (BufferHandle& output : outputs) {
+        output = *device->create_buffer(
+            {.size = uint64_t{kSize} * kSize * 16, .usage = BufferUsage::Storage, .memory = MemoryLocation::Readback});
+    }
+    de::core::Array<std::byte> texels(test_heap());
+    texels.resize(size_t{kSize} * kSize * 4);
+    int wrong_frames = 0;
+    for (uint32_t frame = 0; frame < kFrames; ++frame) {
+        // Every texel this frame: red = the frame number.
+        for (size_t i = 0; i < texels.size(); i += 4) {
+            texels[i] = static_cast<std::byte>(frame * 16);
+            texels[i + 1] = std::byte{0};
+            texels[i + 2] = std::byte{0};
+            texels[i + 3] = std::byte{255};
+        }
+        REQUIRE(uploader->upload_texture(texture, as_span(texels), {.after_stages = ShaderStages::Compute}).ok());
+        device->begin_frame();
+        // The output of kFramesInFlight frames ago is done: check it showed that frame's color.
+        const BufferHandle output = outputs[frame % kFramesInFlight];
+        if (frame >= kFramesInFlight) {
+            device->invalidate_mapped(output);
+            float texel[4];
+            std::memcpy(texel, device->mapped(output).data(), sizeof(texel));
+            const float expected = static_cast<float>((frame - kFramesInFlight) * 16) / 255.0f;
+            wrong_frames += std::fabs(texel[0] - expected) > 1.0f / 512.0f ? 1 : 0;
+        }
+        CommandList list = device->begin_command_list();
+        uploader->record(list);
+        list.bind_pipeline(kit.pipeline(program));
+        list.push_constants(SampleTexturePush{.output = device->buffer_address(output),
+                                              .texture = device->texture_index(texture),
+                                              .sampler = sampler_index(DefaultSampler::PointClamp),
+                                              .width = kSize,
+                                              .height = kSize});
+        list.dispatch(1, 1);
+        list.barrier(BufferBarrier{.buffer = output,
+                                   .before = ResourceState::ShaderWrite,
+                                   .after = ResourceState::HostRead,
+                                   .before_stages = ShaderStages::Compute});
+        device->end_frame();
+    }
+    device->wait_idle();
+    CHECK(wrong_frames == 0);
+    device->destroy(texture);
+    for (const BufferHandle output : outputs) {
+        device->destroy(output);
+    }
     device->wait_idle();
     check_clean(*device);
 }

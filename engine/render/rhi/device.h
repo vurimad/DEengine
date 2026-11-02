@@ -125,12 +125,18 @@ public:
     // Call it at most once per frame, as late as possible.
     TextureHandle acquire_swapchain_texture();
 
-    // A new command list for this frame. Only QueueType::Graphics until async compute and
-    // transfer submission arrive with the render graph.
+    // A new command list for this frame, on the graphics queue or, when
+    // Capabilities::transfer_queue, the transfer queue (copies and barriers only). Async compute
+    // lists arrive with the render graph.
     CommandList begin_command_list(QueueType queue = QueueType::Graphics);
 
-    // Submits this frame's command lists in the order they were begun, then presents the
-    // swapchain texture if one was acquired.
+    // Transfer lists of frame N run alongside the GPU's work on frame N-1, and all of frame N's
+    // graphics work waits for them. When they overwrite something frame N-1 (or earlier) may
+    // still read, call this: frame N's transfers then start after frame N-1 is done.
+    void transfer_after_previous_frame();
+
+    // Submits this frame's command lists in the order they were begun, per queue (transfer lists
+    // first), then presents the swapchain texture if one was acquired.
     void end_frame();
 
     // Waits for all GPU work to finish and frees every pending destroy. For shutdown, tests and tools.
