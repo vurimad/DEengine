@@ -11,6 +11,10 @@ target_link_libraries(de_shader
     PUBLIC de::core de::platform de::rhi de::compile_options
     PRIVATE slang::slang)
 
+# Slang's interfaces are COM-style: objects free themselves in release() and are never deleted
+# through an interface pointer, so the interfaces have no virtual destructor by design.
+set_source_files_properties(shader_compiler.cpp PROPERTIES COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU>:-Wno-non-virtual-dtor>")
+
 # Slang's runtime: the compiler library, its SPIR-V helpers and its precompiled standard modules,
 # which it loads from beside slang.dll. On Linux it finds them in vcpkg's lib folder through the
 # rpath; on Windows they are copied next to each executable that compiles shaders. slang-llvm
