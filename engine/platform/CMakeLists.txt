@@ -1,10 +1,14 @@
 find_package(SDL3 CONFIG REQUIRED)
+find_package(imgui CONFIG REQUIRED)
 
 add_library(de_platform STATIC
     debug.h
     events.cpp
     events.h
     file.h
+    imgui_events.h
+    imgui_platform.cpp
+    imgui_platform.h
     input.cpp
     input.h
     platform.cpp
@@ -28,4 +32,4 @@ endif()
 
 target_link_libraries(de_platform
     PUBLIC de::core de::compile_options
-    PRIVATE SDL3::SDL3)
+    PRIVATE SDL3::SDL3 imgui::imgui)

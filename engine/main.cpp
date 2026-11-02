@@ -17,6 +17,8 @@
 #include "render/rhi/upload.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "tools/debug_ui.h"
+#include "tools/stats_panel.h"
 #include "world/world.h"
 
 #include <cmath>
@@ -175,6 +177,8 @@ int main(int argc, char** argv) {
     bind(move_y, "key:W");
     bind(move_y, "key:S", -1.0f);
     bind(move_y, "gamepad:lefty", -1.0f); // stick up is negative y
+    const ActionId toggle_stats = input.add_action("toggle_stats"_sid, ActionKind::Button);
+    bind(toggle_stats, "key:F1");
     if (!bound) {
         return EXIT_FAILURE;
     }
@@ -266,6 +270,13 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
+    // device, uploader and graph, so it goes before them.
+    de::tools::DebugUi debug_ui =
+        de::tools::DebugUi::create(*window, *device, shaders ? &*shaders : nullptr, *uploader);
+    de::tools::StatsPanel stats_panel;
+    bool show_stats = true;
+
     const char* frames_flag = flag_value(argc, argv, "--frames");
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
     uint64_t next_stick_report_ns = 0;
@@ -318,6 +329,17 @@ int main(int argc, char** argv) {
         }
 
         world->advance(frame_s); // fixed ticks, then RenderExtract
+
+        // The debug UI for this frame. Its textures go to the uploader before record().
+        if (input.state(toggle_stats).pressed) {
+            show_stats = !show_stats;
+        }
+        if (debug_ui.begin_frame(*window, static_cast<float>(frame_s))) {
+            if (show_stats) {
+                stats_panel.draw(&show_stats);
+            }
+            debug_ui.end_frame();
+        }
 
         device->begin_frame();
         uploader->record(); // uploads land at the start of the frame
@@ -406,6 +428,7 @@ int main(int argc, char** argv) {
                     }
                     context.list.end_rendering();
                 });
+            debug_ui.add_pass(*graph, back, device->swapchain_format());
             graph->execute();
         }
         device->end_frame();
@@ -426,9 +449,15 @@ int main(int argc, char** argv) {
             title_start_ns = now;
         }
 
-        // The "zero heap allocations per frame" rule, made visible in the profiler.
-        DE_PROFILE_PLOT("heap allocations/frame",
-                        static_cast<int64_t>(de::core::heap_allocation_count() - frame_start_allocations));
+        // The "zero heap allocations per frame" rule, made visible in the profiler and the panel.
+        const uint64_t allocations = de::core::heap_allocation_count() - frame_start_allocations;
+        DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
+        stats_panel.record({.frame_ms = static_cast<float>(frame_s * 1000.0),
+                            .heap_allocations = allocations,
+                            .device = device->stats(),
+                            .memory = device->memory_stats(),
+                            .graph = graph->stats(),
+                            .uploads = uploader->stats()});
         DE_PROFILE_FRAME();
 
         ++frame;

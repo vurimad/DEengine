@@ -807,6 +807,11 @@ void Uploader::flush_and_wait() {
     device.wait_idle();
 }
 
+bool Uploader::ready(TextureHandle texture) const {
+    const MipStates* mips = state_->texture_states.find(texture);
+    return mips != nullptr && mips->initialized;
+}
+
 bool Uploader::idle() const {
     return state_->queue_head == state_->queue.size();
 }

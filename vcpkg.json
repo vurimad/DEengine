@@ -8,6 +8,12 @@
     "flecs",
     "glm",
     {
+      "name": "imgui",
+      "features": [
+        "docking-experimental"
+      ]
+    },
+    {
       "name": "sdl3",
       "default-features": false,
       "features": [
