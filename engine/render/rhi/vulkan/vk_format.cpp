@@ -46,14 +46,26 @@ constexpr std::array<VkFormat, kFormatCount> kVkFormats = {{
 }};
 static_assert(kVkFormats.back() == VK_FORMAT_BC7_SRGB_BLOCK, "kVkFormats is out of step with Format");
 
-constexpr VkPipelineStageFlags2 kShaderStages = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
-                                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
-                                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
 constexpr VkPipelineStageFlags2 kDepthStages =
     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 
-constexpr VkStateInfo state_info(VkPipelineStageFlags2 stages, VkAccessFlags2 access, VkImageLayout layout) {
-    return {.stages = stages, .access = access, .layout = layout};
+// CommandList::barriers asserts a shader state names a stage. Should one slip through a ship
+// build anyway, every stage is used: over-synchronizing is slow, under-synchronizing is a bug.
+VkPipelineStageFlags2 vk_shader_stages(ShaderStages stages) {
+    if (stages == ShaderStages::None) {
+        stages = ShaderStages::All;
+    }
+    VkPipelineStageFlags2 flags = VK_PIPELINE_STAGE_2_NONE;
+    if (core::has_any(stages, ShaderStages::Vertex)) {
+        flags |= VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+    }
+    if (core::has_any(stages, ShaderStages::Fragment)) {
+        flags |= VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    }
+    if (core::has_any(stages, ShaderStages::Compute)) {
+        flags |= VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    }
+    return flags;
 }
 
 } // namespace
@@ -85,64 +97,52 @@ VkImageAspectFlags format_aspects(Format format) {
     return aspects != 0 ? aspects : static_cast<VkImageAspectFlags>(VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
-// Each state as the stages and accesses it covers, plus the image layout it needs. A barrier from
-// A to B waits for A's stages and accesses and blocks B's.
-VkStateInfo vk_state_info(ResourceState state) {
-    switch (state) {
-    case ResourceState::Undefined:
-        // All commands as the source stage: discarding contents must still wait for earlier
-        // readers and for the swapchain acquire (whose semaphore wait sits at the color output stage).
-        return state_info(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_NONE, VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::General:
-        return state_info(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                          VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    case ResourceState::RenderTarget:
-        return state_info(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                          VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL);
-    case ResourceState::DepthWrite:
-        return state_info(kDepthStages,
-                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL);
-    case ResourceState::DepthRead:
-        return state_info(kDepthStages | kShaderStages,
-                          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                          VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
-    case ResourceState::ShaderRead:
-        return state_info(kShaderStages, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
-                          VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
-    case ResourceState::ShaderWrite:
-        return state_info(kShaderStages, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_GENERAL);
-    case ResourceState::CopySrc:
-        return state_info(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
-                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    case ResourceState::CopyDst:
-        return state_info(VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    case ResourceState::Present:
-        // The present's semaphore signal (all commands) orders it; the stage only anchors the
-        // dependency chain when the next frame starts from this state.
-        return state_info(VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
-                          VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    case ResourceState::VertexBuffer:
-        return state_info(VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT, VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT,
-                          VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::IndexBuffer:
-        return state_info(VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT, VK_ACCESS_2_INDEX_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::UniformBuffer:
-        return state_info(kShaderStages, VK_ACCESS_2_UNIFORM_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::IndirectArgument:
-        return state_info(VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
-                          VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::HostRead:
-        return state_info(VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
-    case ResourceState::Count:
-        break;
-    }
-    DE_ASSERT_MSG(false, "invalid ResourceState");
-    return {};
+// The stages and accesses a state covers, plus the image layout it needs. A barrier from A to B
+// waits for A's stages and accesses and blocks B's. Combined states add up their bits.
+VkStateInfo vk_state_info(ResourceState state, ShaderStages shader_stages) {
+    VkStateInfo info;
+    const auto add = [&](ResourceState bit, VkPipelineStageFlags2 stages, VkAccessFlags2 access, VkImageLayout layout) {
+        if (core::has_any(state, bit)) {
+            info.stages |= stages;
+            info.access |= access;
+            info.layout = layout; // combinations share a layout (is_valid_state)
+        }
+    };
+    const bool shader_state =
+        core::has_any(state, ResourceState::ShaderRead | ResourceState::ShaderWrite | ResourceState::UniformBuffer);
+    const VkPipelineStageFlags2 shaders = shader_state ? vk_shader_stages(shader_stages) : VK_PIPELINE_STAGE_2_NONE;
+
+    add(ResourceState::RenderTarget, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL);
+    add(ResourceState::DepthWrite, kDepthStages,
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL);
+    add(ResourceState::DepthRead, kDepthStages, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+        VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
+    add(ResourceState::ShaderRead, shaders, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT,
+        VK_IMAGE_LAYOUT_READ_ONLY_OPTIMAL);
+    add(ResourceState::ShaderWrite, shaders, VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+        VK_IMAGE_LAYOUT_GENERAL);
+    add(ResourceState::UniformBuffer, shaders, VK_ACCESS_2_UNIFORM_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    add(ResourceState::VertexBuffer, VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT,
+        VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    add(ResourceState::IndexBuffer, VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT, VK_ACCESS_2_INDEX_READ_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED);
+    add(ResourceState::IndirectArgument, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT, VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT,
+        VK_IMAGE_LAYOUT_UNDEFINED);
+    add(ResourceState::CopySrc, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    add(ResourceState::CopyDst, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    // Presentation is ordered by the frame's semaphore signal; the stage anchors the dependency
+    // chain with the next acquire, whose semaphore wait sits at the color output stage.
+    add(ResourceState::Present, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_NONE,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    add(ResourceState::HostRead, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED);
+    add(ResourceState::General, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    return info; // Undefined: no stages, no access, UNDEFINED layout
 }
 
 const char* vk_result_name(VkResult result) {

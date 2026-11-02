@@ -3,6 +3,7 @@
 #include "core/assert.h"
 
 #include <array>
+#include <iterator>
 
 namespace de::rhi {
 
@@ -67,42 +68,75 @@ const FormatInfo& format_info(Format format) {
     return kFormats[index < kFormatCount ? index : 0];
 }
 
-const char* resource_state_name(ResourceState state) {
-    switch (state) {
-    case ResourceState::Undefined:
-        return "undefined";
-    case ResourceState::General:
-        return "general";
-    case ResourceState::RenderTarget:
-        return "render_target";
-    case ResourceState::DepthWrite:
-        return "depth_write";
-    case ResourceState::DepthRead:
-        return "depth_read";
-    case ResourceState::ShaderRead:
-        return "shader_read";
-    case ResourceState::ShaderWrite:
-        return "shader_write";
-    case ResourceState::CopySrc:
-        return "copy_src";
-    case ResourceState::CopyDst:
-        return "copy_dst";
-    case ResourceState::Present:
-        return "present";
-    case ResourceState::VertexBuffer:
-        return "vertex_buffer";
-    case ResourceState::IndexBuffer:
-        return "index_buffer";
-    case ResourceState::UniformBuffer:
-        return "uniform_buffer";
-    case ResourceState::IndirectArgument:
-        return "indirect_argument";
-    case ResourceState::HostRead:
-        return "host_read";
-    case ResourceState::Count:
-        break;
+namespace {
+
+constexpr ResourceState kWriteStates = ResourceState::RenderTarget | ResourceState::DepthWrite |
+                                       ResourceState::ShaderWrite | ResourceState::CopyDst | ResourceState::General;
+constexpr ResourceState kBufferOnlyStates = ResourceState::UniformBuffer | ResourceState::VertexBuffer |
+                                            ResourceState::IndexBuffer | ResourceState::IndirectArgument |
+                                            ResourceState::HostRead;
+constexpr ResourceState kTextureOnlyStates =
+    ResourceState::RenderTarget | ResourceState::DepthWrite | ResourceState::DepthRead | ResourceState::Present;
+// The only read states that share a texture layout (read-only optimal).
+constexpr ResourceState kSharedLayoutReads = ResourceState::DepthRead | ResourceState::ShaderRead;
+
+// Indexed by bit position in ResourceState.
+constexpr const char* kStateNames[] = {
+    "render_target",  "depth_write",   "depth_read",   "shader_read",       "shader_write",
+    "uniform_buffer", "vertex_buffer", "index_buffer", "indirect_argument", "copy_src",
+    "copy_dst",       "present",       "host_read",    "general",
+};
+static_assert(static_cast<uint32_t>(kAllResourceStates) == (1U << std::size(kStateNames)) - 1,
+              "kStateNames is out of step with ResourceState");
+static_assert(ResourceState::General == static_cast<ResourceState>(1U << (std::size(kStateNames) - 1)),
+              "kStateNames is out of step with ResourceState");
+
+bool single_bit(ResourceState state) {
+    const auto bits = static_cast<uint32_t>(state);
+    return bits != 0 && (bits & (bits - 1)) == 0;
+}
+
+} // namespace
+
+bool is_valid_state(ResourceState state, bool texture) {
+    if ((state & ~kAllResourceStates) != ResourceState::Undefined) {
+        return false; // unknown bits
     }
-    return "unknown";
+    if (state == ResourceState::Undefined) {
+        return true;
+    }
+    if (core::has_any(state, kWriteStates) && !single_bit(state)) {
+        return false; // a write state stands alone
+    }
+    if (texture) {
+        if (core::has_any(state, kBufferOnlyStates)) {
+            return false;
+        }
+        return single_bit(state) || (state & ~kSharedLayoutReads) == ResourceState::Undefined;
+    }
+    return !core::has_any(state, kTextureOnlyStates);
+}
+
+core::FixedString<255> resource_state_name(ResourceState state) {
+    core::FixedString<255> name;
+    if (state == ResourceState::Undefined) {
+        name.assign("undefined");
+        return name;
+    }
+    for (size_t bit = 0; bit < std::size(kStateNames); ++bit) {
+        if ((static_cast<uint32_t>(state) & (1U << bit)) != 0) {
+            // Every name together fits in 255 characters, so the appends always succeed.
+            const bool fits = (name.empty() || name.append('|')) && name.append(kStateNames[bit]);
+            DE_ASSERT(fits);
+            static_cast<void>(fits);
+        }
+    }
+    if ((state & ~kAllResourceStates) != ResourceState::Undefined) {
+        const bool fits = name.append(name.empty() ? "unknown" : "|unknown");
+        DE_ASSERT(fits);
+        static_cast<void>(fits);
+    }
+    return name;
 }
 
 const char* shader_stage_name(ShaderStage stage) {

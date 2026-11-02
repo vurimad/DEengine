@@ -10,6 +10,7 @@
 // - Texture coordinates and pixel rectangles start at the top-left corner.
 
 #include "core/enum_flags.h"
+#include "core/fixed_string.h"
 #include "core/slot_map.h"
 
 #include <cstddef>
@@ -167,33 +168,66 @@ struct BufferDesc {
     const char* debug_name = nullptr; // copied
 };
 
-// How a resource is about to be used. Barriers move resources between states; the render graph
-// will emit them from the reads and writes passes declare.
-enum class ResourceState : uint8_t {
-    // Contents are discarded. As the state before a barrier, it also waits for all earlier work
-    // on the queue, so it is always safe (and never cheap): prefer the real previous state.
-    Undefined,
-    General,      // any access; slow, for debugging
-    RenderTarget, // color attachment
-    DepthWrite,   // depth-stencil attachment, tested and written
-    DepthRead,    // depth-stencil attachment tested read-only, and sampled by shaders
-    ShaderRead,   // sampled textures, read-only storage buffers, in any shader stage
-    ShaderWrite,  // storage textures and buffers, read and written by shaders
-    CopySrc,
-    CopyDst,
-    Present,          // swapchain textures only: handed to the display
-    VertexBuffer,     // buffers only
-    IndexBuffer,      // buffers only
-    UniformBuffer,    // buffers only
-    IndirectArgument, // buffers only
-    HostRead,         // buffers only: after GPU writes, before the CPU reads a Readback buffer
-    Count,
+// How a resource is used. Barriers move resources between states; the render graph will emit them
+// from the reads and writes passes declare.
+//
+// Flags: read-only states combine (a buffer read as indirect arguments and by shaders in one pass
+// is IndirectArgument | ShaderRead), a write state stands alone. Textures combine only read states
+// that share an image layout (DepthRead | ShaderRead); see is_valid_state().
+enum class ResourceState : uint32_t {
+    // Nothing on the GPU uses the resource: it was just created, or every earlier use has finished
+    // (its frame was waited for). As a barrier's old state it waits for nothing. Anything that may
+    // still be in flight must name its real previous state instead (with discard for textures).
+    Undefined = 0,
+    RenderTarget = 1U << 0,     // color attachment, read and written
+    DepthWrite = 1U << 1,       // depth-stencil attachment, tested and written
+    DepthRead = 1U << 2,        // depth-stencil attachment, tested read-only; add ShaderRead to also sample it
+    ShaderRead = 1U << 3,       // sampled textures, and buffers read by shaders (through pointers)
+    ShaderWrite = 1U << 4,      // storage textures (even when only read) and buffers written by shaders
+    UniformBuffer = 1U << 5,    // buffers only
+    VertexBuffer = 1U << 6,     // buffers only
+    IndexBuffer = 1U << 7,      // buffers only
+    IndirectArgument = 1U << 8, // buffers only: draw and dispatch arguments
+    CopySrc = 1U << 9,
+    CopyDst = 1U << 10,
+    Present = 1U << 11,  // swapchain textures only: handed to the display
+    HostRead = 1U << 12, // buffers only: after GPU writes, before the CPU reads a Readback buffer
+    General = 1U << 13,  // any access by any stage: slow, for debugging and odd cases
 };
+DE_ENUM_FLAGS(ResourceState)
 
-const char* resource_state_name(ResourceState state);
+inline constexpr ResourceState kAllResourceStates = static_cast<ResourceState>((1U << 14) - 1);
+
+// The states whose shader stages a barrier names (TextureBarrier::before_stages and friends).
+inline constexpr ResourceState kShaderStates =
+    ResourceState::ShaderRead | ResourceState::ShaderWrite | ResourceState::UniformBuffer;
+
+// True if the state is one write state, or a combination of read states (for textures, read
+// states that share a layout), with no unknown bits. Barriers assert it.
+bool is_valid_state(ResourceState state, bool texture);
+
+// "render_target", "depth_read|shader_read"... for logs and debug views.
+core::FixedString<255> resource_state_name(ResourceState state);
+
+// The shader stages a ShaderRead, ShaderWrite or UniformBuffer state applies to. Naming only the
+// stages that really touch the resource lets unrelated work overlap the barrier.
+enum class ShaderStages : uint8_t {
+    None = 0,
+    Vertex = 1U << 0,
+    Fragment = 1U << 1,
+    Compute = 1U << 2,
+    Graphics = Vertex | Fragment,
+    All = Vertex | Fragment | Compute,
+};
+DE_ENUM_FLAGS(ShaderStages)
 
 inline constexpr uint32_t kAllMips = UINT32_MAX;
 inline constexpr uint32_t kAllLayers = UINT32_MAX;
+inline constexpr uint64_t kWholeBuffer = UINT64_MAX;
+
+// Barriers of each kind a barrier command handles without touching the heap (BarrierBatch keeps
+// as many inline).
+inline constexpr size_t kInlineBarriers = 32;
 
 struct TextureRange {
     uint32_t first_mip = 0;
@@ -206,13 +240,32 @@ struct TextureBarrier {
     TextureHandle texture{};
     ResourceState before = ResourceState::Undefined;
     ResourceState after = ResourceState::Undefined;
+    ShaderStages before_stages = ShaderStages::All; // for shader states in before
+    ShaderStages after_stages = ShaderStages::All;  // for shader states in after
     TextureRange range{};
+    // The old contents aren't needed: skip preserving them through the layout change (cheaper),
+    // while still waiting for the previous use to finish. For targets overwritten every frame.
+    bool discard = false;
 };
 
 struct BufferBarrier {
     BufferHandle buffer{};
     ResourceState before = ResourceState::Undefined;
     ResourceState after = ResourceState::Undefined;
+    ShaderStages before_stages = ShaderStages::All;
+    ShaderStages after_stages = ShaderStages::All;
+    uint64_t offset = 0;
+    uint64_t size = kWholeBuffer; // kWholeBuffer: from offset to the end
+};
+
+// Orders every buffer access matching before against every one matching after, with no handle:
+// one global barrier is cheaper than many buffer barriers when a pass touches lots of buffers
+// (GPU-driven culling, particles). No texture layout changes. States may combine freely here.
+struct GlobalBarrier {
+    ResourceState before = ResourceState::Undefined;
+    ResourceState after = ResourceState::Undefined;
+    ShaderStages before_stages = ShaderStages::All;
+    ShaderStages after_stages = ShaderStages::All;
 };
 
 enum class LoadOp : uint8_t {
@@ -241,7 +294,7 @@ struct ColorAttachment {
 };
 
 struct DepthAttachment {
-    TextureHandle texture{}; // in DepthWrite state, or DepthRead when read_only
+    TextureHandle texture{}; // in DepthWrite state, or DepthRead (| ShaderRead if sampled too) when read_only
     LoadOp load = LoadOp::Clear;
     StoreOp store = StoreOp::Store;
     float clear_depth = 0.0f; // reverse Z: 0 is the far plane

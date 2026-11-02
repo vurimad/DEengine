@@ -262,7 +262,11 @@ int main(int argc, char** argv) {
             const float glow = 0.5f + 0.5f * std::sin(seconds * 0.8f);
             de::rhi::CommandList list = device->begin_command_list();
             const de::rhi::ScopedDebugLabel label(list, "clear backbuffer");
-            list.barrier(backbuffer, de::rhi::ResourceState::Undefined, de::rhi::ResourceState::RenderTarget);
+            // Last frame left it with the display; its contents are overwritten, so they're discarded.
+            list.barrier({.texture = backbuffer,
+                          .before = de::rhi::ResourceState::Present,
+                          .after = de::rhi::ResourceState::RenderTarget,
+                          .discard = true});
             const de::rhi::ColorAttachment color{
                 .texture = backbuffer,
                 .clear = {.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f}};

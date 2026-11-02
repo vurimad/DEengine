@@ -2,6 +2,7 @@
 #include "render/rhi/device.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "support/gpu.h"
 #include "support/sandbox.h"
 
 #include <doctest/doctest.h>
@@ -16,6 +17,10 @@ using namespace de::shader;
 using de::platform::Vfs;
 using de::rhi::ShaderStage;
 using de::test::bytes_of;
+using de::test::check_clean;
+using de::test::FillBufferPush;
+using de::test::make_device;
+using de::test::read_u32;
 using de::test::Sandbox;
 
 namespace {
@@ -59,24 +64,6 @@ const PushConstantField* field(const ShaderReflection& reflection, std::string_v
     return nullptr;
 }
 
-// Same rule as the RHI tests: skip without a Vulkan 1.3 device unless DE_REQUIRE_GPU is set.
-de::core::Result<de::rhi::Device> make_device() {
-    auto device = de::rhi::Device::create({.app_name = "de_tests", .validation = true, .sync_validation = true});
-    if (!device) {
-        const char* require = std::getenv("DE_REQUIRE_GPU");
-        if (require != nullptr && require[0] != '\0' && require[0] != '0') {
-            FAIL("no Vulkan 1.3 device, and DE_REQUIRE_GPU is set: ", device.error().message);
-        }
-        MESSAGE("skipped: no Vulkan 1.3 device (", device.error().message, ")");
-    }
-    return device;
-}
-
-void check_clean(const de::rhi::Device& device) {
-    CHECK(device.stats().validation_errors == 0);
-    CHECK(device.stats().validation_warnings == 0);
-}
-
 void write_source(const Vfs& vfs, const char* path, std::string_view text) {
     REQUIRE(vfs.write_file(path, bytes_of(text)).ok());
 }
@@ -85,31 +72,18 @@ std::string_view text_of(const de::core::Array<char>& diagnostics) {
     return {diagnostics.data(), diagnostics.empty() ? 0 : diagnostics.size() - 1};
 }
 
-// Push constants of shaders/tests/fill_buffer.slang and the hot reload test shaders.
-struct FillPush {
-    uint64_t output = 0;
-    uint32_t value = 0;
-    uint32_t count = 0;
-};
-
 // Runs a compute program that writes count uint32 values through a pointer, and reads them back.
 void run_fill(de::rhi::Device& device, de::rhi::PipelineHandle pipeline, de::rhi::BufferHandle buffer, uint32_t value,
               uint32_t count) {
     device.begin_frame();
     de::rhi::CommandList list = device.begin_command_list();
     list.bind_pipeline(pipeline);
-    list.push_constants(FillPush{.output = device.buffer_address(buffer), .value = value, .count = count});
+    list.push_constants(FillBufferPush{.output = device.buffer_address(buffer), .value = value, .count = count});
     list.dispatch((count + 63) / 64);
     list.barrier(buffer, de::rhi::ResourceState::ShaderWrite, de::rhi::ResourceState::HostRead);
     device.end_frame();
     device.wait_idle();
     device.invalidate_mapped(buffer);
-}
-
-uint32_t read_u32(de::rhi::Device& device, de::rhi::BufferHandle buffer, size_t index) {
-    uint32_t value = 0;
-    std::memcpy(&value, device.mapped(buffer).data() + index * sizeof(uint32_t), sizeof(value));
-    return value;
 }
 
 } // namespace
