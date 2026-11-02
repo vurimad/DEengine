@@ -2,6 +2,7 @@
 #include "render/rhi/device.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "support/gpu.h"
 #include "support/sandbox.h"
 
 #include <doctest/doctest.h>
@@ -12,26 +13,14 @@
 #include <string_view>
 
 using namespace de::rhi;
+using de::test::AddBuffersPush;
+using de::test::check_clean;
+using de::test::FillBufferPush;
+using de::test::make_device;
+using de::test::read_u32;
 using de::test::Sandbox;
 
 namespace {
-
-de::core::Result<Device> make_device() {
-    auto device = Device::create({.app_name = "de_tests", .validation = true, .sync_validation = true});
-    if (!device) {
-        const char* require = std::getenv("DE_REQUIRE_GPU");
-        if (require != nullptr && require[0] != '\0' && require[0] != '0') {
-            FAIL("no Vulkan 1.3 device, and DE_REQUIRE_GPU is set: ", device.error().message);
-        }
-        MESSAGE("skipped: no Vulkan 1.3 device (", device.error().message, ")");
-    }
-    return device;
-}
-
-void check_clean(const Device& device) {
-    CHECK(device.stats().validation_errors == 0);
-    CHECK(device.stats().validation_warnings == 0);
-}
 
 // Compute programs from the repository's shaders/tests/, for the GPU tests.
 struct ComputeKit {
@@ -66,25 +55,6 @@ struct ComputeKit {
     de::shader::ProgramHandle add;
 };
 
-struct FillPush {
-    uint64_t output = 0;
-    uint32_t value = 0;
-    uint32_t count = 0;
-};
-
-struct AddPush {
-    uint64_t input = 0;
-    uint64_t output = 0;
-    uint32_t value = 0;
-    uint32_t count = 0;
-};
-
-uint32_t read_u32(Device& device, BufferHandle buffer, size_t index) {
-    uint32_t value = 0;
-    std::memcpy(&value, device.mapped(buffer).data() + index * sizeof(uint32_t), sizeof(value));
-    return value;
-}
-
 } // namespace
 
 TEST_CASE("resource states: one write, or reads that go together") {
@@ -104,10 +74,39 @@ TEST_CASE("resource states: one write, or reads that go together") {
     CHECK_FALSE(is_valid_state(ResourceState::DepthWrite | ResourceState::ShaderRead, true));
     CHECK_FALSE(is_valid_state(ResourceState::IndirectArgument, true)); // buffer-only state
 
-    char name[128];
-    CHECK((std::string_view(resource_state_name(ResourceState::Undefined, name)) == "undefined"));
-    CHECK((std::string_view(resource_state_name(ResourceState::DepthRead | ResourceState::ShaderRead, name)) ==
-           "depth_read|shader_read"));
+    CHECK((resource_state_name(ResourceState::Undefined).view() == "undefined"));
+    CHECK(
+        (resource_state_name(ResourceState::DepthRead | ResourceState::ShaderRead).view() == "depth_read|shader_read"));
+}
+
+TEST_CASE("unknown state bits are invalid, and names cover every state") {
+    const auto unknown = static_cast<ResourceState>(1U << 14);
+    CHECK_FALSE(is_valid_state(unknown, false));
+    CHECK_FALSE(is_valid_state(unknown, true));
+    CHECK_FALSE(is_valid_state(ResourceState::ShaderRead | unknown, false));
+    CHECK((resource_state_name(kAllResourceStates).view().find("general") != std::string_view::npos));
+    CHECK((resource_state_name(ResourceState::CopySrc | unknown).view() == "copy_src|unknown"));
+}
+
+TEST_CASE("a batch merges global barriers without widening their shader stages") {
+    BarrierBatch batch;
+    CHECK(batch.global() == nullptr);
+    // Each half names one side; the empty side's default stages must not widen the merge.
+    batch.add(GlobalBarrier{.before = ResourceState::ShaderWrite, .before_stages = ShaderStages::Compute});
+    batch.add(GlobalBarrier{.after = ResourceState::ShaderRead, .after_stages = ShaderStages::Compute});
+    batch.add(GlobalBarrier{.before = ResourceState::CopyDst, .after = ResourceState::IndirectArgument});
+    const GlobalBarrier* merged = batch.global();
+    REQUIRE(merged != nullptr);
+    CHECK(merged->before == (ResourceState::ShaderWrite | ResourceState::CopyDst));
+    CHECK(merged->after == (ResourceState::ShaderRead | ResourceState::IndirectArgument));
+    CHECK(merged->before_stages == ShaderStages::Compute);
+    CHECK(merged->after_stages == ShaderStages::Compute);
+    batch.add(GlobalBarrier{.after = ResourceState::UniformBuffer, .after_stages = ShaderStages::Vertex});
+    CHECK(batch.global()->after_stages == (ShaderStages::Compute | ShaderStages::Vertex));
+
+    batch.clear(); // dropped unrecorded (no device here)
+    CHECK(batch.empty());
+    CHECK(batch.global() == nullptr);
 }
 
 TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges included") {
@@ -125,7 +124,7 @@ TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges i
     device->begin_frame();
     CommandList list = device->begin_command_list();
     list.bind_pipeline(kit.library.pipeline(kit.fill));
-    list.push_constants(FillPush{.output = device->buffer_address(*input), .value = 100, .count = kCount});
+    list.push_constants(FillBufferPush{.output = device->buffer_address(*input), .value = 100, .count = kCount});
     list.dispatch(kCount / 64);
     // Only compute wrote it and only compute reads it, and only the first half matters below.
     BarrierBatch batch;
@@ -139,10 +138,10 @@ TEST_CASE("compute passes chain through stage-narrowed buffer barriers, ranges i
     batch.flush(list);
     CHECK(batch.empty());
     list.bind_pipeline(kit.library.pipeline(kit.add));
-    list.push_constants(AddPush{.input = device->buffer_address(*input),
-                                .output = device->buffer_address(*output),
-                                .value = 5,
-                                .count = kCount / 2});
+    list.push_constants(AddBuffersPush{.input = device->buffer_address(*input),
+                                       .output = device->buffer_address(*output),
+                                       .value = 5,
+                                       .count = kCount / 2});
     list.dispatch(kCount / 2 / 64);
     list.barrier(BufferBarrier{.buffer = *output,
                                .before = ResourceState::ShaderWrite,
@@ -180,7 +179,8 @@ TEST_CASE("a global barrier orders every buffer at once") {
     CommandList list = device->begin_command_list();
     list.bind_pipeline(kit.library.pipeline(kit.fill));
     for (uint32_t i = 0; i < 3; ++i) {
-        list.push_constants(FillPush{.output = device->buffer_address(inputs[i]), .value = i * 1000, .count = kCount});
+        list.push_constants(
+            FillBufferPush{.output = device->buffer_address(inputs[i]), .value = i * 1000, .count = kCount});
         list.dispatch(1);
     }
     // One barrier for all three, merged in a batch from two halves.
@@ -190,10 +190,10 @@ TEST_CASE("a global barrier orders every buffer at once") {
     batch.flush(list);
     list.bind_pipeline(kit.library.pipeline(kit.add));
     for (uint32_t i = 0; i < 3; ++i) {
-        list.push_constants(AddPush{.input = device->buffer_address(inputs[i]),
-                                    .output = device->buffer_address(outputs[i]),
-                                    .value = 1,
-                                    .count = kCount});
+        list.push_constants(AddBuffersPush{.input = device->buffer_address(inputs[i]),
+                                           .output = device->buffer_address(outputs[i]),
+                                           .value = 1,
+                                           .count = kCount});
         list.dispatch(1);
     }
     list.barrier(GlobalBarrier{.before = ResourceState::ShaderWrite,

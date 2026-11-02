@@ -49,8 +49,9 @@ static_assert(kVkFormats.back() == VK_FORMAT_BC7_SRGB_BLOCK, "kVkFormats is out 
 constexpr VkPipelineStageFlags2 kDepthStages =
     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
 
+// CommandList::barriers asserts a shader state names a stage. Should one slip through a ship
+// build anyway, every stage is used: over-synchronizing is slow, under-synchronizing is a bug.
 VkPipelineStageFlags2 vk_shader_stages(ShaderStages stages) {
-    DE_ASSERT_MSG(stages != ShaderStages::None, "a shader state needs at least one shader stage");
     if (stages == ShaderStages::None) {
         stages = ShaderStages::All;
     }

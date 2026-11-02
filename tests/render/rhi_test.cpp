@@ -1,5 +1,6 @@
 #include "core/function_ref.h"
 #include "render/rhi/device.h"
+#include "support/gpu.h"
 
 #include <doctest/doctest.h>
 
@@ -8,22 +9,10 @@
 #include <cstring>
 
 using namespace de::rhi;
+using de::test::check_clean;
+using de::test::make_device;
 
 namespace {
-
-// A headless device with validation (and synchronization validation) on. Without a Vulkan 1.3
-// device the tests skip, unless DE_REQUIRE_GPU is set (CI's Linux runners, which have lavapipe).
-de::core::Result<Device> make_device() {
-    auto device = Device::create({.app_name = "de_tests", .validation = true, .sync_validation = true});
-    if (!device) {
-        const char* require = std::getenv("DE_REQUIRE_GPU");
-        if (require != nullptr && require[0] != '\0' && require[0] != '0') {
-            FAIL("no Vulkan 1.3 device, and DE_REQUIRE_GPU is set: ", device.error().message);
-        }
-        MESSAGE("skipped: no Vulkan 1.3 device (", device.error().message, ")");
-    }
-    return device;
-}
 
 // Records one frame, submits it and waits for the GPU.
 void run_frame(Device& device, de::core::FunctionRef<void(CommandList&)> record) {
@@ -32,12 +21,6 @@ void run_frame(Device& device, de::core::FunctionRef<void(CommandList&)> record)
     record(list);
     device.end_frame();
     device.wait_idle();
-}
-
-void check_clean(Device& device) {
-    const DeviceStats stats = device.stats();
-    CHECK(stats.validation_errors == 0);
-    CHECK(stats.validation_warnings == 0);
 }
 
 bool near_byte(uint8_t value, int expected) {

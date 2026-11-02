@@ -10,6 +10,7 @@
 // - Texture coordinates and pixel rectangles start at the top-left corner.
 
 #include "core/enum_flags.h"
+#include "core/fixed_string.h"
 #include "core/slot_map.h"
 
 #include <cstddef>
@@ -180,9 +181,9 @@ enum class ResourceState : uint32_t {
     Undefined = 0,
     RenderTarget = 1U << 0,     // color attachment, read and written
     DepthWrite = 1U << 1,       // depth-stencil attachment, tested and written
-    DepthRead = 1U << 2,        // depth-stencil attachment, tested read-only
-    ShaderRead = 1U << 3,       // sampled textures, read-only storage, buffers read through pointers
-    ShaderWrite = 1U << 4,      // storage textures and buffers, read and written by shaders
+    DepthRead = 1U << 2,        // depth-stencil attachment, tested read-only; add ShaderRead to also sample it
+    ShaderRead = 1U << 3,       // sampled textures, and buffers read by shaders (through pointers)
+    ShaderWrite = 1U << 4,      // storage textures (even when only read) and buffers written by shaders
     UniformBuffer = 1U << 5,    // buffers only
     VertexBuffer = 1U << 6,     // buffers only
     IndexBuffer = 1U << 7,      // buffers only
@@ -195,12 +196,18 @@ enum class ResourceState : uint32_t {
 };
 DE_ENUM_FLAGS(ResourceState)
 
+inline constexpr ResourceState kAllResourceStates = static_cast<ResourceState>((1U << 14) - 1);
+
+// The states whose shader stages a barrier names (TextureBarrier::before_stages and friends).
+inline constexpr ResourceState kShaderStates =
+    ResourceState::ShaderRead | ResourceState::ShaderWrite | ResourceState::UniformBuffer;
+
 // True if the state is one write state, or a combination of read states (for textures, read
-// states that share a layout). Barriers assert it.
+// states that share a layout), with no unknown bits. Barriers assert it.
 bool is_valid_state(ResourceState state, bool texture);
 
-// "render_target", "depth_read|shader_read"... into out; returns out.
-const char* resource_state_name(ResourceState state, char (&out)[128]);
+// "render_target", "depth_read|shader_read"... for logs and debug views.
+core::FixedString<255> resource_state_name(ResourceState state);
 
 // The shader stages a ShaderRead, ShaderWrite or UniformBuffer state applies to. Naming only the
 // stages that really touch the resource lets unrelated work overlap the barrier.
@@ -217,6 +224,10 @@ DE_ENUM_FLAGS(ShaderStages)
 inline constexpr uint32_t kAllMips = UINT32_MAX;
 inline constexpr uint32_t kAllLayers = UINT32_MAX;
 inline constexpr uint64_t kWholeBuffer = UINT64_MAX;
+
+// Barriers of each kind a barrier command handles without touching the heap (BarrierBatch keeps
+// as many inline).
+inline constexpr size_t kInlineBarriers = 32;
 
 struct TextureRange {
     uint32_t first_mip = 0;
@@ -283,7 +294,7 @@ struct ColorAttachment {
 };
 
 struct DepthAttachment {
-    TextureHandle texture{}; // in DepthWrite state, or DepthRead when read_only
+    TextureHandle texture{}; // in DepthWrite state, or DepthRead (| ShaderRead if sampled too) when read_only
     LoadOp load = LoadOp::Clear;
     StoreOp store = StoreOp::Store;
     float clear_depth = 0.0f; // reverse Z: 0 is the far plane

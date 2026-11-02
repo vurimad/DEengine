@@ -76,8 +76,10 @@ private:
     CommandListImpl* impl_ = nullptr;
 };
 
-// Collects barriers and records them as one command. Kept on the stack: the first 16 of each kind
-// stay inside the object; global barriers merge into one.
+// Collects barriers and records them as one command. Kept on the stack: the first kInlineBarriers
+// of each kind stay inside the object (as in the barrier command itself); global barriers merge
+// into one. Each resource range appears at most once per batch: barriers within one command are
+// unordered, so two transitions of the same texture can't share a batch.
 //     BarrierBatch batch;
 //     batch.add({.texture = gbuffer, .before = RenderTarget, .after = ShaderRead, .after_stages = Fragment});
 //     batch.add({.buffer = instances, .before = ShaderWrite, .after = IndirectArgument});
@@ -99,17 +101,25 @@ public:
         buffers_.push(barrier);
         return *this;
     }
-    // Merged with any global barrier already added: the union of both sides.
+    // Merged with any global barrier already added: the union of the states on each side, and of
+    // the shader stages only where a side has shader states (an empty side adds no stages).
     BarrierBatch& add(const GlobalBarrier& barrier) {
         global_.before |= barrier.before;
         global_.after |= barrier.after;
-        global_.before_stages = has_global_ ? global_.before_stages | barrier.before_stages : barrier.before_stages;
-        global_.after_stages = has_global_ ? global_.after_stages | barrier.after_stages : barrier.after_stages;
+        if (core::has_any(barrier.before, kShaderStates)) {
+            global_.before_stages |= barrier.before_stages;
+        }
+        if (core::has_any(barrier.after, kShaderStates)) {
+            global_.after_stages |= barrier.after_stages;
+        }
         has_global_ = true;
         return *this;
     }
 
     [[nodiscard]] bool empty() const { return textures_.empty() && buffers_.empty() && !has_global_; }
+
+    // The merged global barrier, or null if none was added.
+    const GlobalBarrier* global() const { return has_global_ ? &global_ : nullptr; }
 
     // Records everything as one barrier command and empties the batch. Does nothing when empty.
     void flush(CommandList& list) {
@@ -118,16 +128,25 @@ public:
         }
         list.barriers(textures_.span(), buffers_.span(),
                       has_global_ ? std::span<const GlobalBarrier>(&global_, 1) : std::span<const GlobalBarrier>());
+        clear();
+    }
+
+    // Drops every barrier without recording it (a pass that turned out not to run).
+    void clear() {
         textures_.clear();
         buffers_.clear();
-        global_ = {};
+        global_ = kEmptyGlobal;
         has_global_ = false;
     }
 
 private:
-    core::InlineArray<TextureBarrier, 16> textures_{core::heap_allocator(core::MemoryTag::Render)};
-    core::InlineArray<BufferBarrier, 16> buffers_{core::heap_allocator(core::MemoryTag::Render)};
-    GlobalBarrier global_{};
+    // Stages start empty and grow only with sides that have shader states.
+    static constexpr GlobalBarrier kEmptyGlobal{.before_stages = ShaderStages::None,
+                                                .after_stages = ShaderStages::None};
+
+    core::InlineArray<TextureBarrier, kInlineBarriers> textures_{core::heap_allocator(core::MemoryTag::Render)};
+    core::InlineArray<BufferBarrier, kInlineBarriers> buffers_{core::heap_allocator(core::MemoryTag::Render)};
+    GlobalBarrier global_ = kEmptyGlobal;
     bool has_global_ = false;
 };
 

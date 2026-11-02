@@ -29,6 +29,7 @@ add_executable(de_tests
     render/barrier_test.cpp
     render/rhi_test.cpp
     render/shader_test.cpp
+    support/gpu.h
     support/sandbox.h)
 
 # Shared test helpers: #include "support/sandbox.h".

@@ -3,7 +3,6 @@
 #include "core/assert.h"
 
 #include <array>
-#include <cstdio>
 #include <iterator>
 
 namespace de::rhi {
@@ -81,11 +80,16 @@ constexpr ResourceState kTextureOnlyStates =
 // The only read states that share a texture layout (read-only optimal).
 constexpr ResourceState kSharedLayoutReads = ResourceState::DepthRead | ResourceState::ShaderRead;
 
+// Indexed by bit position in ResourceState.
 constexpr const char* kStateNames[] = {
     "render_target",  "depth_write",   "depth_read",   "shader_read",       "shader_write",
     "uniform_buffer", "vertex_buffer", "index_buffer", "indirect_argument", "copy_src",
     "copy_dst",       "present",       "host_read",    "general",
 };
+static_assert(static_cast<uint32_t>(kAllResourceStates) == (1U << std::size(kStateNames)) - 1,
+              "kStateNames is out of step with ResourceState");
+static_assert(ResourceState::General == static_cast<ResourceState>(1U << (std::size(kStateNames) - 1)),
+              "kStateNames is out of step with ResourceState");
 
 bool single_bit(ResourceState state) {
     const auto bits = static_cast<uint32_t>(state);
@@ -95,6 +99,9 @@ bool single_bit(ResourceState state) {
 } // namespace
 
 bool is_valid_state(ResourceState state, bool texture) {
+    if ((state & ~kAllResourceStates) != ResourceState::Undefined) {
+        return false; // unknown bits
+    }
     if (state == ResourceState::Undefined) {
         return true;
     }
@@ -110,25 +117,26 @@ bool is_valid_state(ResourceState state, bool texture) {
     return !core::has_any(state, kTextureOnlyStates);
 }
 
-const char* resource_state_name(ResourceState state, char (&out)[128]) {
+core::FixedString<255> resource_state_name(ResourceState state) {
+    core::FixedString<255> name;
     if (state == ResourceState::Undefined) {
-        std::snprintf(out, sizeof(out), "undefined");
-        return out;
+        name.assign("undefined");
+        return name;
     }
-    size_t length = 0;
-    out[0] = '\0';
     for (size_t bit = 0; bit < std::size(kStateNames); ++bit) {
-        if ((static_cast<uint32_t>(state) & (1U << bit)) == 0) {
-            continue;
+        if ((static_cast<uint32_t>(state) & (1U << bit)) != 0) {
+            // Every name together fits in 255 characters, so the appends always succeed.
+            const bool fits = (name.empty() || name.append('|')) && name.append(kStateNames[bit]);
+            DE_ASSERT(fits);
+            static_cast<void>(fits);
         }
-        const int written =
-            std::snprintf(out + length, sizeof(out) - length, "%s%s", length == 0 ? "" : "|", kStateNames[bit]);
-        if (written < 0 || static_cast<size_t>(written) >= sizeof(out) - length) {
-            break;
-        }
-        length += static_cast<size_t>(written);
     }
-    return out;
+    if ((state & ~kAllResourceStates) != ResourceState::Undefined) {
+        const bool fits = name.append(name.empty() ? "unknown" : "|unknown");
+        DE_ASSERT(fits);
+        static_cast<void>(fits);
+    }
+    return name;
 }
 
 const char* shader_stage_name(ShaderStage stage) {
