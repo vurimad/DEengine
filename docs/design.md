@@ -405,6 +405,14 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 - LOD selection on the GPU per instance; distant trees and rocks swap to impostors.
 - CPU work per frame is tiny: upload changed instance data, dispatch culling, issue a handful of indirect draws per material class.
 
+**GPU uploads.** One `rhi::Uploader` moves CPU data into textures and buffers; nothing else records upload copies.
+
+- Requests are checked when queued (exact byte size for the mips, copy usage, mips in range) and refused whole if wrong; accepted data is copied into a staging ring at once, so the caller's memory is free on return.
+- Once a frame, `record` issues the queued copies oldest first within a byte budget (16 MiB by default), so a burst of streamed textures spreads over frames instead of stalling one.
+- The uploader tracks the state of every mip it fills: low mips can stream in first and the top mip later, each upload starting from the state the last one left.
+- Staging is reused once the GPU finishes the frame that copied from it; an upload larger than the ring, or one that finds it full, gets a staging buffer of its own.
+- Copies run on the graphics queue for now; moving them to the transfer queue, with queue ownership transfers, is the next step.
+
 **Hardware ray tracing (optional, RT-ready from day one).** The game must look right with RT off; RT features are passes that replace or improve a raster fallback when the GPU supports them.
 
 - Ready from the start: the RHI exposes acceleration structures (BLAS per mesh LOD0, TLAS rebuilt from the GPU instance buffer each frame), and the bindless setup lets ray shaders reach any material.

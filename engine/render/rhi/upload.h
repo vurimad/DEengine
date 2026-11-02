@@ -1,0 +1,102 @@
+#pragma once
+
+#include "core/result.h"
+#include "render/rhi/command_list.h"
+#include "render/rhi/rhi.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <span>
+
+namespace de::rhi {
+
+class Device;
+struct UploaderState;
+
+struct UploaderDesc {
+    // The staging ring: CPU-written memory the GPU copies from. Data is copied in when an upload
+    // is queued; an upload bigger than the whole ring gets a staging buffer of its own.
+    uint64_t staging_bytes = uint64_t{64} << 20U;
+    // Bytes copied to the GPU per record() call at most, so a burst of uploads spreads over frames
+    // instead of stalling one. A single upload bigger than this still goes, alone.
+    uint64_t frame_budget_bytes = uint64_t{16} << 20U;
+};
+
+// Which mips of a texture an upload fills, and the state it leaves them in.
+struct TextureUpload {
+    uint32_t first_mip = 0;
+    uint32_t mip_count = kAllMips; // kAllMips: from first_mip to the last
+    ResourceState after = ResourceState::ShaderRead;
+    ShaderStages after_stages = ShaderStages::All;
+};
+
+// The bytes an upload of these mips takes, tightly packed: mip by mip from first_mip; within a mip
+// layer by layer (cube faces in +X -X +Y -Y +Z -Z order), then depth slices, rows top to bottom.
+// Compressed formats count whole blocks (a 2x2 BC mip is one 4x4 block). 0 if the range is invalid.
+uint64_t texture_upload_size(const TextureDesc& desc, const TextureUpload& upload);
+
+struct UploaderStats {
+    uint32_t queued_uploads = 0; // validated and in staging, not yet copied on the GPU
+    uint64_t queued_bytes = 0;
+    uint64_t staging_bytes_in_use = 0; // ring bytes the GPU may still read
+    uint64_t staging_bytes = 0;
+    uint64_t uploaded_bytes = 0;    // copied to the GPU so far, in total
+    uint32_t dedicated_staging = 0; // uploads that didn't fit the ring and got their own buffer
+    uint32_t dropped_uploads = 0;   // uploads whose texture or buffer was destroyed before they were recorded
+};
+
+// Moves data from the CPU into GPU textures and buffers (docs/design.md, File system & IO: GPU
+// uploads go through a staging ring, batched).
+//
+//     uploader.upload_texture(albedo, texels);   // validated, copied into staging, queued
+//     ...
+//     uploader.record(list);                    // once per frame: copies and barriers, within budget
+//
+// It owns the state of what it uploads: the first upload takes a texture from Undefined, later
+// ones (more mips streamed in) from the state it last left them in, and every upload ends in the
+// requested state (ShaderRead by default) for exactly the mips it filled. Don't transition those
+// textures yourself until their uploads are recorded.
+//
+// Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
+// GPU in the order they were queued. Destroying a texture or buffer with uploads still queued is
+// fine: they are dropped. Single-threaded, like the device. Move-only; the device must outlive it.
+class Uploader {
+public:
+    static core::Result<Uploader> create(Device& device, const UploaderDesc& desc = {});
+
+    ~Uploader();
+    Uploader(Uploader&& other) noexcept;
+    Uploader& operator=(Uploader&& other) noexcept;
+    Uploader(const Uploader&) = delete;
+    Uploader& operator=(const Uploader&) = delete;
+
+    // Fails, uploading nothing, if the texture is stale or lacks CopyDst usage, the mips are out of
+    // range, the format has a stencil aspect, or data isn't exactly texture_upload_size() bytes.
+    // Every layer of the mips is uploaded at once.
+    core::Result<void> upload_texture(TextureHandle texture, std::span<const std::byte> data,
+                                      const TextureUpload& upload = {});
+
+    // Fails if the buffer is stale, lacks CopyDst usage or the range doesn't fit. The bytes after
+    // the upload are in after state, for after_stages. A buffer's state is tracked as a whole: read
+    // states left by uploads to different ranges add up, and the next upload waits for all of them.
+    core::Result<void> upload_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data,
+                                     ResourceState after, ShaderStages after_stages = ShaderStages::All);
+
+    // Once per frame, before the queued textures and buffers are used: records the queued copies,
+    // within the frame budget, and the barriers around them. Does nothing when idle().
+    void record(CommandList& list);
+
+    // For load time and tests, outside a frame: runs frames until everything queued is copied, and
+    // waits for the GPU.
+    void flush_and_wait();
+
+    [[nodiscard]] bool idle() const;
+    UploaderStats stats() const;
+
+private:
+    explicit Uploader(UploaderState* state) : state_(state) {}
+
+    UploaderState* state_ = nullptr;
+};
+
+} // namespace de::rhi

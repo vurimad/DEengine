@@ -778,10 +778,14 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
                              .baseArrayLayer = 0,
                              .layerCount = VK_REMAINING_ARRAY_LAYERS},
     };
-    DE_VK_CHECK(vkCreateImageView(impl_->device, &view_info, nullptr, &texture.view));
-
+    // Views need a usage that views the image; a copy-only texture (a readback or staging image) has none.
+    constexpr TextureUsage kViewed =
+        TextureUsage::Sampled | TextureUsage::Storage | TextureUsage::RenderTarget | TextureUsage::DepthStencil;
+    if (core::has_any(desc.usage, kViewed)) {
+        DE_VK_CHECK(vkCreateImageView(impl_->device, &view_info, nullptr, &texture.view));
+        impl_->set_debug_name(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(texture.view), desc.debug_name);
+    }
     impl_->set_debug_name(VK_OBJECT_TYPE_IMAGE, reinterpret_cast<uint64_t>(texture.image), desc.debug_name);
-    impl_->set_debug_name(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(texture.view), desc.debug_name);
     if (desc.debug_name != nullptr) {
         vmaSetAllocationName(impl_->allocator, texture.allocation, desc.debug_name);
     }
@@ -1038,6 +1042,20 @@ void Device::wait_idle() {
             impl.free_pending(slot);
         }
     }
+}
+
+uint64_t Device::frame_index() const {
+    return impl_->frame_index;
+}
+
+uint64_t Device::completed_frame() const {
+    uint64_t value = 0;
+    DE_VK_CHECK(vkGetSemaphoreCounterValue(impl_->device, impl_->frame_timeline, &value));
+    return value;
+}
+
+bool Device::in_frame() const {
+    return impl_->in_frame;
 }
 
 void Device::set_vsync(bool vsync) {

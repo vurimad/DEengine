@@ -30,6 +30,7 @@ add_executable(de_tests
     render/bindless_test.cpp
     render/rhi_test.cpp
     render/shader_test.cpp
+    render/upload_test.cpp
     support/gpu.h
     support/sandbox.h
     support/shader_kit.h)

@@ -136,6 +136,13 @@ public:
     // Waits for all GPU work to finish and frees every pending destroy. For shutdown, tests and tools.
     void wait_idle();
 
+    // Frames begun so far: the current frame between begin_frame() and end_frame().
+    uint64_t frame_index() const;
+    // The last frame the GPU has finished (0 before any): resources a frame used are free once
+    // completed_frame() reaches it.
+    uint64_t completed_frame() const;
+    bool in_frame() const;
+
     // Takes effect at the next swapchain acquire.
     void set_vsync(bool vsync);
 

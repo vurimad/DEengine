@@ -280,6 +280,8 @@ void CommandList::begin_rendering(const RenderingDesc& desc) {
         const ColorAttachment& attachment = desc.colors[i];
         const Texture& texture = device.texture(attachment.texture);
         check_single_subresource(texture);
+        DE_ASSERT_MSG(core::has_any(texture.desc.usage, TextureUsage::RenderTarget),
+                      "a color attachment needs RenderTarget usage");
         if (area.width == 0) {
             area = {.width = texture.desc.width, .height = texture.desc.height};
         }
@@ -301,6 +303,8 @@ void CommandList::begin_rendering(const RenderingDesc& desc) {
         const DepthAttachment& attachment = *desc.depth;
         const Texture& texture = device.texture(attachment.texture);
         check_single_subresource(texture);
+        DE_ASSERT_MSG(core::has_any(texture.desc.usage, TextureUsage::DepthStencil),
+                      "a depth attachment needs DepthStencil usage");
         if (area.width == 0) {
             area = {.width = texture.desc.width, .height = texture.desc.height};
         }
