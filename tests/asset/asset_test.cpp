@@ -37,8 +37,10 @@ private:
 // The bytes after offset filler bytes: copied into aligned memory, the file starts misaligned.
 de::core::Array<std::byte> file_bytes_with_offset(std::span<const std::byte> bytes, size_t offset) {
     de::core::Array<std::byte> padded;
-    padded.resize(bytes.size() + offset);
-    std::memcpy(padded.data() + offset, bytes.data(), bytes.size());
+    padded.resize(offset);
+    for (const std::byte byte : bytes) {
+        padded.push(byte);
+    }
     return padded;
 }
 
