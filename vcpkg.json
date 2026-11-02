@@ -5,6 +5,8 @@
   "builtin-baseline": "9a5dfef5d1a0438a7d24856a85bd60f309d355e9",
   "dependencies": [
     "doctest",
+    "flecs",
+    "glm",
     {
       "name": "sdl3",
       "default-features": false,

@@ -17,6 +17,7 @@
 #include "render/rhi/upload.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "world/world.h"
 
 #include <cmath>
 #include <cstdint>
@@ -257,6 +258,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The game world: flecs, ticking at a fixed 60 Hz (nothing lives in it yet).
+    auto world = de::world::World::create({.jobs = &jobs});
+    if (!world) {
+        DE_LOG_ERROR("world", "%s", world.error().message);
+        device->destroy(*quad_texture);
+        return EXIT_FAILURE;
+    }
+
     const char* frames_flag = flag_value(argc, argv, "--frames");
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
     uint64_t next_stick_report_ns = 0;
@@ -266,8 +275,12 @@ int main(int argc, char** argv) {
     uint32_t title_frames = 0;
     bool was_moving = false;
     bool was_minimized = false;
+    uint64_t previous_frame_ns = start_ns;
     while (!window->close_requested()) {
         const uint64_t frame_start_allocations = de::core::heap_allocation_count(); // every thread, jobs included
+        const uint64_t frame_start_ns = de::platform::time_ns();
+        const double frame_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
+        previous_frame_ns = frame_start_ns;
         de::platform::pump_events(*window, input);
         input.sample();
 
@@ -303,6 +316,8 @@ int main(int argc, char** argv) {
         if (shaders) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
+
+        world->advance(frame_s); // fixed ticks, then RenderExtract
 
         device->begin_frame();
         uploader->record(); // uploads land at the start of the frame
@@ -426,7 +441,8 @@ int main(int argc, char** argv) {
     device->destroy(*quad_texture);
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
-    DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",
-                static_cast<unsigned long long>(frame), stats.validation_errors, stats.validation_warnings);
+    DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
+                static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),
+                stats.validation_errors, stats.validation_warnings);
     return stats.validation_errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

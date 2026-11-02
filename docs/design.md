@@ -147,6 +147,19 @@ The core is flecs for the world, a job system and allocators for streaming, a co
 - Systems run in explicit pipeline phases: Input → PreSim → Combat → Physics → Animation → PostSim → RenderExtract.
 - The flecs REST explorer runs in dev builds, so humans and AI can query the live world from outside.
 
+**World data rules.** flecs keeps entities with the same set of components together in one archetype table, one tightly packed column per component; a cached query holds the tables it matches, and a system runs as a flat loop over each table's columns. Everything below keeps the world on that path (checked against flecs 4.1.6):
+
+- **Few tables.** Every distinct component set is a table, and many small tables mean short loops and overhead per table.
+  - State that changes every few frames is a field in a hot component (`CombatState.flags`), not a tag: adding or removing a component moves the entity to another table, copying every column. On/off states use the `CanToggle` trait (a bitset; nothing moves).
+  - Relationship pairs make a table per target: `(InCell, cell)` across 200 cells would be 200 tables. Hierarchies use flecs' non-fragmenting parent (`EcsParent`); relationships that would fragment are marked `DontFragment` or become an ID in a component. Spatial structure lives in our own grid, not in pairs.
+  - Bulky, rarely iterated data (debug info, editor metadata) is `Sparse`: stable pointers, no table moves.
+- **Queries, never `get()` in a loop.** Per-frame systems iterate cached queries; `get()` is for one entity, once. Hot components stay small, plain and split from cold data (doc rule 1).
+- **Shared, not copied.** Data the same for every instance of a prefab (stats, mesh and material IDs, collision shapes) is marked `(OnInstantiate, Inherit)`: stored once on the prefab, read as one value per table. flecs copies prefab components by default.
+- **Change detection by table.** Systems skip tables nothing wrote to (`changed()`); data that changes often and data that rarely does live in different components, since one write marks its whole table. Render extraction sends only changed transforms to the GPU instance buffer.
+- **Events, not polling.** Observers for reactions, singletons for global state, IDs hashed at load, spatial queries through the grid.
+- **Our memory and threads.** flecs' allocations go through our allocators (its OS API hooks, tag World), so they count in the per-frame allocation counter; its multithreaded systems run as tasks on our JobSystem (`ecs_set_task_threads` with our task hooks), not a second thread pool. Structural changes stay deferred and merge at phase boundaries; Tracy shows each merge.
+- **Measured.** A headless world benchmark (about 10k entities in typical shapes: a transform hierarchy, movement, render extraction) runs in CI, and Tracy plots tables and entities per query, so fragmentation is a number, not a guess.
+
 **Memory.** Per-frame linear arenas, pools for hot small objects, a per-cell arena that frees in one shot when a cell unloads, and VMA for all GPU memory. Fixed streaming budgets per category (textures, meshes, physics, audio) with eviction by distance and priority.
 
 **Asset pipeline.**
