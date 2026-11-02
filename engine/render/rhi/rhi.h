@@ -214,6 +214,14 @@ struct TextureDesc {
     const char* debug_name = nullptr; // shown in RenderDoc and validation messages; copied
 };
 
+// The size of one mip in texels; depth counts the slices of a 3D texture and is 1 otherwise.
+struct MipExtent {
+    uint32_t width = 1;
+    uint32_t height = 1;
+    uint32_t depth = 1;
+};
+MipExtent mip_extent(const TextureDesc& desc, uint32_t mip);
+
 enum class BufferUsage : uint8_t {
     None = 0,
     Vertex = 1 << 0,
@@ -272,6 +280,11 @@ inline constexpr ResourceState kAllResourceStates = static_cast<ResourceState>((
 // The states whose shader stages a barrier names (TextureBarrier::before_stages and friends).
 inline constexpr ResourceState kShaderStates =
     ResourceState::ShaderRead | ResourceState::ShaderWrite | ResourceState::UniformBuffer;
+
+// The states that write; each stands alone (the others are reads and combine).
+inline constexpr ResourceState kWriteStates = ResourceState::RenderTarget | ResourceState::DepthWrite |
+                                              ResourceState::ShaderWrite | ResourceState::CopyDst |
+                                              ResourceState::General;
 
 // True if the state is one write state, or a combination of read states (for textures, read
 // states that share a layout), with no unknown bits. Barriers assert it.
@@ -404,6 +417,7 @@ struct BufferTextureCopy {
     uint32_t buffer_row_texels = 0; // texels per row in the buffer; 0: tightly packed
     uint32_t mip = 0;
     uint32_t layer = 0;
+    uint32_t layer_count = 1; // layers from layer on, one after another in the buffer
     uint32_t x = 0;
     uint32_t y = 0;
     uint32_t z = 0;

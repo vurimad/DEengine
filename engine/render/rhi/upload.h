@@ -19,6 +19,7 @@ struct UploaderDesc {
     uint64_t staging_bytes = uint64_t{64} << 20U;
     // Bytes copied to the GPU per record() call at most, so a burst of uploads spreads over frames
     // instead of stalling one. A single upload bigger than this still goes, alone.
+    // record() keeps each barrier command within kInlineBarriers, splitting big batches.
     uint64_t frame_budget_bytes = uint64_t{16} << 20U;
 };
 
@@ -52,10 +53,12 @@ struct UploaderStats {
 //     ...
 //     uploader.record(list);                    // once per frame: copies and barriers, within budget
 //
-// It owns the state of what it uploads: the first upload takes a texture from Undefined, later
-// ones (more mips streamed in) from the state it last left them in, and every upload ends in the
-// requested state (ShaderRead by default) for exactly the mips it filled. Don't transition those
-// textures yourself until their uploads are recorded.
+// It owns the state of what it uploads. The first upload to a texture takes every mip out of
+// Undefined into the requested state (ShaderRead by default), so the texture's views are valid at
+// once: mips not uploaded yet hold undefined texels until they are (sample them with a mip clamp).
+// Later uploads (more mips streamed in, or new contents) start from the state the last one left
+// and move only their mips. Don't transition those textures yourself until their uploads are
+// recorded.
 //
 // Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
 // GPU in the order they were queued. Destroying a texture or buffer with uploads still queued is

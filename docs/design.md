@@ -409,9 +409,10 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 - Requests are checked when queued (exact byte size for the mips, copy usage, mips in range) and refused whole if wrong; accepted data is copied into a staging ring at once, so the caller's memory is free on return.
 - Once a frame, `record` issues the queued copies oldest first within a byte budget (16 MiB by default), so a burst of streamed textures spreads over frames instead of stalling one.
-- The uploader tracks the state of every mip it fills: low mips can stream in first and the top mip later, each upload starting from the state the last one left.
+- The uploader tracks the state of every mip it fills: low mips can stream in first and the top mip later, each upload starting from the state the last one left. The first upload moves every mip out of Undefined, so a texture's views are valid from then on; mips not streamed in yet are sampled with a mip clamp.
 - Staging is reused once the GPU finishes the frame that copied from it; an upload larger than the ring, or one that finds it full, gets a staging buffer of its own.
-- Copies run on the graphics queue for now; moving them to the transfer queue, with queue ownership transfers, is the next step.
+- Interim (M0a): copies run on the graphics queue. The target, as in File system & IO above, is the transfer queue with queue ownership transfers; that is the next step.
+- Planned for streaming (M1): a reserve/commit form, where a decompression job writes straight into staging memory instead of handing a buffer to copy.
 
 **Hardware ray tracing (optional, RT-ready from day one).** The game must look right with RT off; RT features are passes that replace or improve a raster fallback when the GPU supports them.
 

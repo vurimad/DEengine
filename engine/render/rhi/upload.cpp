@@ -20,31 +20,32 @@ core::Allocator& render_heap() {
     return core::heap_allocator(core::MemoryTag::Render);
 }
 
-// Every mip and layer starts at a multiple of this in staging: whole texel blocks, and the 4 bytes
-// depth copies need.
-constexpr uint64_t kSubresourceAlignment = 16;
+// Every upload and every mip starts at a multiple of this in staging: whole texel blocks, and the
+// 4 bytes depth copies need. The layers of a mip follow each other tightly, as one copy reads them.
+constexpr uint64_t kStagingAlignment = 16;
 constexpr uint64_t kNotRecorded = UINT64_MAX;
 constexpr uint32_t kMaxTrackedMips = 16;
 // The ring's region list and the upload queue are compacted once this many entries are done and
 // they are at least half of the list, so constant streaming doesn't grow them forever.
 constexpr size_t kCompactAfter = 64;
 
-uint32_t mip_extent(uint32_t size, uint32_t mip) {
-    return std::max(size >> mip, 1U);
-}
-
 // Bytes of one layer of one mip, tightly packed in whole blocks.
 uint64_t mip_layer_bytes(const TextureDesc& desc, uint32_t mip) {
     const FormatInfo& info = format_info(desc.format);
-    const uint64_t blocks_x = (mip_extent(desc.width, mip) + info.block_width - 1) / info.block_width;
-    const uint64_t blocks_y = (mip_extent(desc.height, mip) + info.block_height - 1) / info.block_height;
-    const uint64_t depth = desc.dimension == TextureDimension::Texture3D ? mip_extent(desc.depth, mip) : 1;
-    return blocks_x * blocks_y * depth * info.block_bytes;
+    const MipExtent extent = mip_extent(desc, mip);
+    const uint64_t blocks_x = (extent.width + info.block_width - 1) / info.block_width;
+    const uint64_t blocks_y = (extent.height + info.block_height - 1) / info.block_height;
+    return blocks_x * blocks_y * extent.depth * info.block_bytes;
 }
 
 uint32_t resolved_mip_count(const TextureDesc& desc, const TextureUpload& upload) {
     return upload.mip_count == kAllMips ? desc.mip_count - std::min(upload.first_mip, desc.mip_count)
                                         : upload.mip_count;
+}
+
+// A shader state needs the stages that use it.
+bool stages_named(ResourceState state, ShaderStages stages) {
+    return !core::has_any(state, kShaderStates) || stages != ShaderStages::None;
 }
 
 // One upload, waiting for record(): its data already sits in staging.
@@ -60,7 +61,10 @@ struct PendingUpload {
     uint64_t staging_offset = 0;
     uint64_t bytes = 0;
     uint64_t region = kNotRecorded; // its ring region's sequence number; kNotRecorded for dedicated staging
-    bool dropped = false;           // its resource was destroyed before the copy was recorded
+    // Set while record() runs: the texture's description, or null once the resource is destroyed
+    // (the upload is then dropped).
+    const TextureDesc* desc = nullptr;
+    bool dropped = false;
 };
 
 // A stretch of the ring, from allocation until the frame that copied from it is done.
@@ -72,12 +76,17 @@ struct RingRegion {
 struct MipStates {
     ResourceState state[kMaxTrackedMips] = {};
     ShaderStages stages[kMaxTrackedMips] = {};
-    uint64_t batch = 0; // the last record batch with an upload to it
+    bool initialized = false; // every mip out of Undefined: the first upload moves them all
+    uint64_t batch = 0;       // the last record batch with an upload to it
 };
 
+// A buffer's state as a whole, not per range: every read state any upload left it in (another
+// range may still be read that way), and the last write state.
 struct BufferState {
-    ResourceState state = ResourceState::Undefined;
-    ShaderStages stages = ShaderStages::All;
+    ResourceState reads = ResourceState::Undefined;
+    ShaderStages read_stages = ShaderStages::None;
+    ResourceState write = ResourceState::Undefined;
+    ShaderStages write_stages = ShaderStages::None;
     uint64_t batch = 0;
 };
 
@@ -125,7 +134,8 @@ struct UploaderState {
 
 namespace {
 
-// Frees ring regions whose frame is done.
+// Frees ring regions whose frame is done. Asks the GPU (a driver call), so it runs once per
+// record() and when an allocation doesn't fit, not per upload.
 void reclaim(UploaderState& state) {
     const uint64_t completed = state.device->completed_frame();
     while (state.region_head < state.regions.size() && state.regions[state.region_head].frame <= completed) {
@@ -152,11 +162,11 @@ void reclaim(UploaderState& state) {
 bool ring_allocate(UploaderState& state, uint64_t size, uint64_t& offset) {
     const uint64_t capacity = state.desc.staging_bytes;
     const bool empty = state.region_head == state.regions.size();
-    const uint64_t aligned = core::align_up(state.head, kSubresourceAlignment);
+    const uint64_t aligned = core::align_up(state.head, kStagingAlignment);
     if (empty || state.head >= state.tail) {
         // Free space: [head, capacity) and, wrapping, [0, tail).
         if (aligned + size <= capacity) {
-            offset = aligned; // (when empty, head is 0: anything up to capacity fits here)
+            offset = aligned;
         } else if (size < state.tail) {
             offset = 0;
         } else {
@@ -175,9 +185,16 @@ bool ring_allocate(UploaderState& state, uint64_t size, uint64_t& offset) {
 // Where an upload's bytes go: a ring stretch, or a buffer of their own if the ring can't hold them
 // now. The returned span is mapped staging memory; empty if there's no memory for it.
 std::span<std::byte> stage(UploaderState& state, uint64_t bytes, PendingUpload& upload) {
-    reclaim(state);
     uint64_t offset = 0;
-    if (bytes <= state.desc.staging_bytes && ring_allocate(state, bytes, offset)) {
+    bool in_ring = false;
+    if (bytes <= state.desc.staging_bytes) {
+        in_ring = ring_allocate(state, bytes, offset);
+        if (!in_ring) {
+            reclaim(state); // frames may have finished since the last look
+            in_ring = ring_allocate(state, bytes, offset);
+        }
+    }
+    if (in_ring) {
         upload.staging = state.ring;
         upload.staging_offset = offset;
         upload.region = state.region_base + state.regions.size() - 1;
@@ -222,6 +239,125 @@ void purge_states(UploaderState& state) {
         state.buffer_states.remove(buffer);
     }
     state.purge_at = std::max<size_t>(256, 2 * (state.texture_states.size() + state.buffer_states.size()));
+}
+
+// The barriers that take an upload's target to CopyDst. Every byte of the target is overwritten
+// (all layers of the mips, or the buffer range), so old contents are discarded.
+size_t add_copy_barriers(const UploaderState& state, const PendingUpload& upload, BarrierBatch& batch) {
+    if (!upload.texture) {
+        const BufferState& buffer = *state.buffer_states.find(upload.buffer_handle);
+        const bool has_write = buffer.write != ResourceState::Undefined;
+        batch.add(BufferBarrier{
+            .buffer = upload.buffer_handle,
+            .before = has_write ? buffer.write : buffer.reads,
+            .after = ResourceState::CopyDst,
+            .before_stages = has_write
+                                 ? buffer.write_stages
+                                 : (buffer.read_stages != ShaderStages::None ? buffer.read_stages : ShaderStages::All),
+            .offset = upload.buffer_offset,
+            .size = upload.bytes,
+        });
+        if (has_write && buffer.reads != ResourceState::Undefined) {
+            // Readers of other ranges may still run; a write state and read states can't share one
+            // buffer barrier, so the reads are waited for by a global one (rare: a buffer some
+            // uploads leave written and others read).
+            batch.add(GlobalBarrier{
+                .before = buffer.reads, .after = ResourceState::CopyDst, .before_stages = buffer.read_stages});
+        }
+        return 1;
+    }
+    const MipStates& mips = *state.texture_states.find(upload.texture_handle);
+    if (!mips.initialized) {
+        // The first upload: every mip from Undefined, so all of them leave in a defined state.
+        batch.add(TextureBarrier{.texture = upload.texture_handle,
+                                 .before = ResourceState::Undefined,
+                                 .after = ResourceState::CopyDst,
+                                 .discard = true});
+        return 1;
+    }
+    // Later uploads: one barrier per run of mips in the same state.
+    size_t count = 0;
+    const uint32_t end = upload.range.first_mip + upload.range.mip_count;
+    uint32_t run = upload.range.first_mip;
+    for (uint32_t mip = run + 1; mip <= end; ++mip) {
+        if (mip == end || mips.state[mip] != mips.state[run] || mips.stages[mip] != mips.stages[run]) {
+            batch.add(TextureBarrier{.texture = upload.texture_handle,
+                                     .before = mips.state[run],
+                                     .after = ResourceState::CopyDst,
+                                     .before_stages = mips.stages[run],
+                                     .range = {.first_mip = run, .mip_count = mip - run},
+                                     .discard = true});
+            ++count;
+            run = mip;
+        }
+    }
+    return count;
+}
+
+// The upper bound of add_copy_barriers, without adding anything.
+size_t copy_barrier_count(const UploaderState& state, const PendingUpload& upload) {
+    if (!upload.texture) {
+        return 1;
+    }
+    const MipStates& mips = *state.texture_states.find(upload.texture_handle);
+    return mips.initialized ? upload.range.mip_count : 1;
+}
+
+// The barrier that takes an upload's target from CopyDst to the state it asked for, and the
+// tracked state that follows.
+void add_use_barrier(UploaderState& state, const PendingUpload& upload, BarrierBatch& batch) {
+    if (!upload.texture) {
+        batch.add(BufferBarrier{.buffer = upload.buffer_handle,
+                                .before = ResourceState::CopyDst,
+                                .after = upload.after,
+                                .after_stages = upload.after_stages,
+                                .offset = upload.buffer_offset,
+                                .size = upload.bytes});
+        BufferState& buffer = *state.buffer_states.find(upload.buffer_handle);
+        if (core::has_any(upload.after, kWriteStates)) {
+            buffer.write = upload.after;
+            buffer.write_stages = upload.after_stages;
+        } else {
+            buffer.reads |= upload.after;
+            buffer.read_stages |= upload.after_stages;
+        }
+        return;
+    }
+    MipStates& mips = *state.texture_states.find(upload.texture_handle);
+    // On the first upload every mip is in CopyDst, and all of them move on: the ones not uploaded
+    // yet hold undefined texels until they are.
+    const TextureRange range =
+        mips.initialized ? TextureRange{.first_mip = upload.range.first_mip, .mip_count = upload.range.mip_count}
+                         : TextureRange{};
+    batch.add(TextureBarrier{.texture = upload.texture_handle,
+                             .before = ResourceState::CopyDst,
+                             .after = upload.after,
+                             .after_stages = upload.after_stages,
+                             .range = range});
+    const uint32_t first = mips.initialized ? upload.range.first_mip : 0;
+    const uint32_t end = mips.initialized ? upload.range.first_mip + upload.range.mip_count : upload.desc->mip_count;
+    for (uint32_t mip = first; mip < end; ++mip) {
+        mips.state[mip] = upload.after;
+        mips.stages[mip] = upload.after_stages;
+    }
+    mips.initialized = true;
+}
+
+void record_copies(const PendingUpload& upload, CommandList& list) {
+    if (!upload.texture) {
+        list.copy_buffer(upload.staging, upload.staging_offset, upload.buffer_handle, upload.buffer_offset,
+                         upload.bytes);
+        return;
+    }
+    // One copy per mip, all layers at once.
+    const TextureDesc& desc = *upload.desc;
+    uint64_t offset = upload.staging_offset;
+    for (uint32_t mip = upload.range.first_mip; mip < upload.range.first_mip + upload.range.mip_count; ++mip) {
+        offset = upload.staging_offset + core::align_up(offset - upload.staging_offset, kStagingAlignment);
+        list.copy_buffer_to_texture(upload.staging, upload.texture_handle,
+                                    {.buffer_offset = offset, .mip = mip, .layer_count = desc.layer_count});
+        offset += mip_layer_bytes(desc, mip) * desc.layer_count;
+    }
 }
 
 } // namespace
@@ -300,8 +436,10 @@ core::Result<void> Uploader::upload_texture(TextureHandle texture, std::span<con
     if (desc->mip_count > kMaxTrackedMips) {
         return core::fail(core::ErrorCode::Unsupported, "uploads go to textures of at most 16 mips");
     }
-    if (upload.after == ResourceState::Undefined || !is_valid_state(upload.after, true)) {
-        return core::fail(core::ErrorCode::InvalidArgument, "an upload must leave the texture in a valid state");
+    if (upload.after == ResourceState::Undefined || !is_valid_state(upload.after, true) ||
+        !stages_named(upload.after, upload.after_stages)) {
+        return core::fail(core::ErrorCode::InvalidArgument,
+                          "an upload must leave the texture in a valid state (with its shader stages)");
     }
     const uint64_t expected = texture_upload_size(*desc, upload);
     if (expected == 0) {
@@ -314,13 +452,12 @@ core::Result<void> Uploader::upload_texture(TextureHandle texture, std::span<con
         return core::fail(core::ErrorCode::InvalidArgument, "the upload's data size doesn't match the texture");
     }
 
-    // Staging holds each mip of each layer at an aligned offset.
+    // Staging holds each mip (all its layers) at an aligned offset.
     const uint32_t mips = resolved_mip_count(*desc, upload);
     uint64_t staged_bytes = 0;
     for (uint32_t mip = upload.first_mip; mip < upload.first_mip + mips; ++mip) {
-        for (uint32_t layer = 0; layer < desc->layer_count; ++layer) {
-            staged_bytes = core::align_up(staged_bytes, kSubresourceAlignment) + mip_layer_bytes(*desc, mip);
-        }
+        staged_bytes =
+            core::align_up(staged_bytes, kStagingAlignment) + (mip_layer_bytes(*desc, mip) * desc->layer_count);
     }
     PendingUpload pending{.texture = true,
                           .texture_handle = texture,
@@ -335,13 +472,11 @@ core::Result<void> Uploader::upload_texture(TextureHandle texture, std::span<con
     uint64_t source = 0;
     uint64_t target = 0;
     for (uint32_t mip = upload.first_mip; mip < upload.first_mip + mips; ++mip) {
-        const uint64_t layer_bytes = mip_layer_bytes(*desc, mip);
-        for (uint32_t layer = 0; layer < desc->layer_count; ++layer) {
-            target = core::align_up(target, kSubresourceAlignment);
-            std::memcpy(staging.data() + target, data.data() + source, static_cast<size_t>(layer_bytes));
-            source += layer_bytes;
-            target += layer_bytes;
-        }
+        const uint64_t mip_bytes = mip_layer_bytes(*desc, mip) * desc->layer_count;
+        target = core::align_up(target, kStagingAlignment);
+        std::memcpy(staging.data() + target, data.data() + source, static_cast<size_t>(mip_bytes));
+        source += mip_bytes;
+        target += mip_bytes;
     }
     state.device->flush_mapped(pending.staging, pending.staging_offset, staged_bytes);
     state.queued_bytes += staged_bytes;
@@ -362,8 +497,9 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
     if (data.empty() || offset > desc->size || data.size() > desc->size - offset) {
         return core::fail(core::ErrorCode::OutOfRange, "the upload doesn't fit in the buffer");
     }
-    if (after == ResourceState::Undefined || !is_valid_state(after, false)) {
-        return core::fail(core::ErrorCode::InvalidArgument, "an upload must leave the buffer in a valid state");
+    if (after == ResourceState::Undefined || !is_valid_state(after, false) || !stages_named(after, after_stages)) {
+        return core::fail(core::ErrorCode::InvalidArgument,
+                          "an upload must leave the buffer in a valid state (with its shader stages)");
     }
     PendingUpload pending{.texture = false,
                           .buffer_handle = buffer,
@@ -383,27 +519,29 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
 }
 
 void Uploader::record(CommandList& list) {
+    DE_PROFILE_ZONE("uploader record");
     UploaderState& state = *state_;
     if (state.queue_head == state.queue.size()) {
         return;
     }
-    DE_PROFILE_ZONE("uploader record");
     reclaim(state);
     purge_states(state);
 
-    // This frame's batch: FIFO, within the budget, and each resource at most once (barriers in one
-    // command are unordered, so a second upload to the same resource waits for the next batch).
-    // Uploads to resources destroyed since they were queued are dropped.
+    // This frame's batch: FIFO, within the budget (an upload bigger than it goes alone), and each
+    // resource at most once (barriers in one command are unordered, so a second upload to the same
+    // resource waits for the next batch). Uploads to resources destroyed since they were queued are
+    // dropped.
     const uint64_t batch = ++state.batch;
     const size_t first = state.queue_head;
     size_t last = first;
     uint64_t batch_bytes = 0;
     while (last < state.queue.size()) {
         PendingUpload& upload = state.queue[last];
-        upload.dropped = upload.texture ? state.device->texture_desc(upload.texture_handle) == nullptr
-                                        : state.device->buffer_desc(upload.buffer_handle) == nullptr;
+        upload.desc = upload.texture ? state.device->texture_desc(upload.texture_handle) : nullptr;
+        upload.dropped =
+            upload.texture ? upload.desc == nullptr : state.device->buffer_desc(upload.buffer_handle) == nullptr;
         if (!upload.dropped) {
-            if (last > first && batch_bytes + upload.bytes > state.desc.frame_budget_bytes) {
+            if (batch_bytes > 0 && batch_bytes + upload.bytes > state.desc.frame_budget_bytes) {
                 break;
             }
             uint64_t& stamp = upload.texture ? state.texture_states.find_or_insert(upload.texture_handle).batch
@@ -417,95 +555,47 @@ void Uploader::record(CommandList& list) {
         ++last;
     }
 
+    // Recorded in chunks that keep each barrier command within its inline capacity (no heap):
+    // barriers to CopyDst, the copies, barriers to the requested states.
     const ScopedDebugLabel label(list, "uploads");
+    const uint64_t frame = state.device->frame_index();
     BarrierBatch to_copy;
     BarrierBatch to_use;
-    for (size_t i = first; i < last; ++i) {
-        const PendingUpload& upload = state.queue[i];
-        if (upload.dropped) {
-            continue;
+    size_t chunk_first = first;
+    while (chunk_first < last) {
+        size_t chunk_last = chunk_first;
+        for (; chunk_last < last; ++chunk_last) {
+            const PendingUpload& upload = state.queue[chunk_last];
+            if (upload.dropped) {
+                continue;
+            }
+            const size_t count = to_copy.texture_count() + to_copy.buffer_count();
+            if (count > 0 && count + copy_barrier_count(state, upload) > kInlineBarriers) {
+                break;
+            }
+            add_copy_barriers(state, upload, to_copy);
         }
-        if (upload.texture) {
-            const TextureDesc& desc = *state.device->texture_desc(upload.texture_handle);
-            const MipStates& mips = state.texture_states.find_or_insert(upload.texture_handle);
-            const bool whole = upload.range.first_mip == 0 && upload.range.mip_count == desc.mip_count;
-            for (uint32_t mip = upload.range.first_mip; mip < upload.range.first_mip + upload.range.mip_count; ++mip) {
-                // One mip at a time: each may come from a different state.
-                to_copy.add(TextureBarrier{.texture = upload.texture_handle,
-                                           .before = mips.state[mip],
-                                           .after = ResourceState::CopyDst,
-                                           .before_stages = mips.stages[mip],
-                                           .range = {.first_mip = mip, .mip_count = 1},
-                                           .discard = whole});
-                to_use.add(TextureBarrier{.texture = upload.texture_handle,
-                                          .before = ResourceState::CopyDst,
-                                          .after = upload.after,
-                                          .after_stages = upload.after_stages,
-                                          .range = {.first_mip = mip, .mip_count = 1}});
-            }
-        } else {
-            const BufferState& buffer = state.buffer_states.find_or_insert(upload.buffer_handle);
-            to_copy.add(BufferBarrier{.buffer = upload.buffer_handle,
-                                      .before = buffer.state,
-                                      .after = ResourceState::CopyDst,
-                                      .before_stages = buffer.stages,
-                                      .offset = upload.buffer_offset,
-                                      .size = upload.bytes});
-            to_use.add(BufferBarrier{.buffer = upload.buffer_handle,
-                                     .before = ResourceState::CopyDst,
-                                     .after = upload.after,
-                                     .after_stages = upload.after_stages,
-                                     .offset = upload.buffer_offset,
-                                     .size = upload.bytes});
-        }
-    }
-    to_copy.flush(list);
-
-    const uint64_t frame = state.device->frame_index();
-    for (size_t i = first; i < last; ++i) {
-        const PendingUpload& upload = state.queue[i];
-        if (upload.dropped) {
-            ++state.dropped;
-        } else if (upload.texture) {
-            const TextureDesc& desc = *state.device->texture_desc(upload.texture_handle);
-            uint64_t offset = upload.staging_offset;
-            for (uint32_t mip = upload.range.first_mip; mip < upload.range.first_mip + upload.range.mip_count; ++mip) {
-                for (uint32_t layer = 0; layer < desc.layer_count; ++layer) {
-                    offset =
-                        upload.staging_offset + core::align_up(offset - upload.staging_offset, kSubresourceAlignment);
-                    list.copy_buffer_to_texture(upload.staging, upload.texture_handle,
-                                                {.buffer_offset = offset, .mip = mip, .layer = layer});
-                    offset += mip_layer_bytes(desc, mip);
-                }
-            }
-            MipStates& mips = *state.texture_states.find(upload.texture_handle);
-            for (uint32_t mip = upload.range.first_mip; mip < upload.range.first_mip + upload.range.mip_count; ++mip) {
-                mips.state[mip] = upload.after;
-                mips.stages[mip] = upload.after_stages;
-            }
-        } else {
-            list.copy_buffer(upload.staging, upload.staging_offset, upload.buffer_handle, upload.buffer_offset,
-                             upload.bytes);
-            // Tracked per buffer, not per range: read states of several ranges add up, so the next
-            // upload waits for every reader; a write state replaces them.
-            BufferState& tracked = *state.buffer_states.find(upload.buffer_handle);
-            const ResourceState combined = tracked.state | upload.after;
-            if (tracked.state != ResourceState::Undefined && is_valid_state(combined, false)) {
-                tracked = {.state = combined, .stages = tracked.stages | upload.after_stages};
+        to_copy.flush(list);
+        for (size_t i = chunk_first; i < chunk_last; ++i) {
+            const PendingUpload& upload = state.queue[i];
+            if (upload.dropped) {
+                ++state.dropped;
             } else {
-                tracked = {.state = upload.after, .stages = upload.after_stages};
+                record_copies(upload, list);
+                add_use_barrier(state, upload, to_use);
+                state.uploaded_bytes += upload.bytes;
             }
+            // The staging can go once this frame is done on the GPU.
+            if (upload.region != kNotRecorded) {
+                state.regions[upload.region - state.region_base].frame = frame;
+            } else {
+                state.device->destroy(upload.staging);
+            }
+            state.queued_bytes -= upload.bytes;
         }
-        // The staging can go once this frame is done on the GPU.
-        if (upload.region != kNotRecorded) {
-            state.regions[upload.region - state.region_base].frame = frame;
-        } else {
-            state.device->destroy(upload.staging);
-        }
-        state.queued_bytes -= upload.bytes;
-        state.uploaded_bytes += upload.dropped ? 0 : upload.bytes;
+        to_use.flush(list);
+        chunk_first = chunk_last;
     }
-    to_use.flush(list);
 
     state.queue_head = last;
     if (state.queue_head == state.queue.size()) {

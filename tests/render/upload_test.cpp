@@ -636,3 +636,120 @@ TEST_CASE("long streams of uploads keep their order and bookkeeping") {
     device->wait_idle();
     check_clean(*device);
 }
+
+TEST_CASE("a first upload of some mips leaves every mip usable") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    const TextureDesc desc{.width = 16, .height = 16, .mip_count = 5, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
+    const auto texture = *device->create_texture(desc);
+    const auto texels = pattern(static_cast<size_t>(texture_upload_size(desc, {})), 12);
+    const size_t mip0 = size_t{16} * 16 * 4;
+    // Only the small mips; mip 0 must still leave Undefined, or reading it back is a layout error.
+    REQUIRE(
+        uploader
+            ->upload_texture(texture, as_span(texels).subspan(mip0), {.first_mip = 1, .after = ResourceState::CopySrc})
+            .ok());
+    uploader->flush_and_wait();
+    const auto bytes = read_texture(*device, texture);
+    CHECK(same_bytes(as_span(bytes).subspan(mip0), as_span(texels).subspan(mip0)));
+    device->destroy(texture);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("an upload bigger than the budget isn't held back by a dropped one ahead of it") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 1024});
+    REQUIRE(uploader.ok());
+    const auto doomed = *device->create_buffer({.size = 256, .usage = kBufferCopyBoth});
+    const auto buffer = *device->create_buffer({.size = 4096, .usage = kBufferCopyBoth});
+    const auto bytes = pattern(4096, 13);
+    REQUIRE(uploader->upload_buffer(doomed, 0, as_span(bytes).first(256), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(bytes), ResourceState::CopySrc).ok());
+    device->destroy(doomed);
+    record_frame(*device, *uploader);
+    CHECK(uploader->idle());
+    device->wait_idle();
+    CHECK(same_bytes(as_span(read_buffer(*device, buffer)), as_span(bytes)));
+    device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("a buffer range left written doesn't hide readers of another range") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth | BufferUsage::Storage});
+    const auto readback =
+        *device->create_buffer({.size = 64, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
+    const auto bytes = pattern(64, 14);
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(bytes).first(32), ResourceState::CopySrc).ok());
+    REQUIRE(
+        uploader
+            ->upload_buffer(buffer, 32, as_span(bytes).subspan(32), ResourceState::ShaderWrite, ShaderStages::Compute)
+            .ok());
+    uploader->flush_and_wait();
+
+    // The first range is copied from, then overwritten in the same frame: the last upload left a
+    // write state, but the copy's read must still be waited for.
+    const auto newer = pattern(32, 15);
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(newer), ResourceState::CopySrc).ok());
+    device->begin_frame();
+    CommandList list = device->begin_command_list();
+    list.copy_buffer(buffer, 0, readback, 0, 32);
+    uploader->record(list);
+    list.barrier(BufferBarrier{.buffer = readback, .before = ResourceState::CopyDst, .after = ResourceState::HostRead});
+    device->end_frame();
+    device->wait_idle();
+    device->invalidate_mapped(readback);
+    CHECK(std::memcmp(device->mapped(readback).data(), bytes.data(), 32) == 0);
+
+    device->destroy(buffer);
+    device->destroy(readback);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("big batches split their barriers, and shader states need stages") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    // Forty textures in one batch: more first-upload barriers than one command holds inline.
+    const TextureDesc desc{.width = 4, .height = 4, .mip_count = 3, .format = Format::RGBA8Unorm, .usage = kCopyBoth};
+    constexpr uint32_t kCount = 40;
+    TextureHandle textures[kCount];
+    const auto texels = pattern(static_cast<size_t>(texture_upload_size(desc, {})), 16);
+    for (TextureHandle& texture : textures) {
+        texture = *device->create_texture(desc);
+        REQUIRE(uploader->upload_texture(texture, as_span(texels), {.after = ResourceState::CopySrc}).ok());
+    }
+    record_frame(*device, *uploader);
+    CHECK(uploader->idle());
+    device->wait_idle();
+    for (const TextureHandle texture : textures) {
+        CHECK(same_bytes(as_span(read_texture(*device, texture)), as_span(texels)));
+        device->destroy(texture);
+    }
+
+    const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth});
+    CHECK(uploader->upload_buffer(buffer, 0, as_span(texels).first(16), ResourceState::ShaderRead, ShaderStages::None)
+              .error()
+              .code == de::core::ErrorCode::InvalidArgument);
+    device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}

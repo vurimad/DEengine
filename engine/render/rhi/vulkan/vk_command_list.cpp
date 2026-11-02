@@ -50,10 +50,14 @@ VkViewport to_vk(const Viewport& viewport) {
 
 VkBufferImageCopy2 to_vk(const Texture& texture, const BufferTextureCopy& region) {
     const TextureDesc& desc = texture.desc;
-    DE_ASSERT(region.mip < desc.mip_count && region.layer < desc.layer_count);
-    const uint32_t mip_width = std::max(desc.width >> region.mip, 1U);
-    const uint32_t mip_height = std::max(desc.height >> region.mip, 1U);
-    const uint32_t mip_depth = std::max(desc.depth >> region.mip, 1U);
+    DE_ASSERT(region.mip < desc.mip_count);
+    DE_ASSERT_MSG(region.layer_count > 0 && region.layer < desc.layer_count &&
+                      region.layer_count <= desc.layer_count - region.layer,
+                  "copy layers outside the texture");
+    const MipExtent extent = mip_extent(desc, region.mip);
+    const uint32_t mip_width = extent.width;
+    const uint32_t mip_height = extent.height;
+    const uint32_t mip_depth = extent.depth;
     DE_ASSERT_MSG(region.x < mip_width && region.y < mip_height && region.z < mip_depth,
                   "copy region starts outside the mip");
     DE_ASSERT_MSG(region.x + region.width <= mip_width && region.y + region.height <= mip_height &&
@@ -71,7 +75,7 @@ VkBufferImageCopy2 to_vk(const Texture& texture, const BufferTextureCopy& region
         .imageSubresource = {.aspectMask = aspect,
                              .mipLevel = region.mip,
                              .baseArrayLayer = region.layer,
-                             .layerCount = 1},
+                             .layerCount = region.layer_count},
         .imageOffset = {.x = static_cast<int32_t>(region.x),
                         .y = static_cast<int32_t>(region.y),
                         .z = static_cast<int32_t>(region.z)},

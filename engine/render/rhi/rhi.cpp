@@ -2,6 +2,7 @@
 
 #include "core/assert.h"
 
+#include <algorithm>
 #include <array>
 #include <iterator>
 
@@ -70,8 +71,6 @@ const FormatInfo& format_info(Format format) {
 
 namespace {
 
-constexpr ResourceState kWriteStates = ResourceState::RenderTarget | ResourceState::DepthWrite |
-                                       ResourceState::ShaderWrite | ResourceState::CopyDst | ResourceState::General;
 constexpr ResourceState kBufferOnlyStates = ResourceState::UniformBuffer | ResourceState::VertexBuffer |
                                             ResourceState::IndexBuffer | ResourceState::IndirectArgument |
                                             ResourceState::HostRead;
@@ -97,6 +96,13 @@ bool single_bit(ResourceState state) {
 }
 
 } // namespace
+
+MipExtent mip_extent(const TextureDesc& desc, uint32_t mip) {
+    const auto shrink = [mip](uint32_t size) { return mip < 32 ? std::max(size >> mip, 1U) : 1U; };
+    return {.width = shrink(desc.width),
+            .height = shrink(desc.height),
+            .depth = desc.dimension == TextureDimension::Texture3D ? shrink(desc.depth) : 1U};
+}
 
 bool is_valid_state(ResourceState state, bool texture) {
     if ((state & ~kAllResourceStates) != ResourceState::Undefined) {
