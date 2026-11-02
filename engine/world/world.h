@@ -1,14 +1,12 @@
 #pragma once
 
+#include "core/job_system.h"
 #include "core/result.h"
 
 #include <flecs.h>
 
+#include <cstddef>
 #include <cstdint>
-
-namespace de::core {
-class JobSystem;
-}
 
 namespace de::world {
 
@@ -32,10 +30,10 @@ struct WorldDesc {
     // A long frame (a hitch, a breakpoint) runs at most this many ticks; the time beyond is dropped,
     // so the game slows down for a moment instead of spiralling.
     uint32_t max_ticks_per_frame = 4;
-    // Multithreaded systems run as flecs task threads on this JobSystem. They synchronize with each
-    // other, so they need workers free at once: at most worker_count() of them. 0: one thread.
+    // For systems that split their rows across threads (for_each_row_parallel); null: one thread.
+    // flecs' own threads stay off: its workers wait on each other at every merge, which a job system
+    // can't promise.
     core::JobSystem* jobs = nullptr;
-    uint32_t task_threads = 0;
 };
 
 // What one advance() did.
@@ -52,7 +50,7 @@ struct FrameStep {
 //     world->ecs().system<Transform, const Velocity>("move").kind(world->phase(Phase::PreSim))...;
 //     each frame: world->advance(frame_seconds);   // ticks as needed, then RenderExtract
 //
-// Move-only. Several may exist one after another (tests), but only one with task threads at a time.
+// Never call ecs().progress(): the phases run only through advance() and tick(). Move-only.
 class World {
 public:
     static core::Result<World> create(const WorldDesc& desc = {});
@@ -64,6 +62,7 @@ public:
     World& operator=(const World&) = delete;
 
     flecs::world& ecs();
+    core::JobSystem* jobs() const;
     // The phase entity a system goes in: .kind(world.phase(Phase::Combat)).
     flecs::entity phase(Phase phase) const;
 
@@ -83,5 +82,29 @@ private:
 
     WorldState* state_ = nullptr;
 };
+
+// Runs row(i) for every i in [0, rows), split across the JobSystem's threads in batches; serial
+// without one or when it all fits in one batch. For a system over big tables: inside its loop over
+// tables, each row is written by one thread only, and nothing structural happens (no add, remove
+// or set on other entities).
+//     for_each_row_parallel(world.jobs(), it.count(), 256, [&](size_t i) { transforms[i] = ...; });
+template <typename Row>
+void for_each_row_parallel(core::JobSystem* jobs, size_t rows, size_t batch, const Row& row) {
+    if (jobs == nullptr || rows <= batch) {
+        for (size_t i = 0; i < rows; ++i) {
+            row(i);
+        }
+        return;
+    }
+    jobs->parallel_for(
+        rows, batch,
+        [](size_t begin, size_t end, void* context) {
+            const Row& each = *static_cast<const Row*>(context);
+            for (size_t i = begin; i < end; ++i) {
+                each(i);
+            }
+        },
+        const_cast<Row*>(&row), "world rows");
+}
 
 } // namespace de::world

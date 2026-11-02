@@ -1,5 +1,6 @@
 #include "core/job_system.h"
 #include "core/memory_stats.h"
+#include "world/flecs_os.h"
 #include "world/transform.h"
 #include "world/world.h"
 
@@ -137,12 +138,15 @@ TEST_CASE("components are reflected: inspectable and serializable") {
     CHECK(memory[3] == 4.0f);
 }
 
-TEST_CASE("flecs memory is ours: tagged World, and no heap allocations per tick in steady state") {
-    const uint64_t world_before = de::core::memory_stats(de::core::MemoryTag::World).live_allocations;
+TEST_CASE("flecs runs on the engine: its memory tagged World, none per tick in steady state") {
+    const de::core::MemoryStats before_world = de::core::memory_stats(de::core::MemoryTag::World);
     {
         auto world = World::create();
         REQUIRE(world.ok());
-        CHECK(de::core::memory_stats(de::core::MemoryTag::World).live_allocations > world_before);
+        REQUIRE(de::world::detail::flecs_os_api_installed());
+        // flecs' own allocations, through our heap: far more than the World object alone.
+        CHECK(de::core::memory_stats(de::core::MemoryTag::World).total_allocations - before_world.total_allocations >
+              100);
         add_movement(*world);
         for (int i = 0; i < 1000; ++i) {
             world->ecs()
@@ -158,34 +162,55 @@ TEST_CASE("flecs memory is ours: tagged World, and no heap allocations per tick 
         for (int i = 0; i < 120; ++i) {
             world->advance(1.0 / 60.0);
         }
-        CHECK(de::core::heap_allocation_count() - before == 0);
+        CHECK(de::core::heap_allocation_count() - before == 0); // flecs' allocations included
     }
-    CHECK(de::core::memory_stats(de::core::MemoryTag::World).live_allocations == world_before); // all given back
+    // Every block given back.
+    CHECK(de::core::memory_stats(de::core::MemoryTag::World).live_allocations == before_world.live_allocations);
 }
 
-TEST_CASE("multithreaded systems run as task threads on the JobSystem") {
-    de::core::JobSystem jobs({.worker_count = 3});
-    CHECK(World::create({.jobs = &jobs, .task_threads = 4}).error().code == de::core::ErrorCode::InvalidArgument);
-    auto world = World::create({.jobs = &jobs, .task_threads = 2});
+TEST_CASE("flecs' own pipeline never runs the engine's phases") {
+    auto world = World::create();
     REQUIRE(world.ok());
-    add_movement(*world);
+    int runs = 0;
+    world->ecs().system(nullptr).kind(world->phase(Phase::Combat)).run([&runs](flecs::iter& it) {
+        while (it.next()) {
+        }
+        ++runs;
+    });
+    world->ecs().progress(1.0f / 60.0f); // what a stray call, or an addon, would do
+    CHECK(runs == 0);
+    world->tick();
+    CHECK(runs == 1);
+}
+
+TEST_CASE("systems split their rows across the JobSystem, each with the fixed step") {
+    de::core::JobSystem jobs({.worker_count = 3});
+    auto world = World::create({.jobs = &jobs});
+    REQUIRE(world.ok());
+    REQUIRE(world->jobs() == &jobs);
     world->ecs()
-        .system<Transform>("spread")
-        .kind(world->phase(Phase::Physics))
-        .multi_threaded()
-        .each([](Transform& transform) { transform.scale.y += 1.0f; });
+        .system<Transform, const Velocity>("move in parallel")
+        .kind(world->phase(Phase::PreSim))
+        .run([pool = world->jobs()](flecs::iter& it) {
+            while (it.next()) {
+                const auto transforms = it.field<Transform>(0);
+                const auto velocities = it.field<const Velocity>(1);
+                const auto dt = static_cast<float>(it.delta_time());
+                de::world::for_each_row_parallel(pool, it.count(), 512, [&](size_t i) {
+                    transforms[i].position += velocities[i].meters_per_s * dt;
+                });
+            }
+        });
     constexpr int kEntities = 20000;
     for (int i = 0; i < kEntities; ++i) {
-        world->ecs().entity().set(Transform{}).set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}});
+        world->ecs().entity().set(Transform{}).set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}}); // 1 m per tick
     }
     for (int i = 0; i < 10; ++i) {
         world->tick();
     }
-    // Every entity was touched once per tick, by exactly one thread.
+    // Every entity moved once per tick, by the fixed step.
     int wrong = 0;
-    world->ecs().each([&wrong](const Transform& transform) {
-        wrong += (near(transform.scale.y, 11.0f) && near(transform.position.x, 10.0f)) ? 0 : 1;
-    });
+    world->ecs().each([&wrong](const Transform& transform) { wrong += near(transform.position.x, 10.0f) ? 0 : 1; });
     CHECK(wrong == 0);
 }
 

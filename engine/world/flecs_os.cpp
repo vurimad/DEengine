@@ -2,7 +2,6 @@
 
 #include "core/allocator.h"
 #include "core/assert.h"
-#include "core/job_system.h"
 #include "core/log.h"
 
 #include <flecs.h>
@@ -22,9 +21,11 @@ core::Allocator& world_heap() {
     return core::heap_allocator(core::MemoryTag::World);
 }
 
-// flecs frees and reallocates without a size; tagged allocators need it, so each block starts
-// with its size.
-constexpr size_t kHeader = alignof(std::max_align_t);
+// flecs frees and reallocates without a size; tagged allocators need it, so each block starts with
+// its size. A whole cache line: flecs needs malloc's 16-byte alignment (its columns hold aligned
+// types), and component columns should start on cache lines, as large malloc blocks do; a smaller
+// header would shift every column off them.
+constexpr size_t kHeader = 64;
 
 void* hooked_malloc(ecs_size_t size) {
     auto* block = static_cast<std::byte*>(world_heap().allocate(static_cast<size_t>(size) + kHeader, kHeader));
@@ -85,50 +86,11 @@ FILE* hooked_fopen(const char* path, const char* /*mode*/) {
     return nullptr;
 }
 
-// --- Task threads on the JobSystem ---
-
-// A task flecs started: a job, and its counter to join on. Fixed slots: no allocation per task.
-struct TaskSlot {
-    core::JobCounter counter;
-    ecs_os_thread_callback_t callback = nullptr;
-    void* param = nullptr;
-    std::atomic<bool> used{false};
-};
-
-constexpr size_t kMaxTasks = 64;
-TaskSlot g_tasks[kMaxTasks];
-std::atomic<core::JobSystem*> g_jobs{nullptr};
-
-void run_task(void* context) {
-    auto* slot = static_cast<TaskSlot*>(context);
-    slot->callback(slot->param);
-}
-
-ecs_os_thread_t task_new(ecs_os_thread_callback_t callback, void* param) {
-    core::JobSystem* jobs = g_jobs.load(std::memory_order_acquire);
-    DE_VERIFY_MSG(jobs != nullptr, "flecs started a task thread, but no world gave it a JobSystem");
-    for (size_t i = 0; i < kMaxTasks; ++i) {
-        bool expected = false;
-        if (g_tasks[i].used.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            TaskSlot& slot = g_tasks[i];
-            slot.callback = callback;
-            slot.param = param;
-            jobs->submit(
-                core::Job{.entry = run_task, .context = &slot, .counter = &slot.counter, .name = "flecs task"});
-            return static_cast<ecs_os_thread_t>(i + 1);
-        }
-    }
-    DE_VERIFY_MSG(false, "more than 64 flecs tasks at once");
+// flecs' worker threads wait on each other at every merge, which a job system can't promise
+// (a job may run inline, or late); parallel systems use JobSystem::parallel_for instead.
+ecs_os_thread_t hooked_no_threads(ecs_os_thread_callback_t /*callback*/, void* /*param*/) {
+    DE_VERIFY_MSG(false, "flecs threads are off: split a system's rows with JobSystem::parallel_for");
     return 0;
-}
-
-void* task_join(ecs_os_thread_t thread) {
-    const auto index = static_cast<size_t>(thread) - 1;
-    DE_ASSERT(index < kMaxTasks);
-    TaskSlot& slot = g_tasks[index];
-    g_jobs.load(std::memory_order_acquire)->wait(slot.counter);
-    slot.used.store(false, std::memory_order_release);
-    return nullptr;
 }
 
 std::atomic<bool> g_installed{false};
@@ -140,22 +102,24 @@ void install_flecs_os_api() {
     if (!g_installed.compare_exchange_strong(expected, true)) {
         return;
     }
-    ecs_set_os_api_impl(); // threads, mutexes and time from flecs' own implementation
-    ecs_os_api_t api = ecs_os_api;
-    api.malloc_ = hooked_malloc;
-    api.calloc_ = hooked_calloc;
-    api.realloc_ = hooked_realloc;
-    api.free_ = hooked_free;
-    api.log_ = hooked_log;
-    api.abort_ = hooked_abort;
-    api.fopen_ = hooked_fopen;
-    api.task_new_ = task_new;
-    api.task_join_ = task_join;
-    ecs_os_set_api(&api);
+    // Threads, mutexes and time from flecs' own implementation. It also marks the API set, so
+    // ecs_os_set_api() would ignore anything after it: the hooks go straight into ecs_os_api, before
+    // any world exists (nothing allocated yet with the defaults).
+    ecs_set_os_api_impl();
+    ecs_os_api.malloc_ = hooked_malloc;
+    ecs_os_api.calloc_ = hooked_calloc;
+    ecs_os_api.realloc_ = hooked_realloc;
+    ecs_os_api.free_ = hooked_free;
+    ecs_os_api.log_ = hooked_log;
+    ecs_os_api.abort_ = hooked_abort;
+    ecs_os_api.fopen_ = hooked_fopen;
+    ecs_os_api.thread_new_ = hooked_no_threads;
+    ecs_os_api.task_new_ = hooked_no_threads;
 }
 
-void set_flecs_jobs(core::JobSystem* jobs) {
-    g_jobs.store(jobs, std::memory_order_release);
+bool flecs_os_api_installed() {
+    return ecs_os_api.malloc_ == hooked_malloc && ecs_os_api.free_ == hooked_free && ecs_os_api.log_ == hooked_log &&
+           ecs_os_api.task_new_ == hooked_no_threads;
 }
 
 } // namespace de::world::detail

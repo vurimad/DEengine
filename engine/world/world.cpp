@@ -56,7 +56,7 @@ struct WorldState {
     double accumulator_s = 0.0;
     uint64_t ticks = 0;
     float alpha = 0.0f;
-    bool task_threads = false;
+    core::JobSystem* jobs = nullptr;
     int64_t merges = 0; // flecs' merge count at the last advance()
 };
 
@@ -64,25 +64,22 @@ core::Result<World> World::create(const WorldDesc& desc) {
     if (!(desc.tick_rate_hz > 0.0) || desc.max_ticks_per_frame == 0) {
         return core::fail(core::ErrorCode::InvalidArgument, "the world needs a positive tick rate and ticks per frame");
     }
-    if (desc.task_threads > 0 && (desc.jobs == nullptr || desc.task_threads > desc.jobs->worker_count())) {
-        // Task threads wait for each other: each needs a worker of its own.
-        return core::fail(core::ErrorCode::InvalidArgument,
-                          "task threads need a JobSystem with at least as many workers");
-    }
     detail::install_flecs_os_api();
 
     auto* state = ::new (world_heap().allocate(sizeof(WorldState), alignof(WorldState))) WorldState();
     state->tick_dt_s = 1.0 / desc.tick_rate_hz;
     state->max_ticks_per_frame = desc.max_ticks_per_frame;
+    state->jobs = desc.jobs;
     flecs::world& ecs = state->ecs;
     register_transform(ecs);
 
-    // The phases: the simulation ones in a DependsOn chain, RenderExtract on its own.
+    // The phases: the simulation ones in a DependsOn chain, RenderExtract on its own. Only our tags,
+    // not flecs::Phase: flecs' built-in pipeline (progress()) must never run them.
     ecs.component<SimulationPhase>();
     ecs.component<FramePhase>();
     flecs::entity previous;
     for (size_t i = 0; i < static_cast<size_t>(Phase::RenderExtract); ++i) {
-        const flecs::entity phase = ecs.entity(kPhaseNames[i]).add(flecs::Phase).add<SimulationPhase>();
+        const flecs::entity phase = ecs.entity(kPhaseNames[i]).add<SimulationPhase>();
         if (previous.is_valid()) {
             phase.depends_on(previous);
         }
@@ -90,7 +87,7 @@ core::Result<World> World::create(const WorldDesc& desc) {
         previous = phase;
     }
     state->phases[static_cast<size_t>(Phase::RenderExtract)] =
-        ecs.entity(kPhaseNames[static_cast<size_t>(Phase::RenderExtract)]).add(flecs::Phase).add<FramePhase>();
+        ecs.entity(kPhaseNames[static_cast<size_t>(Phase::RenderExtract)]).add<FramePhase>();
     state->simulation = make_pipeline<SimulationPhase>(ecs, "de::SimulationPipeline");
     state->frame = make_pipeline<FramePhase>(ecs, "de::FramePipeline");
 
@@ -102,6 +99,7 @@ core::Result<World> World::create(const WorldDesc& desc) {
         .out() // written only: changes to it alone don't make a table "changed"
         .detect_changes()
         .run([](flecs::iter& it) {
+            DE_PROFILE_ZONE("keep previous transforms");
             while (it.next()) {
                 if (!it.changed()) {
                     it.skip();
@@ -114,12 +112,6 @@ core::Result<World> World::create(const WorldDesc& desc) {
                 }
             }
         });
-
-    if (desc.task_threads > 0) {
-        detail::set_flecs_jobs(desc.jobs);
-        ecs.set_task_threads(static_cast<int32_t>(desc.task_threads));
-        state->task_threads = true;
-    }
     return World(state);
 }
 
@@ -127,12 +119,8 @@ World::~World() {
     if (state_ == nullptr) {
         return;
     }
-    const bool task_threads = state_->task_threads;
-    state_->~WorldState(); // the flecs world first: its task threads end with it
+    state_->~WorldState();
     world_heap().deallocate(state_, sizeof(WorldState), alignof(WorldState));
-    if (task_threads) {
-        detail::set_flecs_jobs(nullptr);
-    }
 }
 
 World::World(World&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
@@ -148,6 +136,10 @@ flecs::world& World::ecs() {
     return state_->ecs;
 }
 
+core::JobSystem* World::jobs() const {
+    return state_->jobs;
+}
+
 flecs::entity World::phase(Phase phase) const {
     DE_ASSERT(phase < Phase::Count);
     return state_->phases[static_cast<size_t>(phase)];
@@ -155,7 +147,11 @@ flecs::entity World::phase(Phase phase) const {
 
 void World::tick() {
     DE_PROFILE_ZONE("world tick");
-    state_->ecs.run_pipeline(state_->simulation, static_cast<ecs_ftime_t>(state_->tick_dt_s));
+    // frame_begin gives systems the step (it.delta_time()) and moves flecs' time and timers on.
+    const flecs::world& ecs = state_->ecs;
+    ecs.frame_begin(static_cast<ecs_ftime_t>(state_->tick_dt_s));
+    ecs.run_pipeline(state_->simulation, static_cast<ecs_ftime_t>(state_->tick_dt_s));
+    ecs.frame_end();
     ++state_->ticks;
 }
 
@@ -178,7 +174,10 @@ FrameStep World::advance(double real_dt_s) {
     step.alpha = state.alpha;
     {
         DE_PROFILE_ZONE("world frame");
-        state.ecs.run_pipeline(state.frame, static_cast<ecs_ftime_t>(real_dt_s));
+        const auto frame_dt = static_cast<ecs_ftime_t>(std::max(real_dt_s, 1e-6)); // 0 would mean "measure it"
+        state.ecs.frame_begin(frame_dt);
+        state.ecs.run_pipeline(state.frame, frame_dt);
+        state.ecs.frame_end();
     }
     // Fragmentation and sync points, visible (World data rules: measured).
     const ecs_world_info_t* info = ecs_get_world_info(state.ecs.c_ptr());
