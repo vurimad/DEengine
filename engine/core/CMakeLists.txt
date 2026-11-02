@@ -1,5 +1,6 @@
 find_package(Threads REQUIRED)
 find_package(Tracy CONFIG REQUIRED)
+find_package(glm CONFIG REQUIRED)
 
 add_library(de_core STATIC
     allocator.cpp
@@ -24,6 +25,7 @@ add_library(de_core STATIC
     job_system.h
     log.cpp
     log.h
+    math.h
     memory_stats.h
     memory_tag.h
     pool.cpp
@@ -53,3 +55,7 @@ target_compile_definitions(de_core PRIVATE
 if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_link_options(de_core INTERFACE "/NATVIS:${CMAKE_CURRENT_SOURCE_DIR}/core.natvis")
 endif()
+
+# Math: GLM with the engine's conventions (core/math.h).
+target_link_libraries(de_core PUBLIC glm::glm)
+target_compile_definitions(de_core PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE GLM_FORCE_XYZW_ONLY GLM_FORCE_SILENT_WARNINGS)

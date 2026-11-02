@@ -19,6 +19,7 @@
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
 #include "tools/stats_panel.h"
+#include "world/world.h"
 
 #include <cmath>
 #include <cstdint>
@@ -261,6 +262,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The game world: flecs, ticking at a fixed 60 Hz (nothing lives in it yet).
+    auto world = de::world::World::create({.jobs = &jobs});
+    if (!world) {
+        DE_LOG_ERROR("world", "%s", world.error().message);
+        device->destroy(*quad_texture);
+        return EXIT_FAILURE;
+    }
+
     // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
     // device, uploader and graph, so it goes before them.
     de::tools::DebugUi debug_ui =
@@ -281,7 +290,7 @@ int main(int argc, char** argv) {
     while (!window->close_requested()) {
         const uint64_t frame_start_allocations = de::core::heap_allocation_count(); // every thread, jobs included
         const uint64_t frame_start_ns = de::platform::time_ns();
-        const float frame_s = static_cast<float>(frame_start_ns - previous_frame_ns) * 1e-9f;
+        const double frame_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
         previous_frame_ns = frame_start_ns;
         de::platform::pump_events(*window, input);
         input.sample();
@@ -319,11 +328,13 @@ int main(int argc, char** argv) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
 
+        world->advance(frame_s); // fixed ticks, then RenderExtract
+
         // The debug UI for this frame. Its textures go to the uploader before record().
         if (input.state(toggle_stats).pressed) {
             show_stats = !show_stats;
         }
-        if (debug_ui.begin_frame(*window, frame_s)) {
+        if (debug_ui.begin_frame(*window, static_cast<float>(frame_s))) {
             if (show_stats) {
                 stats_panel.draw(&show_stats);
             }
@@ -441,7 +452,7 @@ int main(int argc, char** argv) {
         // The "zero heap allocations per frame" rule, made visible in the profiler and the panel.
         const uint64_t allocations = de::core::heap_allocation_count() - frame_start_allocations;
         DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
-        stats_panel.record({.frame_ms = frame_s * 1000.0f,
+        stats_panel.record({.frame_ms = static_cast<float>(frame_s * 1000.0),
                             .heap_allocations = allocations,
                             .device = device->stats(),
                             .memory = device->memory_stats(),
@@ -459,7 +470,8 @@ int main(int argc, char** argv) {
     device->destroy(*quad_texture);
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
-    DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",
-                static_cast<unsigned long long>(frame), stats.validation_errors, stats.validation_warnings);
+    DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
+                static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),
+                stats.validation_errors, stats.validation_warnings);
     return stats.validation_errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
