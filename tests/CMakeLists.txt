@@ -26,10 +26,15 @@ add_executable(de_tests
     platform/input_test.cpp
     platform/thread_test.cpp
     platform/vfs_test.cpp
-    render/rhi_test.cpp)
+    render/rhi_test.cpp
+    render/shader_test.cpp
+    support/sandbox.h)
+
+# Shared test helpers: #include "support/sandbox.h".
+target_include_directories(de_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Platform tests never open a window or initialize SDL's video, so they run on headless CI.
-target_link_libraries(de_tests PRIVATE de::core de::platform de::rhi de::compile_options doctest::doctest Threads::Threads)
+target_link_libraries(de_tests PRIVATE de::core de::platform de::rhi de::shader de::compile_options doctest::doctest Threads::Threads)
 
 # The engine builds without exceptions, so tests do too. REQUIRE failures terminate the run.
 target_compile_definitions(de_tests PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
@@ -38,5 +43,9 @@ target_compile_definitions(de_tests PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WIT
 if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_compile_definitions(de_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
+
+# The repository root, so tests compile the real shaders from src:/shaders/.
+target_compile_definitions(de_tests PRIVATE "DE_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
+de_deploy_slang_runtime(de_tests)
 
 add_test(NAME de_tests COMMAND de_tests)

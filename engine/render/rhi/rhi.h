@@ -22,14 +22,19 @@ namespace de::rhi {
 // the GPU has finished it, at most this many frames later.
 inline constexpr uint32_t kFramesInFlight = 2;
 inline constexpr uint32_t kMaxColorAttachments = 8;
+// Every pipeline shares one layout: push constants of this size, visible to all stages (the
+// guaranteed minimum on every GPU). Resources are reached bindlessly, by index.
+inline constexpr uint32_t kMaxPushConstantBytes = 128;
 
 // Backend records behind the handles. Only the backend defines them.
 struct Texture;
 struct Buffer;
+struct Pipeline;
 
 // Generational handles: a handle to a destroyed resource never resolves, even after its slot is reused.
 using TextureHandle = core::SlotHandle<Texture>;
 using BufferHandle = core::SlotHandle<Buffer>;
+using PipelineHandle = core::SlotHandle<Pipeline>;
 
 enum class QueueType : uint8_t {
     Graphics, // graphics, compute and copies
@@ -281,6 +286,81 @@ struct BufferTextureCopy {
     uint32_t width = 0; // 0: the whole mip, from x/y/z
     uint32_t height = 0;
     uint32_t depth = 0;
+};
+
+enum class ShaderStage : uint8_t {
+    Vertex,
+    Fragment,
+    Compute,
+    Count,
+};
+
+const char* shader_stage_name(ShaderStage stage);
+
+// Compiled shader code for this backend (SPIR-V for Vulkan), with one entry point named "main".
+struct ShaderCode {
+    ShaderStage stage = ShaderStage::Vertex;
+    std::span<const std::byte> code{};
+};
+
+enum class Topology : uint8_t {
+    TriangleList,
+    TriangleStrip,
+    LineList,
+    PointList,
+};
+
+enum class CullMode : uint8_t {
+    None,
+    Front,
+    Back,
+};
+
+// Reverse Z: nearer is greater, so depth tests use Greater or GreaterEqual.
+enum class CompareOp : uint8_t {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always,
+};
+
+enum class BlendMode : uint8_t {
+    Opaque,        // overwrite
+    Alpha,         // src * a + dst * (1 - a)
+    Premultiplied, // src + dst * (1 - a)
+    Additive,      // src * a + dst
+};
+
+// Vertices are pulled from buffers by shaders (by device address), so there are no vertex
+// input layouts. Attachment formats must match the textures used in begin_rendering.
+struct GraphicsPipelineDesc {
+    ShaderCode vertex{};
+    ShaderCode fragment{};
+    Format color_formats[kMaxColorAttachments] = {};
+    BlendMode blend[kMaxColorAttachments] = {};
+    uint32_t color_count = 0;
+    Format depth_format = Format::Unknown;
+    bool depth_test = false;
+    bool depth_write = false;
+    CompareOp depth_compare = CompareOp::GreaterEqual;
+    Topology topology = Topology::TriangleList;
+    CullMode cull = CullMode::Back;
+    bool front_counter_clockwise = true;
+    const char* debug_name = nullptr;
+};
+
+struct ComputePipelineDesc {
+    ShaderCode shader{};
+    const char* debug_name = nullptr;
+};
+
+enum class IndexType : uint8_t {
+    Uint16,
+    Uint32,
 };
 
 enum class GpuVendor : uint8_t {

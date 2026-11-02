@@ -151,6 +151,22 @@ bool path_exists(const char* path) {
     return ::stat(path, &info) == 0;
 }
 
+core::Result<FileInfo> file_info(const char* path) {
+    struct stat info = {};
+    if (::stat(path, &info) != 0) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return fail(ErrorCode::NotFound, "no file at this path");
+        }
+        return fail(ErrorCode::IoError, "file attributes could not be read");
+    }
+    return FileInfo{
+        .size = static_cast<uint64_t>(info.st_size),
+        .modified_time = (static_cast<uint64_t>(info.st_mtim.tv_sec) * 1'000'000'000ULL) +
+                         static_cast<uint64_t>(info.st_mtim.tv_nsec),
+        .is_directory = S_ISDIR(info.st_mode),
+    };
+}
+
 core::Result<void> create_directories(const char* path) {
     const PathString full(path);
     if (full.size() != std::strlen(path)) {

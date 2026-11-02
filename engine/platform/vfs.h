@@ -19,7 +19,12 @@ enum class Mount : uint8_t {
     Game, // game:/  cooked game data. Read only. Dev: loose files; ship: archives (later)
     User, // user:/  saves, settings, logs, caches. Read and write
     Temp, // temp:/  scratch, one folder per process, emptied at start. Read and write
+    // src:/  the source tree: shaders/, content/, meta/. Editor, cooker and dev builds only:
+    // mounted when VfsDesc::src_root is set. Read and write (the editor and AI tools edit sources)
+    Src,
 };
+
+inline constexpr size_t kMountCount = 4;
 
 enum class IoPriority : uint8_t {
     Critical, // the player and the boss, now
@@ -79,6 +84,7 @@ struct VfsDesc {
     const char* game_root = nullptr;      // folder with the cooked game data (required)
     const char* user_root = nullptr;      // null: the OS user data folder; the Vfs uses <root>/DEengine
     const char* temp_root = nullptr;      // null: the OS temp folder; the Vfs uses <root>/deengine_temp/<process>
+    const char* src_root = nullptr;       // the repository root; null: no src:/ mount (ship builds)
     uint32_t reader_threads = 2;          // phase 1: blocking positional reads on a small pool
     uint32_t max_reads = 1024;            // reads in flight at once
     core::JobSystem* jobs = nullptr;      // where ReadRequest::on_complete callbacks run
@@ -117,6 +123,8 @@ public:
 
     bool exists(const char* path) const;
     core::Result<uint64_t> file_size(const char* path) const;
+    // Size and last write time, for hot reload: a changed time or size means a changed file.
+    core::Result<FileInfo> file_info(const char* path) const;
 
     // Blocking: the whole file into dest (which must be large enough). Returns the bytes read.
     core::Result<size_t> read_file(const char* path, std::span<std::byte> dest) const;
@@ -144,7 +152,7 @@ public:
 
     IoStats stats() const;
 
-    // The OS folder behind a mount point.
+    // The OS folder behind a mount point; empty if it isn't mounted (src:/ without a src_root).
     const char* mount_root(Mount mount) const;
 
 private:

@@ -33,6 +33,7 @@ struct DeviceStats {
     uint64_t frame_index = 0;   // frames begun so far
     uint32_t live_textures = 0; // swapchain textures included
     uint32_t live_buffers = 0;
+    uint32_t live_pipelines = 0;
     uint32_t pending_destroys = 0; // destroyed resources waiting for the GPU to finish with them
     uint32_t swapchain_recreations = 0;
     uint32_t validation_errors = 0;
@@ -70,16 +71,24 @@ public:
 
     core::Result<TextureHandle> create_texture(const TextureDesc& desc);
     core::Result<BufferHandle> create_buffer(const BufferDesc& desc);
+    // Fails if the driver rejects the shader code or the state.
+    core::Result<PipelineHandle> create_graphics_pipeline(const GraphicsPipelineDesc& desc);
+    core::Result<PipelineHandle> create_compute_pipeline(const ComputePipelineDesc& desc);
 
     // The handle stops resolving at once; the GPU memory is freed when the frames in flight that
     // may still use it are done. Invalid handles are ignored. Swapchain textures can't be destroyed.
     void destroy(TextureHandle texture);
     void destroy(BufferHandle buffer);
+    void destroy(PipelineHandle pipeline);
 
     // The description the texture was created with (debug_name excluded), or null if the handle is stale.
     const TextureDesc* texture_desc(TextureHandle texture) const;
     // Null if the handle is stale.
     const BufferDesc* buffer_desc(BufferHandle buffer) const;
+
+    // The GPU address shaders reach the buffer by (a pointer in Slang). Every buffer with a
+    // shader-visible usage (vertex, index, uniform, storage, indirect) has one.
+    uint64_t buffer_address(BufferHandle buffer) const;
 
     // The persistent mapping of an Upload or Readback buffer; empty for GpuOnly buffers.
     std::span<std::byte> mapped(BufferHandle buffer);

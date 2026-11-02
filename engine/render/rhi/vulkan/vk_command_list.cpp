@@ -254,6 +254,53 @@ void CommandList::set_scissor(const Rect& rect) {
     vkCmdSetScissor(impl_->cmd, 0, 1, &scissor);
 }
 
+void CommandList::bind_pipeline(PipelineHandle handle) {
+    DE_ASSERT(impl_ != nullptr);
+    const Pipeline& pipeline = impl_->device->pipeline(handle);
+    DE_ASSERT_MSG(impl_->in_rendering == (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS),
+                  "graphics pipelines bind inside begin_rendering, compute pipelines outside it");
+    vkCmdBindPipeline(impl_->cmd, pipeline.bind_point, pipeline.pipeline);
+    if (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        impl_->graphics_bound = true;
+    } else {
+        impl_->compute_bound = true;
+    }
+}
+
+void CommandList::push_constants(std::span<const std::byte> data, uint32_t offset) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(offset % 4 == 0 && data.size() % 4 == 0 && offset + data.size() <= kMaxPushConstantBytes,
+                  "push constants: 4-byte aligned, within kMaxPushConstantBytes");
+    vkCmdPushConstants(impl_->cmd, impl_->device->pipeline_layout, VK_SHADER_STAGE_ALL, offset,
+                       static_cast<uint32_t>(data.size()), data.data());
+}
+
+void CommandList::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
+    vkCmdDraw(impl_->cmd, vertex_count, instance_count, first_vertex, first_instance);
+}
+
+void CommandList::bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexType type) {
+    DE_ASSERT(impl_ != nullptr);
+    vkCmdBindIndexBuffer(impl_->cmd, impl_->device->buffer(buffer).buffer, offset,
+                         type == IndexType::Uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+}
+
+void CommandList::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
+                               int32_t vertex_offset, uint32_t first_instance) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
+    vkCmdDrawIndexed(impl_->cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
+}
+
+void CommandList::dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(!impl_->in_rendering && impl_->compute_bound,
+                  "dispatches need a compute pipeline, outside begin_rendering");
+    vkCmdDispatch(impl_->cmd, groups_x, groups_y, groups_z);
+}
+
 void CommandList::copy_buffer(BufferHandle src, uint64_t src_offset, BufferHandle dst, uint64_t dst_offset,
                               uint64_t size) {
     DE_ASSERT(impl_ != nullptr);

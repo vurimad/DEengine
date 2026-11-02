@@ -251,6 +251,41 @@ TEST_CASE("a batch submitted at once runs completely") {
     CHECK(runs.load() == 300);
 }
 
+namespace {
+
+void record_thread(void* context) {
+    *static_cast<std::thread::id*>(context) = std::this_thread::get_id();
+}
+
+} // namespace
+
+TEST_CASE("background jobs run on workers, never inside wait()") {
+    JobSystem jobs(JobSystemDesc{.worker_count = 2});
+    for (int round = 0; round < 50; ++round) {
+        std::thread::id ran_on;
+        JobCounter counter;
+        jobs.submit_background(Job{.entry = &record_thread, .context = &ran_on, .counter = &counter});
+        // Regular work submitted alongside still runs, and the waiting thread may help with it.
+        std::atomic<int> runs{0};
+        for (int i = 0; i < 8; ++i) {
+            jobs.submit(Job{.entry = &add_one, .context = &runs, .counter = &counter});
+        }
+        jobs.wait(counter);
+        CHECK(runs.load() == 8);
+        CHECK(ran_on != std::thread::id());
+        CHECK(ran_on != std::this_thread::get_id());
+    }
+}
+
+TEST_CASE("without workers, a background job runs at once on the caller") {
+    JobSystem jobs(JobSystemDesc{.worker_count = 0});
+    std::thread::id ran_on;
+    JobCounter counter;
+    jobs.submit_background(Job{.entry = &record_thread, .context = &ran_on, .counter = &counter});
+    CHECK(ran_on == std::this_thread::get_id());
+    CHECK(counter.done());
+}
+
 TEST_CASE("destroying the system runs jobs nobody waited for") {
     std::atomic<int> runs{0};
     {

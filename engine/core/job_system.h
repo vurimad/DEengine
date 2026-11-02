@@ -89,7 +89,13 @@ public:
     void submit_reserved(const Job& job);
     void release_reserved(JobCounter& counter, uint32_t count = 1);
 
-    // Runs queued jobs on the calling thread until counter reaches zero.
+    // For long jobs that must never stall a frame (shader compiles, cooking): only idle workers
+    // run them, after all regular work, and a thread inside wait() never picks one up. Without
+    // workers, the job runs at once on the calling thread.
+    void submit_background(const Job& job);
+
+    // Runs queued jobs on the calling thread until counter reaches zero. Background jobs are left
+    // to the workers.
     void wait(JobCounter& counter);
 
     // Calls entry(begin, end, context) over [0, count) in ranges of at most batch_size items, on

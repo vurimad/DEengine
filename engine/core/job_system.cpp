@@ -66,6 +66,13 @@ struct JobSystemState {
     size_t shared_head = 0;
     std::atomic<size_t> shared_count{0};
 
+    // Background jobs: a fixed ring behind one lock, taken by idle workers only.
+    std::mutex background_mutex;
+    Job* background_jobs = nullptr;
+    size_t background_capacity = 0;
+    size_t background_head = 0;
+    std::atomic<size_t> background_count{0};
+
     alignas(64) std::atomic<uint32_t> sleepers{0}; // threads asleep or about to be
     alignas(64) std::atomic<uint32_t> epoch{0};    // bumped to wake sleepers
     std::atomic<bool> running{true};
@@ -127,6 +134,25 @@ bool has_work(const JobSystemState& state) {
         }
     }
     return false;
+}
+
+bool has_background_work(const JobSystemState& state) {
+    return state.background_count.load(std::memory_order_relaxed) > 0;
+}
+
+bool pop_background(JobSystemState& state, Job& out) {
+    if (!has_background_work(state)) {
+        return false;
+    }
+    const std::scoped_lock lock(state.background_mutex);
+    const size_t count = state.background_count.load(std::memory_order_relaxed);
+    if (count == 0) {
+        return false;
+    }
+    out = state.background_jobs[state.background_head];
+    state.background_head = (state.background_head + 1) % state.background_capacity;
+    state.background_count.store(count - 1, std::memory_order_relaxed);
+    return true;
 }
 
 void run(JobSystemState& state, const Job& job) {
@@ -208,7 +234,8 @@ void worker_main(JobSystemState* state, uint32_t index) {
     Job job;
     int idle = 0;
     for (;;) {
-        if (take(*state, index, job)) {
+        // Regular work first; background jobs only when there is none.
+        if (take(*state, index, job) || pop_background(*state, job)) {
             run(*state, job);
             idle = 0;
             continue;
@@ -220,7 +247,9 @@ void worker_main(JobSystemState* state, uint32_t index) {
             std::this_thread::yield();
             continue;
         }
-        sleep(*state, [state] { return !state->running.load(std::memory_order_acquire) || has_work(*state); });
+        sleep(*state, [state] {
+            return !state->running.load(std::memory_order_acquire) || has_work(*state) || has_background_work(*state);
+        });
         idle = 0;
     }
 }
@@ -264,6 +293,8 @@ JobSystem::JobSystem(const JobSystemDesc& desc, Allocator& allocator) {
     }
     state.shared_capacity = desc.queue_capacity;
     state.shared_jobs = allocate_array<Job>(allocator, state.shared_capacity);
+    state.background_capacity = desc.queue_capacity;
+    state.background_jobs = allocate_array<Job>(allocator, state.background_capacity);
 
     current_system = &state;
     current_index = 0;
@@ -281,7 +312,7 @@ JobSystem::~JobSystem() {
 
     // Jobs nobody waited on still run: drain what's left, with the workers' help.
     Job job;
-    while (take(state, 0, job)) {
+    while (take(state, 0, job) || pop_background(state, job)) {
         run(state, job);
     }
 
@@ -292,11 +323,12 @@ JobSystem::~JobSystem() {
         state.workers[i].join();
         state.workers[i].~thread();
     }
-    DE_ASSERT_MSG(!has_work(state), "JobSystem destroyed with jobs still queued");
+    DE_ASSERT_MSG(!has_work(state) && !has_background_work(state), "JobSystem destroyed with jobs still queued");
 
     Allocator& allocator = *state.allocator;
     deallocate_array(allocator, state.workers, state.worker_count);
     deallocate_array(allocator, state.shared_jobs, state.shared_capacity);
+    deallocate_array(allocator, state.background_jobs, state.background_capacity);
     for (uint32_t i = 0; i < state.thread_count(); ++i) {
         state.queues[i].~ThreadQueue();
     }
@@ -320,6 +352,31 @@ void JobSystem::submit(std::span<const Job> jobs) {
         }
     }
     enqueue(*state_, jobs);
+}
+
+void JobSystem::submit_background(const Job& job) {
+    DE_ASSERT(job.entry != nullptr);
+    DE_ASSERT(job.name != nullptr);
+    JobSystemState& state = *state_;
+    if (job.counter != nullptr) {
+        JobSystemState::add(*job.counter, 1);
+    }
+    bool queued = false;
+    if (state.worker_count > 0) {
+        const std::scoped_lock lock(state.background_mutex);
+        const size_t count = state.background_count.load(std::memory_order_relaxed);
+        if (count < state.background_capacity) {
+            state.background_jobs[(state.background_head + count) % state.background_capacity] = job;
+            state.background_count.store(count + 1, std::memory_order_relaxed);
+            queued = true;
+        }
+    }
+    if (!queued) {
+        run(state, job); // no workers (or the ring is full): the caller runs it
+        return;
+    }
+    // Everyone: a waiter woken in place of a worker would leave the job alone.
+    wake(state, true);
 }
 
 void JobSystem::reserve(JobCounter& counter, uint32_t count) {

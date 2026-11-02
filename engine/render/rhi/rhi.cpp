@@ -105,6 +105,20 @@ const char* resource_state_name(ResourceState state) {
     return "unknown";
 }
 
+const char* shader_stage_name(ShaderStage stage) {
+    switch (stage) {
+    case ShaderStage::Vertex:
+        return "vertex";
+    case ShaderStage::Fragment:
+        return "fragment";
+    case ShaderStage::Compute:
+        return "compute";
+    case ShaderStage::Count:
+        break;
+    }
+    return "unknown";
+}
+
 const char* gpu_vendor_name(GpuVendor vendor) {
     switch (vendor) {
     case GpuVendor::Unknown:

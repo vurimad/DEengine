@@ -6,9 +6,9 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 
 | File | What it gives |
 | --- | --- |
-| `rhi.h` | Formats and `format_info`, texture and buffer descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` |
+| `rhi.h` | Formats and `format_info`, texture, buffer and pipeline descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` / `PipelineHandle` |
 | `device.h` | `Device`: creation (windowed or headless), resources, deferred destruction, frames, swapchain, stats |
-| `command_list.h` | `CommandList`: barriers, dynamic rendering, copies, debug labels; `ScopedDebugLabel` |
+| `command_list.h` | `CommandList`: barriers, dynamic rendering, pipelines, push constants, draws, dispatches, copies, debug labels; `ScopedDebugLabel` |
 | `vulkan/` | The backend: volk, VMA, vk-bootstrap. Nothing outside this folder includes it. The window surface comes from `platform::create_vulkan_surface`, so no SDL here |
 
 ## How a frame runs
@@ -36,7 +36,8 @@ device.end_frame();                                      // one submit for all l
 - Swapchain formats are sRGB, so shaders write linear color; a window without one gets a warning in the log.
 - Frames present from the graphics queue; a GPU whose graphics queue can't present to the window is rejected.
 - Required: Vulkan 1.3 with dynamic rendering, cube map arrays, synchronization2, maintenance4, descriptor indexing (update-after-bind, partially bound, variable count, non-uniform indexing), buffer device address, draw indirect count, timeline semaphores, scalar block layout, BC textures, 64-bit shader integers. Optional, reported in `Capabilities`: ray query (with acceleration structures), memory budget, a separate async compute queue, a dedicated transfer queue.
-- Every buffer a shader can read gets a device address (bindless arrives in M0a task 9).
+- Every buffer a shader can read gets a device address (`Device::buffer_address`); shaders reach buffers through pointers in push constants. Bindless textures arrive in M0a task 9.
+- One pipeline layout for every pipeline: 128 bytes of push constants visible to all stages, no per-pipeline descriptor layouts. Pipelines take compiled shader code (from `render/shader`), attachment formats and fixed state; viewport and scissor are dynamic. No vertex input layouts: vertices are pulled from buffers by address.
 - Validation is on by default in debug and dev builds when the layer is installed (Vulkan SDK). Its messages go to the log under `vulkan` and are counted in `DeviceStats`; the tests require zero, with synchronization validation on. `deengine --frames N` fails when validation reported errors.
 - Object names and command-list labels reach RenderDoc and Nsight whenever `VK_EXT_debug_utils` is available, in every build.
 

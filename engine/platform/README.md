@@ -10,8 +10,8 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | `window.h` | `Window`: Vulkan-capable window, drawable size in pixels, resize / minimize / focus / close; Vulkan surface creation for the RHI |
 | `events.h` | `pump_events(window, input)`: once per rendered frame |
 | `input.h` | `Input`: named actions bound by text, sampled once per tick |
-| `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` mounts, path rules, blocking and async reads by priority, atomic writes |
-| `file.h` | Native files: positional reads, atomic writes, folders, the OS user and temp folders |
+| `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` `src:/` mounts, path rules, blocking and async reads by priority, atomic writes, file info for hot reload |
+| `file.h` | Native files: positional reads, atomic writes, size and write time, folders, the OS user and temp folders |
 | `time.h` | `time_ns()`, `sleep_ns()`: the same clock as input timestamps |
 | `thread.h` | `Thread` (named, joined on destruction), thread names and ids, core count |
 | `debug.h` | Debugger detection, break, and the debugger output log sink |
@@ -26,5 +26,6 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 - `push` and `sample` never allocate.
 - The platform tests never initialize SDL video, so they run on headless CI.
 - Engine code reads and writes files only through the `Vfs`; `file.h` is for the VFS and tools. Paths are `mount:/lowercase/forward/slashes`.
-- `game:/` is read only. Writes to `user:/` and `temp:/` are atomic (temp file, then rename). `temp:/` is emptied at every start; the VFS only ever clears folders it named itself (`DEengine`, `deengine_temp`).
+- `src:/` is the source tree (the repository root: `shaders/`, `content/`, `meta/`), mounted only in dev builds and tools (`VfsDesc::src_root`). Shaders compile from it and the editor writes sources through it.
+- `game:/` is read only. Writes to `user:/`, `temp:/` and `src:/` are atomic (temp file, then rename). `temp:/` is emptied at every start; the VFS only ever clears folders it named itself (`DEengine`, `deengine_temp`).
 - Async reads go straight into caller memory; queueing, polling and finishing never allocate. Phase 1: blocking positional reads on a small reader pool behind one lock; phase 2 (IoRing / io_uring) keeps the API.
