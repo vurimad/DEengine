@@ -182,6 +182,7 @@ struct VfsState {
     Queue queues[kIoPriorityCount];
     uint32_t free_head = kNoSlot;
     bool stopping = false;
+    bool paused = false;
 
     Thread* readers = nullptr;
     uint32_t reader_count = 0;
@@ -329,7 +330,7 @@ void reader_main(void* context) {
         RequestSlot* slot = nullptr;
         {
             std::unique_lock lock(state.mutex);
-            state.work.wait(lock, [&state] { return state.stopping || any_queued(state); });
+            state.work.wait(lock, [&state] { return state.stopping || (!state.paused && any_queued(state)); });
             if (state.stopping) {
                 return;
             }
@@ -648,6 +649,19 @@ CancelResult Vfs::cancel(ReadHandle handle) {
         break;
     }
     return CancelResult::UnknownHandle;
+}
+
+void Vfs::pause() {
+    const std::scoped_lock lock(state_->mutex);
+    state_->paused = true;
+}
+
+void Vfs::resume() {
+    {
+        const std::scoped_lock lock(state_->mutex);
+        state_->paused = false;
+    }
+    state_->work.notify_all();
 }
 
 IoStats Vfs::stats() const {

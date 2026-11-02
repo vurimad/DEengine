@@ -137,6 +137,11 @@ public:
     // handle. A read in flight can't be stopped: InFlight means dest is still in use.
     CancelResult cancel(ReadHandle handle);
 
+    // While paused, reads still queue (and can be cancelled) but none starts; reads already in
+    // flight finish. For suspending streaming when the game is backgrounded or the device sleeps.
+    void pause();
+    void resume();
+
     IoStats stats() const;
 
     // The OS folder behind a mount point.
