@@ -42,6 +42,7 @@ The engine is designed for a full Elden Ring-scale world: at least 16 x 16 km of
 | Vegetation | GPU-instanced grass on a patch | GPU-driven indirect grass fields, trees with LOD and impostors, wind | Interactive bending, destructible foliage |
 | Rendering | Deferred PBR, sun shadows | Render graph, GPU culling, cascades + local shadows, volumetrics, sky, SSR, TAA | GI probes or DDGI, upscalers |
 | VFX | GPU particles | Data-driven emitters, decals, trails, weather, spell and blood effects | Fluid/smoke sims, mesh particles at scale |
+| Cloth | Spring bones, one simulated cape on the player | Character cloth on player, enemies and bosses with LOD; wind-driven banners and rags | Self-collision for long robes, torn cloth |
 | Combat | Attacks, roll, stamina | Poise, guard, parry, backstab, weapon arts, spells | Ranged, mounted combat |
 | Scripting | Lua bindings for entities | Lua for quests, bosses, events, with hot reload | Lua debugger integration |
 | Editor | World viewer + inspector | Full world editor (see Editor & tooling) | Collaborative editing |
@@ -369,6 +370,7 @@ meta/characters/knight/
 | Navmesh tile | `.denav` | Detour tile data |
 | Sound | `.desnd` | Opus/Vorbis data + playback metadata |
 | Shader | `.deshader` | SPIR-V per permutation + reflection |
+| Cloth | `.decloth` | Simulation mesh, constraints, painted limits, render-mesh mapping, LODs |
 | Cell / prefab | `.decell` | Binary form of the text scene data |
 
 **Rules for every cooked format.**
@@ -500,7 +502,7 @@ The sky is a core system, not a skybox: it drives the lighting, fog, mood and co
 | Fog | density, height falloff, color |
 | Precipitation | GPU rain/snow particles, splashes, streaks on lens |
 | Surfaces | wetness (darker albedo, lower roughness, puddles), snow cover |
-| Wind | grass and tree motion, cloud and particle drift |
+| Wind | grass and tree motion, cloth, cloud and particle drift |
 | Lighting | sun intensity, sky tint, lightning flashes |
 | Audio | rain beds, thunder, wind layers |
 
@@ -646,6 +648,47 @@ Animation serves combat: the action system picks what plays, and animation only 
 - **Skinning** on the GPU with dual-quaternion or linear blend skinning; up to 4 bone weights per vertex.
 - **Debug view:** scrub any action frame by frame in-engine, with hitboxes and windows overlaid.
 
+## Cloth & secondary motion
+
+Cloth is a primary part of the look, not late polish: capes, robes, tabards, skirts, sashes, tattered rags, banners and hair give every silhouette its motion, and a character with stiff cloth reads as unfinished. Cloth is planned into characters, the asset pipeline and the frame budget from the start.
+
+**What moves, and how.**
+
+| Kind | Examples | Simulation |
+| --- | --- | --- |
+| Hero cloth | player, boss and NPC capes, robes, skirts, tabards | CPU, position-based, full body collision, near the camera |
+| Crowd cloth | enemies in groups | same solver, fewer iterations and particles, aggressive LOD |
+| Environment cloth | banners, flags, sails, curtains, hanging rags | GPU compute, wind driven, simple colliders, hundreds at once |
+| Secondary motion | hair cards, braids, belts, pouches, chains, tails | spring bones (jiggle chains) on the CPU |
+| Far away | everything above beyond its LOD range | vertex-shader wind sway, no simulation |
+
+**Solver.** Extended position-based dynamics (XPBD) on a simulation mesh: a coarse particle mesh per garment (about 100–600 particles) that drives the render mesh through a precomputed mapping. Character cloth starts on Jolt's soft bodies, which are XPBD-based, collide with the Jolt world and support skinned constraints, so there is one physics library. If profiling or feel demands more control, an in-house solver replaces it behind the same cloth component. Environment cloth uses our own small XPBD compute pass, since it needs no physics world.
+
+**What this genre needs from cloth.**
+
+- **Skinned limits.** Every particle has a maximum distance from its animated (skinned) position, painted per vertex: zero at the collar and belt, generous at the hem. Cloth never leaves the body, whatever the animation does.
+- **Tethers.** Long-range attachment constraints keep cloth from stretching, even with few iterations.
+- **Inertia control.** Rolls, backsteps, jump attacks, mounting and teleports must not whip cloth across the screen or through the body. Cloth simulates relative to the character, inheriting a tunable fraction of world motion (linear and angular), with velocity clamps, and resets on teleports and camera cuts.
+- **Collision.** Capsules and spheres authored with the skeleton (legs, hips, torso, arms) plus the ground; no self-collision by default (too costly), optional for long robes.
+- **Wind.** Driven by the weather system (global wind and gusts) plus local wind fields from spells, explosions and wing beats.
+- **Animation control.** Actions can pull cloth toward its animated pose for authored moments (a cape flourish, a cutscene) through a cloth weight window on the action timeline.
+- **Stable timing.** Fixed simulation steps with substeps, interpolated for rendering like every other transform.
+
+**Cosmetic only.** Cloth never affects hitboxes, combat, AI or saves. It can run at its own rate, drop to a cheaper LOD or skip a frame without touching the deterministic simulation or co-op sync.
+
+**Data.** Cloth is authored on the garment mesh in the DCC as vertex attributes (max distance, stiffness, which vertices are pinned), with folder rules supplying defaults. The cooker builds a `.decloth` per garment: simulation mesh, constraints, painted limits, the mapping to render vertices, and LODs. Collision shapes live in the skeleton (`.deskel`). Tuning values (stiffness, damping, inertia, wind response) live in text so they diff and hot reload.
+
+**Threading and budget.**
+
+- Character cloth runs as jobs after animation sampling, one job per garment, results written straight into the skinning input; environment cloth is a compute pass on the async compute queue.
+- LOD by screen size: full detail near the camera, fewer iterations and particles in the middle distance, then a blend to plain skinning and vertex wind. Off-screen characters don't simulate and reset when they come back into view.
+- Budget at 120 FPS: at most 0.6 ms of CPU across workers for about 6 hero/boss garments and 20 crowd garments, at most 0.2 ms of GPU for environment cloth.
+- Tracy zones per garment, and a cloth debug view: simulation mesh, constraints, colliders, painted limits, LOD level.
+
+**Tools.** A cloth panel in the editor tunes a garment live while an action loops in the preview scenes (scrub frame by frame, slow motion, the lighting and wind presets), and the same values are reachable through the command API.
+
+**Sequencing.** Spring bones and character cloth arrive with the first animated character, since a moving silhouette is part of judging animation; environment cloth arrives with the weather system. The vertical slice is not complete without both.
+
 ## AI & enemies
 
 Enemies use a hierarchical state machine plus weighted attack selection. Behavior trees and utility AI are overkill for Souls-like enemies, whose fun comes from readable, repeatable patterns.
@@ -702,7 +745,7 @@ The world is one seamless space streamed around the player in a grid of cells, w
 
 ## Physics, camera, input & audio
 
-**Physics (Jolt).** Static level collision from simplified meshes; a capsule character controller (Jolt CharacterVirtual) for player and enemies; simple rigid bodies only for breakables and corpses (ragdolls in a later tier). Combat hit detection does not use physics bodies; it uses its own swept capsule queries so it stays deterministic and frame-exact.
+**Physics (Jolt).** Static level collision from simplified meshes; a capsule character controller (Jolt CharacterVirtual) for player and enemies; simple rigid bodies only for breakables and corpses (ragdolls in a later tier); soft bodies for character cloth (see Cloth & secondary motion). Combat hit detection does not use physics bodies; it uses its own swept capsule queries so it stays deterministic and frame-exact.
 
 **Camera.** A third-person orbit camera with collision (sphere cast back from the pivot), smoothed follow, and a lock-on mode that frames player and target. Camera shake is data-driven per hit type. Camera pull-in near walls must never hide an enemy's startup frames.
 
@@ -998,3 +1041,4 @@ Decisions so far:
 | 2026-11-01 | miniaudio + own audio layer; Steam Audio optional; FMOD as exit path | Free, cross-platform, text-authored sound data for humans and AI |
 | 2026-11-01 | Own cooked formats (.demesh, .detex...); source + mirrored meta tree with GUIDs | Load-in-place speed, clean source folders, rename-safe references |
 | 2026-11-02 | Clip space +Y up with depth 0..1 and reverse Z on every backend | One convention for Vulkan, D3D12 and consoles; depth precision for long view distances |
+| 2026-11-02 | Cloth is a primary system: XPBD character cloth (Jolt soft bodies first), GPU environment cloth, spring bones | Moving capes, robes and banners are central to the look; cosmetic only, so determinism is untouched |
