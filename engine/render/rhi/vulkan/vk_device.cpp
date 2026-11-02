@@ -95,6 +95,9 @@ FormatSupport format_support_from_vk(VkFormatFeatureFlags features) {
     add(VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatSupport::DepthStencil);
     add(VK_FORMAT_FEATURE_TRANSFER_SRC_BIT, FormatSupport::CopySrc);
     add(VK_FORMAT_FEATURE_TRANSFER_DST_BIT, FormatSupport::CopyDst);
+    if ((features & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0 && (features & VK_FORMAT_FEATURE_BLIT_DST_BIT) != 0) {
+        support |= FormatSupport::Blit;
+    }
     return support;
 }
 
@@ -775,7 +778,14 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         }
     };
     use(TextureUsage::Sampled, VK_IMAGE_USAGE_SAMPLED_BIT, FormatSupport::Sampled);
-    use(TextureUsage::Storage, VK_IMAGE_USAGE_STORAGE_BIT, FormatSupport::Storage);
+    // Storage views of an sRGB texture use its UNORM twin (storage_format): the image's own format
+    // needn't support storage, the twin must.
+    const Format storage_view_format = storage_format(desc.format);
+    const bool storage_twin = core::has_any(desc.usage, TextureUsage::Storage) && storage_view_format != desc.format;
+    use(TextureUsage::Storage, VK_IMAGE_USAGE_STORAGE_BIT, storage_twin ? FormatSupport::None : FormatSupport::Storage);
+    if (storage_twin && !caps.supports(storage_view_format, FormatSupport::Storage)) {
+        return core::fail(core::ErrorCode::Unsupported, "the texture's format has no storage support, even as UNORM");
+    }
     use(TextureUsage::RenderTarget, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, FormatSupport::RenderTarget);
     use(TextureUsage::DepthStencil, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatSupport::DepthStencil);
     use(TextureUsage::CopySrc, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, FormatSupport::CopySrc);
@@ -786,9 +796,21 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::Unsupported, "texture format doesn't support the requested usage");
     }
 
+    // An sRGB storage texture is viewed in two formats: sRGB to sample and render, UNORM to store.
+    const VkFormat view_formats[] = {to_vk_format(desc.format), to_vk_format(storage_view_format)};
+    const VkImageFormatListCreateInfo format_list{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+        .viewFormatCount = 2,
+        .pViewFormats = view_formats,
+    };
+    VkImageCreateFlags image_flags = cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0U;
+    if (storage_twin) {
+        image_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    }
     const VkImageCreateInfo image_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .flags = cube ? static_cast<VkImageCreateFlags>(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) : 0U,
+        .pNext = storage_twin ? &format_list : nullptr,
+        .flags = image_flags,
         .imageType = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
         .format = to_vk_format(desc.format),
         .extent = {.width = desc.width, .height = desc.height, .depth = desc.depth},
@@ -811,8 +833,15 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
         return core::fail(core::ErrorCode::OutOfMemory, "GPU memory for the texture could not be allocated");
     }
 
+    // The main view samples and renders; storage goes through per-mip views (vk_bindless.cpp), so
+    // an sRGB storage texture's main view leaves storage out of its usage.
+    const VkImageViewUsageCreateInfo view_usage{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+        .usage = usage & ~static_cast<VkImageUsageFlags>(VK_IMAGE_USAGE_STORAGE_BIT),
+    };
     const VkImageViewCreateInfo view_info{
         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .pNext = storage_twin ? &view_usage : nullptr,
         .image = texture.image,
         .viewType = vk_view_type(desc, false),
         .format = image_info.format,
@@ -822,9 +851,9 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
                              .baseArrayLayer = 0,
                              .layerCount = VK_REMAINING_ARRAY_LAYERS},
     };
-    // Views need a usage that views the image; a copy-only texture (a readback or staging image) has none.
-    constexpr TextureUsage kViewed =
-        TextureUsage::Sampled | TextureUsage::Storage | TextureUsage::RenderTarget | TextureUsage::DepthStencil;
+    // The main view serves sampling and attachments; a copy-only texture (a readback or staging
+    // image) or a storage-only one doesn't need it.
+    constexpr TextureUsage kViewed = TextureUsage::Sampled | TextureUsage::RenderTarget | TextureUsage::DepthStencil;
     if (core::has_any(desc.usage, kViewed)) {
         DE_VK_CHECK(vkCreateImageView(impl_->device, &view_info, nullptr, &texture.view));
         impl_->set_debug_name(VK_OBJECT_TYPE_IMAGE_VIEW, reinterpret_cast<uint64_t>(texture.view), desc.debug_name);

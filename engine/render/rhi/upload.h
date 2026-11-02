@@ -32,6 +32,10 @@ struct TextureUpload {
     uint32_t mip_count = kAllMips; // kAllMips: from first_mip to the last
     ResourceState after = ResourceState::ShaderRead;
     ShaderStages after_stages = ShaderStages::All;
+    // Generate the mips after the uploaded ones on the GPU, from the last uploaded (rhi/mips.h):
+    // upload from mip 0, typically just it. Needs can_generate_mips(); on the transfer queue, the
+    // generation runs on the frame's graphics list.
+    bool generate_mips = false;
 };
 
 // The bytes an upload of these mips takes, tightly packed: mip by mip from first_mip; within a mip

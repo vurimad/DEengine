@@ -178,6 +178,10 @@ struct FormatInfo {
 
 const FormatInfo& format_info(Format format);
 
+// The format storage views of a texture use: the UNORM twin of an sRGB format (GPUs don't write
+// sRGB storage images: shaders write sRGB-encoded values themselves), the format itself otherwise.
+Format storage_format(Format format);
+
 // What a format can do on this GPU (Capabilities::format_support), for optimally tiled textures.
 enum class FormatSupport : uint16_t {
     None = 0,
@@ -189,6 +193,7 @@ enum class FormatSupport : uint16_t {
     DepthStencil = 1 << 5,
     CopySrc = 1 << 6,
     CopyDst = 1 << 7,
+    Blit = 1 << 8, // filtered copies between mips or textures, both ways (CommandList::blit_texture)
 };
 DE_ENUM_FLAGS(FormatSupport)
 
@@ -432,6 +437,16 @@ struct RenderingDesc {
     std::span<const ColorAttachment> colors{}; // at most kMaxColorAttachments
     const DepthAttachment* depth = nullptr;
     Rect area{}; // width 0: the size of the first attachment. Also set as the viewport and scissor
+};
+
+// A filtered copy of a whole mip into another mip (of the same texture or another one), every
+// layer from first_layer on: the source in CopySrc state, the destination in CopyDst. Sizes may
+// differ: the source is scaled with a linear filter (sRGB decoded first, encoded after).
+struct TextureBlit {
+    uint32_t src_mip = 0;
+    uint32_t dst_mip = 0;
+    uint32_t first_layer = 0;
+    uint32_t layer_count = kAllLayers; // kAllLayers: from first_layer to the last layer
 };
 
 // Buffer <-> texture copies. The texture must be in CopyDst (or CopySrc) state.

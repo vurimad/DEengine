@@ -69,6 +69,17 @@ const FormatInfo& format_info(Format format) {
     return kFormats[index < kFormatCount ? index : 0];
 }
 
+Format storage_format(Format format) {
+    switch (format) {
+    case Format::RGBA8Srgb:
+        return Format::RGBA8Unorm;
+    case Format::BGRA8Srgb:
+        return Format::BGRA8Unorm;
+    default:
+        return format; // block-compressed sRGB formats have no storage at all
+    }
+}
+
 namespace {
 
 constexpr ResourceState kBufferOnlyStates = ResourceState::UniformBuffer | ResourceState::VertexBuffer |

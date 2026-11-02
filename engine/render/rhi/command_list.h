@@ -64,6 +64,9 @@ public:
     void fill_buffer(BufferHandle buffer, uint64_t offset, uint64_t size, uint32_t value);
     void copy_buffer_to_texture(BufferHandle src, TextureHandle dst, const BufferTextureCopy& region = {});
     void copy_texture_to_buffer(TextureHandle src, BufferHandle dst, const BufferTextureCopy& region = {});
+    // Graphics lists only. Both formats need FormatSupport::Blit and LinearFilter; src needs
+    // CopySrc usage, dst CopyDst. src and dst may be the same texture (different mips).
+    void blit_texture(TextureHandle src, TextureHandle dst, const TextureBlit& blit);
 
     // Named regions, shown in RenderDoc, Nsight and validation messages. Must nest within the list.
     void begin_debug_label(const char* name, Color color = kDefaultLabelColor);
