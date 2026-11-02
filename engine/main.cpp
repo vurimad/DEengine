@@ -1,3 +1,4 @@
+#include "core/array.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/memory_stats.h"
@@ -12,6 +13,7 @@
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/rhi/device.h"
+#include "render/rhi/upload.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 
@@ -201,32 +203,29 @@ int main(int argc, char** argv) {
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
 
+    // GPU uploads: queued at any time, recorded at the start of each frame.
+    auto uploader = de::rhi::Uploader::create(*device, {.staging_bytes = uint64_t{8} << 20U});
+    if (!uploader) {
+        DE_LOG_ERROR("render", "uploader: %s", uploader.error().message);
+        return EXIT_FAILURE;
+    }
+
     // The quad's texture, made here until the cooker brings real ones (after every early return,
-    // so nothing leaks): a gold and stone checker
-    // darkening toward the bottom, uploaded on the first frame through a staging buffer.
+    // so nothing leaks): a gold and stone checker darkening toward the bottom.
     constexpr uint32_t kQuadTextureSize = 256;
-    constexpr uint64_t kQuadTextureBytes = uint64_t{kQuadTextureSize} * kQuadTextureSize * 4;
+    constexpr size_t kQuadTextureBytes = size_t{kQuadTextureSize} * kQuadTextureSize * 4;
     const auto quad_texture =
         device->create_texture({.width = kQuadTextureSize,
                                 .height = kQuadTextureSize,
                                 .format = de::rhi::Format::RGBA8Srgb,
                                 .usage = de::rhi::TextureUsage::Sampled | de::rhi::TextureUsage::CopyDst,
                                 .debug_name = "quad texture"});
-    const auto quad_staging = device->create_buffer({.size = kQuadTextureBytes,
-                                                     .usage = de::rhi::BufferUsage::CopySrc,
-                                                     .memory = de::rhi::MemoryLocation::Upload,
-                                                     .debug_name = "quad texture staging"});
-    if (!quad_texture || !quad_staging) {
-        if (quad_texture) {
-            device->destroy(*quad_texture);
-        }
-        if (quad_staging) {
-            device->destroy(*quad_staging);
-        }
+    if (!quad_texture) {
         return EXIT_FAILURE;
     }
     {
-        const std::span<std::byte> texels = device->mapped(*quad_staging);
+        de::core::Array<std::byte> texels(de::core::heap_allocator(de::core::MemoryTag::Render));
+        texels.resize(kQuadTextureBytes);
         for (uint32_t y = 0; y < kQuadTextureSize; ++y) {
             for (uint32_t x = 0; x < kQuadTextureSize; ++x) {
                 const bool gold = ((x / 32) + (y / 32)) % 2 == 0;
@@ -240,9 +239,15 @@ int main(int argc, char** argv) {
                 texel[3] = std::byte{255};
             }
         }
-        device->flush_mapped(*quad_staging);
+        const auto queued = uploader->upload_texture(
+            *quad_texture, std::as_bytes(texels.span()),
+            {.after = de::rhi::ResourceState::ShaderRead, .after_stages = de::rhi::ShaderStages::Fragment});
+        if (!queued) {
+            DE_LOG_ERROR("render", "quad texture upload: %s", queued.error().message);
+            device->destroy(*quad_texture);
+            return EXIT_FAILURE;
+        }
     }
-    bool quad_uploaded = false;
 
     const char* frames_flag = flag_value(argc, argv, "--frames");
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
@@ -292,17 +297,9 @@ int main(int argc, char** argv) {
         }
 
         device->begin_frame();
-        if (!quad_uploaded) {
+        if (!uploader->idle()) {
             de::rhi::CommandList list = device->begin_command_list();
-            const de::rhi::ScopedDebugLabel label(list, "upload quad texture");
-            list.barrier(*quad_texture, de::rhi::ResourceState::Undefined, de::rhi::ResourceState::CopyDst);
-            list.copy_buffer_to_texture(*quad_staging, *quad_texture);
-            list.barrier({.texture = *quad_texture,
-                          .before = de::rhi::ResourceState::CopyDst,
-                          .after = de::rhi::ResourceState::ShaderRead,
-                          .after_stages = de::rhi::ShaderStages::Fragment});
-            device->destroy(*quad_staging); // freed once this frame is done on the GPU
-            quad_uploaded = true;
+            uploader->record(list);
         }
 
         // Clear the window to a slowly breathing dusk color, then draw the triangle and the quad.
@@ -402,9 +399,6 @@ int main(int argc, char** argv) {
     }
 
     device->destroy(*quad_texture);
-    if (!quad_uploaded) {
-        device->destroy(*quad_staging); // quit before the first frame
-    }
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames (%u validation errors, %u warnings)",

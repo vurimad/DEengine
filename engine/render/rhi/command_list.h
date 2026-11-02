@@ -117,6 +117,8 @@ public:
     }
 
     [[nodiscard]] bool empty() const { return textures_.empty() && buffers_.empty() && !has_global_; }
+    [[nodiscard]] size_t texture_count() const { return textures_.size(); }
+    [[nodiscard]] size_t buffer_count() const { return buffers_.size(); }
 
     // The merged global barrier, or null if none was added.
     const GlobalBarrier* global() const { return has_global_ ? &global_ : nullptr; }

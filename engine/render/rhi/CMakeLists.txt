@@ -9,7 +9,9 @@ add_library(de_rhi STATIC
     command_list.h
     device.h
     rhi.cpp
-    rhi.h)
+    rhi.h
+    upload.cpp
+    upload.h)
 add_library(de::rhi ALIAS de_rhi)
 
 # The graphics API backend, picked here like the per-OS platform files. Only Vulkan exists;
