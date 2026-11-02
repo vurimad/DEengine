@@ -140,6 +140,47 @@ bool stages_named(ResourceState state, ShaderStages stages) {
     return !core::has_any(state, kShaderStates) || stages != ShaderStages::None;
 }
 
+// What a barrier waits for and makes wait, with queue ownership applied: a release doesn't make
+// anything on its queue wait (the acquire does); an acquire waits at every stage, with no access,
+// so its layout change chains after the semaphore wait that ordered it behind the release (the
+// device's semaphore waits are at all stages).
+struct BarrierSides {
+    VkStateInfo before;
+    VkStateInfo after;
+    uint32_t src_family = VK_QUEUE_FAMILY_IGNORED;
+    uint32_t dst_family = VK_QUEUE_FAMILY_IGNORED;
+};
+
+BarrierSides barrier_sides(const CommandListImpl& list, ResourceState before, ShaderStages before_stages,
+                           ResourceState after, ShaderStages after_stages, QueueOwnership ownership,
+                           QueueType other_queue) {
+    BarrierSides sides{.before = vk_state_info(before, before_stages), .after = vk_state_info(after, after_stages)};
+    if (ownership != QueueOwnership::None) {
+        const uint32_t own = list.device->queue_families[static_cast<size_t>(list.queue)];
+        const uint32_t other = list.device->queue_families[static_cast<size_t>(other_queue)];
+        DE_ASSERT_MSG(own != other, "a queue handover between queues of one family: use a plain barrier");
+        if (ownership == QueueOwnership::Release) {
+            sides.src_family = own;
+            sides.dst_family = other;
+            sides.after.stages = VK_PIPELINE_STAGE_2_NONE;
+            sides.after.access = VK_ACCESS_2_NONE;
+        } else {
+            sides.src_family = other;
+            sides.dst_family = own;
+            sides.before.stages = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+            sides.before.access = VK_ACCESS_2_NONE;
+        }
+    }
+    // A transfer queue only runs copies: its barriers can't name graphics or compute stages.
+    constexpr VkPipelineStageFlags2 kTransferStages = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT |
+                                                      VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_HOST_BIT |
+                                                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    DE_ASSERT_MSG(list.queue != QueueType::Transfer ||
+                      ((sides.before.stages | sides.after.stages) & ~kTransferStages) == 0,
+                  "a transfer list's barriers can only involve copy states (or a queue handover)");
+    return sides;
+}
+
 } // namespace
 
 void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<const BufferBarrier> buffers,
@@ -168,20 +209,22 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
         DE_ASSERT_MSG(stages_named(barrier.before, barrier.before_stages) &&
                           stages_named(barrier.after, barrier.after_stages),
                       "a shader state needs at least one shader stage");
-        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
-        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
+        DE_ASSERT_MSG(barrier.ownership == QueueOwnership::None || !barrier.discard,
+                      "a queue handover keeps the contents: it can't discard");
+        const BarrierSides sides = barrier_sides(*impl_, barrier.before, barrier.before_stages, barrier.after,
+                                                 barrier.after_stages, barrier.ownership, barrier.other_queue);
         image_barriers.push({
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
-            .srcStageMask = before.stages,
-            .srcAccessMask = before.access,
-            .dstStageMask = after.stages,
-            .dstAccessMask = after.access,
+            .srcStageMask = sides.before.stages,
+            .srcAccessMask = sides.before.access,
+            .dstStageMask = sides.after.stages,
+            .dstAccessMask = sides.after.access,
             // Discarding still waits for the previous use (stages and accesses), it just doesn't
             // keep the contents through the layout change.
-            .oldLayout = barrier.discard ? VK_IMAGE_LAYOUT_UNDEFINED : before.layout,
-            .newLayout = after.layout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .oldLayout = barrier.discard ? VK_IMAGE_LAYOUT_UNDEFINED : sides.before.layout,
+            .newLayout = sides.after.layout,
+            .srcQueueFamilyIndex = sides.src_family,
+            .dstQueueFamilyIndex = sides.dst_family,
             .image = texture.image,
             .subresourceRange = subresource_range(texture, barrier.range),
         });
@@ -197,16 +240,16 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
         DE_ASSERT_MSG(stages_named(barrier.before, barrier.before_stages) &&
                           stages_named(barrier.after, barrier.after_stages),
                       "a shader state needs at least one shader stage");
-        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
-        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
+        const BarrierSides sides = barrier_sides(*impl_, barrier.before, barrier.before_stages, barrier.after,
+                                                 barrier.after_stages, barrier.ownership, barrier.other_queue);
         buffer_barriers.push({
             .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2,
-            .srcStageMask = before.stages,
-            .srcAccessMask = before.access,
-            .dstStageMask = after.stages,
-            .dstAccessMask = after.access,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .srcStageMask = sides.before.stages,
+            .srcAccessMask = sides.before.access,
+            .dstStageMask = sides.after.stages,
+            .dstAccessMask = sides.after.access,
+            .srcQueueFamilyIndex = sides.src_family,
+            .dstQueueFamilyIndex = sides.dst_family,
             .buffer = buffer.buffer,
             .offset = barrier.offset,
             .size = barrier.size,
@@ -219,8 +262,10 @@ void CommandList::barriers(std::span<const TextureBarrier> textures, std::span<c
         DE_ASSERT_MSG(stages_named(barrier.before, barrier.before_stages) &&
                           stages_named(barrier.after, barrier.after_stages),
                       "a shader state needs at least one shader stage");
-        const VkStateInfo before = vk_state_info(barrier.before, barrier.before_stages);
-        const VkStateInfo after = vk_state_info(barrier.after, barrier.after_stages);
+        const BarrierSides sides = barrier_sides(*impl_, barrier.before, barrier.before_stages, barrier.after,
+                                                 barrier.after_stages, QueueOwnership::None, QueueType::Graphics);
+        const VkStateInfo& before = sides.before;
+        const VkStateInfo& after = sides.after;
         memory_barriers.push({
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
             .srcStageMask = before.stages,
@@ -266,6 +311,7 @@ void CommandList::barrier(BufferHandle buffer, ResourceState before, ResourceSta
 
 void CommandList::begin_rendering(const RenderingDesc& desc) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(!impl_->in_rendering, "begin_rendering twice without end_rendering");
     DE_ASSERT_MSG(desc.colors.size() <= kMaxColorAttachments, "too many color attachments");
     DE_ASSERT_MSG(!desc.colors.empty() || desc.depth != nullptr, "rendering needs at least one attachment");
@@ -368,6 +414,7 @@ void CommandList::set_scissor(const Rect& rect) {
 
 void CommandList::bind_pipeline(PipelineHandle handle) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     const Pipeline& pipeline = impl_->device->pipeline(handle);
     DE_ASSERT_MSG(impl_->in_rendering == (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS),
                   "graphics pipelines bind inside begin_rendering, compute pipelines outside it");
@@ -381,6 +428,7 @@ void CommandList::bind_pipeline(PipelineHandle handle) {
 
 void CommandList::push_constants(std::span<const std::byte> data, uint32_t offset) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(offset % 4 == 0 && data.size() % 4 == 0 && offset + data.size() <= kMaxPushConstantBytes,
                   "push constants: 4-byte aligned, within kMaxPushConstantBytes");
     vkCmdPushConstants(impl_->cmd, impl_->device->pipeline_layout, VK_SHADER_STAGE_ALL, offset,
@@ -389,12 +437,14 @@ void CommandList::push_constants(std::span<const std::byte> data, uint32_t offse
 
 void CommandList::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
     vkCmdDraw(impl_->cmd, vertex_count, instance_count, first_vertex, first_instance);
 }
 
 void CommandList::bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexType type) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     vkCmdBindIndexBuffer(impl_->cmd, impl_->device->buffer(buffer).buffer, offset,
                          type == IndexType::Uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
 }
@@ -402,12 +452,14 @@ void CommandList::bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexT
 void CommandList::draw_indexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
                                int32_t vertex_offset, uint32_t first_instance) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
     vkCmdDrawIndexed(impl_->cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
 void CommandList::dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups_z) {
     DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(!impl_->in_rendering && impl_->compute_bound,
                   "dispatches need a compute pipeline, outside begin_rendering");
     vkCmdDispatch(impl_->cmd, groups_x, groups_y, groups_z);

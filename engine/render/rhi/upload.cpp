@@ -65,6 +65,7 @@ struct PendingUpload {
     // (the upload is then dropped).
     const TextureDesc* desc = nullptr;
     bool dropped = false;
+    bool overwrite = false; // over something uploaded before, which the GPU may still read
 };
 
 // A stretch of the ring, from allocation until the frame that copied from it is done.
@@ -125,6 +126,8 @@ struct UploaderState {
     size_t purge_at = 256;
 
     uint64_t batch = 0; // record batches so far
+    uint64_t recorded_frame = 0;
+    bool transfer = false; // copies on the transfer queue, handed over to graphics
 
     uint64_t queued_bytes = 0;
     uint64_t uploaded_bytes = 0;
@@ -243,7 +246,28 @@ void purge_states(UploaderState& state) {
 
 // The barriers that take an upload's target to CopyDst. Every byte of the target is overwritten
 // (all layers of the mips, or the buffer range), so old contents are discarded.
+//
+// On the transfer queue they start from Undefined: earlier graphics use is waited for by the
+// semaphore between the queues (Device::transfer_after_previous_frame), and discarded contents
+// need no queue handover.
 size_t add_copy_barriers(const UploaderState& state, const PendingUpload& upload, BarrierBatch& batch) {
+    if (state.transfer) {
+        const MipStates* mips = upload.texture ? state.texture_states.find(upload.texture_handle) : nullptr;
+        if (!upload.texture) {
+            batch.add(BufferBarrier{.buffer = upload.buffer_handle,
+                                    .after = ResourceState::CopyDst,
+                                    .offset = upload.buffer_offset,
+                                    .size = upload.bytes});
+        } else {
+            batch.add(TextureBarrier{.texture = upload.texture_handle,
+                                     .after = ResourceState::CopyDst,
+                                     .range = mips->initialized ? TextureRange{.first_mip = upload.range.first_mip,
+                                                                               .mip_count = upload.range.mip_count}
+                                                                : TextureRange{},
+                                     .discard = true});
+        }
+        return 1;
+    }
     if (!upload.texture) {
         const BufferState& buffer = *state.buffer_states.find(upload.buffer_handle);
         const bool has_write = buffer.write != ResourceState::Undefined;
@@ -296,7 +320,7 @@ size_t add_copy_barriers(const UploaderState& state, const PendingUpload& upload
 
 // The upper bound of add_copy_barriers, without adding anything.
 size_t copy_barrier_count(const UploaderState& state, const PendingUpload& upload) {
-    if (!upload.texture) {
+    if (!upload.texture || state.transfer) {
         return 1;
     }
     const MipStates& mips = *state.texture_states.find(upload.texture_handle);
@@ -304,15 +328,26 @@ size_t copy_barrier_count(const UploaderState& state, const PendingUpload& uploa
 }
 
 // The barrier that takes an upload's target from CopyDst to the state it asked for, and the
-// tracked state that follows.
-void add_use_barrier(UploaderState& state, const PendingUpload& upload, BarrierBatch& batch) {
+// tracked state that follows. On the transfer queue it is a handover: released on the transfer
+// list (batch), acquired on the graphics list (acquire).
+void add_use_barrier(UploaderState& state, const PendingUpload& upload, BarrierBatch& batch, BarrierBatch& acquire) {
+    const QueueOwnership release = state.transfer ? QueueOwnership::Release : QueueOwnership::None;
     if (!upload.texture) {
-        batch.add(BufferBarrier{.buffer = upload.buffer_handle,
-                                .before = ResourceState::CopyDst,
-                                .after = upload.after,
-                                .after_stages = upload.after_stages,
-                                .offset = upload.buffer_offset,
-                                .size = upload.bytes});
+        const BufferBarrier barrier{.buffer = upload.buffer_handle,
+                                    .before = ResourceState::CopyDst,
+                                    .after = upload.after,
+                                    .after_stages = upload.after_stages,
+                                    .offset = upload.buffer_offset,
+                                    .size = upload.bytes,
+                                    .ownership = release,
+                                    .other_queue = QueueType::Graphics};
+        batch.add(barrier);
+        if (state.transfer) {
+            BufferBarrier acquired = barrier;
+            acquired.ownership = QueueOwnership::Acquire;
+            acquired.other_queue = QueueType::Transfer;
+            acquire.add(acquired);
+        }
         BufferState& buffer = *state.buffer_states.find(upload.buffer_handle);
         if (core::has_any(upload.after, kWriteStates)) {
             buffer.write = upload.after;
@@ -329,11 +364,20 @@ void add_use_barrier(UploaderState& state, const PendingUpload& upload, BarrierB
     const TextureRange range =
         mips.initialized ? TextureRange{.first_mip = upload.range.first_mip, .mip_count = upload.range.mip_count}
                          : TextureRange{};
-    batch.add(TextureBarrier{.texture = upload.texture_handle,
-                             .before = ResourceState::CopyDst,
-                             .after = upload.after,
-                             .after_stages = upload.after_stages,
-                             .range = range});
+    const TextureBarrier barrier{.texture = upload.texture_handle,
+                                 .before = ResourceState::CopyDst,
+                                 .after = upload.after,
+                                 .after_stages = upload.after_stages,
+                                 .range = range,
+                                 .ownership = release,
+                                 .other_queue = QueueType::Graphics};
+    batch.add(barrier);
+    if (state.transfer) {
+        TextureBarrier acquired = barrier;
+        acquired.ownership = QueueOwnership::Acquire;
+        acquired.other_queue = QueueType::Transfer;
+        acquire.add(acquired);
+    }
     const uint32_t first = mips.initialized ? upload.range.first_mip : 0;
     const uint32_t end = mips.initialized ? upload.range.first_mip + upload.range.mip_count : upload.desc->mip_count;
     for (uint32_t mip = first; mip < end; ++mip) {
@@ -393,6 +437,7 @@ core::Result<Uploader> Uploader::create(Device& device, const UploaderDesc& desc
     state->desc = desc;
     state->ring = *ring;
     state->ring_memory = device.mapped(*ring).data();
+    state->transfer = desc.use_transfer_queue && device.capabilities().transfer_queue;
     return Uploader(state);
 }
 
@@ -430,8 +475,9 @@ core::Result<void> Uploader::upload_texture(TextureHandle texture, std::span<con
     if (!core::has_any(desc->usage, TextureUsage::CopyDst)) {
         return core::fail(core::ErrorCode::InvalidArgument, "the texture needs CopyDst usage to be uploaded to");
     }
-    if (format_info(desc->format).stencil) {
-        return core::fail(core::ErrorCode::Unsupported, "uploads to depth-stencil formats aren't supported");
+    if (format_info(desc->format).depth) {
+        // Depth comes from rendering, and a transfer queue can't copy depth at all.
+        return core::fail(core::ErrorCode::Unsupported, "uploads to depth formats aren't supported");
     }
     if (desc->mip_count > kMaxTrackedMips) {
         return core::fail(core::ErrorCode::Unsupported, "uploads go to textures of at most 16 mips");
@@ -518,9 +564,12 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
     return {};
 }
 
-void Uploader::record(CommandList& list) {
+void Uploader::record() {
     DE_PROFILE_ZONE("uploader record");
     UploaderState& state = *state_;
+    DE_ASSERT_MSG(state.device->in_frame(), "record() goes inside begin_frame/end_frame");
+    DE_ASSERT_MSG(state.recorded_frame != state.device->frame_index(), "record() runs once per frame");
+    state.recorded_frame = state.device->frame_index();
     if (state.queue_head == state.queue.size()) {
         return;
     }
@@ -535,6 +584,8 @@ void Uploader::record(CommandList& list) {
     const size_t first = state.queue_head;
     size_t last = first;
     uint64_t batch_bytes = 0;
+    size_t fresh = 0;
+    size_t overwrites = 0;
     while (last < state.queue.size()) {
         PendingUpload& upload = state.queue[last];
         upload.desc = upload.texture ? state.device->texture_desc(upload.texture_handle) : nullptr;
@@ -544,57 +595,106 @@ void Uploader::record(CommandList& list) {
             if (batch_bytes > 0 && batch_bytes + upload.bytes > state.desc.frame_budget_bytes) {
                 break;
             }
-            uint64_t& stamp = upload.texture ? state.texture_states.find_or_insert(upload.texture_handle).batch
-                                             : state.buffer_states.find_or_insert(upload.buffer_handle).batch;
-            if (stamp == batch) {
+            uint64_t* stamp = nullptr;
+            if (upload.texture) {
+                MipStates& mips = state.texture_states.find_or_insert(upload.texture_handle);
+                upload.overwrite = mips.initialized;
+                stamp = &mips.batch;
+            } else {
+                BufferState& buffer = state.buffer_states.find_or_insert(upload.buffer_handle);
+                upload.overwrite = buffer.reads != ResourceState::Undefined || buffer.write != ResourceState::Undefined;
+                stamp = &buffer.batch;
+            }
+            if (*stamp == batch) {
                 break; // a second upload to this resource
             }
-            stamp = batch;
+            *stamp = batch;
             batch_bytes += upload.bytes;
+            if (upload.overwrite) {
+                ++overwrites;
+            } else {
+                ++fresh;
+            }
         }
         ++last;
     }
 
-    // Recorded in chunks that keep each barrier command within its inline capacity (no heap):
-    // barriers to CopyDst, the copies, barriers to the requested states.
-    const ScopedDebugLabel label(list, "uploads");
+    // The lists, begun only when needed. The graphics list starts the frame, so the uploads land
+    // before any of its other graphics work wherever record() is called. On the transfer queue,
+    // the copies go on transfer lists (fresh resources on one that runs alongside the previous
+    // frame, overwrites on one that waits for it, as that frame may still read the old contents)
+    // and the graphics list gets the acquires.
+    if (fresh + overwrites > 0) {
+        CommandList graphics = state.device->begin_command_list(QueueType::Graphics, ListStart::FrameStart);
+        const ScopedDebugLabel label(graphics, "uploads");
+        const auto record_group = [&](bool overwrite_group, CommandList& copies) {
+            // Chunks keep each barrier command within its inline capacity (no heap): barriers to
+            // CopyDst, the copies, barriers to the requested states.
+            BarrierBatch to_copy;
+            BarrierBatch to_use;
+            BarrierBatch acquire;
+            const auto in_group = [&](const PendingUpload& upload) {
+                return !upload.dropped && (!state.transfer || upload.overwrite == overwrite_group);
+            };
+            size_t chunk_first = first;
+            while (chunk_first < last) {
+                size_t chunk_last = chunk_first;
+                for (; chunk_last < last; ++chunk_last) {
+                    const PendingUpload& upload = state.queue[chunk_last];
+                    if (!in_group(upload)) {
+                        continue;
+                    }
+                    const size_t count = to_copy.texture_count() + to_copy.buffer_count();
+                    if (count > 0 && count + copy_barrier_count(state, upload) > kInlineBarriers) {
+                        break;
+                    }
+                    add_copy_barriers(state, upload, to_copy);
+                }
+                to_copy.flush(copies);
+                for (size_t i = chunk_first; i < chunk_last; ++i) {
+                    if (in_group(state.queue[i])) {
+                        record_copies(state.queue[i], copies);
+                        add_use_barrier(state, state.queue[i], to_use, acquire);
+                    }
+                }
+                to_use.flush(copies);
+                acquire.flush(graphics);
+                chunk_first = chunk_last;
+            }
+        };
+        if (!state.transfer) {
+            record_group(false, graphics);
+        } else {
+            if (fresh > 0) {
+                CommandList copies = state.device->begin_command_list(QueueType::Transfer);
+                const ScopedDebugLabel copies_label(copies, "upload copies");
+                record_group(false, copies);
+            }
+            if (overwrites > 0) {
+                CommandList copies =
+                    state.device->begin_command_list(QueueType::Transfer, ListStart::AfterPreviousFrame);
+                const ScopedDebugLabel copies_label(copies, "upload overwrites");
+                record_group(true, copies);
+            }
+        }
+    }
+
+    // Staging and stats: everything in the batch is done with, dropped or not. The staging can go
+    // once this frame is done on the GPU.
     const uint64_t frame = state.device->frame_index();
-    BarrierBatch to_copy;
-    BarrierBatch to_use;
-    size_t chunk_first = first;
-    while (chunk_first < last) {
-        size_t chunk_last = chunk_first;
-        for (; chunk_last < last; ++chunk_last) {
-            const PendingUpload& upload = state.queue[chunk_last];
-            if (upload.dropped) {
-                continue;
-            }
-            const size_t count = to_copy.texture_count() + to_copy.buffer_count();
-            if (count > 0 && count + copy_barrier_count(state, upload) > kInlineBarriers) {
-                break;
-            }
-            add_copy_barriers(state, upload, to_copy);
+    for (size_t i = first; i < last; ++i) {
+        const PendingUpload& upload = state.queue[i];
+        if (upload.dropped) {
+            ++state.dropped;
+        } else {
+            state.uploaded_bytes += upload.bytes;
         }
-        to_copy.flush(list);
-        for (size_t i = chunk_first; i < chunk_last; ++i) {
-            const PendingUpload& upload = state.queue[i];
-            if (upload.dropped) {
-                ++state.dropped;
-            } else {
-                record_copies(upload, list);
-                add_use_barrier(state, upload, to_use);
-                state.uploaded_bytes += upload.bytes;
-            }
-            // The staging can go once this frame is done on the GPU.
-            if (upload.region != kNotRecorded) {
-                state.regions[upload.region - state.region_base].frame = frame;
-            } else {
-                state.device->destroy(upload.staging);
-            }
-            state.queued_bytes -= upload.bytes;
+        if (upload.region != kNotRecorded) {
+            state.regions[upload.region - state.region_base].frame = frame;
+        } else {
+            state.device->destroy(upload.staging);
         }
-        to_use.flush(list);
-        chunk_first = chunk_last;
+        state.queued_bytes -= upload.bytes;
     }
 
     state.queue_head = last;
@@ -612,8 +712,7 @@ void Uploader::flush_and_wait() {
     DE_ASSERT_MSG(!device.in_frame(), "flush_and_wait runs its own frames: call it outside begin_frame/end_frame");
     while (!idle()) {
         device.begin_frame();
-        CommandList list = device.begin_command_list();
-        record(list);
+        record();
         device.end_frame();
     }
     device.wait_idle();
@@ -638,6 +737,7 @@ UploaderStats Uploader::stats() const {
         .uploaded_bytes = state.uploaded_bytes,
         .dedicated_staging = state.dedicated,
         .dropped_uploads = state.dropped,
+        .transfer_queue = state.transfer,
     };
 }
 

@@ -112,6 +112,8 @@ private:
 struct CommandListImpl {
     DeviceImpl* device = nullptr;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
+    QueueType queue = QueueType::Graphics;
+    ListStart start = ListStart::InOrder;
     uint32_t label_depth = 0;
     bool in_rendering = false;
     // Vulkan keeps a graphics and a compute binding side by side.
@@ -120,6 +122,7 @@ struct CommandListImpl {
 };
 
 inline constexpr uint32_t kMaxCommandListsPerFrame = 64;
+inline constexpr uint32_t kMaxTransferListsPerFrame = 16; // of the 64
 inline constexpr uint32_t kMaxSwapchainImages = 16;
 
 struct FrameSlot {
@@ -128,7 +131,12 @@ struct FrameSlot {
     CommandListImpl lists[kMaxCommandListsPerFrame];
     VkCommandBuffer command_buffers[kMaxCommandListsPerFrame] = {}; // allocated on first use, reused
     uint32_t allocated_count = 0;
-    uint32_t list_count = 0; // lists begun this frame
+    uint32_t list_count = 0; // lists begun this frame, every queue
+    // Transfer lists come from a pool of the transfer queue's family (Capabilities::transfer_queue).
+    VkCommandPool transfer_pool = VK_NULL_HANDLE;
+    VkCommandBuffer transfer_buffers[kMaxTransferListsPerFrame] = {};
+    uint32_t transfer_allocated = 0;
+    uint32_t transfer_count = 0;
     VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
     uint64_t timeline_value = 0; // the frame timeline value that marks this slot's last frame done
     core::Array<PendingDestroy> pending{core::heap_allocator(core::MemoryTag::Render)};
@@ -177,7 +185,7 @@ struct DeviceImpl {
     void write_descriptor(BindlessTable table, uint32_t entry, VkImageView view);
 
     // --- Frames (vk_device.cpp) ---
-    CommandList begin_command_list(QueueType queue);
+    CommandList begin_command_list(QueueType queue, ListStart start);
 
     // --- Helpers ---
     Texture& texture(TextureHandle handle);
@@ -228,6 +236,9 @@ struct DeviceImpl {
 
     // Frame pacing: frame N signals value N on the graphics queue when its work completes.
     VkSemaphore frame_timeline = VK_NULL_HANDLE;
+    // Frame N's transfer submissions signal values up to 2N; frame N's graphics submission waits
+    // for 2N, so frame N complete on frame_timeline means its transfers are too.
+    VkSemaphore transfer_timeline = VK_NULL_HANDLE;
     uint64_t frame_index = 0; // frames begun; the current frame while in_frame
     bool in_frame = false;
     FrameSlot frames[kFramesInFlight];
