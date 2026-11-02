@@ -113,6 +113,9 @@ public:
     void flush_and_wait();
 
     [[nodiscard]] bool idle() const;
+    // True once the texture's first upload has been recorded (in this frame's record() or before):
+    // its mips are out of Undefined, so it may be sampled. Until then, don't.
+    [[nodiscard]] bool ready(TextureHandle texture) const;
     UploaderStats stats() const;
 
 private:

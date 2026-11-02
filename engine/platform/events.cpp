@@ -2,6 +2,7 @@
 
 #include "core/log.h"
 #include "core/profile.h"
+#include "platform/imgui_events.h"
 #include "platform/input.h"
 #include "platform/window.h"
 
@@ -35,6 +36,7 @@ void pump_events(Window& window, Input& input) {
         if (is_window_event(event.type) && event.window.windowID != window.window_id_) {
             continue;
         }
+        imgui_platform_event(event); // debug UI, when it's on
         switch (event.type) {
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:

@@ -6,6 +6,7 @@
 #include "core/string_id.h"
 #include "core/version.h"
 #include "platform/events.h"
+#include "platform/imgui_platform.h"
 #include "platform/input.h"
 #include "platform/platform.h"
 #include "platform/thread.h"
@@ -13,10 +14,15 @@
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/graph/render_graph.h"
+#include "render/imgui/imgui_renderer.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "tools/debug_ui.h"
+#include "tools/stats_panel.h"
+
+#include <imgui.h>
 
 #include <cmath>
 #include <cstdint>
@@ -25,6 +31,7 @@
 #include <cstring>
 #include <span>
 #include <string_view>
+#include <utility>
 
 using namespace de::core::literals;
 using de::platform::ActionId;
@@ -174,6 +181,8 @@ int main(int argc, char** argv) {
     bind(move_y, "key:W");
     bind(move_y, "key:S", -1.0f);
     bind(move_y, "gamepad:lefty", -1.0f); // stick up is negative y
+    const ActionId toggle_stats = input.add_action("toggle_stats"_sid, ActionKind::Button);
+    bind(toggle_stats, "key:F1");
     if (!bound) {
         return EXIT_FAILURE;
     }
@@ -257,6 +266,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it).
+    de::tools::create_imgui();
+    de::platform::imgui_platform_init(*window);
+    auto imgui = shaders ? de::render::ImGuiRenderer::create(*device, *shaders, *uploader)
+                         : de::core::Result<de::render::ImGuiRenderer>(
+                               de::core::fail(de::core::ErrorCode::Unsupported, "no shader library"));
+    de::tools::StatsPanel stats_panel;
+    bool show_stats = true;
+
     const char* frames_flag = flag_value(argc, argv, "--frames");
     const uint64_t max_frames = frames_flag != nullptr ? std::strtoull(frames_flag, nullptr, 10) : 0;
     uint64_t next_stick_report_ns = 0;
@@ -266,8 +284,12 @@ int main(int argc, char** argv) {
     uint32_t title_frames = 0;
     bool was_moving = false;
     bool was_minimized = false;
+    uint64_t previous_frame_ns = start_ns;
     while (!window->close_requested()) {
         const uint64_t frame_start_allocations = de::core::heap_allocation_count(); // every thread, jobs included
+        const uint64_t frame_start_ns = de::platform::time_ns();
+        const float frame_s = static_cast<float>(frame_start_ns - previous_frame_ns) * 1e-9f;
+        previous_frame_ns = frame_start_ns;
         de::platform::pump_events(*window, input);
         input.sample();
 
@@ -302,6 +324,20 @@ int main(int argc, char** argv) {
 
         if (shaders) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
+        }
+
+        // The debug UI for this frame. Its textures go to the uploader before record().
+        if (input.state(toggle_stats).pressed) {
+            show_stats = !show_stats;
+        }
+        de::platform::imgui_platform_new_frame(*window, frame_s);
+        ImGui::NewFrame();
+        if (show_stats) {
+            stats_panel.draw(&show_stats);
+        }
+        ImGui::Render();
+        if (imgui) {
+            imgui->update_textures(ImGui::GetDrawData());
         }
 
         device->begin_frame();
@@ -391,6 +427,9 @@ int main(int argc, char** argv) {
                     }
                     context.list.end_rendering();
                 });
+            if (imgui) {
+                imgui->add_pass(*graph, back, device->swapchain_format(), ImGui::GetDrawData());
+            }
             graph->execute();
         }
         device->end_frame();
@@ -411,9 +450,15 @@ int main(int argc, char** argv) {
             title_start_ns = now;
         }
 
-        // The "zero heap allocations per frame" rule, made visible in the profiler.
-        DE_PROFILE_PLOT("heap allocations/frame",
-                        static_cast<int64_t>(de::core::heap_allocation_count() - frame_start_allocations));
+        // The "zero heap allocations per frame" rule, made visible in the profiler and the panel.
+        const uint64_t allocations = de::core::heap_allocation_count() - frame_start_allocations;
+        DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
+        stats_panel.record({.frame_ms = frame_s * 1000.0f,
+                            .heap_allocations = allocations,
+                            .device = device->stats(),
+                            .memory = device->memory_stats(),
+                            .graph = graph->stats(),
+                            .uploads = uploader->stats()});
         DE_PROFILE_FRAME();
 
         ++frame;
@@ -422,6 +467,11 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (imgui) {
+        const de::render::ImGuiRenderer discarded = std::move(*imgui); // before the context goes
+    }
+    de::platform::imgui_platform_shutdown();
+    de::tools::destroy_imgui();
     device->log_memory_report(5);
     device->destroy(*quad_texture);
     device->wait_idle();

@@ -1,3 +1,4 @@
+find_package(imgui CONFIG REQUIRED)
 find_package(doctest CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 
@@ -29,6 +30,7 @@ add_executable(de_tests
     render/barrier_test.cpp
     render/bindless_test.cpp
     render/graph_test.cpp
+    render/imgui_test.cpp
     render/memory_test.cpp
     render/mips_test.cpp
     render/rhi_test.cpp
@@ -43,7 +45,7 @@ add_executable(de_tests
 target_include_directories(de_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Platform tests never open a window or initialize SDL's video, so they run on headless CI.
-target_link_libraries(de_tests PRIVATE de::core de::platform de::rhi de::render_graph de::shader de::compile_options doctest::doctest Threads::Threads)
+target_link_libraries(de_tests PRIVATE de::core de::platform de::rhi de::render_graph de::render_imgui de::shader de::tools de::compile_options imgui::imgui doctest::doctest Threads::Threads)
 
 # The engine builds without exceptions, so tests do too. REQUIRE failures terminate the run.
 target_compile_definitions(de_tests PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)
@@ -58,3 +60,6 @@ target_compile_definitions(de_tests PRIVATE "DE_SOURCE_DIR=\"${PROJECT_SOURCE_DI
 de_deploy_slang_runtime(de_tests)
 
 add_test(NAME de_tests COMMAND de_tests)
+# Screen-capture tools hook every Vulkan program on a machine (OBS's capture layer slows these
+# tests about threefold); tests are never worth capturing.
+set_tests_properties(de_tests PROPERTIES ENVIRONMENT "DISABLE_VULKAN_OBS_CAPTURE=1")
