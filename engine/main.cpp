@@ -145,7 +145,11 @@ int main(int argc, char** argv) {
     de::core::Result<de::shader::ShaderLibrary> shaders =
         compiler ? de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler)
                  : de::shader::ShaderLibrary::create_cooked(*device, *vfs, jobs);
-    if (!compiler) {
+    if (!compiler && src_root != nullptr) {
+        // Sources are there but can't be compiled: no hot reload, and cooked shaders may be stale.
+        DE_LOG_WARN("engine", "the shader compiler didn't start (%s): using cooked shaders from game:/",
+                    compiler.error().message);
+    } else if (!compiler) {
         DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
     }
     // Built once the swapchain format is known, and again if it changes. If the shader has an

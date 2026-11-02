@@ -135,9 +135,11 @@ struct Vertex {
 };
 
 // A glTF with one mesh in one node (translated by node_y), its buffer embedded as a data: URI.
-// materials_json, images_json and textures_json are spliced in as they are.
+// materials_json, images_json and textures_json are spliced in as they are. With second_indices,
+// the mesh has a second primitive over the same vertices, with material 1.
 std::string gltf(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices, float node_y,
-                 const std::string& materials_json, const std::string& images_json, const std::string& textures_json) {
+                 const std::string& materials_json, const std::string& images_json, const std::string& textures_json,
+                 const std::vector<uint32_t>& second_indices = {}) {
     std::vector<uint8_t> buffer;
     const auto append = [&](const void* data, size_t size) {
         const auto* bytes = static_cast<const uint8_t*>(data);
@@ -160,24 +162,38 @@ std::string gltf(const std::vector<Vertex>& vertices, const std::vector<uint32_t
     }
     append(indices.data(), indices.size() * 4);
     const size_t count = vertices.size();
-    char text[2048];
+    std::string second_primitive;
+    std::string second_view;
+    std::string second_accessor;
+    if (!second_indices.empty()) {
+        const size_t offset = buffer.size();
+        append(second_indices.data(), second_indices.size() * 4);
+        second_primitive =
+            R"(, {"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 4, "material": 1})";
+        second_view = R"(, {"buffer": 0, "byteOffset": )" + std::to_string(offset) + R"(, "byteLength": )" +
+                      std::to_string(second_indices.size() * 4) + "}";
+        second_accessor = R"(, {"bufferView": 4, "componentType": 5125, "count": )" +
+                          std::to_string(second_indices.size()) + R"(, "type": "SCALAR"})";
+    }
+    char text[4096];
     std::snprintf(text, sizeof(text),
                   R"({"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
   "nodes": [{"mesh": 0, "translation": [0, %g, 0]}],
-  "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0}]}],
+  "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0}%s]}],
   "buffers": [{"byteLength": %zu, "uri": "data:application/octet-stream;base64,%%s"}],
   "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": %zu}, {"buffer": 0, "byteOffset": %zu, "byteLength": %zu},
-                  {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}, {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}],
+                  {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}, {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}%s],
   "accessors": [
     {"bufferView": 0, "componentType": 5126, "count": %zu, "type": "VEC3", "min": [%g, %g, %g], "max": [%g, %g, %g]},
     {"bufferView": 1, "componentType": 5126, "count": %zu, "type": "VEC3"},
     {"bufferView": 2, "componentType": 5126, "count": %zu, "type": "VEC2"},
-    {"bufferView": 3, "componentType": 5125, "count": %zu, "type": "SCALAR"}],
+    {"bufferView": 3, "componentType": 5125, "count": %zu, "type": "SCALAR"}%s],
   "materials": %s, "images": %s, "textures": %s}
 )",
-                  node_y, buffer.size(), count * 12, count * 12, count * 12, count * 24, count * 8, count * 32,
-                  indices.size() * 4, count, min[0], min[1], min[2], max[0], max[1], max[2], count, count,
-                  indices.size(), materials_json.c_str(), images_json.c_str(), textures_json.c_str());
+                  node_y, second_primitive.c_str(), buffer.size(), count * 12, count * 12, count * 12, count * 24,
+                  count * 8, count * 32, indices.size() * 4, second_view.c_str(), count, min[0], min[1], min[2], max[0],
+                  max[1], max[2], count, count, indices.size(), second_accessor.c_str(), materials_json.c_str(),
+                  images_json.c_str(), textures_json.c_str());
     std::string json(text);
     const size_t at = json.find("%s");
     json.replace(at, 2, base64(buffer.data(), buffer.size()));
@@ -423,6 +439,21 @@ TEST_CASE("a second cook skips what didn't change, and re-cooks what did") {
     REQUIRE(vfs.remove_file(cooked_path(asset_id(mask), AssetType::Texture).c_str()).ok());
     CHECK(run_cook(vfs).stats.cooked == 1);
     CHECK(run_cook(vfs, {.force = true}).stats.cooked == 4);
+
+    // A new texture nothing uses: only it cooks (models depend on the textures they reference, not
+    // on every texture there is).
+    write_src(sandbox, "content/other/sky.png", png(8, 8, color_texels(8, 2)));
+    again = run_cook(vfs);
+    CHECK(again.stats.cooked == 1);
+    CHECK(again.stats.up_to_date == 4);
+
+    // A broken edit to the model: it fails, but its normal map keeps its use (BC5), and stays cooked.
+    write_src(sandbox, "content/wall/wall.gltf", "{ not json");
+    again = run_cook(vfs);
+    CHECK(again.stats.failed == 1);
+    CHECK(again.stats.cooked == 0);
+    Cooked normal_file(vfs, asset_id(guid_of(vfs, "src:/meta/wall/bricks_n.png.json")), AssetType::Texture);
+    CHECK(normal_file.load<TextureAsset>().format == TextureFormat::BC5Unorm);
 }
 
 TEST_CASE("metas follow files moved outside the tools; orphans, copies and bad names are reported") {
@@ -650,6 +681,175 @@ Connections:  {
     CHECK(color->value[1] == doctest::Approx(0.2f));
 }
 
+TEST_CASE("LODs keep material seams closed") {
+    const Sandbox sandbox;
+    // One wavy grid, its left half in one material and its right half in another: the halves
+    // share the column of vertices at x = 2 m.
+    constexpr uint32_t kSize = 32;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> all;
+    grid(kSize, vertices, all);
+    std::vector<uint32_t> left;
+    std::vector<uint32_t> right;
+    for (size_t t = 0; t < all.size(); t += 3) {
+        const bool is_left = (t / 6) % kSize < kSize / 2; // two triangles per cell, kSize cells a row
+        (is_left ? left : right)
+            .insert((is_left ? left : right).end(), all.begin() + static_cast<std::ptrdiff_t>(t),
+                    all.begin() + static_cast<std::ptrdiff_t>(t + 3));
+    }
+    write_src(sandbox, "content/field/split.gltf",
+              gltf(vertices, left, 0.0f, R"([{"name": "grass"}, {"name": "dirt"}])", "[]", "[]", right));
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    Cooked file(vfs, asset_id(guid_of(vfs, "src:/meta/field/split.gltf.json")), AssetType::Mesh);
+    const auto& mesh = file.load<MeshAsset>();
+    const auto lods = mesh.lods.get(file.data());
+    const auto parts = mesh.parts.get(file.data());
+    const auto indices = mesh.indices.get(file.data());
+    const auto mesh_vertices = mesh.vertices.get(file.data());
+    REQUIRE(lods.size() >= 2);
+    for (const MeshLod& lod : lods) {
+        REQUIRE(lod.part_count == 2);
+        // Each part's vertices on the seam: every one of the column, in both parts, at every LOD.
+        for (uint32_t p = 0; p < 2; ++p) {
+            const MeshPart& part = parts[lod.first_part + p];
+            std::vector<float> seam;
+            for (uint32_t i = 0; i < part.index_count; ++i) {
+                const MeshVertex& vertex = mesh_vertices[indices[part.first_index + i]];
+                if (std::abs(vertex.position[0] - 2.0f) < 1e-4f &&
+                    std::ranges::find(seam, vertex.position[2]) == seam.end()) {
+                    seam.push_back(vertex.position[2]);
+                }
+            }
+            CHECK(seam.size() == kSize + 1);
+        }
+    }
+    CHECK(parts[lods.back().first_part].index_count < parts[0].index_count); // and it still simplified
+}
+
+TEST_CASE("FBX tangents keep their handedness under a mirroring node") {
+    const Sandbox sandbox;
+    // A quad with tangents along +U and binormals along +V, in a node mirrored in X. In the engine's
+    // space (V flipped, then mirrored) the bitangent cross(n, t) * w points to -Y: w = +1.
+    std::string fbx = R"(; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UpAxis", "int", "Integer", "",1
+		P: "UpAxisSign", "int", "Integer", "",1
+		P: "FrontAxis", "int", "Integer", "",2
+		P: "FrontAxisSign", "int", "Integer", "",1
+		P: "CoordAxis", "int", "Integer", "",0
+		P: "CoordAxisSign", "int", "Integer", "",1
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::card", "Mesh" {
+		Vertices: *12 {
+			a: 0,0,0,1,0,0,1,1,0,0,1,0
+		}
+		PolygonVertexIndex: *4 {
+			a: 0,1,2,-4
+		}
+		GeometryVersion: 124
+		LayerElementNormal: 0 {
+			Version: 101
+			Name: ""
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "Direct"
+			Normals: *12 {
+				a: 0,0,1,0,0,1,0,0,1,0,0,1
+			}
+		}
+		LayerElementBinormal: 0 {
+			Version: 101
+			Name: "map1"
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "Direct"
+			Binormals: *12 {
+				a: 0,1,0,0,1,0,0,1,0,0,1,0
+			}
+		}
+		LayerElementTangent: 0 {
+			Version: 101
+			Name: "map1"
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "Direct"
+			Tangents: *12 {
+				a: 1,0,0,1,0,0,1,0,0,1,0,0
+			}
+		}
+		LayerElementUV: 0 {
+			Version: 101
+			Name: "map1"
+			MappingInformationType: "ByPolygonVertex"
+			ReferenceInformationType: "IndexToDirect"
+			UV: *8 {
+				a: 0,0,1,0,1,1,0,1
+			}
+			UVIndex: *4 {
+				a: 0,1,2,3
+			}
+		}
+		Layer: 0 {
+			Version: 100
+			LayerElement:  {
+				Type: "LayerElementNormal"
+				TypedIndex: 0
+			}
+			LayerElement:  {
+				Type: "LayerElementBinormal"
+				TypedIndex: 0
+			}
+			LayerElement:  {
+				Type: "LayerElementTangent"
+				TypedIndex: 0
+			}
+			LayerElement:  {
+				Type: "LayerElementUV"
+				TypedIndex: 0
+			}
+		}
+	}
+	Model: 2000, "Model::card", "Mesh" {
+		Version: 232
+		Properties70:  {
+			P: "Lcl Scaling", "Lcl Scaling", "", "A",MIRROR,1,1
+		}
+	}
+}
+Connections:  {
+	C: "OO",1000,2000
+	C: "OO",2000,0
+}
+)";
+    const auto tangent_sign = [&](const char* name, const char* mirror) {
+        std::string text = fbx;
+        text.replace(text.find("MIRROR"), 6, mirror);
+        const std::string path = std::string("content/props/") + name;
+        write_src(sandbox, path, text);
+        Vfs vfs = cooker_vfs(sandbox);
+        REQUIRE(run_cook(vfs).ok());
+        Cooked file(vfs, asset_id(guid_of(vfs, ("src:/meta/props/" + std::string(name) + ".json").c_str())),
+                    AssetType::Mesh);
+        const auto& mesh = file.load<MeshAsset>();
+        int sign = 0;
+        for (const MeshVertex& vertex : mesh.vertices.get(file.data())) {
+            const auto w = static_cast<int8_t>(vertex.tangent >> 24U);
+            CHECK((sign == 0 || sign == (w > 0 ? 1 : -1)));
+            sign = w > 0 ? 1 : -1;
+        }
+        return sign;
+    };
+    CHECK(tangent_sign("plain.fbx", "1") == -1);
+    CHECK(tangent_sign("mirrored.fbx", "-1") == 1);
+}
+
 TEST_CASE("text materials name their textures by path and set how they are used") {
     const Sandbox sandbox;
     write_src(sandbox, "content/rock/rock_albedo.png", png(8, 8, color_texels(8, 1)));
@@ -706,6 +906,11 @@ TEST_CASE("shader modules cook to .deshader, and the library builds pipelines fr
     const CookReport again = de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true});
     CHECK(again.stats.cooked == 0);
     CHECK(again.stats.up_to_date == report.stats.cooked);
+    // Cooking without a compiler (--no-shaders) leaves cooked shaders alone.
+    const CookReport content_only = de::cooker::cook(*vfs, jobs, nullptr, {.test_shaders = true});
+    CHECK(content_only.stats.removed == 0);
+    CHECK(vfs->exists(cooked_path(shader_asset_id("tests.solid_color"), AssetType::Shader).c_str()));
+    CHECK(de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true}).stats.up_to_date == report.stats.cooked);
 
     // The cooked module holds every entry point, as the compiler makes them.
     Cooked file(*vfs, shader_asset_id("tests.solid_color"), AssetType::Shader);

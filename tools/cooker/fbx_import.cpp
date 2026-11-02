@@ -1,5 +1,6 @@
 #include "cooker/model.h"
 #include "cooker/source_tree.h"
+#include "core/hash_map.h"
 #include "core/math.h"
 #include "core/profile.h"
 #include "platform/vfs.h"
@@ -76,9 +77,15 @@ private:
         }
         ModelTexture reference{.usage = usage};
         if (map->content.size > 0) {
-            ModelImage& image = model_->images.emplace();
-            image.encoded.assign(std::span(static_cast<const std::byte*>(map->content.data), map->content.size));
-            reference.embedded = static_cast<uint32_t>(model_->images.size() - 1);
+            // One image per embedded file, however many materials share it.
+            if (const uint32_t* known = embedded_.find(map->content.data); known != nullptr) {
+                reference.embedded = *known;
+            } else {
+                ModelImage& image = model_->images.emplace();
+                image.encoded.assign(std::span(static_cast<const std::byte*>(map->content.data), map->content.size));
+                reference.embedded = static_cast<uint32_t>(model_->images.size() - 1);
+                embedded_.set(map->content.data, reference.embedded);
+            }
             return add_texture(*model_, reference, source_.path.view(), diagnostics_);
         }
         // DCCs write paths with backslashes, and often absolute ones from the artist's machine:
@@ -156,8 +163,7 @@ private:
                 const ufbx_face face = mesh.faces.data[part.face_indices.data[f]];
                 const uint32_t count = ufbx_triangulate_face(triangles.data(), triangles.size(), &mesh, face);
                 for (uint32_t c = 0; c < count * 3; ++c) {
-                    primitive.vertices.push(
-                        read_vertex(mesh, triangles[c], transform, normal_matrix, mirrored, has_tangents));
+                    primitive.vertices.push(read_vertex(mesh, triangles[c], transform, normal_matrix, has_tangents));
                 }
             }
             primitive.indices.resize(primitive.vertices.size());
@@ -176,7 +182,7 @@ private:
     }
 
     static ModelVertex read_vertex(const ufbx_mesh& mesh, uint32_t index, const ufbx_matrix& transform,
-                                   const ufbx_matrix& normal_matrix, bool mirrored, bool has_tangents) {
+                                   const ufbx_matrix& normal_matrix, bool has_tangents) {
         ModelVertex vertex;
         store(vertex.position,
               vec3(ufbx_transform_position(&transform, ufbx_get_vertex_vec3(&mesh.vertex_position, index))));
@@ -201,7 +207,8 @@ private:
             vertex.tangent[1] = tangent.y;
             vertex.tangent[2] = tangent.z;
             const bool negative = glm::dot(glm::cross(normal, tangent), bitangent) < 0.0f;
-            vertex.tangent[3] = negative != mirrored ? -1.0f : 1.0f;
+            // From world-space vectors, so a mirroring transform is already in the sign.
+            vertex.tangent[3] = negative ? -1.0f : 1.0f;
         }
         if (mesh.vertex_color.exists) {
             const ufbx_vec4 color = ufbx_get_vertex_vec4(&mesh.vertex_color, index);
@@ -217,6 +224,7 @@ private:
     Diagnostics& diagnostics_;
     const ufbx_scene& scene_;
     ModelData* model_ = nullptr;
+    core::HashMap<const void*, uint32_t> embedded_{tools_heap()}; // embedded file data -> ModelData::images
 };
 
 } // namespace

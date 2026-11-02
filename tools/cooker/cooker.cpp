@@ -83,15 +83,6 @@ public:
 
 private:
     void cook_all() {
-        Hasher textures("texture table");
-        for (const Source& source : tree_.sources()) {
-            if (source.kind == SourceKind::Texture) {
-                textures.add(source.path.view());
-                textures.add(source.id.value());
-            }
-        }
-        texture_table_hash_ = textures.value();
-
         cook_shaders();
         // Models and materials first: how they use textures picks the textures' defaults.
         for (const Source& source : tree_.sources()) {
@@ -130,16 +121,45 @@ private:
         for (const TextureUse& use : record.texture_uses) {
             note_use(use, record.path.view());
         }
+        for (const CookedOutput& output : record.outputs) {
+            static_cast<void>(claim(record.path.view(), output.id));
+        }
         next_.put(clone(record));
         ++stats_.up_to_date;
+    }
+
+    // One source per asset ID: claims it for path, or reports a collision (two GUIDs, or two
+    // names, deriving the same ID) with whichever source claimed it first this run.
+    bool claim(std::string_view path, asset::AssetId id) {
+        const uint64_t key = path_key(path);
+        if (const uint64_t* owner = written_.find(id.value()); owner != nullptr && *owner != key) {
+            diagnostics_.error(path, "cooks to asset %s, which another source makes too (a GUID or name collision)",
+                               asset::format_asset_id(id).c_str());
+            return false;
+        }
+        written_.set(id.value(), key);
+        return true;
     }
 
     // A failed source keeps its last cooked files and record (so they aren't removed as stale),
     // with an input hash that never matches: it cooks again next time. Files this attempt wrote
     // before failing (partial) join the record, so they are tracked and removed once stale too.
+    // Its texture uses carry over too (the last good ones, else this attempt's), so a texture
+    // doesn't lose its defaults because the model using it broke.
     void failed(std::string_view path, const CookRecord* partial = nullptr) {
         ++stats_.failed;
         const CookRecord* record = previous_.find(path);
+        const CookRecord* uses = record != nullptr ? record : partial;
+        if (uses != nullptr) {
+            for (const TextureUse& use : uses->texture_uses) {
+                note_use(use, path);
+            }
+        }
+        if (record != nullptr) {
+            for (const CookedOutput& output : record->outputs) {
+                static_cast<void>(claim(path, output.id));
+            }
+        }
         if (record == nullptr && (partial == nullptr || partial->outputs.empty())) {
             return;
         }
@@ -169,11 +189,7 @@ private:
     }
 
     bool write(CookRecord& record, asset::AssetId id, asset::AssetType type, const core::Array<std::byte>& bytes) {
-        if (const uint64_t* owner = written_.find(id.value()); owner != nullptr) {
-            diagnostics_.error(record.path.view(),
-                               "cooks to asset %s, which another source made this run (a GUID or "
-                               "name collision)",
-                               asset::format_asset_id(id).c_str());
+        if (!claim(record.path.view(), id)) {
             return false;
         }
         const asset::CookedPath path = asset::cooked_path(id, type);
@@ -182,7 +198,6 @@ private:
                                written.error().message);
             return false;
         }
-        written_.set(id.value(), path_key(record.path.view()));
         record.outputs.push(CookedOutput{.id = id, .type = type});
         return true;
     }
@@ -193,6 +208,16 @@ private:
             diagnostics_.error(path, "could not be read: %s", bytes.error().message);
         }
         return bytes;
+    }
+
+    // The IDs of the textures a model or material references (a renamed or re-minted texture
+    // changes the material that points at it); a missing one hashes as missing.
+    void hash_texture_ids(Hasher& hasher, std::span<const TextureUse> uses) const {
+        for (const TextureUse& use : uses) {
+            hasher.add(use.path.view());
+            const Source* texture = tree_.find(use.path.view());
+            hasher.add(texture != nullptr ? texture->id.value() : 0);
+        }
     }
 
     // Each file's path and bytes (a missing file hashes as missing).
@@ -208,6 +233,15 @@ private:
 
     void cook_shaders() {
         if (compiler_ == nullptr) {
+            // Not cooking shaders this time (--no-shaders): what was cooked stays, untouched.
+            for (const CookRecord& record : previous_.records()) {
+                if (record.path.view().starts_with("shaders/")) {
+                    for (const CookedOutput& output : record.outputs) {
+                        static_cast<void>(claim(record.path.view(), output.id));
+                    }
+                    next_.put(clone(record));
+                }
+            }
             return;
         }
         core::Array<SourcePath> files(tools_heap());
@@ -271,7 +305,7 @@ private:
         JsonBuilder texture_json; // for its embedded images, over their usage defaults
         tree_.resolve_settings(source, "texture", texture_json);
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
-        const auto input_hash = [&](std::span<const SourcePath> dependencies) {
+        const auto input_hash = [&](std::span<const SourcePath> dependencies, std::span<const TextureUse> uses) {
             Hasher hasher(source_kind_name(source.kind));
             hasher.add(asset::MeshAsset::kFormatVersion);
             hasher.add(asset::MaterialAsset::kFormatVersion);
@@ -279,12 +313,14 @@ private:
             hasher.add(source_hash);
             hasher.add(std::as_bytes(mesh_json.write(false).span()));
             hasher.add(std::as_bytes(texture_json.write(false).span()));
-            hasher.add(texture_table_hash_);
+            hash_texture_ids(hasher, uses);
             hash_files(hasher, dependencies);
             return hasher.value();
         };
         if (const CookRecord* last = previous_.find(path); last != nullptr) {
-            if (const CookRecord* same = unchanged(path, input_hash(last->dependencies.span())); same != nullptr) {
+            if (const CookRecord* same =
+                    unchanged(path, input_hash(last->dependencies.span(), last->texture_uses.span()));
+                same != nullptr) {
                 keep(*same);
                 return;
             }
@@ -345,7 +381,7 @@ private:
             failed(path, &record);
             return;
         }
-        record.input_hash = input_hash(record.dependencies.span());
+        record.input_hash = input_hash(record.dependencies.span(), record.texture_uses.span());
         for (const TextureUse& use : record.texture_uses) {
             note_use(use, path);
         }
@@ -378,24 +414,28 @@ private:
             failed(path);
             return;
         }
-        Hasher hasher("material");
-        hasher.add(asset::MaterialAsset::kFormatVersion);
-        hasher.add(core::hash_bytes(bytes->data(), bytes->size()));
-        hasher.add(texture_table_hash_);
-        if (const CookRecord* same = unchanged(path, hasher.value()); same != nullptr) {
-            keep(*same);
-            return;
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        const auto input_hash = [&](std::span<const TextureUse> uses) {
+            Hasher hasher("material");
+            hasher.add(asset::MaterialAsset::kFormatVersion);
+            hasher.add(source_hash);
+            hash_texture_ids(hasher, uses);
+            return hasher.value();
+        };
+        if (const CookRecord* last = previous_.find(path); last != nullptr) {
+            if (const CookRecord* same = unchanged(path, input_hash(last->texture_uses.span())); same != nullptr) {
+                keep(*same);
+                return;
+            }
         }
-        CookRecord record{.path = source.path,
-                          .guid = source.guid,
-                          .source_hash = core::hash_bytes(bytes->data(), bytes->size()),
-                          .input_hash = hasher.value()};
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
         core::Result<MaterialBuild> build =
             import_text_material(vfs_, tree_, source, record.texture_uses, diagnostics_);
         if (!build || !write(record, source.id, asset::AssetType::Material, cook_material(*build, source.id))) {
-            failed(path);
+            failed(path, &record);
             return;
         }
+        record.input_hash = input_hash(record.texture_uses.span());
         for (const TextureUse& use : record.texture_uses) {
             note_use(use, path);
         }
@@ -475,9 +515,8 @@ private:
     CookState previous_;
     CookState next_;
     SourceTree tree_;
-    uint64_t texture_table_hash_ = 0;
     core::HashMap<uint64_t, TextureUsage> usages_{tools_heap()}; // texture path -> how it is used
-    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};    // asset ID -> source path, this run
+    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};    // asset ID -> source path key, this run
 };
 
 } // namespace

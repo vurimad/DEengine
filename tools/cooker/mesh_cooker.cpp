@@ -25,6 +25,33 @@ struct PartBuild {
     uint32_t index_count = 0;
 };
 
+// Marks every vertex whose position two or more parts use: what no part may move when it simplifies.
+void lock_seams(std::span<const ModelVertex> vertices, std::span<const uint32_t> indices,
+                std::span<const PartBuild> parts, core::Array<uint8_t>& locks) {
+    locks.clear();
+    locks.resize(vertices.size(), 0);
+    if (parts.size() < 2) {
+        return;
+    }
+    // The first vertex with each position stands for all of them.
+    core::Array<uint32_t> position_of(tools_heap());
+    position_of.resize_uninit(vertices.size());
+    meshopt_generatePositionRemap(position_of.data(), &vertices[0].position[0], vertices.size(), sizeof(ModelVertex));
+    constexpr uint32_t kUnused = UINT32_MAX;
+    constexpr uint32_t kShared = UINT32_MAX - 1;
+    core::Array<uint32_t> owner(tools_heap()); // per position: the one part using it, or kShared
+    owner.resize(vertices.size(), kUnused);
+    for (uint32_t p = 0; p < parts.size(); ++p) {
+        for (const uint32_t index : indices.subspan(parts[p].first_index, parts[p].index_count)) {
+            uint32_t& part = owner[position_of[index]];
+            part = part == kUnused || part == p ? p : kShared;
+        }
+    }
+    for (size_t v = 0; v < vertices.size(); ++v) {
+        locks[v] = owner[position_of[v]] == kShared ? meshopt_SimplifyVertex_Lock : 0;
+    }
+}
+
 } // namespace
 
 uint32_t encode_octahedral(const float (&normal)[3]) {
@@ -145,14 +172,11 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
 
     const float* positions = &vertices[0].position[0];
     if (settings.optimize) {
-        core::Array<uint32_t> scratch(tools_heap());
         for (const PartBuild& part : parts) {
-            uint32_t* range = indices.data() + part.first_index;
-            scratch.assign(std::span<const uint32_t>(range, part.index_count));
-            meshopt_optimizeVertexCache(range, scratch.data(), part.index_count, vertices.size());
-            scratch.assign(std::span<const uint32_t>(range, part.index_count));
-            meshopt_optimizeOverdraw(range, scratch.data(), part.index_count, positions, vertices.size(),
-                                     sizeof(ModelVertex), 1.05f);
+            uint32_t* range = indices.data() + part.first_index; // both work in place
+            meshopt_optimizeVertexCache(range, range, part.index_count, vertices.size());
+            meshopt_optimizeOverdraw(range, range, part.index_count, positions, vertices.size(), sizeof(ModelVertex),
+                                     1.05f);
         }
         core::Array<ModelVertex> fetched(tools_heap());
         fetched.resize(vertices.size());
@@ -176,6 +200,10 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
     const float target_error =
         settings.lod_error * meshopt_simplifyScale(positions, vertices.size(), sizeof(ModelVertex));
     size_t previous_indices = lod0_indices;
+    // Parts simplify one by one; where two meet (the same position, whether or not the vertex is
+    // split there), the vertices stay put, so no LOD opens a crack along a material seam.
+    core::Array<uint8_t> locks(tools_heap());
+    lock_seams(vertices.span(), indices.span(), parts.span(), locks);
     core::Array<uint32_t> simplified(tools_heap());
     for (uint32_t level = 1; level < settings.lod_count; ++level) {
         const float keep = std::pow(settings.lod_ratio, static_cast<float>(level));
@@ -186,10 +214,10 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
             const auto target = static_cast<size_t>(static_cast<float>(part.index_count) * keep) / 3 * 3;
             simplified.resize_uninit(part.index_count);
             float part_error = 0.0f;
-            const size_t count =
-                meshopt_simplify(simplified.data(), indices.data() + part.first_index, part.index_count, positions,
-                                 vertices.size(), sizeof(ModelVertex), std::max<size_t>(target, 3), target_error,
-                                 meshopt_SimplifyErrorAbsolute, &part_error);
+            const size_t count = meshopt_simplifyWithAttributes(
+                simplified.data(), indices.data() + part.first_index, part.index_count, positions, vertices.size(),
+                sizeof(ModelVertex), nullptr, 0, nullptr, 0, locks.data(), std::max<size_t>(target, 3), target_error,
+                meshopt_SimplifyErrorAbsolute, &part_error);
             if (count == 0) {
                 continue; // simplified away entirely at this distance
             }

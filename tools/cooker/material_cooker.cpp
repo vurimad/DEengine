@@ -37,7 +37,10 @@ core::Array<std::byte> cook_material(MaterialBuild& build, asset::AssetId id) {
                       [](const asset::MaterialTexture& a, const asset::MaterialTexture& b) { return a.slot < b.slot; });
     core::Array<asset::AssetId> dependencies(tools_heap());
     for (const asset::MaterialTexture& texture : build.textures) {
-        dependencies.push(texture.texture);
+        // One texture in two slots (glTF's packed occlusion-metallic-roughness) is one dependency.
+        if (std::ranges::find(dependencies, texture.texture) == dependencies.end()) {
+            dependencies.push(texture.texture);
+        }
     }
     asset::MaterialAsset asset;
     asset.shader_template = build.shader_template;

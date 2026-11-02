@@ -140,6 +140,17 @@ TEST_CASE("cooked files load in place, and broken ones are refused") {
     CHECK_FALSE(verify_content_hash(file.bytes()));
 }
 
+TEST_CASE("a texture in two material slots is one dependency") {
+    MaterialBuild build;
+    build.set_texture(material::kOcclusionTexture, AssetId::from_value(5));
+    build.set_texture(material::kMetallicRoughnessTexture, AssetId::from_value(5));
+    AlignedFile file(de::cooker::cook_material(build, AssetId::from_value(3)));
+    const auto loaded = load_in_place<MaterialAsset>(file.bytes());
+    REQUIRE(loaded.ok());
+    CHECK((*loaded)->textures.count == 2);
+    CHECK((*loaded)->header.dependencies.count == 1);
+}
+
 TEST_CASE("cooking the same input twice gives the same bytes") {
     const auto first = sample_material(AssetId::from_value(9));
     const auto second = sample_material(AssetId::from_value(9));
