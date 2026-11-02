@@ -4,6 +4,7 @@
 
 #include "core/allocator.h"
 #include "core/array.h"
+#include "core/fixed_string.h"
 #include "core/slot_map.h"
 #include "render/rhi/command_list.h"
 #include "render/rhi/device.h"
@@ -64,6 +65,8 @@ struct Texture {
     TextureBindless bindless;
     TextureDesc desc;
     bool swapchain = false;
+    core::FixedString<63> name;
+    uint64_t memory_bytes = 0; // its allocation; 0 for swapchain images
 };
 
 struct Buffer {
@@ -72,6 +75,7 @@ struct Buffer {
     std::byte* mapped = nullptr;
     uint64_t address = 0; // 0 when no shader-visible usage
     BufferDesc desc;
+    uint64_t memory_bytes = 0;
 };
 
 struct Pipeline {
@@ -80,12 +84,25 @@ struct Pipeline {
 };
 
 // GPU objects waiting for the frames that may use them to finish.
+// The driver's view of GPU-local memory (VMA budgets): totals, and the fullest heap.
+struct DeviceLocalBudget {
+    uint64_t used = 0;
+    uint64_t budget = 0;
+    uint32_t fullest_heap = 0;
+    uint64_t fullest_used = 0;
+    uint64_t fullest_budget = 0;
+};
+
+GpuMemoryCategory texture_memory_category(const TextureDesc& desc);
+GpuMemoryCategory buffer_memory_category(MemoryLocation location);
+
 struct PendingDestroy {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    uint64_t memory_bytes = 0; // counted in pending_destroy_bytes until freed
 };
 
 // Hands out the entries of one kind of table (sampled or storage): an entry is the same position
@@ -259,6 +276,14 @@ struct DeviceImpl {
     bool acquired = false; // a swapchain image was acquired this frame
     uint32_t acquired_image = 0;
     uint32_t swapchain_recreations = 0;
+
+    // GPU memory accounting (Device::memory_stats).
+    GpuMemoryStats memory;           // the categories and pending bytes; the budget is read when asked
+    bool over_budget_warned = false; // set at 90% of the fullest heap's budget, cleared below 80%
+    void count_memory(GpuMemoryCategory category, uint64_t bytes);
+    void uncount_memory(GpuMemoryCategory category, uint64_t bytes); // moves them to pending
+    DeviceLocalBudget read_budget() const;
+    void check_memory_budget(); // once per frame
 
     std::atomic<uint32_t> validation_errors{0};
     std::atomic<uint32_t> validation_warnings{0};

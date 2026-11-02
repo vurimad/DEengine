@@ -583,8 +583,65 @@ void DeviceImpl::free_pending(FrameSlot& slot) {
         if (entry.pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, entry.pipeline, nullptr);
         }
+        memory.pending_destroy_bytes -= entry.memory_bytes;
     }
     pending.clear();
+}
+
+void DeviceImpl::count_memory(GpuMemoryCategory category, uint64_t bytes) {
+    memory.bytes[static_cast<size_t>(category)] += bytes;
+    ++memory.counts[static_cast<size_t>(category)];
+}
+
+void DeviceImpl::uncount_memory(GpuMemoryCategory category, uint64_t bytes) {
+    DE_ASSERT(memory.bytes[static_cast<size_t>(category)] >= bytes && memory.counts[static_cast<size_t>(category)] > 0);
+    memory.bytes[static_cast<size_t>(category)] -= bytes;
+    --memory.counts[static_cast<size_t>(category)];
+    memory.pending_destroy_bytes += bytes;
+}
+
+DeviceLocalBudget DeviceImpl::read_budget() const {
+    const VkPhysicalDeviceMemoryProperties* properties = nullptr;
+    vmaGetMemoryProperties(allocator, &properties);
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+    vmaGetHeapBudgets(allocator, budgets);
+    DeviceLocalBudget result;
+    for (uint32_t i = 0; i < properties->memoryHeapCount; ++i) {
+        if ((properties->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) {
+            continue;
+        }
+        const VmaBudget& heap = budgets[i];
+        result.used += heap.usage;
+        result.budget += heap.budget;
+        // The fullest heap: used / budget compared without division.
+        if (heap.budget > 0 &&
+            (result.fullest_budget == 0 || heap.usage * result.fullest_budget > result.fullest_used * heap.budget)) {
+            result.fullest_heap = i;
+            result.fullest_used = heap.usage;
+            result.fullest_budget = heap.budget;
+        }
+    }
+    return result;
+}
+
+// Warns when a GPU-local heap passes 90% of its budget (paging, then failed allocations follow),
+// and again only once the fullest heap has come back below 80%.
+void DeviceImpl::check_memory_budget() {
+    const DeviceLocalBudget budget = read_budget();
+    if (budget.fullest_budget == 0) {
+        return;
+    }
+    const bool high = budget.fullest_used * 10 >= budget.fullest_budget * 9;
+    const bool low = budget.fullest_used * 10 < budget.fullest_budget * 8;
+    if (!over_budget_warned && high) {
+        over_budget_warned = true;
+        DE_LOG_WARN("render", "GPU memory heap %u at %llu of %llu MiB (%s): close to paging", budget.fullest_heap,
+                    static_cast<unsigned long long>(budget.fullest_used >> 20U),
+                    static_cast<unsigned long long>(budget.fullest_budget >> 20U),
+                    memory_budget ? "the OS budget" : "an estimate: 80% of the heap");
+    } else if (over_budget_warned && low) {
+        over_budget_warned = false;
+    }
 }
 
 CommandList DeviceImpl::begin_command_list(QueueType queue, ListStart start) {
@@ -713,17 +770,115 @@ DeviceStats Device::stats() const {
         stats.pending_destroys += static_cast<uint32_t>(slot.pending.size());
     }
 
-    const VkPhysicalDeviceMemoryProperties* memory = nullptr;
-    vmaGetMemoryProperties(impl_->allocator, &memory);
-    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
-    vmaGetHeapBudgets(impl_->allocator, budgets);
-    for (uint32_t i = 0; i < memory->memoryHeapCount; ++i) {
-        if ((memory->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) {
-            stats.gpu_memory_used_bytes += budgets[i].usage;
-            stats.gpu_memory_budget_bytes += budgets[i].budget;
-        }
-    }
+    const DeviceLocalBudget budget = impl_->read_budget();
+    stats.gpu_memory_used_bytes = budget.used;
+    stats.gpu_memory_budget_bytes = budget.budget;
     return stats;
+}
+
+GpuMemoryCategory texture_memory_category(const TextureDesc& desc) {
+    if (core::has_any(desc.usage, TextureUsage::RenderTarget | TextureUsage::DepthStencil)) {
+        return GpuMemoryCategory::RenderTargets;
+    }
+    return core::has_any(desc.usage, TextureUsage::Storage) ? GpuMemoryCategory::StorageTextures
+                                                            : GpuMemoryCategory::Textures;
+}
+
+GpuMemoryCategory buffer_memory_category(MemoryLocation location) {
+    switch (location) {
+    case MemoryLocation::Upload:
+        return GpuMemoryCategory::UploadBuffers;
+    case MemoryLocation::Readback:
+        return GpuMemoryCategory::ReadbackBuffers;
+    default:
+        return GpuMemoryCategory::GpuBuffers;
+    }
+}
+
+const char* gpu_memory_category_name(GpuMemoryCategory category) {
+    switch (category) {
+    case GpuMemoryCategory::RenderTargets:
+        return "render targets";
+    case GpuMemoryCategory::StorageTextures:
+        return "storage textures";
+    case GpuMemoryCategory::Textures:
+        return "textures";
+    case GpuMemoryCategory::GpuBuffers:
+        return "GPU buffers";
+    case GpuMemoryCategory::UploadBuffers:
+        return "upload buffers";
+    case GpuMemoryCategory::ReadbackBuffers:
+        return "readback buffers";
+    case GpuMemoryCategory::Count:
+        break;
+    }
+    return "unknown";
+}
+
+GpuMemoryStats Device::memory_stats() const {
+    GpuMemoryStats stats = impl_->memory;
+    const DeviceLocalBudget budget = impl_->read_budget();
+    stats.device_local_used_bytes = budget.used;
+    stats.device_local_budget_bytes = budget.budget;
+    stats.budget_from_os = impl_->memory_budget;
+    return stats;
+}
+
+size_t Device::largest_textures(std::span<TextureMemory> out) const {
+    if (out.empty()) {
+        return 0;
+    }
+    size_t filled = 0;
+    const DeviceImpl& impl = *impl_;
+    const std::span<const Texture> textures = impl.textures.values();
+    for (size_t index = 0; index < textures.size(); ++index) {
+        const Texture& texture = textures[index];
+        if (texture.swapchain) {
+            continue;
+        }
+        // Insertion into the sorted prefix: the smallest falls off when out is full.
+        size_t at = filled;
+        while (at > 0 && out[at - 1].bytes < texture.memory_bytes) {
+            --at;
+        }
+        if (at == out.size()) {
+            continue;
+        }
+        const size_t end = std::min(filled + 1, out.size());
+        for (size_t i = end - 1; i > at; --i) {
+            out[i] = out[i - 1];
+        }
+        out[at] = TextureMemory{.texture = impl.textures.handle_at(index),
+                                .desc = texture.desc,
+                                .name = texture.name,
+                                .bytes = texture.memory_bytes,
+                                .category = texture_memory_category(texture.desc)};
+        filled = end;
+    }
+    return filled;
+}
+
+void Device::log_memory_report(size_t largest) const {
+    const GpuMemoryStats stats = memory_stats();
+    const auto mib = [](uint64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); };
+    DE_LOG_INFO("render",
+                "GPU memory: %.1f MiB in resources, %.1f MiB waiting to be freed; GPU-local %.1f of %.1f MiB (%s)",
+                mib(stats.total_bytes()), mib(stats.pending_destroy_bytes), mib(stats.device_local_used_bytes),
+                mib(stats.device_local_budget_bytes), stats.budget_from_os ? "OS budget" : "estimated budget");
+    for (size_t i = 0; i < static_cast<size_t>(GpuMemoryCategory::Count); ++i) {
+        DE_LOG_INFO("render", "  %-17s %9.1f MiB  %5u", gpu_memory_category_name(static_cast<GpuMemoryCategory>(i)),
+                    mib(stats.bytes[i]), stats.counts[i]);
+    }
+    core::Array<TextureMemory> top(core::heap_allocator(core::MemoryTag::Render)); // a report: not per frame
+    top.resize(std::min(largest, impl_->textures.size()));
+    const size_t count = largest_textures(top.span());
+    for (size_t i = 0; i < count; ++i) {
+        const TextureMemory& texture = top[i];
+        DE_LOG_INFO("render", "  %9.1f MiB  %ux%ux%u x%u, %u mips, %s  %s (%s)", mib(texture.bytes), texture.desc.width,
+                    texture.desc.height, texture.desc.depth, texture.desc.layer_count, texture.desc.mip_count,
+                    format_info(texture.desc.format).name, texture.name.empty() ? "unnamed" : texture.name.c_str(),
+                    gpu_memory_category_name(texture.category));
+    }
 }
 
 // --- Resources ---
@@ -825,8 +980,9 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
     const VmaAllocationCreateInfo allocation_info{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     Texture texture{.aspects = format_aspects(desc.format), .desc = desc};
     texture.desc.debug_name = nullptr;
-    const VkResult result =
-        vmaCreateImage(impl_->allocator, &image_info, &allocation_info, &texture.image, &texture.allocation, nullptr);
+    VmaAllocationInfo allocated{};
+    const VkResult result = vmaCreateImage(impl_->allocator, &image_info, &allocation_info, &texture.image,
+                                           &texture.allocation, &allocated);
     if (result != VK_SUCCESS) {
         DE_LOG_ERROR("render", "texture '%s' (%ux%u %s): %s", desc.debug_name != nullptr ? desc.debug_name : "",
                      desc.width, desc.height, info.name, vk_result_name(result));
@@ -870,6 +1026,9 @@ core::Result<TextureHandle> Device::create_texture(const TextureDesc& desc) {
                      registered.error().message);
         return core::fail(registered.error());
     }
+    texture.name.assign(desc.debug_name != nullptr ? desc.debug_name : "");
+    texture.memory_bytes = allocated.size;
+    impl_->count_memory(texture_memory_category(desc), texture.memory_bytes);
     return impl_->textures.insert(texture);
 }
 
@@ -934,6 +1093,8 @@ core::Result<BufferHandle> Device::create_buffer(const BufferDesc& desc) {
     if (desc.debug_name != nullptr) {
         vmaSetAllocationName(impl_->allocator, buffer.allocation, desc.debug_name);
     }
+    buffer.memory_bytes = allocated.size;
+    impl_->count_memory(buffer_memory_category(desc.memory), buffer.memory_bytes);
     return impl_->buffers.insert(buffer);
 }
 
@@ -946,8 +1107,11 @@ void Device::destroy(TextureHandle handle) {
     if (texture->swapchain) {
         return;
     }
-    impl_->current_slot().pending.push(
-        PendingDestroy{.image = texture->image, .view = texture->view, .allocation = texture->allocation});
+    impl_->current_slot().pending.push(PendingDestroy{.image = texture->image,
+                                                      .view = texture->view,
+                                                      .allocation = texture->allocation,
+                                                      .memory_bytes = texture->memory_bytes});
+    impl_->uncount_memory(texture_memory_category(texture->desc), texture->memory_bytes);
     impl_->current_slot().pending_bindless.push(texture->bindless);
     impl_->textures.remove(handle);
 }
@@ -957,7 +1121,9 @@ void Device::destroy(BufferHandle handle) {
     if (buffer == nullptr) {
         return;
     }
-    impl_->current_slot().pending.push(PendingDestroy{.buffer = buffer->buffer, .allocation = buffer->allocation});
+    impl_->current_slot().pending.push(PendingDestroy{
+        .buffer = buffer->buffer, .allocation = buffer->allocation, .memory_bytes = buffer->memory_bytes});
+    impl_->uncount_memory(buffer_memory_category(buffer->desc.memory), buffer->memory_bytes);
     impl_->buffers.remove(handle);
 }
 
@@ -1028,6 +1194,8 @@ void Device::begin_frame() {
         DE_VK_CHECK(vkWaitSemaphores(impl.device, &wait, UINT64_MAX));
     }
     impl.free_pending(slot);
+    vmaSetCurrentFrameIndex(impl.allocator, static_cast<uint32_t>(impl.frame_index));
+    impl.check_memory_budget();
     DE_VK_CHECK(vkResetCommandPool(impl.device, slot.command_pool, 0));
     if (slot.transfer_pool != VK_NULL_HANDLE) {
         DE_VK_CHECK(vkResetCommandPool(impl.device, slot.transfer_pool, 0));

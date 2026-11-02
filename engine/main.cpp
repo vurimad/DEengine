@@ -395,6 +395,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    device->log_memory_report(5);
     device->destroy(*quad_texture);
     device->wait_idle();
     const de::rhi::DeviceStats stats = device->stats();
