@@ -42,7 +42,13 @@ device.end_frame();                                      // one submit for all l
 - Swapchain formats are sRGB, so shaders write linear color; a window without one gets a warning in the log.
 - Frames present from the graphics queue; a GPU whose graphics queue can't present to the window is rejected.
 - Required: Vulkan 1.3 with dynamic rendering, cube map arrays, synchronization2, maintenance4, descriptor indexing (update-after-bind, partially bound, variable count, non-uniform indexing), buffer device address, draw indirect count, timeline semaphores, scalar block layout, BC textures, 64-bit shader integers. Optional, reported in `Capabilities`: ray query (with acceleration structures), memory budget, a separate async compute queue, a dedicated transfer queue.
-- Every buffer a shader can read gets a device address (`Device::buffer_address`); shaders reach buffers through pointers in push constants. Bindless textures arrive in M0a task 9.
+- Every buffer a shader can read gets a device address (`Device::buffer_address`); shaders reach buffers through pointers in push constants.
+- Bindless textures and samplers: one descriptor set, bound once per command list, with a table per texture shape (2D, 2D array, cube, cube array, 3D sampled; 2D, 2D array, 3D storage) plus samplers and comparison samplers (`shaders/common/bindless.slang`).
+  - A texture gets one index per usage when it's created (`texture_index`, `storage_texture_index`), written into the table of its shape. Shaders can't read a texture as another shape: no aliasing, no silent type mismatch.
+  - Indices are freed with the texture's memory, once the GPU is done with it, and only then reused. Freed 2D entries point back at the fallback (index 0, 1x1 magenta), so a stale index draws magenta instead of garbage.
+  - Depth-stencil textures are sampled through a depth-only view; storage textures through a mip 0 view (cubes as arrays of faces).
+  - The default samplers (`DefaultSampler`) sit at fixed indices: linear, point and anisotropic in wrap and clamp, and a reverse-Z shadow comparison sampler.
+  - Tables hold up to 16384 sampled and 4096 storage textures per shape and 64 samplers, less if the GPU's limits are lower.
 - One pipeline layout for every pipeline: 128 bytes of push constants visible to all stages, no per-pipeline descriptor layouts. Pipelines take compiled shader code (from `render/shader`), attachment formats and fixed state; viewport and scissor are dynamic. No vertex input layouts: vertices are pulled from buffers by address.
 - Validation is on by default in debug and dev builds when the layer is installed (Vulkan SDK). Its messages go to the log under `vulkan` and are counted in `DeviceStats`; the tests require zero, with synchronization validation on. `deengine --frames N` fails when validation reported errors.
 - Object names and command-list labels reach RenderDoc and Nsight whenever `VK_EXT_debug_utils` is available, in every build.
