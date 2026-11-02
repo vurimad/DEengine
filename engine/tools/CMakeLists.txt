@@ -9,4 +9,5 @@ add_library(de_tools STATIC
 add_library(de::tools ALIAS de_tools)
 
 target_link_libraries(de_tools
-    PUBLIC de::core de::rhi de::render_graph de::compile_options imgui::imgui)
+    PUBLIC de::core de::rhi de::render_graph de::compile_options imgui::imgui
+    PRIVATE de::platform de::render_imgui de::shader)

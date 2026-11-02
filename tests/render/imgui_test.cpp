@@ -46,14 +46,19 @@ struct ImGuiScope {
 // One frame: a window filling the target with some text, drawn by the renderer over a black
 // clear, then copied out.
 void draw_frame(Device& device, Uploader& uploader, RenderGraph& graph, ImGuiRenderer& renderer, TextureHandle target,
-                BufferHandle readback) {
+                BufferHandle readback, bool two_windows = false) {
     ImGui::NewFrame();
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
-    ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kSize), static_cast<float>(kSize)));
-    ImGui::Begin("test", nullptr, ImGuiWindowFlags_NoDecoration);
-    ImGui::TextUnformatted("Hello, graph");
-    ImGui::Button("A button");
-    ImGui::End();
+    // One window over all of it, or two side by side: two draw lists, the second's vertices after
+    // the first's in the vertex buffer.
+    const float width = two_windows ? kSize / 2.0f : static_cast<float>(kSize);
+    for (int window = 0; window < (two_windows ? 2 : 1); ++window) {
+        ImGui::SetNextWindowPos(ImVec2(width * static_cast<float>(window), 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(width, static_cast<float>(kSize)));
+        ImGui::Begin(window == 0 ? "left" : "right", nullptr, ImGuiWindowFlags_NoDecoration);
+        ImGui::TextUnformatted("Hello");
+        ImGui::Button("Button");
+        ImGui::End();
+    }
     ImGui::Render();
     renderer.update_textures(ImGui::GetDrawData());
 
@@ -152,6 +157,51 @@ TEST_CASE("Dear ImGui draws through the RHI and the render graph, sRGB targets i
     for (uint32_t c = 0; c < 3; ++c) {
         CHECK(std::abs(channel(seen[0].background, c) - channel(seen[1].background, c)) <= 3);
     }
+    device->destroy(readback);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("every draw list draws its own vertices") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    ShaderKit kit(*device);
+    auto uploader = Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const ImGuiScope imgui;
+    auto renderer = ImGuiRenderer::create(*device, kit.library(), *uploader);
+    REQUIRE(renderer.ok());
+    const TextureHandle target = *device->create_texture({.width = kSize,
+                                                          .height = kSize,
+                                                          .format = Format::RGBA8Unorm,
+                                                          .usage = TextureUsage::RenderTarget | TextureUsage::CopySrc});
+    const BufferHandle readback = *device->create_buffer(
+        {.size = uint64_t{kSize} * kSize * 4, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
+    // Text in each half: if the second list read the first list's vertices, its half would hold
+    // nothing (or the first window again, over the left half).
+    uint32_t left = 0;
+    uint32_t right = 0;
+    for (int frame = 0; frame < 30 && (left == 0 || right == 0); ++frame) {
+        draw_frame(*device, *uploader, *graph, *renderer, target, readback, true);
+        left = 0;
+        right = 0;
+        for (uint32_t y = 0; y < kSize; ++y) {
+            for (uint32_t x = 0; x < kSize; ++x) {
+                const uint32_t texel = read_u32(*device, readback, (y * kSize) + x);
+                const bool bright = (texel & 0xFFU) > 200 || ((texel >> 8U) & 0xFFU) > 200;
+                (x < kSize / 2 ? left : right) += bright ? 1 : 0;
+            }
+        }
+        kit.library().update();
+    }
+    CHECK(ImGui::GetDrawData()->CmdLists.Size >= 2);
+    CHECK(left > 10);
+    CHECK(right > 10);
+    device->destroy(target);
     device->destroy(readback);
     device->wait_idle();
     check_clean(*device);

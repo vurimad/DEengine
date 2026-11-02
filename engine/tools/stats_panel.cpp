@@ -1,5 +1,7 @@
 #include "tools/stats_panel.h"
 
+#include "core/profile.h"
+
 #include <imgui.h>
 
 #include <algorithm>
@@ -15,6 +17,7 @@ double mib(uint64_t bytes) {
 } // namespace
 
 void StatsPanel::record(const FrameStats& stats) {
+    DE_PROFILE_ZONE("stats panel record");
     frame_ms_[next_] = stats.frame_ms;
     next_ = (next_ + 1) % kHistory;
     count_ = std::min(count_ + 1, kHistory);
@@ -23,6 +26,7 @@ void StatsPanel::record(const FrameStats& stats) {
 }
 
 void StatsPanel::draw(bool* open) const {
+    DE_PROFILE_ZONE("stats panel");
     ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(380.0f, 0.0f), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Frame stats", open)) {

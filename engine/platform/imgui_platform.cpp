@@ -1,6 +1,7 @@
 #include "platform/imgui_platform.h"
 
 #include "core/assert.h"
+#include "core/profile.h"
 #include "platform/imgui_events.h"
 #include "platform/window.h"
 
@@ -19,6 +20,7 @@ namespace de::platform {
 namespace {
 
 struct ImGuiPlatformState {
+    SDL_Window* window = nullptr;
     bool initialized = false;
     bool text_input = false;
     char* clipboard = nullptr; // the last text handed to ImGui, owned by SDL
@@ -147,13 +149,12 @@ int to_imgui_button(uint8_t button) {
 void imgui_platform_init(Window& window) {
     DE_ASSERT_MSG(ImGui::GetCurrentContext() != nullptr, "imgui_platform_init needs an ImGui context");
     DE_ASSERT_MSG(!g_imgui.initialized, "imgui_platform_init twice");
-    static_cast<void>(window);
     ImGuiIO& io = ImGui::GetIO();
     io.BackendPlatformName = "deengine_sdl3";
     ImGuiPlatformIO& platform_io = ImGui::GetPlatformIO();
     platform_io.Platform_GetClipboardTextFn = get_clipboard;
     platform_io.Platform_SetClipboardTextFn = set_clipboard;
-    g_imgui = ImGuiPlatformState{.initialized = true};
+    g_imgui = ImGuiPlatformState{.window = window.native_handle(), .initialized = true};
 }
 
 void imgui_platform_shutdown() {
@@ -162,6 +163,9 @@ void imgui_platform_shutdown() {
     }
     if (g_imgui.clipboard != nullptr) {
         SDL_free(g_imgui.clipboard);
+    }
+    if (g_imgui.text_input) {
+        SDL_StopTextInput(g_imgui.window); // no input method left open for the game
     }
     if (ImGui::GetCurrentContext() != nullptr) {
         ImGui::GetIO().BackendPlatformName = nullptr;
@@ -172,6 +176,7 @@ void imgui_platform_shutdown() {
 }
 
 void imgui_platform_new_frame(Window& window, float delta_s) {
+    DE_PROFILE_ZONE("imgui platform");
     DE_ASSERT_MSG(g_imgui.initialized, "imgui_platform_new_frame before imgui_platform_init");
     ImGuiIO& io = ImGui::GetIO();
     int width = 0;

@@ -32,6 +32,7 @@ struct ImGuiPush {
     uint32_t texture = 0;
     uint32_t sampler = 0;
     uint32_t srgb_target = 0;
+    uint32_t vertex_base = 0; // the draw's first vertex in the buffer (SV_VertexID is its index)
 };
 
 static_assert(sizeof(ImDrawVert) == 20, "shaders/imgui.slang reads 20-byte vertices");
@@ -70,6 +71,7 @@ struct ImGuiRendererState {
     core::Array<OwnedTexture> textures{render_heap()};
     core::Array<uint32_t> free_slots{render_heap()};
     FrameBuffers frames[rhi::kFramesInFlight];
+    core::Array<std::byte> converted{render_heap()}; // an alpha-only atlas as RGBA8
     uint32_t failed_textures = 0;
 
     // Room for `bytes` in a mapped buffer of the current frame, grown by half again when short.
@@ -92,15 +94,16 @@ struct ImGuiRendererState {
         return true;
     }
 
-    // The texture's pixels as RGBA8 (ImGui may keep an alpha-only atlas).
-    void upload(rhi::TextureHandle handle, ImTextureData& texture) {
+    // The texture's pixels as RGBA8 (ImGui may keep an alpha-only atlas), the whole texture each
+    // time: ImGui only adds pixels where none were used before, and updates are rare (new glyphs).
+    // A partial upload would need regions in the uploader. False if it couldn't be queued.
+    bool upload(rhi::TextureHandle handle, ImTextureData& texture) {
         const auto pixels = static_cast<size_t>(texture.Width) * static_cast<size_t>(texture.Height);
-        core::Array<std::byte> converted(render_heap());
         std::span<const std::byte> bytes;
         if (texture.Format == ImTextureFormat_RGBA32) {
             bytes = std::span(static_cast<const std::byte*>(texture.GetPixels()), pixels * 4);
         } else {
-            converted.resize(pixels * 4);
+            converted.resize(pixels * 4); // kept between uploads: no allocation once it's big enough
             const auto* alpha = static_cast<const uint8_t*>(texture.GetPixels());
             for (size_t i = 0; i < pixels; ++i) {
                 converted[(i * 4) + 0] = std::byte{255};
@@ -110,12 +113,12 @@ struct ImGuiRendererState {
             }
             bytes = converted.span();
         }
-        // The whole texture each time: ImGui only adds pixels where none were used before.
         const auto queued = uploader->upload_texture(
             handle, bytes, {.after = rhi::ResourceState::ShaderRead, .after_stages = rhi::ShaderStages::Fragment});
-        if (!queued) {
+        if (!queued && ++failed_textures <= 4) {
             DE_LOG_ERROR("render", "imgui texture upload: %s", queued.error().message);
         }
+        return queued.ok();
     }
 
     void create(ImTextureData& texture) {
@@ -139,8 +142,12 @@ struct ImGuiRendererState {
             slot = static_cast<uint32_t>(textures.size());
             textures.push({});
         }
+        if (!upload(*handle, texture)) {
+            device->destroy(*handle);
+            free_slots.push(slot);
+            return; // stays WantCreate: tried again next frame
+        }
         textures[slot] = OwnedTexture{.handle = *handle, .live = true};
-        upload(*handle, texture);
         texture.SetTexID((static_cast<uint64_t>(slot + 1) << 32U) | device->texture_index(*handle));
         texture.SetStatus(ImTextureStatus_OK);
     }
@@ -238,10 +245,10 @@ void ImGuiRenderer::update_textures(ImDrawData* draw_data) {
             break;
         case ImTextureStatus_WantUpdates: {
             const uint32_t slot = slot_of(texture->TexID);
-            if (slot != 0 && slot - 1 < state_->textures.size() && state_->textures[slot - 1].live) {
-                state_->upload(state_->textures[slot - 1].handle, *texture);
+            const bool owned = slot != 0 && slot - 1 < state_->textures.size() && state_->textures[slot - 1].live;
+            if (!owned || state_->upload(state_->textures[slot - 1].handle, *texture)) {
+                texture->SetStatus(ImTextureStatus_OK); // else stays WantUpdates: tried again next frame
             }
-            texture->SetStatus(ImTextureStatus_OK);
             break;
         }
         case ImTextureStatus_WantDestroy:
@@ -349,7 +356,10 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                         std::min((command.ClipRect.z - origin.x) * scale.x, static_cast<float>(target_desc.width));
                     const float bottom =
                         std::min((command.ClipRect.w - origin.y) * scale.y, static_cast<float>(target_desc.height));
-                    const ImTextureID texture = command.GetTexID();
+                    // Not GetTexID(): it asserts for a texture whose creation failed (retried
+                    // next frame); such draws are skipped instead.
+                    const ImTextureID texture =
+                        command.TexRef._TexData != nullptr ? command.TexRef._TexData->TexID : command.TexRef._TexID;
                     if (right <= left || bottom <= top || !data.state->drawable(texture)) {
                         continue;
                     }
@@ -358,9 +368,11 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                                               .width = static_cast<uint32_t>(right - left),
                                               .height = static_cast<uint32_t>(bottom - top)});
                     push.texture = bindless_of(texture);
+                    // The vertex base goes through push constants, not the draw's vertex offset:
+                    // whether SV_VertexID includes that offset differs between shading languages.
+                    push.vertex_base = command.VtxOffset + vertex_base;
                     context.list.push_constants(push);
-                    context.list.draw_indexed(command.ElemCount, 1, command.IdxOffset + index_base,
-                                              static_cast<int32_t>(command.VtxOffset + vertex_base));
+                    context.list.draw_indexed(command.ElemCount, 1, command.IdxOffset + index_base, 0);
                 }
                 vertex_base += static_cast<uint32_t>(list->VtxBuffer.Size);
                 index_base += static_cast<uint32_t>(list->IdxBuffer.Size);

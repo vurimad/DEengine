@@ -12,6 +12,7 @@ struct ImGuiPush
     uint texture;      // bindless index
     uint sampler;      // DefaultSampler
     uint srgb_target;  // 1: the target encodes sRGB, so ImGui's sRGB colors go in linear
+    uint vertex_base;  // the draw's first vertex: draws use vertex offset 0, so SV_VertexID is the index
 };
 
 [[vk::push_constant]]
@@ -28,7 +29,7 @@ struct VertexOutput
 VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 {
     // Five 32-bit words per vertex: no struct, so no padding rules get in the way.
-    uint* vertex = push.vertices + vertex_id * 5;
+    uint* vertex = push.vertices + (push.vertex_base + vertex_id) * 5;
     const float2 position = float2(asfloat(vertex[0]), asfloat(vertex[1]));
     const float2 uv = float2(asfloat(vertex[2]), asfloat(vertex[3]));
     const uint packed = vertex[4];

@@ -6,7 +6,6 @@
 #include "core/string_id.h"
 #include "core/version.h"
 #include "platform/events.h"
-#include "platform/imgui_platform.h"
 #include "platform/input.h"
 #include "platform/platform.h"
 #include "platform/thread.h"
@@ -14,15 +13,12 @@
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/graph/render_graph.h"
-#include "render/imgui/imgui_renderer.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
 #include "tools/stats_panel.h"
-
-#include <imgui.h>
 
 #include <cmath>
 #include <cstdint>
@@ -31,7 +27,6 @@
 #include <cstring>
 #include <span>
 #include <string_view>
-#include <utility>
 
 using namespace de::core::literals;
 using de::platform::ActionId;
@@ -266,12 +261,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it).
-    de::tools::create_imgui();
-    de::platform::imgui_platform_init(*window);
-    auto imgui = shaders ? de::render::ImGuiRenderer::create(*device, *shaders, *uploader)
-                         : de::core::Result<de::render::ImGuiRenderer>(
-                               de::core::fail(de::core::ErrorCode::Unsupported, "no shader library"));
+    // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
+    // device, uploader and graph, so it goes before them.
+    de::tools::DebugUi debug_ui =
+        de::tools::DebugUi::create(*window, *device, shaders ? &*shaders : nullptr, *uploader);
     de::tools::StatsPanel stats_panel;
     bool show_stats = true;
 
@@ -330,14 +323,11 @@ int main(int argc, char** argv) {
         if (input.state(toggle_stats).pressed) {
             show_stats = !show_stats;
         }
-        de::platform::imgui_platform_new_frame(*window, frame_s);
-        ImGui::NewFrame();
-        if (show_stats) {
-            stats_panel.draw(&show_stats);
-        }
-        ImGui::Render();
-        if (imgui) {
-            imgui->update_textures(ImGui::GetDrawData());
+        if (debug_ui.begin_frame(*window, frame_s)) {
+            if (show_stats) {
+                stats_panel.draw(&show_stats);
+            }
+            debug_ui.end_frame();
         }
 
         device->begin_frame();
@@ -427,9 +417,7 @@ int main(int argc, char** argv) {
                     }
                     context.list.end_rendering();
                 });
-            if (imgui) {
-                imgui->add_pass(*graph, back, device->swapchain_format(), ImGui::GetDrawData());
-            }
+            debug_ui.add_pass(*graph, back, device->swapchain_format());
             graph->execute();
         }
         device->end_frame();
@@ -467,11 +455,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (imgui) {
-        const de::render::ImGuiRenderer discarded = std::move(*imgui); // before the context goes
-    }
-    de::platform::imgui_platform_shutdown();
-    de::tools::destroy_imgui();
     device->log_memory_report(5);
     device->destroy(*quad_texture);
     device->wait_idle();
