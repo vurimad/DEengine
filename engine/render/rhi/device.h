@@ -35,10 +35,13 @@ struct GpuMemoryStats {
     uint64_t bytes[static_cast<size_t>(GpuMemoryCategory::Count)] = {};
     uint32_t counts[static_cast<size_t>(GpuMemoryCategory::Count)] = {};
     uint64_t pending_destroy_bytes = 0; // destroyed, freed once the GPU is done with them
-    // From the driver, for this process across GPU-local heaps: everything it allocated (the
-    // categories, internals, other allocators), and what the OS lets it use before paging.
+    // From the driver, for this process across GPU-local heaps: what it allocated, and what it may
+    // use before paging. With budget_from_os (VK_EXT_memory_budget) the OS's numbers, counting
+    // every allocation of the process; without, an estimate: 80% of the heaps, VMA's own
+    // allocations only. The same numbers as DeviceStats::gpu_memory_*.
     uint64_t device_local_used_bytes = 0;
     uint64_t device_local_budget_bytes = 0;
+    bool budget_from_os = false;
 
     uint64_t total_bytes() const {
         uint64_t total = 0;
@@ -116,12 +119,13 @@ public:
     const Capabilities& capabilities() const;
     DeviceStats stats() const;
 
-    // GPU memory by category, kept as resources come and go (cheap: every frame is fine).
+    // GPU memory by category, kept as resources come and go, and the driver's budget. Cheap
+    // enough to poll every frame. (The over-budget warning is begin_frame's, not this.)
     GpuMemoryStats memory_stats() const;
     // The largest live textures, biggest first: fills out and returns how many it filled. Walks
     // every texture: for reports and debug views, not every frame.
     size_t largest_textures(std::span<TextureMemory> out) const;
-    // Logs memory_stats() and the largest textures ("render" channel).
+    // Logs memory_stats() and the largest textures, as many as asked ("render" channel).
     void log_memory_report(size_t largest = 10) const;
     bool validation_enabled() const;
 

@@ -68,6 +68,8 @@ TEST_CASE("GPU memory is counted per category as resources come and go") {
     CHECK(stats.total_bytes() > before.total_bytes());
     CHECK(stats.device_local_budget_bytes > 0);
     CHECK(stats.device_local_used_bytes > 0);
+    CHECK(stats.device_local_used_bytes == device->stats().gpu_memory_used_bytes); // one source
+    CHECK(stats.device_local_budget_bytes == device->stats().gpu_memory_budget_bytes);
 
     // Destroyed memory waits for the GPU, then it's gone.
     const uint64_t sampled_bytes = grew(GpuMemoryCategory::Textures);
@@ -136,6 +138,7 @@ TEST_CASE("the largest textures come biggest first, with their names") {
     CHECK(top[0].name.size() == 63);
     CHECK(std::strncmp(top[0].name.c_str(), long_name, 63) == 0);
     device->log_memory_report(3);
+    device->log_memory_report(100); // more than there are: all of them
 
     device->destroy(named);
     for (const TextureHandle texture : textures) {

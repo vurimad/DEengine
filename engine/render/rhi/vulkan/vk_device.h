@@ -67,7 +67,6 @@ struct Texture {
     bool swapchain = false;
     core::FixedString<63> name;
     uint64_t memory_bytes = 0; // its allocation; 0 for swapchain images
-    GpuMemoryCategory category = GpuMemoryCategory::Textures;
 };
 
 struct Buffer {
@@ -76,9 +75,7 @@ struct Buffer {
     std::byte* mapped = nullptr;
     uint64_t address = 0; // 0 when no shader-visible usage
     BufferDesc desc;
-    core::FixedString<63> name;
     uint64_t memory_bytes = 0;
-    GpuMemoryCategory category = GpuMemoryCategory::GpuBuffers;
 };
 
 struct Pipeline {
@@ -87,6 +84,18 @@ struct Pipeline {
 };
 
 // GPU objects waiting for the frames that may use them to finish.
+// The driver's view of GPU-local memory (VMA budgets): totals, and the fullest heap.
+struct DeviceLocalBudget {
+    uint64_t used = 0;
+    uint64_t budget = 0;
+    uint32_t fullest_heap = 0;
+    uint64_t fullest_used = 0;
+    uint64_t fullest_budget = 0;
+};
+
+GpuMemoryCategory texture_memory_category(const TextureDesc& desc);
+GpuMemoryCategory buffer_memory_category(MemoryLocation location);
+
 struct PendingDestroy {
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -269,11 +278,12 @@ struct DeviceImpl {
     uint32_t swapchain_recreations = 0;
 
     // GPU memory accounting (Device::memory_stats).
-    GpuMemoryStats memory;
-    bool over_budget_warned = false; // set at 90% of the budget, cleared below 80%
+    GpuMemoryStats memory;           // the categories and pending bytes; the budget is read when asked
+    bool over_budget_warned = false; // set at 90% of the fullest heap's budget, cleared below 80%
     void count_memory(GpuMemoryCategory category, uint64_t bytes);
     void uncount_memory(GpuMemoryCategory category, uint64_t bytes); // moves them to pending
-    void check_memory_budget();
+    DeviceLocalBudget read_budget() const;
+    void check_memory_budget(); // once per frame
 
     std::atomic<uint32_t> validation_errors{0};
     std::atomic<uint32_t> validation_warnings{0};
