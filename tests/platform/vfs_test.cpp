@@ -284,36 +284,82 @@ TEST_CASE("many concurrent reads all complete with the right contents") {
     CHECK(stats.bytes_read == kFiles * 3);
 }
 
-TEST_CASE("a critical read overtakes queued prefetches") {
+namespace {
+
+struct OrderProbe {
+    std::vector<int>* order = nullptr;
+    int id = 0;
+};
+
+void record_order(void* context, const de::core::Result<size_t>& /*result*/) {
+    const auto* probe = static_cast<OrderProbe*>(context);
+    probe->order->push_back(probe->id);
+}
+
+} // namespace
+
+TEST_CASE("a critical read is served before queued prefetches") {
     const QuietLog quiet;
     const Sandbox sandbox;
     sandbox.add_game_file("a.bin", "a");
-    Vfs vfs = sandbox.make_vfs(VfsDesc{.reader_threads = 1});
+    // A big file keeps the single reader busy for milliseconds while everything else is queued
+    // in microseconds.
+    const std::vector<char> big(32U << 20U, 'x');
+    sandbox.add_game_file("big.bin", std::string_view(big.data(), big.size()));
+
+    // With no workers, completion callbacks wait in the job system's shared queue in the order
+    // the reads finished, and run on this thread, in that order, inside wait().
+    de::core::JobSystem jobs(de::core::JobSystemDesc{.worker_count = 0});
+    Vfs vfs = sandbox.make_vfs(VfsDesc{.reader_threads = 1, .jobs = &jobs});
 
     constexpr int kPrefetches = 300;
-    std::vector<std::byte> buffers(kPrefetches);
-    std::vector<ReadHandle> prefetches;
-    prefetches.reserve(kPrefetches);
-    for (int i = 0; i < kPrefetches; ++i) {
-        prefetches.push_back(*vfs.read(ReadRequest{.path = "game:/a.bin",
-                                                   .dest = std::span(buffers).subspan(static_cast<size_t>(i), 1),
-                                                   .priority = IoPriority::Prefetch}));
+    std::vector<int> order;
+    order.reserve(kPrefetches + 2);
+    std::vector<OrderProbe> probes(kPrefetches + 2);
+    for (int i = 0; i < kPrefetches + 2; ++i) {
+        probes[i] = OrderProbe{.order = &order, .id = i};
     }
-    std::byte critical_buffer[1];
-    const ReadHandle critical =
-        *vfs.read(ReadRequest{.path = "game:/a.bin", .dest = critical_buffer, .priority = IoPriority::Critical});
-    REQUIRE(wait_for(vfs, critical));
+    std::vector<std::byte> big_buffer(big.size());
+    std::vector<std::byte> buffers(kPrefetches + 1);
+    de::core::JobCounter done;
 
-    int prefetches_done = 0;
-    for (const ReadHandle handle : prefetches) {
-        prefetches_done += vfs.status(handle) == ReadStatus::Done ? 1 : 0;
+    const auto blocker = vfs.read(ReadRequest{.path = "game:/big.bin",
+                                              .dest = big_buffer,
+                                              .priority = IoPriority::Far,
+                                              .on_complete = &record_order,
+                                              .context = &probes[0],
+                                              .counter = &done});
+    REQUIRE(blocker.ok());
+    // Only once the reader has picked it up is the order of everything else down to priority.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (vfs.status(*blocker) == ReadStatus::Pending && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
     }
-    CHECK(prefetches_done < kPrefetches / 2); // it didn't wait its turn behind them
-    for (const ReadHandle handle : prefetches) {
-        REQUIRE(wait_for(vfs, handle));
-        CHECK(vfs.finish(handle).ok());
+    REQUIRE(vfs.status(*blocker) == ReadStatus::InFlight);
+    for (int i = 1; i <= kPrefetches; ++i) {
+        REQUIRE(vfs.read(ReadRequest{.path = "game:/a.bin",
+                                     .dest = std::span(buffers).subspan(static_cast<size_t>(i), 1),
+                                     .priority = IoPriority::Prefetch,
+                                     .on_complete = &record_order,
+                                     .context = &probes[i],
+                                     .counter = &done})
+                    .ok());
     }
-    CHECK(vfs.finish(critical).ok());
+    REQUIRE(vfs.read(ReadRequest{.path = "game:/a.bin",
+                                 .dest = std::span(buffers).first(1),
+                                 .priority = IoPriority::Critical,
+                                 .on_complete = &record_order,
+                                 .context = &probes[kPrefetches + 1],
+                                 .counter = &done})
+                .ok());
+    jobs.wait(done);
+
+    REQUIRE(order.size() == kPrefetches + 2);
+    CHECK(order[0] == 0);               // the big read was already in flight
+    CHECK(order[1] == kPrefetches + 1); // then the critical read jumped all 300 prefetches
+    for (int i = 2; i < kPrefetches + 2; ++i) {
+        CHECK(order[i] == i - 1); // prefetches in the order they were queued
+    }
 }
 
 TEST_CASE("cancelling a queued read means it never touches the destination") {
@@ -396,7 +442,7 @@ struct Delivery {
     std::atomic<bool> failed{false};
 };
 
-void on_read(void* context, de::core::Result<size_t> result) {
+void on_read(void* context, const de::core::Result<size_t>& result) {
     auto* delivery = static_cast<Delivery*>(context);
     if (result.ok()) {
         delivery->bytes = *result;

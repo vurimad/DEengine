@@ -59,7 +59,7 @@ inline constexpr uint64_t kWholeFile = UINT64_MAX;
 
 // Delivers a read's result as a job (decompression and setup run on the job system). The read
 // is finished by the Vfs right after the callback returns: don't call finish() or cancel() on it.
-using ReadCallback = void (*)(void* context, core::Result<size_t> result);
+using ReadCallback = void (*)(void* context, const core::Result<size_t>& result);
 
 struct ReadRequest {
     const char* path = nullptr; // "game:/characters/knight/knight.demesh"

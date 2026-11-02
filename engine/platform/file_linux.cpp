@@ -4,12 +4,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <ftw.h>
-#include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
