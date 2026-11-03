@@ -517,6 +517,8 @@ GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
 **Look study: Elden Ring (part 1, 2026-11-03).** From its shaders, studied from an owned copy (names, buffer layouts and the disassembled sun-light, tonemapping and grading passes), in our own words. Not yet checked against a frame capture: what runs each frame, and the render-target formats, still need one.
 
+*What we take from it, and what we don't.* Their look comes mostly from art direction (artists tuning lighting groups, shadow tints, fog, haze and grading per area, time and weather), not from advanced rendering: much of the low-level tech is dated (ad-hoc local lights, grading on SDR, tens of thousands of shader permutations, an unused GI system). Their low-level rendering isn't a model to follow. What we study and match is the feel, the atmosphere, and the art controls that produce them; the G-buffer, lighting core, shadows, anti-aliasing and upscaling are our own modern designs (one physically consistent core, few uber-shaders, bindless), with those art controls on top.
+
 *What their renderer does:*
 
 - **Deferred, tile-based lighting.** Lights accumulate per tile, with variants by light type and count; a composite pass combines them. Forward variants of every material exist for transparents, and every material has G-buffer, velocity, depth and shadow variants.
@@ -1170,3 +1172,4 @@ Decisions so far:
 | 2026-11-03 | Cells are assets and entities: members carry a non-fragmenting `(InCell, cell)` that deletes them with the cell; entities hold non-owning asset handles | One owner per thing, no mirrored lists between world, assets and renderer; streaming mechanism built in M0b, policy in M1 |
 | 2026-11-03 | `.cell` is JSON with world-space positions for roots; props are static by default (children as their parent); members respawn when hot reload swaps in a re-cooked cell | Readable and diffable by people and agents; most placed things never move; edit, cook and see it in the running game |
 | 2026-11-03 | Elden Ring may be studied in full from an owned copy, shader code included (captures and dumps, offline only); own implementations, findings in our words, nothing extracted committed | Its techniques are the reference for the look; studying the real thing beats guessing, and clean implementations keep the engine ours |
+| 2026-11-03 | Match Elden Ring's feel, atmosphere and art controls, not its low-level renderer; our own G-buffer, lighting core, shadows and upscaling | Their look comes from art direction on dated tech; a modern, consistent core with their art levers on top looks as good and ages better |
