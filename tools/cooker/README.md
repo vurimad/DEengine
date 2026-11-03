@@ -82,7 +82,8 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 
 - The same inputs give the same bytes: no timestamps or paths in cooked files, padding zeroed.
 - A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references, or (for cells) the IDs of the models it places: a model cooked again doesn't cook its cells again. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
-- A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are.
+- A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are; `CookOptions::content = false` (shaders only, for tests) leaves what was cooked from `content/` as it is.
+- A glTF buffer shorter than the glTF says (a Git LFS pointer that was never pulled) is reported, never read past.
 - LODs never move vertices where two material parts meet, so they don't crack along seams.
 - Files go through the VFS only; third-party libraries allocate on the Tools heap (yyjson, cgltf, ufbx and stb per call, meshoptimizer process-wide).
 - Texture blocks encode in parallel on the job system. Shader compiles run one at a time (Slang's global session).

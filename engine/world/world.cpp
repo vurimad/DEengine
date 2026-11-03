@@ -96,14 +96,17 @@ core::Result<World> World::create(const WorldDesc& desc) {
     // World transforms in a phase of their own after PostSim, so they follow every game system
     // that moves something, whenever it was made.
     const flecs::entity transforms = ecs.entity("de::WorldTransformsPhase").add<SimulationPhase>().depends_on(previous);
+    // Cells spawn before extraction too: a frame may run no tick.
+    const flecs::entity spawn_cells = ecs.entity("de::SpawnCellsPhase").add<FramePhase>();
     state->phases[static_cast<size_t>(Phase::RenderExtract)] =
-        ecs.entity(kPhaseNames[static_cast<size_t>(Phase::RenderExtract)]).add<FramePhase>();
+        ecs.entity(kPhaseNames[static_cast<size_t>(Phase::RenderExtract)]).add<FramePhase>().depends_on(spawn_cells);
     state->simulation = make_pipeline<SimulationPhase>(ecs, "de::SimulationPipeline");
     state->frame = make_pipeline<FramePhase>(ecs, "de::FramePipeline");
 
     add_transform_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], transforms);
     if (desc.assets != nullptr) {
-        add_cell_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], *desc.assets, state->cell_scratch);
+        add_cell_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], spawn_cells, *desc.assets,
+                         state->cell_scratch);
     }
     add_render_extract(
         ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],

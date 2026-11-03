@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace de::cooker {
 
@@ -35,13 +36,26 @@ bool read_numbers(yyjson_val* value, T* out, size_t count) {
     return true;
 }
 
+enum class StaticSetting : uint8_t { Unset, Yes, No };
+
 // One entity as read, before parents are put first.
 struct Parsed {
     CellEntity entity;
     std::string_view name;
-    std::string_view parent; // its name, resolved once every entity is read
-    uint32_t depth = 0;      // parents to the root
+    std::string_view parent;     // its name, resolved once every entity is read
+    bool parent_missing = false; // named a parent that isn't there (reported)
+    uint32_t depth = 0;          // parents to the root
+    StaticSetting static_setting = StaticSetting::Unset;
 };
+
+// A float from a JSON number, if it fits.
+bool to_float(double value, float& out) {
+    if (!std::isfinite(value) || std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
+        return false;
+    }
+    out = static_cast<float>(value);
+    return true;
+}
 
 class CellImport {
 public:
@@ -77,6 +91,7 @@ public:
             read_entity(item, i);
         }
         resolve_parents();
+        resolve_static();
         if (diagnostics_.error_count() != errors_before) {
             return core::fail(core::ErrorCode::InvalidArgument, "the cell has errors");
         }
@@ -104,10 +119,11 @@ private:
         if (parsed.name.size() > UINT16_MAX) {
             bad("its name is too long");
         }
-        for (const Parsed& other : parsed_.span().first(parsed_.size() - 1)) {
-            if (!parsed.name.empty() && other.name == parsed.name) {
+        if (!parsed.name.empty()) {
+            if (find_name(parsed.name) != CellEntity::kNone) {
                 bad("another entity has its name");
-                break;
+            } else {
+                by_name_.set(name_key(parsed.name), static_cast<uint32_t>(index));
             }
         }
 
@@ -118,21 +134,28 @@ private:
         if (reader.has("rotation") && reader.has("rotation_deg")) {
             bad("has both rotation and rotation_deg");
         } else if (reader.has("rotation")) {
-            float q[4] = {};
+            double q[4] = {};
             const bool read = read_numbers(yyjson_obj_get(object, "rotation"), q, 4);
-            const float norm = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-            if (!read || !(norm > 1e-6f)) {
+            // In doubles: large components would overflow a float's square.
+            const double norm = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
+            if (!read || !std::isfinite(norm) || !(norm > 1e-6)) {
                 bad("rotation should be a quaternion [x, y, z, w], not all zero");
             } else {
                 for (size_t c = 0; c < 4; ++c) {
-                    entity.rotation[c] = q[c] / norm;
+                    entity.rotation[c] = static_cast<float>(q[c] / norm);
                 }
             }
         } else if (reader.has("rotation_deg")) {
+            double read_degrees[3] = {};
             float degrees[3] = {};
-            if (!read_numbers(yyjson_obj_get(object, "rotation_deg"), degrees, 3)) {
+            if (!read_numbers(yyjson_obj_get(object, "rotation_deg"), read_degrees, 3) ||
+                !(std::abs(read_degrees[0]) <= 1e6 && std::abs(read_degrees[1]) <= 1e6 &&
+                  std::abs(read_degrees[2]) <= 1e6)) {
                 bad("rotation_deg should be [x, y, z] in degrees");
             } else {
+                for (size_t c = 0; c < 3; ++c) {
+                    degrees[c] = static_cast<float>(read_degrees[c]);
+                }
                 const Quat q = glm::angleAxis(glm::radians(degrees[1]), Vec3(0.0f, 1.0f, 0.0f)) *
                                glm::angleAxis(glm::radians(degrees[0]), Vec3(1.0f, 0.0f, 0.0f)) *
                                glm::angleAxis(glm::radians(degrees[2]), Vec3(0.0f, 0.0f, 1.0f));
@@ -144,19 +167,22 @@ private:
             }
         }
         if (yyjson_val* scale = yyjson_obj_get(object, "scale"); scale != nullptr) {
+            double read_scale[3] = {};
             if (yyjson_is_num(scale)) {
-                const auto uniform = static_cast<float>(yyjson_get_num(scale));
-                entity.scale[0] = uniform;
-                entity.scale[1] = uniform;
-                entity.scale[2] = uniform;
-            } else if (!read_numbers(scale, entity.scale, 3)) {
+                read_scale[0] = read_scale[1] = read_scale[2] = yyjson_get_num(scale);
+            } else if (!read_numbers(scale, read_scale, 3)) {
                 bad("scale should be a number or [x, y, z]");
             }
-            if (entity.scale[0] == 0.0f || entity.scale[1] == 0.0f || entity.scale[2] == 0.0f) {
+            if (!to_float(read_scale[0], entity.scale[0]) || !to_float(read_scale[1], entity.scale[1]) ||
+                !to_float(read_scale[2], entity.scale[2])) {
+                bad("scale is too large for a float");
+            } else if (entity.scale[0] == 0.0f || entity.scale[1] == 0.0f || entity.scale[2] == 0.0f) {
                 bad("scale has a zero (it couldn't be undone, for attaching)");
             }
         }
-        entity.flags = reader.boolean("static", true) ? asset::CellEntityFlags::Static : asset::CellEntityFlags::None;
+        if (reader.has("static")) {
+            parsed.static_setting = reader.boolean("static", true) ? StaticSetting::Yes : StaticSetting::No;
+        }
 
         if (reader.has("mesh")) {
             const std::string_view reference = reader.string("mesh", "");
@@ -190,6 +216,26 @@ private:
         return label;
     }
 
+    static uint64_t name_key(std::string_view name) { return core::hash_bytes(name.data(), name.size()); }
+
+    // The entity with this name, read so far; kNone if there's none.
+    uint32_t find_name(std::string_view name) const {
+        const uint32_t* found = by_name_.find(name_key(name));
+        if (found != nullptr && parsed_[*found].name == name) {
+            return *found;
+        }
+        if (found == nullptr) {
+            return CellEntity::kNone;
+        }
+        // Two names with one hash: look it up the slow way.
+        for (size_t i = 0; i < parsed_.size(); ++i) {
+            if (parsed_[i].name == name) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        return CellEntity::kNone;
+    }
+
     uint32_t mesh_index(const Source& mesh) {
         const asset::AssetRef ref{.id = mesh.id, .type = asset::AssetType::Mesh};
         for (size_t i = 0; i < build_.meshes.size(); ++i) {
@@ -209,14 +255,14 @@ private:
             if (parsed.parent.empty()) {
                 continue;
             }
-            const auto* found = std::ranges::find_if(
-                parsed_, [&](const Parsed& other) { return !other.name.empty() && other.name == parsed.parent; });
-            if (found == parsed_.end() || found == &parsed) {
+            const uint32_t found = find_name(parsed.parent);
+            if (found == CellEntity::kNone || found == i) {
                 diagnostics_.error(path_, "%s: parent '%.*s' isn't another entity of the cell", label_of(i).c_str(),
                                    static_cast<int>(parsed.parent.size()), parsed.parent.data());
+                parsed.parent_missing = true;
                 continue;
             }
-            parsed.entity.parent = static_cast<uint32_t>(found - parsed_.begin()); // source index for now
+            parsed.entity.parent = found; // source index for now
         }
         const double cell_size = asset::kCellSize;
         for (size_t i = 0; i < parsed_.size(); ++i) {
@@ -228,32 +274,71 @@ private:
                 at = parsed_[at].entity.parent;
             }
             if (depth > parsed_.size()) {
-                diagnostics_.error(path_, "%s: its parents loop back to it", label_of(i).c_str());
+                // Its chain runs into a loop: reported for the entities on it.
+                if (on_loop(i)) {
+                    diagnostics_.error(path_, "%s: its parents loop back to it", label_of(i).c_str());
+                }
                 continue;
             }
             parsed.depth = depth;
             const double x = parsed.entity.position[0] / cell_size - build_.coord_x;
             const double z = parsed.entity.position[2] / cell_size - build_.coord_z;
-            if (depth == 0 && (x < 0.0 || x >= 1.0 || z < 0.0 || z >= 1.0)) {
+            if (depth == 0 && !parsed.parent_missing && (x < 0.0 || x >= 1.0 || z < 0.0 || z >= 1.0)) {
                 diagnostics_.warning(path_, "%s: lies outside the cell [%d, %d]", label_of(i).c_str(), build_.coord_x,
                                      build_.coord_z);
             }
         }
     }
 
-    // Parents first (by depth, otherwise in source order), with parent indices remapped.
-    void write_in_order() {
-        core::Array<uint32_t> order(tools_heap());
-        for (size_t i = 0; i < parsed_.size(); ++i) {
-            order.push(static_cast<uint32_t>(i));
+    // Whether following parents from entity i comes back to it.
+    bool on_loop(size_t i) const {
+        uint32_t at = parsed_[i].entity.parent;
+        for (size_t steps = 0; steps < parsed_.size() && at != CellEntity::kNone; ++steps) {
+            if (at == i) {
+                return true;
+            }
+            at = parsed_[at].entity.parent;
         }
-        std::ranges::stable_sort(order, [&](uint32_t a, uint32_t b) { return parsed_[a].depth < parsed_[b].depth; });
+        return false;
+    }
+
+    // Parents first: by depth, otherwise in source order.
+    void sort_by_depth() {
+        order_.clear();
+        for (size_t i = 0; i < parsed_.size(); ++i) {
+            order_.push(static_cast<uint32_t>(i));
+        }
+        std::ranges::stable_sort(order_, [&](uint32_t a, uint32_t b) { return parsed_[a].depth < parsed_[b].depth; });
+    }
+
+    // Static unless said otherwise, and as its parent: a child of something that moves moves with it,
+    // so it can't be static (StaticTransform promises it never moves).
+    void resolve_static() {
+        sort_by_depth();
+        for (const uint32_t i : order_) {
+            Parsed& parsed = parsed_[i];
+            const uint32_t parent = parsed.entity.parent;
+            const bool parent_static = parent == CellEntity::kNone ||
+                                       core::has_any(parsed_[parent].entity.flags, asset::CellEntityFlags::Static);
+            bool is_static = parent_static;
+            if (parsed.static_setting == StaticSetting::No) {
+                is_static = false;
+            } else if (parsed.static_setting == StaticSetting::Yes && !parent_static) {
+                diagnostics_.error(path_, "%s: can't be static: its parent '%.*s' moves", label_of(i).c_str(),
+                                   static_cast<int>(parsed.parent.size()), parsed.parent.data());
+            }
+            parsed.entity.flags = is_static ? asset::CellEntityFlags::Static : asset::CellEntityFlags::None;
+        }
+    }
+
+    // Parents first, with parent indices remapped.
+    void write_in_order() {
         core::Array<uint32_t> written_at(tools_heap());
         written_at.resize(parsed_.size());
-        for (size_t i = 0; i < order.size(); ++i) {
-            written_at[order[i]] = static_cast<uint32_t>(i);
+        for (size_t i = 0; i < order_.size(); ++i) {
+            written_at[order_[i]] = static_cast<uint32_t>(i);
         }
-        for (const uint32_t source_index : order) {
+        for (const uint32_t source_index : order_) {
             const Parsed& parsed = parsed_[source_index];
             CellEntity entity = parsed.entity;
             if (entity.parent != CellEntity::kNone) {
@@ -273,6 +358,8 @@ private:
     Diagnostics& diagnostics_;
     CellBuild build_;
     core::Array<Parsed> parsed_{tools_heap()};
+    core::HashMap<uint64_t, uint32_t> by_name_{tools_heap()}; // name hash -> first entity with it
+    core::Array<uint32_t> order_{tools_heap()};               // source indices, parents first
 };
 
 } // namespace

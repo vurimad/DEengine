@@ -5,7 +5,6 @@
 #include "world/render_extract.h"
 
 #include <cmath>
-#include <cstring>
 
 namespace de::world {
 
@@ -15,17 +14,6 @@ namespace {
 struct CellAssets {
     asset::AssetRegistry* assets = nullptr;
 };
-
-// The file a cell's members should match: its loaded file (null while loading, or if it failed).
-CellContents loaded_contents(const asset::AssetRegistry& assets, asset::AssetHandle cell) {
-    const std::span<const std::byte> file = assets.file(cell);
-    if (file.empty()) {
-        return {};
-    }
-    asset::AssetHeader header;
-    std::memcpy(&header, file.data(), sizeof(header));
-    return {.spawned_from = file.data(), .content_hash = header.content_hash};
-}
 
 } // namespace
 
@@ -68,17 +56,25 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
                    CellSpawnScratch& scratch) {
     ecs.delete_with(ecs.pair<InCell>(cell));
     const asset::AssetHandle handle = cell.get<Cell>().asset;
+    cell.set(CellContents{.revision = assets.revision(handle)});
     const auto* asset = assets.get<asset::CellAsset>(handle);
-    cell.set(loaded_contents(assets, handle));
     if (asset == nullptr) {
         return; // failed, or unloaded: empty
     }
+    // The meshes by the header's dependencies, which the cell holds (a dependency the registry
+    // skipped, closing a cycle in a corrupt file, is an invalid handle: drawn as a placeholder).
+    const std::span<const asset::AssetRef> dependencies = asset->header.dependencies.get(asset);
+    scratch.meshes.resize(dependencies.size());
+    for (size_t i = 0; i < dependencies.size(); ++i) {
+        scratch.meshes[i] = assets.find(dependencies[i]);
+    }
     const std::span<const asset::CellEntity> entities = asset->entities.get(asset);
-    const std::span<const asset::AssetHandle> meshes = assets.dependencies(handle);
     // set(), not get_mut() (Cell's replace hook): the same hold, so nothing is released.
     cell.set(Cell(handle, {.x = asset->coord_x, .z = asset->coord_z}));
     scratch.members.resize(entities.size());
     scratch.worlds.resize(entities.size());
+    // Deferred, so each member's components land in one table move.
+    ecs.defer_begin();
     for (size_t i = 0; i < entities.size(); ++i) {
         const asset::CellEntity& source = entities[i];
         const Transform local{
@@ -86,27 +82,53 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
             .rotation = Quat(source.rotation[3], source.rotation[0], source.rotation[1], source.rotation[2]),
             .scale = {source.scale[0], source.scale[1], source.scale[2]},
         };
-        // Parents come first: theirs is known (validated by the format).
+        // Parents come first (the format checks it): their world transforms are known.
+        const bool has_parent = source.parent != asset::CellEntity::kNone;
         const WorldTransform world =
-            source.parent != asset::CellEntity::kNone
-                ? compose(scratch.worlds[source.parent], local)
-                : WorldTransform{.position = local.position, .rotation = local.rotation, .scale = local.scale};
+            has_parent ? compose(scratch.worlds[source.parent], local)
+                       : WorldTransform{.position = local.position, .rotation = local.rotation, .scale = local.scale};
         scratch.worlds[i] = world;
+        const bool is_static = core::has_any(source.flags, asset::CellEntityFlags::Static);
+        const bool attached = has_parent && !is_static; // static ones become roots where they are
         const flecs::entity member = ecs.entity().add<InCell>(cell);
-        if (source.parent != asset::CellEntity::kNone) {
+        if (attached) {
             member.set(flecs::Parent{scratch.members[source.parent]});
         }
-        if (core::has_any(source.flags, asset::CellEntityFlags::Static)) {
+        if (is_static) {
             member.add<StaticTransform>();
         }
-        if (source.mesh != asset::CellEntity::kNone && source.mesh < meshes.size()) {
-            member.set(MeshInstance{.mesh = meshes[source.mesh]});
+        if (source.mesh != asset::CellEntity::kNone) {
+            member.set(MeshInstance{.mesh = scratch.meshes[source.mesh]});
         }
-        member.set(local).set(world).set(PreviousWorldTransform{.value = world});
+        const Transform placed =
+            attached ? local : Transform{.position = world.position, .rotation = world.rotation, .scale = world.scale};
+        member.set(placed).set(world).set(PreviousWorldTransform{.value = world});
         scratch.members[i] = member.id();
     }
+    ecs.defer_end();
     DE_LOG_INFO("world", "cell [%d, %d] spawned: %zu entities, %zu meshes", asset->coord_x, asset->coord_z,
-                entities.size(), meshes.size());
+                entities.size(), dependencies.size());
+}
+
+// Spawns every cell whose members are behind its loaded file. Immediate: members are made at once,
+// not deferred, for the systems after it. Cells are gathered first, then spawned outside the
+// query's iteration.
+void spawn_cells(flecs::iter& it, const asset::AssetRegistry& assets, CellSpawnScratch& scratch) {
+    DE_PROFILE_ZONE("spawn cells");
+    scratch.pending.clear();
+    while (it.next()) {
+        const auto cells = it.field<const Cell>(0);
+        const auto contents = it.field<const CellContents>(1);
+        for (const size_t i : it) {
+            if (assets.revision(cells[i].asset) != contents[i].revision) {
+                scratch.pending.push(it.entity(i).id());
+            }
+        }
+    }
+    flecs::world world = it.world();
+    for (const flecs::entity_t cell : scratch.pending) {
+        spawn_members(world, assets, world.entity(cell), scratch);
+    }
 }
 
 } // namespace
@@ -121,31 +143,18 @@ flecs::entity load_cell(flecs::world& ecs, asset::AssetId id, platform::IoPriori
     return ecs.entity().set(Cell(registry->assets->load<asset::CellAsset>(id, priority), {})).add<CellContents>();
 }
 
-void add_cell_systems(flecs::world& ecs, flecs::entity phase, asset::AssetRegistry& assets, CellSpawnScratch& scratch) {
-    // Immediate: members are made at once, not deferred, so they're there for the tick's systems.
-    // Cells whose file changed are gathered first, then spawned outside the query's iteration.
+void add_cell_systems(flecs::world& ecs, flecs::entity tick_phase, flecs::entity frame_phase,
+                      asset::AssetRegistry& assets, CellSpawnScratch& scratch) {
+    // Twice: at the start of every tick, and before every frame's extraction (a frame may run no
+    // tick, and must not extract members whose meshes a reload let go).
     ecs.system<const Cell, const CellContents>("de::SpawnCells")
-        .kind(phase)
+        .kind(tick_phase)
         .immediate()
-        .run([&assets, &scratch](flecs::iter& it) {
-            DE_PROFILE_ZONE("spawn cells");
-            scratch.pending.clear();
-            while (it.next()) {
-                const auto cells = it.field<const Cell>(0);
-                const auto contents = it.field<const CellContents>(1);
-                for (const size_t i : it) {
-                    const CellContents loaded = loaded_contents(assets, cells[i].asset);
-                    if (loaded.spawned_from != contents[i].spawned_from ||
-                        loaded.content_hash != contents[i].content_hash) {
-                        scratch.pending.push(it.entity(i).id());
-                    }
-                }
-            }
-            flecs::world world = it.world();
-            for (const flecs::entity_t cell : scratch.pending) {
-                spawn_members(world, assets, world.entity(cell), scratch);
-            }
-        });
+        .run([&assets, &scratch](flecs::iter& it) { spawn_cells(it, assets, scratch); });
+    ecs.system<const Cell, const CellContents>("de::SpawnCellsBeforeExtract")
+        .kind(frame_phase)
+        .immediate()
+        .run([&assets, &scratch](flecs::iter& it) { spawn_cells(it, assets, scratch); });
 }
 
 flecs::entity create_cell(flecs::world& ecs, CellCoord coord, asset::AssetHandle asset) {

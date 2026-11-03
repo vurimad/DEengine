@@ -23,6 +23,8 @@ struct CookOptions {
     bool shader_checks = false;
     // Cook shaders/tests/ too (the test suite's own modules), which games never load.
     bool test_shaders = false;
+    // Cook content/. Off: shaders only, and what was cooked from content/ stays as it is.
+    bool content = true;
 };
 
 struct CookStats {

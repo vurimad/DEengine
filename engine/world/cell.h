@@ -43,14 +43,11 @@ struct Cell {
     ~Cell() = default;
 };
 
-// On a cell entity made by load_cell(): the file its members were spawned from (null: none yet).
-// Its members always match the cell's loaded file: spawned once it's Ready, spawned again when hot
-// reload swaps in a new one.
-// The file is told by its address and its content hash: after two reloads between ticks, the
-// newest file may lie where the first one did.
+// On a cell entity made by load_cell(): the revision of the cell asset its members were spawned
+// from (AssetRegistry::revision; 0: none yet). Its members always match the cell's loaded file:
+// spawned once it's Ready, spawned again when hot reload swaps in a new one.
 struct CellContents {
-    const void* spawned_from = nullptr; // compared, never read: it may be gone
-    uint64_t content_hash = 0;
+    uint32_t revision = 0;
 };
 
 // (InCell, cell): which cell an entity belongs to. Doesn't fragment tables (cells would otherwise
@@ -63,9 +60,12 @@ struct InCell {};
 void register_cells(flecs::world& ecs, asset::AssetRegistry* assets);
 
 // Starts loading a cooked cell (.decell) and returns its entity. Once the cell and every mesh it
-// uses are loaded, its members are spawned in one batch at the start of a tick (Input phase): each
-// placed (world and previous transforms set, so nothing slides in), a member of the cell, with its
-// mesh, its parent and, for static ones, StaticTransform. Cell::coord is set then. A cell that
+// uses are loaded, its members are spawned in one batch, at the start of the next tick or before
+// the frame's render extraction, whichever comes first (so no frame ever extracts members whose
+// meshes a reload let go): each placed (world and previous transforms set, so nothing slides in), a
+// member of the cell, with its mesh and, for static ones, StaticTransform. Moving children keep
+// their flecs::Parent; static ones (whose parents are static too: the cooker sees to it) become
+// roots at their world transform, so they cost nothing per tick. Cell::coord is set then. A cell that
 // fails to load stays empty (the registry logs why). Deleting the entity unloads it. It loads
 // through the world's registry (WorldDesc::assets); without one it logs an error and returns an
 // invalid entity.
@@ -77,11 +77,14 @@ struct CellSpawnScratch {
     core::Array<flecs::entity_t> pending{core::heap_allocator(core::MemoryTag::World)};
     core::Array<flecs::entity_t> members{core::heap_allocator(core::MemoryTag::World)};
     core::Array<WorldTransform> worlds{core::heap_allocator(core::MemoryTag::World)};
+    core::Array<asset::AssetHandle> meshes{core::heap_allocator(core::MemoryTag::World)};
 };
 
-// Adds the system that spawns cells' members (see load_cell), in phase. scratch must outlive the
-// world. World::create calls it when it has a registry.
-void add_cell_systems(flecs::world& ecs, flecs::entity phase, asset::AssetRegistry& assets, CellSpawnScratch& scratch);
+// Adds the systems that spawn cells' members (see load_cell): one first in tick_phase, one in
+// frame_phase (before render extraction). scratch must outlive the world. World::create calls it
+// when it has a registry.
+void add_cell_systems(flecs::world& ecs, flecs::entity tick_phase, flecs::entity frame_phase,
+                      asset::AssetRegistry& assets, CellSpawnScratch& scratch);
 
 // A cell's entity, taking over a hold on its asset (load() it, hand the handle here; the cell
 // releases it). Its members are added with add_to_cell(). Deleting the entity unloads the cell.

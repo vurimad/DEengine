@@ -21,6 +21,7 @@ using de::DVec3;
 using de::Quat;
 using de::Vec3;
 using de::world::Camera;
+using de::world::FrameStep;
 using de::world::InCell;
 using de::world::MeshInstance;
 using de::world::Transform;
@@ -481,13 +482,14 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
     world->tick();
     CHECK(near(child.get<WorldTransform>().position.z, -102.0)); // the system agrees
 
-    // A new file where the old one lay (two reloads between ticks): told apart by its content hash.
+    // Members behind the asset's revision are spawned again (a reload swapped in a new file).
     const de::world::CellContents spawned = cell.get<de::world::CellContents>();
-    cell.set(de::world::CellContents{.spawned_from = spawned.spawned_from, .content_hash = spawned.content_hash + 1});
+    CHECK(spawned.revision == assets->revision(cell.get<de::world::Cell>().asset));
+    cell.set(de::world::CellContents{.revision = spawned.revision + 1});
     world->tick();
     CHECK_FALSE(child.is_alive());
     CHECK(members_of(ecs, cell) == 5);
-    CHECK(cell.get<de::world::CellContents>().content_hash == spawned.content_hash);
+    CHECK(cell.get<de::world::CellContents>().revision == spawned.revision);
     world->tick();
     CHECK(members_of(ecs, cell) == 5); // settled: not spawned again
     ecs.query_builder<const MeshInstance>().with<InCell>(cell).build().each([&](flecs::entity e, const MeshInstance&) {
@@ -504,9 +506,13 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
         assets->wait_all();
     }
     REQUIRE(assets->stats().reloads == 1);
-    world->tick();
+    // A frame without a tick still spawns them before extraction: nothing extracted names the old
+    // file's meshes.
+    const FrameStep step = world->advance(0.0);
+    CHECK(step.ticks == 0);
     CHECK(members_of(ecs, cell) == 3);
     CHECK_FALSE(child.is_alive());
+    CHECK(world->render_frame().instances.size() == 2); // the rock and the lamp; the third has no mesh
 
     // Unloading is deleting the entity: members, the cell asset and its meshes all go.
     cell.destruct();
@@ -515,6 +521,42 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
     int left = 0;
     ecs.query_builder<const Transform>().build().each([&](const Transform&) { ++left; });
     CHECK(left == 0);
+}
+
+TEST_CASE("static children of static parents are spawned as roots where they are") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId cell_id = de::asset::AssetId::from_value(0xa0);
+    de::cooker::CellBuild build;
+    const Quat yaw = yaw_deg(90.0f);
+    build.entities.push({.position = {10.0, 0.0, 20.0},
+                         .rotation = {yaw.x, yaw.y, yaw.z, yaw.w},
+                         .scale = {2.0f, 2.0f, 2.0f},
+                         .flags = de::asset::CellEntityFlags::Static});
+    build.entities.push({.position = {1.0, 0.0, 0.0}, .parent = 0, .flags = de::asset::CellEntityFlags::Static});
+    const auto cooked = de::cooker::cook_cell(build, cell_id);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(cell_id, de::asset::AssetType::Cell).c_str(), cooked.span()).ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(ecs, cell_id);
+    assets->wait_all();
+    world->tick();
+    REQUIRE(members_of(ecs, cell) == 2);
+    int roots = 0;
+    ecs.query_builder<const Transform>().with<InCell>(cell).build().each([&](flecs::entity e, const Transform& t) {
+        CHECK_FALSE(e.parent().is_valid());
+        CHECK(e.has<de::world::StaticTransform>());
+        if (near(t.position.z, 18.0)) { // the child, at its world transform: (10, 0, 20 - 2)
+            CHECK(near(t.position.x, 10.0));
+            CHECK(t.scale.x == doctest::Approx(2.0f));
+        }
+        ++roots;
+    });
+    CHECK(roots == 2);
 }
 
 TEST_CASE("a cell that can't load stays empty, and the world goes on") {

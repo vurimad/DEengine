@@ -1110,19 +1110,20 @@ TEST_CASE("shader modules cook to .deshader, and the library builds pipelines fr
     auto compiler = de::shader::ShaderCompiler::create(*vfs, {.debug_info = false, .checks = false});
     REQUIRE(compiler.ok());
     de::core::JobSystem jobs({.worker_count = 1});
-    const CookReport report = de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true});
+    const CookReport report = de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true, .content = false});
     // tests.own_slot binds a descriptor slot on purpose: refused, as the library refuses it.
     CHECK(has_message(report, "shaders/tests/own_slot.slang", "descriptor slot"));
     CHECK(report.stats.failed == 1);
     CHECK(report.stats.cooked >= 8);
-    const CookReport again = de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true});
+    const CookReport again = de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true, .content = false});
     CHECK(again.stats.cooked == 0);
     CHECK(again.stats.up_to_date == report.stats.cooked);
     // Cooking without a compiler (--no-shaders) leaves cooked shaders alone.
-    const CookReport content_only = de::cooker::cook(*vfs, jobs, nullptr, {.test_shaders = true});
+    const CookReport content_only = de::cooker::cook(*vfs, jobs, nullptr, {.test_shaders = true, .content = false});
     CHECK(content_only.stats.removed == 0);
     CHECK(vfs->exists(cooked_path(shader_asset_id("tests.solid_color"), AssetType::Shader).c_str()));
-    CHECK(de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true}).stats.up_to_date == report.stats.cooked);
+    CHECK(de::cooker::cook(*vfs, jobs, &*compiler, {.test_shaders = true, .content = false}).stats.up_to_date ==
+          report.stats.cooked);
 
     // The cooked module holds every entry point, as the compiler makes them.
     Cooked file(*vfs, shader_asset_id("tests.solid_color"), AssetType::Shader);
@@ -1198,6 +1199,7 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "lamp", "parent": "post", "mesh": "../props/lamp.gltf", "position": [0, 2, 0], "static": false},
     {"name": "post", "mesh": "../props/crate.gltf", "position": [130, 0, 260], "rotation_deg": [0, 90, 0], "scale": 2},
     {"mesh": "../props/crate.gltf", "position": [200, 0.5, 300.25], "rotation": [0, 0, 0, 2], "scale": [1, 2, 3]},
+    {"name": "flame", "parent": "lamp", "position": [0, 0.5, 0], "rotation": [1e20, 0, 0, 1]},
   ],
 })");
     write_src(sandbox, "content/world/broken.cell", R"({
@@ -1207,7 +1209,11 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "c", "parent": "nobody", "mesh": "../props/crate.png"},
     {"name": "c", "scale": [1, 0, 1], "colour": 1},
     {"name": "far", "position": [-5, 0, 0]},
-    {"parent": "ghost"},
+    {"parent": "ghost", "position": [-3, 0, 0]},
+    {"name": "into_loop", "parent": "a"},
+    {"name": "huge", "scale": 1e39},
+    {"name": "cart", "static": false},
+    {"name": "wheel", "parent": "cart", "static": true},
   ],
 })");
     Vfs vfs = cooker_vfs(sandbox);
@@ -1217,6 +1223,10 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "its parents loop back to it"));
     CHECK(has_message(report, broken, "parent 'nobody' isn't another entity"));
     CHECK(has_message(report, broken, "entity 5: parent 'ghost' isn't another entity")); // unnamed: by index
+    CHECK_FALSE(has_message(report, broken, "entity 5: lies outside"));                  // its position is local
+    CHECK_FALSE(has_message(report, broken, "into_loop: its parents loop")); // leads into a loop, isn't on it
+    CHECK(has_message(report, broken, "huge: scale is too large for a float"));
+    CHECK(has_message(report, broken, "wheel: can't be static: its parent 'cart' moves"));
     CHECK(has_message(report, broken, "should name a model source"));
     CHECK(has_message(report, broken, "another entity has its name"));
     CHECK(has_message(report, broken, "scale has a zero"));
@@ -1237,7 +1247,7 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
         CHECK(dependencies[0] == AssetRef{.id = lamp, .type = AssetType::Mesh});
         CHECK(dependencies[1] == AssetRef{.id = crate, .type = AssetType::Mesh});
         const auto entities = cell.entities.get(file.data());
-        REQUIRE(entities.size() == 3);
+        REQUIRE(entities.size() == 4);
         CHECK((cell.name(file.data(), entities[0]) == "post"));
         CHECK((cell.name(file.data(), entities[1]) == ""));
         CHECK((cell.name(file.data(), entities[2]) == "lamp"));
@@ -1256,7 +1266,18 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
         CHECK(entities[1].rotation[3] == 1.0f);
         CHECK((entities[0].flags & CellEntityFlags::Static) == CellEntityFlags::Static);
         CHECK((entities[2].flags & CellEntityFlags::Static) == CellEntityFlags::None);
+        // The flame moves with the lamp (not static by default), its huge quaternion normalized.
+        CHECK((cell.name(file.data(), entities[3]) == "flame"));
+        CHECK(entities[3].parent == 2);
+        CHECK((entities[3].flags & CellEntityFlags::Static) == CellEntityFlags::None);
+        CHECK(entities[3].rotation[0] == doctest::Approx(1.0f));
+        CHECK(entities[3].rotation[3] == doctest::Approx(0.0f));
     }
+    // Cooking without content (shaders only) keeps what was cooked from it.
+    const CookReport shaders_only = run_cook(vfs, {.content = false});
+    CHECK(shaders_only.stats.removed == 0);
+    CHECK(vfs.exists(cooked_path(cell_id, AssetType::Cell).c_str()));
+    CHECK(run_cook(vfs).stats.up_to_date == 4); // and the state still knows it
     // A root outside its cell is only a warning.
     write_src(sandbox, broken, R"({"coord": [0, 0], "entities": [{"name": "far", "position": [-5, 0, 0]}]})");
     const CookReport fixed = run_cook(vfs);
@@ -1276,4 +1297,21 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     Cooked file(vfs, cell_id, AssetType::Cell);
     const auto& cell = file.load<CellAsset>();
     CHECK(cell.header.dependencies.get(file.data())[0].id == new_lamp);
+}
+
+TEST_CASE("a glTF buffer shorter than the glTF says is reported, not read past") {
+    const Sandbox sandbox;
+    // What a Git LFS pointer looks like where the buffer should be.
+    write_src(sandbox, "content/props/rock.bin", "version https://git-lfs.github.com/spec/v1\n");
+    write_src(sandbox, "content/props/rock.gltf",
+              R"({"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
+  "nodes": [{"mesh": 0}], "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+  "buffers": [{"byteLength": 4096, "uri": "rock.bin"}],
+  "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 4096}],
+  "accessors": [{"bufferView": 0, "componentType": 5126, "count": 300, "type": "VEC3",
+                 "min": [0, 0, 0], "max": [1, 1, 1]}]})");
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    CHECK(has_message(report, "content/props/rock.gltf", "shorter than the 4096 the glTF says"));
+    CHECK(report.stats.failed == 1);
 }

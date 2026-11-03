@@ -29,7 +29,7 @@ namespace {
 
 // Bumped when the cooker writes different files for the same inputs (a better encoder, a fixed
 // bug): every source cooks again. Format versions are hashed in too, per kind.
-constexpr uint64_t kCookerVersion = 1;
+constexpr uint64_t kCookerVersion = 2; // 2: cell children are as static as their parent
 
 constexpr std::string_view kShaderTests = "shaders/tests/";
 
@@ -63,7 +63,9 @@ public:
     CookReport run() {
         previous_ = CookState::load(vfs_, diagnostics_);
         ScanStats scan;
-        tree_ = SourceTree::scan(vfs_, previous_, {.write_metas = !options_.check_only}, diagnostics_, &scan);
+        if (options_.content) {
+            tree_ = SourceTree::scan(vfs_, previous_, {.write_metas = !options_.check_only}, diagnostics_, &scan);
+        }
         stats_.metas_created = scan.metas_created;
         stats_.metas_relinked = scan.metas_relinked;
         if (!options_.check_only) {
@@ -88,6 +90,9 @@ private:
             failed(path.view());
         }
         cook_shaders();
+        if (!options_.content) {
+            keep_content();
+        }
         // Models and materials first: how they use textures picks the textures' defaults.
         for (const Source& source : tree_.sources()) {
             if (source.kind == SourceKind::Gltf || source.kind == SourceKind::Fbx) {
@@ -106,6 +111,18 @@ private:
         remove_stale();
         if (const core::Result<void> saved = next_.save(vfs_); !saved) {
             diagnostics_.error("", "%s could not be written: %s", CookState::kPath, saved.error().message);
+        }
+    }
+
+    // Not cooking content this time: what was cooked from it stays, untouched.
+    void keep_content() {
+        for (const CookRecord& record : previous_.records()) {
+            if (!record.path.view().starts_with("shaders/")) {
+                for (const CookedOutput& output : record.outputs) {
+                    static_cast<void>(claim(record.path.view(), output.id));
+                }
+                next_.put(clone(record));
+            }
         }
     }
 
@@ -225,19 +242,22 @@ private:
     // changes the material that points at it); a missing one hashes as missing.
     void hash_texture_ids(Hasher& hasher, std::span<const TextureUse> uses) const {
         for (const TextureUse& use : uses) {
-            hasher.add(use.path.view());
-            const Source* texture = tree_.find(use.path.view());
-            hasher.add(texture != nullptr ? texture->id.value() : 0);
+            hash_source_id(hasher, use.path.view());
         }
+    }
+
+    // A source's path and the ID it has now (0 if it's gone).
+    void hash_source_id(Hasher& hasher, std::string_view path) const {
+        hasher.add(path);
+        const Source* source = tree_.find(path);
+        hasher.add(source != nullptr ? source->id.value() : 0);
     }
 
     // The IDs of other sources an asset names (a cell's models): a re-minted one changes it. A
     // missing one hashes as missing.
     void hash_source_ids(Hasher& hasher, std::span<const SourcePath> sources) const {
         for (const SourcePath& path : sources) {
-            hasher.add(path.view());
-            const Source* source = tree_.find(path.view());
-            hasher.add(source != nullptr ? source->id.value() : 0);
+            hash_source_id(hasher, path.view());
         }
     }
 

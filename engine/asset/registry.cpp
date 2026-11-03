@@ -90,6 +90,7 @@ struct Entry {
     core::Array<AssetHandle> dependencies{streaming_heap()};
     core::Array<AssetHandle> waiting{streaming_heap()}; // assets waiting for this one to be Ready or Failed
     uint32_t dependencies_pending = 0;
+    uint32_t revision = 0; // contents committed: Ready, then each reload swapped in
 
     // A reload whose file is in and checked, waiting for its new dependencies before it's swapped
     // in: until then the loaded version stays, so Ready keeps meaning "dependencies settled".
@@ -285,6 +286,7 @@ void resolve_waiting(RegistryState& state, Entry& entry) {
 
 void become_ready(RegistryState& state, Entry& entry) {
     entry.state = AssetState::Ready;
+    ++entry.revision;
     notify(state, AssetEvent::Ready, entry);
     resolve_waiting(state, entry);
 }
@@ -352,6 +354,7 @@ void finish_reload(RegistryState& state, Entry& entry) {
         drop(state, dependency);
     }
     ++state.reloads;
+    ++entry.revision;
     DE_LOG_INFO("asset", "reloaded %s %s", asset_type_name(entry.asset.type), format_asset_id(entry.asset.id).c_str());
     notify(state, AssetEvent::Reloaded, entry);
 }
@@ -643,6 +646,11 @@ std::span<const std::byte> AssetRegistry::file(AssetHandle handle) const {
         return {};
     }
     return {entry->data.data, entry->data.size};
+}
+
+uint32_t AssetRegistry::revision(AssetHandle handle) const {
+    const Entry* entry = find_entry(*state_, handle);
+    return entry != nullptr && entry->state == AssetState::Ready ? entry->revision : 0;
 }
 
 std::span<const AssetHandle> AssetRegistry::dependencies(AssetHandle handle) const {

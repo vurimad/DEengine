@@ -32,7 +32,9 @@ struct CellBuild {
 //                                                 // then yaw y), or "rotation": [x, y, z, w]
 //           "scale": 1.5,                         // or [x, y, z]; no zeros
 //           "parent": "plinth",                   // optional: another entity's name
-//           "static": true                        // default: never moves (StaticTransform)
+//           "static": true                        // never moves (StaticTransform). Default: as its
+//                                                 // parent; true for roots. A child of something
+//                                                 // that moves can't be static.
 //         }
 //       ]
 //     }
