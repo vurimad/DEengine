@@ -261,6 +261,7 @@ TEST_CASE("a re-cooked file is loaded again in place, and a missing one is picke
     const AssetHandle material = dependency_of(registry, mesh, kMaterial);
     const AssetHandle albedo = dependency_of(registry, material, kAlbedo);
     REQUIRE(registry.get<TextureAsset>(albedo)->width == 16);
+    CHECK(registry.revision(albedo) == 1);
 
     const auto settle = [&] {
         for (int i = 0; i < 4; ++i) {
@@ -276,6 +277,8 @@ TEST_CASE("a re-cooked file is loaded again in place, and a missing one is picke
     REQUIRE(registry.get<TextureAsset>(albedo) != nullptr);
     CHECK(registry.get<TextureAsset>(albedo)->width == 8);
     CHECK(registry.stats().reloads == 1);
+    CHECK(registry.revision(albedo) == 2);
+    CHECK(registry.revision(material) == 1); // what uses it is untouched
 
     // The missing texture appears: it loads (the material using it was Ready all along).
     put_texture(fixture.vfs, kMissing, 4);

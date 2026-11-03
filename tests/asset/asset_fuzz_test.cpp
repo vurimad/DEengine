@@ -3,18 +3,21 @@
 // that every file load_in_place() accepts is safe to use: every array, mip, part and entry the
 // asset hands out lies inside the file, and every number a consumer sizes things by is sane.
 
+#include "asset/cell_format.h"
 #include "asset/format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/texture_format.h"
 #include "cooker/blob_writer.h"
+#include "cooker/cell_cooker.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/texture_cooker.h"
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstring>
 #include <string_view>
 #include <vector>
@@ -116,6 +119,29 @@ bool safe(std::span<const std::byte> file, const MaterialAsset& material) {
     }
     static_cast<void>(material.find_param(file.data(), material::kRoughness));
     static_cast<void>(material.find_texture(file.data(), material::kNormalTexture));
+    return true;
+}
+
+// What spawning relies on: parents already made, meshes among the dependencies, names in the file,
+// finite transforms.
+bool safe(std::span<const std::byte> file, const CellAsset& cell) {
+    if (!inside(file, cell.entities) || !inside(file, cell.names) || !inside(file, cell.header.dependencies)) {
+        return false;
+    }
+    const auto entities = cell.entities.get(file.data());
+    for (size_t i = 0; i < entities.size(); ++i) {
+        const CellEntity& entity = entities[i];
+        if ((entity.parent != CellEntity::kNone && entity.parent >= i) ||
+            (entity.mesh != CellEntity::kNone &&
+             (entity.mesh >= cell.header.dependencies.count ||
+              cell.header.dependencies.get(file.data())[entity.mesh].type != AssetType::Mesh)) ||
+            uint64_t{entity.name_offset} + entity.name_length > cell.names.count ||
+            !std::isfinite(entity.position[0]) || !std::isfinite(entity.scale[1]) ||
+            !std::isfinite(entity.rotation[3])) {
+            return false;
+        }
+        static_cast<void>(cell.name(file.data(), entity));
+    }
     return true;
 }
 
@@ -258,6 +284,21 @@ std::vector<std::byte> sample_material() {
     return to_vector(de::cooker::cook_material(build, AssetId::from_value(13)));
 }
 
+// A cell with a parent, two meshes, and names.
+std::vector<std::byte> sample_cell() {
+    de::cooker::CellBuild build;
+    build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
+    build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
+    const char names[] = "rootchildother";
+    for (const char c : std::string_view(names)) {
+        build.names.push(c);
+    }
+    build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
+    build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
+    build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5});
+    return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
+}
+
 // A shader file as the cooker lays it out, around stand-in SPIR-V.
 std::vector<std::byte> sample_shader() {
     de::cooker::BlobWriter writer(sizeof(ShaderAsset));
@@ -289,18 +330,22 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     const std::vector<std::byte> texture = sample_texture();
     const std::vector<std::byte> material = sample_material();
     const std::vector<std::byte> shader = sample_shader();
+    const std::vector<std::byte> cell = sample_cell();
     // The samples themselves load and are safe.
     Buffer mesh_file(mesh);
     REQUIRE(load_in_place<MeshAsset>(mesh_file.bytes()).ok());
     REQUIRE(safe(mesh_file.bytes(), **load_in_place<MeshAsset>(mesh_file.bytes())));
     Buffer shader_file(shader);
     REQUIRE(load_in_place<ShaderAsset>(shader_file.bytes()).ok());
+    Buffer cell_file(cell);
+    REQUIRE(load_in_place<CellAsset>(cell_file.bytes()).ok());
 
     constexpr int kRounds = 4000;
     fuzz<MeshAsset>(mesh, 1, kRounds);
     fuzz<TextureAsset>(texture, 2, kRounds);
     fuzz<MaterialAsset>(material, 3, kRounds);
     fuzz<ShaderAsset>(shader, 4, kRounds);
+    fuzz<CellAsset>(cell, 5, kRounds);
 }
 
 TEST_CASE("textures whose sizes overflow the mip arithmetic are refused") {

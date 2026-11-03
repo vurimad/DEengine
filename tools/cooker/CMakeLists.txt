@@ -10,6 +10,8 @@ find_path(CGLTF_INCLUDE_DIR cgltf.h REQUIRED)
 add_library(de_cooker STATIC
     blob_writer.cpp
     blob_writer.h
+    cell_cooker.cpp
+    cell_cooker.h
     common.cpp
     common.h
     cook_state.cpp

@@ -51,6 +51,16 @@ cgltf_result read_external(const cgltf_memory_options* /*memory*/, const cgltf_f
     // Read straight into the memory cgltf keeps (and frees through release_external).
     const auto buffer_path = src_path(relative.view());
     const core::Result<uint64_t> length = context.vfs->file_size(buffer_path.c_str());
+    // *size comes in as the glTF's byteLength, and cgltf keeps that size whatever is read: a shorter
+    // file would be read past its end.
+    if (length && *length < *size) {
+        context.diagnostics->error(context.path,
+                                   "its buffer %s is %llu bytes, shorter than the %llu the glTF says (a Git LFS "
+                                   "pointer? run git lfs pull)",
+                                   relative.c_str(), static_cast<unsigned long long>(*length),
+                                   static_cast<unsigned long long>(*size));
+        return cgltf_result_data_too_short;
+    }
     void* memory = length ? core::tagged_malloc(core::MemoryTag::Tools, static_cast<size_t>(*length)) : nullptr;
     const core::Result<size_t> read =
         memory != nullptr ? context.vfs->read_file(buffer_path.c_str(), std::span(static_cast<std::byte*>(memory),

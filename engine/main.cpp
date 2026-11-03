@@ -20,6 +20,7 @@
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
 #include "tools/stats_panel.h"
+#include "world/cell.h"
 #include "world/world.h"
 
 #include <cmath>
@@ -36,6 +37,9 @@ using de::platform::ActionKind;
 using de::platform::Input;
 
 namespace {
+
+// content/world/test/cell_0_0.cell: the test scene, until there's a world asset listing cells.
+constexpr de::asset::AssetId kTestCell = de::asset::AssetId::from_value(0xbf4c53ca6b99a5e7);
 
 // The value after a flag ("--frames 120"), or null if the flag isn't there.
 const char* flag_value(int argc, char** argv, const char* flag) {
@@ -63,6 +67,7 @@ bool has_flag(int argc, char** argv, const char* flag) {
 // samples input and logs actions, so the layers below can be tried by hand. Edit
 // shaders/triangle.slang or shaders/textured_quad.slang while it runs.
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
+//   --cell ID        the cooked cell to load (asset ID, 16 hex digits; default: the test cell)
 //   --no-vsync       present without waiting for vertical blank (mailbox or immediate)
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked)
@@ -275,13 +280,23 @@ int main(int argc, char** argv) {
         device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
-    // The game world: flecs, ticking at a fixed 60 Hz (nothing lives in it yet; cells come next).
+    // The game world: flecs, ticking at a fixed 60 Hz.
     auto world = de::world::World::create({.jobs = &jobs, .assets = &*assets});
     if (!world) {
         DE_LOG_ERROR("world", "%s", world.error().message);
         device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
+    // One cell, loaded explicitly until the streamer picks cells around the player (M1). Its members
+    // spawn once it and its meshes are loaded.
+    de::asset::AssetId cell_id = kTestCell;
+    if (const char* cell_flag = flag_value(argc, argv, "--cell");
+        cell_flag != nullptr && !de::asset::parse_asset_id(cell_flag, cell_id)) {
+        DE_LOG_ERROR("world", "--cell takes an asset ID, 16 hex digits: '%s'", cell_flag);
+        device->destroy(*quad_texture);
+        return EXIT_FAILURE;
+    }
+    de::world::load_cell(world->ecs(), cell_id);
 
     // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
     // device, uploader and graph, so it goes before them.

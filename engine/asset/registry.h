@@ -119,6 +119,10 @@ public:
         return bytes.empty() || asset(handle).type != T::kType ? nullptr : reinterpret_cast<const T*>(bytes.data());
     }
 
+    // Which version of its contents file() gives: 0 unless Ready, then 1, one more for each reload
+    // swapped in. What was built from an asset is up to date while this is unchanged.
+    uint32_t revision(AssetHandle handle) const;
+
     // The assets it depends on, held for it, in its header's order; empty until its file is loaded.
     std::span<const AssetHandle> dependencies(AssetHandle handle) const;
 

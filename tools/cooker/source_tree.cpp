@@ -189,6 +189,8 @@ const char* source_kind_name(SourceKind kind) {
         return "fbx";
     case SourceKind::Material:
         return "material";
+    case SourceKind::Cell:
+        return "cell";
     }
     return "unknown";
 }
@@ -204,7 +206,7 @@ bool source_kind_of(std::string_view path, SourceKind& kind) {
         {.extension = ".jpeg", .kind = SourceKind::Texture},      {.extension = ".tga", .kind = SourceKind::Texture},
         {.extension = ".bmp", .kind = SourceKind::Texture},       {.extension = ".gltf", .kind = SourceKind::Gltf},
         {.extension = ".glb", .kind = SourceKind::Gltf},          {.extension = ".fbx", .kind = SourceKind::Fbx},
-        {.extension = ".material", .kind = SourceKind::Material},
+        {.extension = ".material", .kind = SourceKind::Material}, {.extension = ".cell", .kind = SourceKind::Cell},
     };
     for (const Entry& entry : kKinds) {
         if (entry.extension == extension) {

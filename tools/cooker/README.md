@@ -28,13 +28,14 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `mesh_cooker.h` | `.demesh`: merged, optimized and LOD-chained with meshoptimizer |
 | `texture_cooker.h` | `.detex`: mips filtered with stb_image_resize2, then BC1/BC4/BC5 (rgbcx) or BC7 (bc7enc) |
 | `material_cooker.h` | `.demat`: from model materials and `.material` text sources |
+| `cell_cooker.h` | `.decell`: from `.cell` text sources (the format is described there) |
 | `shader_cooker.h` | `.deshader`: every entry point of a Slang module, with reflection |
 | `blob_writer.h` | `BlobWriter`: the load-in-place layout and common header of every cooked file |
 | `json.h`, `settings.h` | yyjson on the Tools heap; the `texture` and `mesh` settings |
 
 ## Sources, metas and settings
 
-- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials. `.bin` files (glTF buffers) are read by their models; other files are ignored with a warning.
+- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials, `.cell` cells. `.bin` files (glTF buffers) are read by their models; other files are ignored with a warning.
 - Every source has a meta at the same path under `meta/`, plus `.json`: `content/rocks/rock.png` has `meta/rocks/rock.png.json`. A meta holds the source's GUID, and the settings sections (`texture`, `mesh`) that differ from the folder rules. New sources get a meta with a fresh GUID on the next cook. Metas are committed with their sources.
 - A source moved without its meta is found again by content (the last cook's hash) and its meta moved after it. A meta whose source can't be found is reported, and a new file that may be that source gets no GUID until it's settled: a GUID is never silently replaced, so references never break.
 - Two metas with one GUID (a copied meta): the file the last cook knew by that GUID keeps it, and the other is reported; deleting that one's meta gives it a GUID of its own. Deleting a meta re-cooks its source under the new ID and removes the old ID's files.
@@ -74,13 +75,15 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | Texture | a `.detex` |
 | glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
+| `.cell` | a `.decell`: its entities, parents first, with the meshes of the models they name (relative paths) as its dependencies |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
 
 ## Rules and invariants
 
 - The same inputs give the same bytes: no timestamps or paths in cooked files, padding zeroed.
-- A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
-- A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are.
+- A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references, or (for cells) the IDs of the models it places: a model cooked again doesn't cook its cells again. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
+- A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are; `CookOptions::content = false` (shaders only, for tests) leaves what was cooked from `content/` as it is.
+- A glTF buffer shorter than the glTF says (a Git LFS pointer that was never pulled) is reported, never read past.
 - LODs never move vertices where two material parts meet, so they don't crack along seams.
 - Files go through the VFS only; third-party libraries allocate on the Tools heap (yyjson, cgltf, ufbx and stb per call, meshoptimizer process-wide).
 - Texture blocks encode in parallel on the job system. Shader compiles run one at a time (Slang's global session).
