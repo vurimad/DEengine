@@ -34,7 +34,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
                                 dot(push.instances[push.instance * 3 + 1], local),
                                 dot(push.instances[push.instance * 3 + 2], local));
     VertexOutput output;
-    output.position = cascade_clip(*push.frame, push.cascade, world);
+    output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;
     return output;
 }

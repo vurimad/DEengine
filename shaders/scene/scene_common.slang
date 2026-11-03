@@ -29,7 +29,9 @@ public float2 cascade_tile(uint cascade)
     return float2(float(cascade & 1u), float(cascade >> 1u)) * 0.5;
 }
 
-public float4 cascade_clip(SceneFrame frame, uint cascade, float3 position)
+// Shaders read the frame through its pointer, never a copy: a copy indexed by cascade would sit in
+// scratch memory.
+public float4 cascade_clip(SceneFrame* frame, uint cascade, float3 position)
 {
     const float4 p = float4(position, 1.0);
     return float4(dot(frame.cascade_view_proj[cascade * 4 + 0], p), dot(frame.cascade_view_proj[cascade * 4 + 1], p),
@@ -140,7 +142,7 @@ public float3 gbuffer_normal(float2 gb1)
 }
 
 // A pixel's position in render-origin space, from its depth (reverse Z; 0 is the far plane).
-public float3 position_from_depth(SceneFrame frame, float2 ndc, float depth)
+public float3 position_from_depth(SceneFrame* frame, float2 ndc, float depth)
 {
     const float4 point = mul_rows(frame.inv_view_proj, float4(ndc, max(depth, 1e-7), 1.0));
     return point.xyz / point.w;

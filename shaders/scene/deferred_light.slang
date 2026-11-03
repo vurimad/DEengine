@@ -65,12 +65,12 @@ float3 env_brdf(float3 f0, float roughness, float n_dot_v)
     return f0 * ab.x + ab.y;
 }
 
-float3 hemisphere(SceneFrame frame, float3 direction)
+float3 hemisphere(SceneFrame* frame, float3 direction)
 {
     return lerp(frame.ground_color.rgb, frame.sky_color.rgb, saturate(direction.y * 0.5 + 0.5));
 }
 
-float3 sky(SceneFrame frame, float3 view_direction)
+float3 sky(SceneFrame* frame, float3 view_direction)
 {
     // A gradient toward the horizon haze, and the sun's disk with a soft glow around it.
     const float up = saturate(view_direction.y);
@@ -85,7 +85,7 @@ float3 sky(SceneFrame frame, float3 view_direction)
 [shader("fragment")]
 float4 fragment_main(VertexOutput input) : SV_Target
 {
-    const SceneFrame frame = *push.frame;
+    SceneFrame* frame = push.frame;
     const int2 texel = int2(input.position.xy);
     const float depth = load_texture(push.depth, texel).r;
     // The point on the far plane (or the surface) back in render-origin space.

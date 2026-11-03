@@ -582,3 +582,94 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     CHECK(lighting.shadows.distance_m == 90.0f);
     CHECK(lighting.shadows.max_penumbra_texels == 3.0f);
 }
+
+TEST_CASE("masked materials are cut out, double-sided ones seen from behind, each by its own pipeline") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    put_assets(*vfs);
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    const auto target =
+        device->create_texture({.width = kSize,
+                                .height = kSize,
+                                .format = de::rhi::Format::RGBA8Unorm,
+                                .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                .debug_name = "target"});
+    REQUIRE(target.ok());
+    // Whether the red square shows in the middle of the view, with its material made this way.
+    const auto draws = [&](de::asset::AlphaMode mode, de::asset::MaterialFlags flags, float alpha, bool behind) {
+        de::cooker::MaterialBuild build;
+        build.alpha_mode = mode;
+        build.flags = flags;
+        build.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, alpha);
+        const auto material = de::cooker::cook_material(build, kRed);
+        REQUIRE(vfs->write_file(de::asset::cooked_path(kRed, AssetType::Material).c_str(), material.span()).ok());
+        auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+        REQUIRE(assets.ok());
+        bool shown = false;
+        {
+            auto gpu_assets =
+                de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+            REQUIRE(gpu_assets.ok());
+            auto renderer = de::render::SceneRenderer::create(
+                {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+            REQUIRE(renderer.ok());
+            const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
+            assets->wait_all();
+            gpu_assets->update();
+            uploader->flush_and_wait();
+            gpu_assets->update();
+            REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+            de::world::RenderFrame frame;
+            // 3 m in front of the square, or behind it turned around (180 degrees about Y).
+            frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+            if (behind) {
+                frame.camera.transform[0] = -1.0f;
+                frame.camera.transform[10] = -1.0f;
+                frame.camera.transform[11] = -3.0f;
+            }
+            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+            auto graph = de::render::RenderGraph::create(*device);
+            REQUIRE(graph.ok());
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {},
+                                 de::render::SceneView::BaseColor);
+            graph->execute();
+            device->end_frame();
+            const de::core::Array<std::byte> pixels = de::test::read_texture(*device, *target);
+            shown = texel(pixels, kSize / 2, kSize / 2)[0] > 200;
+            assets->release(mesh);
+            assets->update();
+            device->wait_idle();
+        }
+        return shown;
+    };
+    using de::asset::AlphaMode;
+    using de::asset::MaterialFlags;
+    CHECK(draws(AlphaMode::Opaque, MaterialFlags::None, 0.2f, false)); // opaque ignores alpha
+    CHECK_FALSE(draws(AlphaMode::Masked, MaterialFlags::None, 0.2f, false));
+    CHECK(draws(AlphaMode::Masked, MaterialFlags::None, 0.8f, false));
+    CHECK_FALSE(draws(AlphaMode::Opaque, MaterialFlags::None, 1.0f, true)); // back face culled
+    CHECK(draws(AlphaMode::Opaque, MaterialFlags::DoubleSided, 1.0f, true));
+    CHECK_FALSE(draws(AlphaMode::Masked, MaterialFlags::DoubleSided, 0.2f, true));
+    CHECK(draws(AlphaMode::Masked, MaterialFlags::DoubleSided, 0.8f, true));
+    device->destroy(*target);
+    device->wait_idle();
+    de::test::check_clean(*device);
+}

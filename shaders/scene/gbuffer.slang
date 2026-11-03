@@ -57,15 +57,9 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
     return output;
 }
 
-[shader("fragment")]
-GBufferOutput fragment_main(VertexOutput input, bool front_face: SV_IsFrontFace)
+// The surface into the G-buffer, past any alpha test.
+GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial material, float3 base)
 {
-    const GpuMaterial material = push.materials[push.material];
-    const float4 base = sample_texture(material.base_color_texture, push.sampler, input.uv) * material.base_color;
-    if ((material.flags & kMaterialMasked) != 0 && base.a < material.alpha_cutoff)
-    {
-        discard;
-    }
     // Tangent-space normal from the map's x, y (z rebuilt), into world space.
     float2 xy = sample_texture(material.normal_texture, push.sampler, input.uv).xy * 2.0 - 1.0;
     xy *= material.normal_scale;
@@ -86,9 +80,31 @@ GBufferOutput fragment_main(VertexOutput input, bool front_face: SV_IsFrontFace)
     const float3 emissive = sample_texture(material.emissive_texture, push.sampler, input.uv).rgb * material.emissive;
 
     GBufferOutput output;
-    output.gb0 = float4(base.rgb, 0.0); // lighting group 0 until materials carry one
+    output.gb0 = float4(base, 0.0); // lighting group 0 until materials carry one
     output.gb1 = octahedral_encode(n) * 0.5 + 0.5;
     output.gb2 = float4(saturate(orm.g * material.roughness), saturate(orm.b * material.metallic), occlusion, 0.0);
     output.emissive = float4(emissive, 1.0);
     return output;
+}
+
+// Opaque materials: no discard anywhere in the shader, so depth is tested before it runs.
+[shader("fragment")]
+GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    const GpuMaterial material = push.materials[push.material];
+    const float3 base = sample_texture(material.base_color_texture, push.sampler, input.uv).rgb * material.base_color.rgb;
+    return write_surface(input, front_face, material, base);
+}
+
+// Masked materials: the alpha test.
+[shader("fragment")]
+GBufferOutput fragment_main(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    const GpuMaterial material = push.materials[push.material];
+    const float4 base = sample_texture(material.base_color_texture, push.sampler, input.uv) * material.base_color;
+    if ((material.flags & kMaterialMasked) != 0 && base.a < material.alpha_cutoff)
+    {
+        discard;
+    }
+    return write_surface(input, front_face, material, base.rgb);
 }

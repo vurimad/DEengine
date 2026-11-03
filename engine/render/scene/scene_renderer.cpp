@@ -119,8 +119,9 @@ struct SceneRendererState {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
-    shader::ProgramHandle gbuffer_cull_back;
-    shader::ProgramHandle gbuffer_cull_none; // double-sided materials
+    // [double-sided][masked]: culling off for double-sided materials, the alpha test only for masked
+    // ones (an opaque shader without discard keeps early depth testing).
+    shader::ProgramHandle gbuffer_programs[2][2];
     shader::ProgramHandle deferred_light;
     shader::ProgramHandle tonemap;
     shader::ProgramHandle shadow_caster;        // masked: alpha-tested
@@ -135,8 +136,9 @@ struct SceneRendererState {
     SceneRendererStats stats;
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap,
-                                                    shadow_caster, shadow_caster_opaque, shadow_mask}) {
+        for (const shader::ProgramHandle program :
+             {gbuffer_programs[0][0], gbuffer_programs[0][1], gbuffer_programs[1][0], gbuffer_programs[1][1],
+              deferred_light, tonemap, shadow_caster, shadow_caster_opaque, shadow_mask}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -144,9 +146,10 @@ struct SceneRendererState {
         }
     }
 
-    shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state) const {
+    shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state,
+                               const char* fragment_entry = "fragment_main") const {
         const core::Result<shader::ProgramHandle> program =
-            shaders->create_graphics({.module = module, .state = state});
+            shaders->create_graphics({.module = module, .fragment_entry = fragment_entry, .state = state});
         return program ? *program : shader::ProgramHandle{};
     }
 
@@ -162,10 +165,16 @@ struct SceneRendererState {
             gbuffer.color_formats[i] = kGBufferFormats[i];
         }
         gbuffer.color_formats[3] = kHdrFormat;
-        gbuffer_cull_back = make("scene.gbuffer", gbuffer);
-        gbuffer.cull = rhi::CullMode::None;
-        gbuffer.debug_name = "gbuffer (double-sided)";
-        gbuffer_cull_none = make("scene.gbuffer", gbuffer);
+        static constexpr const char* kNames[2][2] = {{"gbuffer", "gbuffer (masked)"},
+                                                     {"gbuffer (double-sided)", "gbuffer (double-sided, masked)"}};
+        for (uint32_t double_sided = 0; double_sided < 2; ++double_sided) {
+            for (uint32_t masked = 0; masked < 2; ++masked) {
+                gbuffer.cull = double_sided != 0 ? rhi::CullMode::None : rhi::CullMode::Back;
+                gbuffer.debug_name = kNames[double_sided][masked];
+                gbuffer_programs[double_sided][masked] =
+                    make("scene.gbuffer", gbuffer, masked != 0 ? "fragment_main" : "fragment_opaque");
+            }
+        }
 
         rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
         light.color_formats[0] = kHdrFormat;
@@ -180,9 +189,7 @@ struct SceneRendererState {
                                                .cull = rhi::CullMode::None,
                                                .debug_name = "shadow caster"};
         shadow_caster = make("scene.shadow_caster", caster);
-        const core::Result<shader::ProgramHandle> opaque = shaders->create_graphics(
-            {.module = "scene.shadow_caster", .fragment_entry = "fragment_opaque", .state = caster});
-        shadow_caster_opaque = opaque ? *opaque : shader::ProgramHandle{};
+        shadow_caster_opaque = make("scene.shadow_caster", caster, "fragment_opaque");
         rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
         mask.color_formats[0] = kShadowMaskFormat;
         shadow_mask = make("scene.shadow_mask", mask);
@@ -476,8 +483,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         std::clamp(state.shadows.max_penumbra_texels, Limits::kMinPenumbraTexels, Limits::kMaxPenumbraTexels);
     state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
-    const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);
-    const rhi::PipelineHandle gbuffer_none = state.shaders->pipeline(state.gbuffer_cull_none);
+    rhi::PipelineHandle gbuffer_pipelines[2][2];
+    bool gbuffer_ready = true;
+    for (uint32_t i = 0; i < 4; ++i) {
+        gbuffer_pipelines[i / 2][i % 2] = state.shaders->pipeline(state.gbuffer_programs[i / 2][i % 2]);
+        gbuffer_ready = gbuffer_ready && gbuffer_pipelines[i / 2][i % 2].is_valid();
+    }
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
     const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
     const rhi::PipelineHandle caster = state.shaders->pipeline(state.shadow_caster);
@@ -489,8 +500,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const float aspect =
         static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
-    const bool ready = written && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster.is_valid() && caster_opaque.is_valid() && mask.is_valid();
+    const bool ready = written && gbuffer_ready && light.is_valid() && tonemap.is_valid() && caster.is_valid() &&
+                       caster_opaque.is_valid() && mask.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -586,8 +597,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         SceneRendererState* state = nullptr;
         const world::RenderFrame* frame = nullptr;
         Targets targets;
-        rhi::PipelineHandle cull_back;
-        rhi::PipelineHandle cull_none;
+        rhi::PipelineHandle pipelines[2][2]; // [double-sided][masked]
         uint64_t frame_address = 0;
     };
     const auto& gbuffer = graph.add_pass<GBufferPass>(
@@ -596,8 +606,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             data = {.state = &state,
                     .frame = &frame,
                     .targets = {},
-                    .cull_back = gbuffer_back,
-                    .cull_none = gbuffer_none,
+                    .pipelines = {{gbuffer_pipelines[0][0], gbuffer_pipelines[0][1]},
+                                  {gbuffer_pipelines[1][0], gbuffer_pipelines[1][1]}},
                     .frame_address = frame_address};
             for (uint32_t i = 0; i < 3; ++i) {
                 data.targets.gb[i] =
@@ -635,8 +645,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 push.vertices = mesh->vertex_address;
                 context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
                 for (const GpuMeshPart& part : mesh->parts) {
-                    const rhi::PipelineHandle pipeline =
-                        renderer.gpu_assets->double_sided(part.material) ? data.cull_none : data.cull_back;
+                    const GpuAssets& assets = *renderer.gpu_assets;
+                    const rhi::PipelineHandle pipeline = data.pipelines[assets.double_sided(part.material) ? 1 : 0]
+                                                                       [assets.masked(part.material) ? 1 : 0];
                     if (!(pipeline == bound)) {
                         context.list.bind_pipeline(pipeline);
                         bound = pipeline;
