@@ -128,6 +128,56 @@ TEST_CASE("world transforms interpolate between ticks, and static tables aren't 
     CHECK(near(glm::degrees(glm::angle(half.rotation)), 45.0));
 }
 
+TEST_CASE("each instance knows where it was a frame ago, from the same two ticks") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    add_movement(*world);
+    constexpr double kTick = 1.0 / 60.0;
+    // Moving at a meter a tick; standing still; and place()d mid-flight.
+    const flecs::entity mover =
+        ecs.entity().set(Transform{}).set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}}).set(de::world::MeshInstance{});
+    const flecs::entity statue = ecs.entity().set(de::world::MeshInstance{});
+    de::world::place(statue, Transform{.position = {-100.0, 0.0, 0.0}});
+
+    const auto instance_x = [&](flecs::entity entity, bool previous) {
+        const de::world::RenderFrame& frame = world->render_frame();
+        const bool want_statue = entity == statue; // told apart by where they are: it's far behind
+        for (const de::world::RenderInstance& instance : frame.instances) {
+            const float x = previous ? instance.previous_transform[3] : instance.transform[3];
+            if (want_statue == (instance.transform[3] < -50.0f)) {
+                return x;
+            }
+        }
+        FAIL("no such instance");
+        return 0.0f;
+    };
+    world->advance(kTick * 1.25); // a tick, and a quarter of the next
+    const float first = instance_x(mover, false);
+    CHECK(first == doctest::Approx(0.25f));
+    // Half a tick later, no tick between: a frame ago is where it was drawn.
+    world->advance(kTick * 0.5);
+    CHECK(instance_x(mover, false) == doctest::Approx(0.75f));
+    CHECK(instance_x(mover, true) == doctest::Approx(first));
+    // Half a tick later again, over a tick: the same, through the tick boundary.
+    world->advance(kTick * 0.5);
+    CHECK(instance_x(mover, false) == doctest::Approx(1.25f));
+    CHECK(instance_x(mover, true) == doctest::Approx(0.75f));
+    // What doesn't move has no motion.
+    CHECK(instance_x(statue, false) == doctest::Approx(-100.0f));
+    CHECK(instance_x(statue, true) == doctest::Approx(-100.0f));
+    // place(): no motion, however far it jumped.
+    de::world::place(mover, Transform{.position = {3.0, 0.0, 0.0}});
+    world->advance(kTick * 0.1);
+    CHECK(instance_x(mover, false) == doctest::Approx(3.0f));
+    CHECK(instance_x(mover, true) == doctest::Approx(3.0f));
+    // A frame longer than a tick steps back no more than a tick's worth of motion.
+    world->advance(kTick * 0.1); // settle: a tick's motion is in play again
+    world->advance(kTick * 3.0);
+    const float now = instance_x(mover, false);
+    CHECK(now - instance_x(mover, true) <= doctest::Approx(2.0f));
+}
+
 TEST_CASE("components are reflected: inspectable and serializable") {
     auto world = World::create();
     REQUIRE(world.ok());

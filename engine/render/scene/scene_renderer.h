@@ -86,6 +86,7 @@ enum class SceneView : uint32_t {
     Translucency,
     ShadowMask, // sunlight seen
     Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
+    Motion,     // screen motion since last frame, about grey (red: right, green: down)
     Count,
 };
 

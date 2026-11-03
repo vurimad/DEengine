@@ -960,3 +960,108 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
     device->wait_idle();
     de::test::check_clean(*device);
 }
+
+TEST_CASE("motion vectors follow the camera and the instances, across render origin moves") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    put_assets(*vfs);
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        REQUIRE(renderer.ok());
+        const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+
+        // The debug view shows uv motion times 5, about grey, in red and green. The square fills the
+        // view's middle from 3 m away: a meter there is 1 / (3 tan 0.5) of the view's half height.
+        de::world::RenderFrame frame;
+        frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+        const de::world::RenderInstance square{.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+                                               .previous_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+                                               .mesh = mesh};
+        frame.instances.push(square);
+        const float uv_per_m = 0.5f / (3.0f * std::tan(0.5f));
+        const auto shown = [&] {
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {}, de::render::SceneView::Motion);
+            graph->execute();
+            device->end_frame();
+            return de::test::read_texture(*device, *target);
+        };
+        const auto level = [](float uv_motion) { return (uv_motion * 5.0f + 0.5f) * 255.0f; };
+        const auto check_center = [&](float motion_u, float motion_v) {
+            const de::core::Array<std::byte> pixels = shown();
+            const uint8_t* center = texel(pixels, kSize / 2, kSize / 2);
+            CHECK(static_cast<float>(center[0]) == doctest::Approx(level(motion_u)).epsilon(0.03));
+            CHECK(static_cast<float>(center[1]) == doctest::Approx(level(motion_v)).epsilon(0.03));
+        };
+        // The first frame has no last frame: no motion.
+        check_center(0.0f, 0.0f);
+        // The camera steps 0.1 m right: what it sees moves left.
+        frame.camera.transform[3] = 0.1f;
+        check_center(-0.1f * uv_per_m, 0.0f);
+        // Still: no motion, whatever it was before.
+        check_center(0.0f, 0.0f);
+        // Up 0.1 m: what it sees moves down the screen, and v grows down.
+        frame.camera.transform[7] = 0.1f;
+        check_center(0.0f, 0.1f * uv_per_m);
+        check_center(0.0f, 0.0f);
+        // The square moved 0.2 m right since last frame, and 0.1 m up.
+        frame.instances[0].transform[3] = 0.2f;
+        frame.instances[0].transform[7] = 0.1f;
+        check_center(0.2f * uv_per_m, -0.1f * uv_per_m);
+        frame.instances[0] = square;
+        check_center(0.0f, 0.0f); // the camera didn't move, and the square says it didn't
+        // The render origin jumps 1 km and everything is given relative to it: nothing moved.
+        frame.origin.x = 1024.0;
+        frame.camera.transform[3] -= 1024.0f;
+        frame.instances[0].transform[3] -= 1024.0f;
+        frame.instances[0].previous_transform[3] -= 1024.0f;
+        check_center(0.0f, 0.0f);
+
+        frame.instances.clear();
+        static_cast<void>(shown());
+        assets->release(mesh);
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}

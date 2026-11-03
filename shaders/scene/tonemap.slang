@@ -13,9 +13,10 @@ struct TonemapPush
     uint gb2;
     float exposure;    // multiplier: 2^EV
     uint view;         // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency,
-                       // 7 shadow mask, 8 cascades
+                       // 7 shadow mask, 8 cascades, 9 motion
     uint srgb_target;  // the target encodes to sRGB: data views are decoded first, so they show as stored
     uint shadow_mask;  // r: sunlight seen, g: cascade
+    uint motion;       // rg: uv now minus uv last frame
 };
 
 [[vk::push_constant]]
@@ -51,6 +52,11 @@ float3 aces(float3 x)
 float4 fragment_main(VertexOutput input) : SV_Target
 {
     const int2 texel = int2(input.position.xy);
+    if (push.view == 9)
+    {
+        // Motion, ten times over, about grey: a tenth of the screen in a frame reaches the ends.
+        return show_data(float3(load_texture(push.motion, texel).rg * 5.0 + 0.5, 0.5));
+    }
     if (push.view >= 7)
     {
         const float2 mask = load_texture(push.shadow_mask, texel).rg;

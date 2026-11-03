@@ -8,7 +8,7 @@ import scene.scene_common;
 struct GBufferPush
 {
     SceneFrame* frame;
-    float4* instances; // 3 rows per instance: object to render-origin space
+    float4* instances; // kInstanceRows per instance: object to render-origin space, now and last frame
     MeshVertex* vertices;
     GpuMaterial* materials;
     uint instance;
@@ -25,6 +25,8 @@ struct VertexOutput
     float3 normal : NORMAL;
     float4 tangent : TANGENT;
     float2 uv : TEXCOORD;
+    float4 clip : CLIP;                   // where the vertex is, and was last frame: the motion vector
+    float4 previous_clip : PREVIOUS_CLIP;
 };
 
 struct GBufferOutput
@@ -33,15 +35,16 @@ struct GBufferOutput
     float2 gb1 : SV_Target1;
     float4 gb2 : SV_Target2;
     float4 emissive : SV_Target3;
+    float2 motion : SV_Target4; // uv now minus uv last frame
 };
 
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
-    const float4 row0 = push.instances[push.instance * 3 + 0];
-    const float4 row1 = push.instances[push.instance * 3 + 1];
-    const float4 row2 = push.instances[push.instance * 3 + 2];
+    const float4 row0 = push.instances[push.instance * kInstanceRows + 0];
+    const float4 row1 = push.instances[push.instance * kInstanceRows + 1];
+    const float4 row2 = push.instances[push.instance * kInstanceRows + 2];
     const float4 local = float4(vertex.position, 1.0);
     const float4 world = float4(dot(row0, local), dot(row1, local), dot(row2, local), 1.0);
     // The inverse transpose would be exact under non-uniform scale; renormalized in the pixel
@@ -50,6 +53,11 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
+    output.clip = output.position;
+    const float4 previous_world = float4(dot(push.instances[push.instance * kInstanceRows + 3], local),
+                                         dot(push.instances[push.instance * kInstanceRows + 4], local),
+                                         dot(push.instances[push.instance * kInstanceRows + 5], local), 1.0);
+    output.previous_clip = mul_rows(push.frame.previous_view_proj, previous_world);
     output.normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
     const float4 tangent = snorm8x4(vertex.tangent);
     output.tangent = float4(mul(linear, tangent.xyz), tangent.w);
@@ -84,6 +92,11 @@ GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial mat
     output.gb1 = octahedral_encode(n) * 0.5 + 0.5;
     output.gb2 = float4(saturate(orm.g * material.roughness), saturate(orm.b * material.metallic), occlusion, 0.0);
     output.emissive = float4(emissive, 1.0);
+    // Clip y is up, uv's v is down. A vertex behind last frame's camera clamps: a big motion, which
+    // is what it is.
+    const float2 ndc = input.clip.xy / input.clip.w;
+    const float2 previous_ndc = input.previous_clip.xy / max(input.previous_clip.w, 1e-4);
+    output.motion = (ndc - previous_ndc) * float2(0.5, -0.5);
     return output;
 }
 

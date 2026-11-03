@@ -25,7 +25,7 @@ The game world (docs/design.md, Core systems; Open world & streaming: world mode
 - **Time:** systems take the fixed step from `it.delta_time()`; count ticks with `World::tick_count()`. flecs' own timers (`interval`, `rate`, tick sources) and its world time don't fit our two pipelines: the timers' systems live in phases the pipelines don't run, and its world time counts ticks and frames both.
 - **Moving an entity:** write `Transform` with `set()` (or call `modified()` after `get_mut()`): world transforms are recomputed only in tables marked changed.
 - **Entities hold no assets:** `MeshInstance` names a mesh by handle without holding it; its cell does, and outlives it, so the handle can't dangle.
-- **Extraction** runs once per frame in RenderExtract: the active camera first (it may move the origin), then every entity with `MeshInstance`, interpolated: every table is cut into 512-row chunks, run as one parallel job over all of them, whatever the tables' sizes. Unmoved entities skip the slerp. The instance and chunk arrays keep their capacity: no allocation per frame once the world has settled.
+- **Extraction** runs once per frame in RenderExtract: the active camera first (it may move the origin), then every entity with `MeshInstance`, interpolated, with its pose a frame ago for motion vectors (the same two ticks stepped back by the frame's share of a tick, at most a tick; nothing per entity is kept): every table is cut into 512-row chunks, run as one parallel job over all of them, whatever the tables' sizes. Unmoved entities skip the slerp. The instance and chunk arrays keep their capacity: no allocation per frame once the world has settled.
 
 ## Not yet
 

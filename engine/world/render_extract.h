@@ -34,11 +34,11 @@ struct ActiveCamera {
 
 // One mesh to draw this frame: where (relative to the frame's render origin) and what.
 struct RenderInstance {
-    float transform[12] = {}; // 3x4, rows x, y, z, translation in the last column
+    float transform[12] = {};          // 3x4, rows x, y, z, translation in the last column
+    float previous_transform[12] = {}; // where it was a frame ago (for motion vectors), same origin
     asset::AssetHandle mesh;
-    uint32_t reserved[2] = {};
 };
-static_assert(sizeof(RenderInstance) == 64);
+static_assert(sizeof(RenderInstance) == 104);
 
 struct RenderView {
     float transform[12] = {}; // the camera's 3x4, relative to the render origin
@@ -79,13 +79,16 @@ struct RenderExtractDesc {
     RenderFrame* frame = nullptr;            // filled; must outlive the world
     RenderExtractScratch* scratch = nullptr; // must outlive the world
     const float* alpha = nullptr;            // this frame's interpolation point, set before RenderExtract
+    const float* alpha_step = nullptr;       // how much of a tick this frame took, set likewise
     core::JobSystem* jobs = nullptr;         // null: one thread
 };
 
 // Adds the RenderExtract systems that fill desc.frame: the active camera, then interpolated world
-// transforms of everything with a MeshInstance, relative to the render origin. Every table's rows
-// are cut into chunks and run as one parallel job over all of them. After the first frames it
-// doesn't allocate (the arrays keep their capacity).
+// transforms of everything with a MeshInstance, relative to the render origin. Each instance's pose
+// a frame ago comes from the same two ticks, stepped back by alpha_step: no history per entity, exact
+// for steady motion, and none for what hasn't moved or was place()d. Every table's rows are cut into
+// chunks and run as one parallel job over all of them. After the first frames it doesn't allocate
+// (the arrays keep their capacity).
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
 } // namespace de::world

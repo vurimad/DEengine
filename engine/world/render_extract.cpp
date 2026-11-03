@@ -55,6 +55,7 @@ struct ExtractJob {
     const RenderExtractScratch* scratch = nullptr;
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
+    float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
     DVec3 origin{0.0};
 };
 
@@ -66,9 +67,9 @@ void extract_chunks(size_t begin, size_t end, void* context) {
             RenderInstance& instance = job.instances[chunk.first + i];
             to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), job.origin,
                           instance.transform);
+            to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.previous_alpha), job.origin,
+                          instance.previous_transform);
             instance.mesh = chunk.meshes[i].mesh;
-            instance.reserved[0] = 0;
-            instance.reserved[1] = 0;
         }
     }
 }
@@ -108,8 +109,12 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                 rows += count;
             }
             out.instances.resize_uninit(rows);
-            ExtractJob job{
-                .scratch = &scratch, .instances = out.instances.data(), .alpha = *desc.alpha, .origin = out.origin};
+            ExtractJob job{.scratch = &scratch,
+                           .instances = out.instances.data(),
+                           .alpha = *desc.alpha,
+                           .previous_alpha =
+                               std::max(*desc.alpha - *desc.alpha_step, -1.0f), // no wilder than a tick back
+                           .origin = out.origin};
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
             } else {
