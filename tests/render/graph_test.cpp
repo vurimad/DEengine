@@ -670,3 +670,82 @@ TEST_CASE("immediate mode makes transients with every usage a later pass may nee
     device->wait_idle();
     check_clean(*device);
 }
+
+TEST_CASE("passes are timed on the GPU, and their times arrive once the frame is done") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device, {.gpu_timing = true}); // ship builds default to off
+    REQUIRE(graph.ok());
+    const auto run_frame = [&] {
+        device->begin_frame();
+        graph->begin(64, 64);
+        const GraphTexture first = add_clear(*graph, "first clear").texture;
+        graph->add_pass(
+            "second clear", [&](PassBuilder& pass) { pass.use(first, ResourceState::RenderTarget).never_cull(); },
+            [first](PassContext& context) { clear_texture(context, first); });
+        graph->execute();
+        device->end_frame();
+    };
+    run_frame();
+    CHECK(graph->gpu_times().empty()); // nothing has finished yet
+    if (!device->capabilities().timestamps) {
+        return;
+    }
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame) {
+        run_frame();
+    }
+    const std::span<const de::render::PassGpuTime> times = graph->gpu_times();
+    REQUIRE(times.size() == 2);
+    CHECK((times[0].name.view() == "first clear"));
+    CHECK((times[1].name.view() == "second clear"));
+    CHECK(times[0].ms >= 0.0f);
+    CHECK(times[0].ms < 100.0f);
+    CHECK(graph->gpu_frame_ms() >= times[1].ms);
+    // Frames later, still the two passes of one frame (each frame's records replace the slot's).
+    for (uint32_t frame = 0; frame < 2 * kFramesInFlight; ++frame) {
+        run_frame();
+    }
+    CHECK(graph->gpu_times().size() == 2);
+    // Frames without the graph, writing timestamps of their own: when the graph comes back, the
+    // finished frame isn't one it timed, so the last times stand (they aren't read from those).
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame) {
+        device->begin_frame();
+        CHECK(device->begin_command_list().write_timestamp() == 0);
+        device->end_frame();
+    }
+    run_frame();
+    REQUIRE(graph->gpu_times().size() == 2);
+    CHECK((graph->gpu_times()[1].name.view() == "second clear"));
+
+    // The graph run twice in one device frame: both runs' passes are timed.
+    const auto run_twice = [&] {
+        device->begin_frame();
+        for (int run = 0; run < 2; ++run) {
+            graph->begin(64, 64);
+            add_clear(*graph, "twice", kSmallColor);
+            graph->add_pass("keep", [&](PassBuilder& pass) { pass.never_cull(); }, [](PassContext&) {});
+            graph->execute();
+        }
+        device->end_frame();
+    };
+    for (uint32_t frame = 0; frame <= kFramesInFlight; ++frame) {
+        run_twice();
+    }
+    CHECK(graph->gpu_times().size() == 2); // "keep" twice: the culled clears don't run
+
+    // Timing off (ship builds' default): nothing is timed.
+    auto untimed = RenderGraph::create(*device, {.gpu_timing = false});
+    REQUIRE(untimed.ok());
+    for (uint32_t frame = 0; frame <= kFramesInFlight; ++frame) {
+        device->begin_frame();
+        untimed->begin(64, 64);
+        untimed->add_pass("keep", [&](PassBuilder& pass) { pass.never_cull(); }, [](PassContext&) {});
+        untimed->execute();
+        device->end_frame();
+    }
+    CHECK(untimed->gpu_times().empty());
+    device->wait_idle();
+    check_clean(*device);
+}

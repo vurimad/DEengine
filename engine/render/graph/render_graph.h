@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/fixed_string.h"
 #include "core/result.h"
 #include "render/rhi/command_list.h"
 #include "render/rhi/rhi.h"
@@ -7,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <span>
 #include <type_traits>
 #include <utility>
 
@@ -114,6 +116,18 @@ struct RenderGraphDesc {
     bool log_transitions = false;
     // Transient resources unused for this many frames go back to the device.
     uint32_t keep_unused_frames = 8;
+    // Time each pass on the GPU (gpu_times()); when the device has timestamps. Off in ship builds,
+    // where nothing reads them.
+    bool gpu_timing = DE_BUILD_DEV != 0;
+};
+
+// The passes a frame's GPU times cover (later ones aren't timed).
+inline constexpr uint32_t kMaxTimedPasses = 32;
+
+// How long a pass took on the GPU: from a timestamp before its barriers to one after its commands.
+struct PassGpuTime {
+    core::FixedString<31> name; // the pass's, cut to fit
+    float ms = 0.0f;
 };
 
 struct RenderGraphStats {
@@ -192,6 +206,12 @@ public:
     rhi::ResourceState final_texture_state(GraphTexture texture) const;
 
     RenderGraphStats stats() const;
+    // GPU time of each pass that ran, in order, in the latest frame the GPU has finished (the
+    // device's kFramesInFlight frames back), from timestamps (RenderGraphDesc::gpu_timing and
+    // rhi::Capabilities::timestamps; empty without them). Valid until the next begin().
+    std::span<const PassGpuTime> gpu_times() const;
+    // That frame's GPU time, from the first pass's start to the last one's end.
+    float gpu_frame_ms() const;
     // Logs the last frame's graph: passes (culled ones too), their uses, the resources.
     void dump() const;
 

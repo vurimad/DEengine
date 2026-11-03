@@ -22,7 +22,8 @@
 // Marks the end of a frame on the main thread.
 #define DE_PROFILE_FRAME() FrameMark
 
-// A value over time in the profiler, e.g. heap allocations per frame. name must be a literal.
+// A value over time in the profiler, e.g. heap allocations per frame. name must be a literal, or
+// a string that lives until the process exits (Tracy keeps the pointer).
 #define DE_PROFILE_PLOT(name, value) TracyPlot(name, value)
 
 // Names the calling thread in the profiler (the OS name is set by the platform layer).

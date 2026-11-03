@@ -45,6 +45,12 @@ public:
     // Overrides the bound graphics pipeline's cull mode until the next bind_pipeline: one pipeline
     // for culled and double-sided draws.
     void set_cull_mode(CullMode cull);
+
+    // Records the GPU's clock once the work recorded before it is done, into the frame's next
+    // timestamp, and returns its index (read it with Device::completed_timestamps() once the frame
+    // is done). kNoTimestamp, writing nothing, on a device without timestamps, outside a graphics
+    // list, or past kMaxTimestampsPerFrame. Lists on several threads may write them.
+    uint32_t write_timestamp();
     // Push constants for the bound pipeline: offset + data.size() <= kMaxPushConstantBytes,
     // both multiples of 4. They stay set across pipeline binds within the list.
     void push_constants(std::span<const std::byte> data, uint32_t offset = 0);

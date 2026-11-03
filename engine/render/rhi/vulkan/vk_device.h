@@ -169,6 +169,11 @@ struct FrameSlot {
     uint32_t transfer_count = 0;
     VkSemaphore acquire_semaphore = VK_NULL_HANDLE;
     uint64_t timeline_value = 0; // the frame timeline value that marks this slot's last frame done
+    // kMaxTimestampsPerFrame timestamps, when the device has them; how many the slot's last frame
+    // wrote, and which frame that was.
+    VkQueryPool timestamps = VK_NULL_HANDLE;
+    uint32_t timestamps_written = 0;
+    uint64_t timestamps_frame = 0;
     core::Array<PendingDestroy> pending{core::heap_allocator(core::MemoryTag::Render)};
     core::Array<TextureBindless> pending_bindless{core::heap_allocator(core::MemoryTag::Render)};
 };
@@ -192,6 +197,8 @@ struct DeviceImpl {
     // --- Creation and teardown (vk_device.cpp) ---
     core::Result<void> init(const DeviceDesc& desc);
     void shutdown();
+    // Reads the timestamps of the slot's finished frame (begin_frame) and resets its queries.
+    void collect_timestamps(FrameSlot& slot);
 
     // --- Surface and swapchain (vk_swapchain.cpp) ---
     core::Result<void> create_surface();
@@ -272,6 +279,11 @@ struct DeviceImpl {
     uint64_t frame_index = 0; // frames begun; the current frame while in_frame
     bool in_frame = false;
     FrameSlot frames[kFramesInFlight];
+    std::atomic<uint32_t> timestamps_used{0}; // by the current frame, every list
+    uint64_t timestamp_mask = UINT64_MAX;     // the graphics queue's valid timestamp bits
+    // Those of the frame begin_frame() last found finished, in nanoseconds (completed_timestamps()).
+    core::Array<uint64_t> completed_timestamps{core::heap_allocator(core::MemoryTag::Render)};
+    uint64_t completed_timestamps_frame = 0;
 
     Swapchain swapchain;
     // Signaled by a frame's submission, waited on by the present of that image: one per image
