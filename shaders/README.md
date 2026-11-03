@@ -6,7 +6,10 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 
 | Path | What |
 | --- | --- |
-| `scene/basic_lit.slang` | The scene's placeholder pass (renderer step 1): mesh instances lit by a sun and an ambient |
+| `scene/scene_common.slang` | What the scene passes share: frame constants, vertex and material layouts, G-buffer packing |
+| `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target |
+| `scene/deferred_light.slang` | Deferred lighting: the sun (GGX, Lambert, wrap and backlight for translucency), hemisphere ambient, the sky |
+| `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel (debug views) |
 | `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color` |
 | `tests/` | Shaders the unit tests run: a solid triangle, buffers through pointers, textures by bindless index |
 

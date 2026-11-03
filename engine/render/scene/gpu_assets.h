@@ -25,7 +25,7 @@ enum class GpuMaterialFlags : uint32_t {
 DE_ENUM_FLAGS(GpuMaterialFlags)
 
 // A material as shaders read it, from GpuAssets::material_table_address() by index (scalar
-// layout; shaders/scene/basic_lit.slang mirrors it: change both). Texture fields are bindless indices; a
+// layout; shaders/scene/scene_common.slang mirrors it: change both). Texture fields are bindless indices; a
 // material without a texture, or whose texture isn't uploaded yet, points at a default (white, or
 // a flat normal), so shaders never branch on it.
 struct GpuMaterial {

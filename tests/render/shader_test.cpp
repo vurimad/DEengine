@@ -93,11 +93,11 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     Vfs vfs = make_repo_vfs(sandbox);
     ShaderCompiler compiler = make_compiler(vfs);
 
-    // Both stages of the scene's placeholder pass in one compile.
+    // Both stages of the scene's G-buffer pass in one compile.
     const ShaderEntry stages[] = {{.name = "vertex_main", .stage = ShaderStage::Vertex},
                                   {.name = "fragment_main", .stage = ShaderStage::Fragment}};
     CompileReport report;
-    auto basic_lit = compiler.compile({.module = "scene.basic_lit", .entries = stages}, &report);
+    auto basic_lit = compiler.compile({.module = "scene.gbuffer", .entries = stages}, &report);
     REQUIRE(basic_lit.ok());
     REQUIRE(basic_lit->stages.size() == 2);
     const CompiledStage& vertex = basic_lit->stages[0];
@@ -112,7 +112,8 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     CHECK(field(vertex.reflection, "instance")->offset == 32);
     CHECK(basic_lit->stages[1].code[0] == kSpirvMagic);
     CHECK(basic_lit->stages[1].reflection.stage == ShaderStage::Fragment);
-    CHECK(has_dependency(report, "src:/shaders/scene/basic_lit.slang"));
+    CHECK(has_dependency(report, "src:/shaders/scene/gbuffer.slang"));
+    CHECK(has_dependency(report, "src:/shaders/scene/scene_common.slang"));
     CHECK(has_dependency(report, "src:/shaders/common/bindless.slang"));
 
     const ShaderEntry compute_entry[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
