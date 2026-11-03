@@ -25,7 +25,7 @@ enum class GpuMaterialFlags : uint32_t {
 DE_ENUM_FLAGS(GpuMaterialFlags)
 
 // A material as shaders read it, from GpuAssets::material_table_address() by index (scalar
-// layout; shaders/scene/scene_common.slang mirrors it). Texture fields are bindless indices; a
+// layout; shaders/scene/basic_lit.slang mirrors it: change both). Texture fields are bindless indices; a
 // material without a texture, or whose texture isn't uploaded yet, points at a default (white, or
 // a flat normal), so shaders never branch on it.
 struct GpuMaterial {
@@ -43,6 +43,8 @@ struct GpuMaterial {
     uint32_t emissive_texture = 0;           // srgb, rgb
     GpuMaterialFlags flags = GpuMaterialFlags::None;
     uint32_t reserved[2] = {};
+
+    constexpr bool operator==(const GpuMaterial&) const = default;
 };
 static_assert(sizeof(GpuMaterial) == 80);
 
@@ -50,8 +52,7 @@ static_assert(sizeof(GpuMaterial) == 80);
 struct GpuMeshPart {
     uint32_t first_index = 0;
     uint32_t index_count = 0;
-    uint32_t material = 0;     // index into the material table
-    bool double_sided = false; // drawn without back-face culling
+    uint32_t material = 0; // index into the material table
 };
 
 // A mesh on the GPU: its vertices (asset::MeshVertex, pulled by address) and 32-bit indices.
@@ -106,6 +107,9 @@ public:
     // Null unless the mesh is uploaded (or for a stale handle).
     const GpuMesh* mesh(asset::AssetHandle mesh) const;
     uint64_t material_table_address() const;
+    // Whether a material table entry draws without back-face culling (as last written: a reloaded
+    // material changes it).
+    bool double_sided(uint32_t material) const;
 
     GpuAssetsStats stats() const;
 

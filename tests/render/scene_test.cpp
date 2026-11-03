@@ -3,6 +3,7 @@
 #include "asset/registry.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
+#include "cooker/texture_cooker.h"
 #include "core/job_system.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/device.h"
@@ -58,6 +59,51 @@ void put_assets(const de::platform::Vfs& vfs) {
     red.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, 1.0f);
     const auto cooked = de::cooker::cook_material(red, kRed);
     REQUIRE(vfs.write_file(de::asset::cooked_path(kRed, AssetType::Material).c_str(), cooked.span()).ok());
+}
+
+// A mesh of `parts` squares side by side, each with a material of its own sampling a texture of its
+// own (with a full mip chain): everything loaded at once.
+constexpr AssetId kMany = AssetId::from_value(0x60);
+
+void put_many(const de::platform::Vfs& vfs, uint32_t parts) {
+    de::cooker::ModelData model;
+    de::core::Array<AssetId> materials;
+    for (uint32_t p = 0; p < parts; ++p) {
+        const AssetId texture_id = AssetId::from_value(0x100 + p);
+        const AssetId material_id = AssetId::from_value(0x200 + p);
+        de::cooker::Image image;
+        image.width = 64;
+        image.height = 64;
+        for (uint32_t i = 0; i < 64 * 64; ++i) {
+            for (const uint8_t channel :
+                 {static_cast<uint8_t>(i), static_cast<uint8_t>(p * 40), uint8_t{90}, uint8_t{255}}) {
+                image.rgba.push(channel);
+            }
+        }
+        de::cooker::Diagnostics diagnostics;
+        const auto texture = de::cooker::cook_texture(image, {}, texture_id, nullptr, "test", diagnostics);
+        REQUIRE(texture.ok());
+        REQUIRE(vfs.write_file(de::asset::cooked_path(texture_id, AssetType::Texture).c_str(), texture->span()).ok());
+        de::cooker::MaterialBuild build;
+        build.set_texture(de::asset::material::kBaseColorTexture, texture_id);
+        const auto material = de::cooker::cook_material(build, material_id);
+        REQUIRE(vfs.write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span()).ok());
+        materials.push(material_id);
+
+        de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
+        primitive.material = p;
+        static_cast<void>(model.materials.emplace());
+        for (uint32_t v = 0; v < 3; ++v) {
+            de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
+            vertex.position[0] = static_cast<float>(p * 3 + v);
+            vertex.position[1] = static_cast<float>(v % 2);
+            primitive.indices.push(v);
+        }
+    }
+    de::cooker::Diagnostics diagnostics;
+    const auto mesh = de::cooker::cook_mesh(model, materials.span(), {.lod_count = 1}, kMany, "test", diagnostics);
+    REQUIRE(mesh.ok());
+    REQUIRE(vfs.write_file(de::asset::cooked_path(kMany, AssetType::Mesh).c_str(), mesh->span()).ok());
 }
 
 const uint8_t* texel(const de::core::Array<std::byte>& pixels, uint32_t x, uint32_t y) {
@@ -183,6 +229,50 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         CHECK(gpu_assets->stats().materials == 0);
         device->wait_idle();
         device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}
+
+TEST_CASE("a mesh with many materials and mipped textures is ready within a few frames") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    constexpr uint32_t kParts = 8;
+    put_many(vfs, kParts);
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kMany);
+        assets->wait_all();
+        // The engine's frame: registry and GPU assets update, then the uploads are recorded. One
+        // upload per texture and per frame for the table: 8 textures of 7 mips and 8 materials take
+        // a few frames, not one per mip and material.
+        int frames = 0;
+        while (frames < 4 && (gpu_assets->mesh(mesh) == nullptr || gpu_assets->stats().pending != 0)) {
+            gpu_assets->update();
+            device->begin_frame();
+            uploader->record();
+            device->end_frame();
+            ++frames;
+        }
+        gpu_assets->update();
+        CHECK(gpu_assets->mesh(mesh) != nullptr);
+        CHECK(gpu_assets->stats().pending == 0);
+        CHECK(gpu_assets->stats().textures == kParts);
+        CHECK(uploader->idle());
+        assets->release(mesh);
+        assets->update();
+        device->wait_idle();
     }
     device->wait_idle();
     de::test::check_clean(*device);

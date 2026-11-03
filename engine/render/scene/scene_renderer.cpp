@@ -201,13 +201,13 @@ void SceneRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
             const rhi::ColorAttachment color{.texture = context.texture(data.target), .clear = data.clear};
             const rhi::DepthAttachment depth{.texture = context.texture(data.depth)};
             context.list.begin_rendering({.colors = std::span(&color, 1), .depth = &depth});
-            SceneRendererState& state = *data.state;
+            SceneRendererState& renderer = *data.state;
             if (data.frame_buffer.is_valid() && data.cull_back.is_valid() && data.cull_none.is_valid()) {
                 const rhi::TextureDesc& size = context.desc(data.target);
-                const world::RenderFrame& frame = *data.frame;
+                const world::RenderFrame& extracted = *data.frame;
                 const std::span<std::byte> mapped = context.device.mapped(data.frame_buffer);
                 SceneFrame scene;
-                camera_view_proj(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m,
+                camera_view_proj(extracted.camera.transform, extracted.camera.vertical_fov_rad, extracted.camera.near_m,
                                  static_cast<float>(size.width) / static_cast<float>(std::max(size.height, 1U)),
                                  scene.view_proj);
                 const SceneLighting& light = data.lighting;
@@ -220,30 +220,31 @@ void SceneRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                     scene.ambient_color[i] = light.ambient_color[i];
                 }
                 std::memcpy(mapped.data(), &scene, sizeof(scene));
-                for (size_t i = 0; i < frame.instances.size(); ++i) {
-                    std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
+                for (size_t i = 0; i < extracted.instances.size(); ++i) {
+                    std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, extracted.instances[i].transform,
                                 kInstanceBytes);
                 }
                 context.device.flush_mapped(data.frame_buffer, 0,
-                                            kInstancesOffset + frame.instances.size() * kInstanceBytes);
+                                            kInstancesOffset + extracted.instances.size() * kInstanceBytes);
 
                 const uint64_t address = context.device.buffer_address(data.frame_buffer);
                 BasicLitPush push{.frame = address,
                                   .instances = address + kInstancesOffset,
-                                  .materials = state.gpu_assets->material_table_address(),
+                                  .materials = renderer.gpu_assets->material_table_address(),
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
                 rhi::PipelineHandle bound;
-                for (size_t i = 0; i < frame.instances.size(); ++i) {
-                    const GpuMesh* mesh = state.gpu_assets->mesh(frame.instances[i].mesh);
+                for (size_t i = 0; i < extracted.instances.size(); ++i) {
+                    const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
                     if (mesh == nullptr) {
                         continue;
                     }
-                    ++state.stats.drawn;
+                    ++renderer.stats.drawn;
                     push.instance = static_cast<uint32_t>(i);
                     push.vertices = mesh->vertex_address;
                     context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
                     for (const GpuMeshPart& part : mesh->parts) {
-                        const rhi::PipelineHandle pipeline = part.double_sided ? data.cull_none : data.cull_back;
+                        const rhi::PipelineHandle pipeline =
+                            renderer.gpu_assets->double_sided(part.material) ? data.cull_none : data.cull_back;
                         if (!(pipeline == bound)) {
                             context.list.bind_pipeline(pipeline);
                             bound = pipeline;
@@ -251,7 +252,7 @@ void SceneRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                         push.material = part.material;
                         context.list.push_constants(push);
                         context.list.draw_indexed(part.index_count, 1, part.first_index);
-                        ++state.stats.draws;
+                        ++renderer.stats.draws;
                     }
                 }
             }
