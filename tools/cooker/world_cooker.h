@@ -55,7 +55,8 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //               "sun_forward": {"color": [1, 0.85, 0.7], "intensity": 0.5},  // times the sun's
 //               "sun_back": {"color": [0.5, 0.6, 0.8], "intensity": 0.08},
 //               "sun_height_attenuation": 1, "ambient": {"color": [0.3, 0.4, 0.62]},
-//               "ambient_height_attenuation": 1, "start_m": 0, "sun_start_m": 5, "end_m": 20000}
+//               "ambient_height_attenuation": 1, "start_m": 0, "sun_start_m": 5, "end_m": 20000,
+//               "volume_distance_m": 128}  // the froxel grid's reach (light shafts); 0: none
 //     }
 // The shadow settings are render::SceneShadows', the fog's render::SceneFog's (asset::FogLimits).
 core::Result<asset::EnvironmentAsset> import_environment(const Source& source, std::span<const std::byte> bytes,

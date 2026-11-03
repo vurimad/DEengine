@@ -507,7 +507,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 11. Post: TAA, SSR, bloom, depth of field, motion blur, tonemapping, color grading LUT, film grain
 12. UI and editor overlays
 
-Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), analytic height fog over the scene and the sky (step 9's far range, ahead of the froxels), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
+Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), fog over the scene and the sky (step 9: a froxel grid near the camera with the sun's shadows, the closed form past it), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
 
 GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
@@ -589,8 +589,12 @@ The sky is a core system, not a skybox: it drives the lighting, fog, mood and co
 
 **Fog: one medium model, near and far.** Elden Ring's way (study 04): extinction is a constant plus a height fog around a base height, with a bounded exponential profile (thinning upward; below the base, rising only to twice its density, so valleys don't fill without limit), coloured per channel (blue fades first, the sun reddens through haze). Light scattered in: the sun through a colour looking toward it and another looking away (artists' controls in place of one phase parameter), dimmed by the fog column above, plus an ambient colour; a start distance, another for sun haze, and an end distance that is also the sky's. The sky is fogged like everything else, so the horizon takes the haze of the land below it.
 
-- v1 (built, `shaders/common/fog.slang`): the closed-form integral of that medium along each view ray, one full-screen pass after lighting (about 0.06 ms at 1600 x 900). Settings in the environment asset, hot reloaded.
-- v2: froxel volumetric fog for the near range, with the same medium: sun shadows in it (light shafts), local lights, fog volumes; v1's integral becomes its far range.
+- Far range (built, `shaders/common/fog.slang`): the closed-form integral of that medium along each view ray, in a full-screen pass after lighting (about 0.06 ms at 1600 x 900). Settings in the environment asset, hot reloaded.
+- Near range, a froxel grid with the same medium, in phases:
+  - A (built): a view-aligned grid (a column per 8 pixels, 64 slices spaced exponentially out to `volume_distance_m`). `fog inject` stores each froxel's extinction and light, with the sun's shadows from the cascaded atlas (light shafts); `fog integrate` walks each column front to back with the slice's closed-form integral; the composite reads it at each pixel's depth, then the far range goes on from the grid's edge. About 0.2 ms at 1600 x 900.
+  - B: temporal reprojection with per-frame jitter and a filter along depth, for smooth shafts.
+  - C: fog volumes artists place (mist banks, fog walls), injected into the grid.
+  - D: local lights in the fog (torch glow), once the engine has local lights.
 
 **Volumetric clouds.**
 
@@ -1196,3 +1200,4 @@ Decisions so far:
 | 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |
 | 2026-11-03 | Until GPU-driven v1 keeps instances on the GPU, render extraction writes every instance each frame; change-only uploads (and the render origin's one re-upload) arrive with it | The simplest correct path first; the per-frame cost is measured (GPU timers, Tracy) before it's optimized |
 | 2026-11-03 | Fog v1 is an analytic height fog (Elden Ring's medium: constant plus bounded exponential height fog, coloured extinction, two-colour sun lobe, ambient) in a full-screen pass over the scene and the sky; froxels come next with the same model | Most of the atmosphere for a few hundredths of a millisecond; the froxel fog needs this model and this far range anyway |
+| 2026-11-03 | Froxel fog in phases: A the grid with sun shadows, B temporal, C fog volumes, D local lights; 8-pixel columns and 64 slices, on when an environment sets `volume_distance_m` | Each phase is usable alone; 0.2 ms measured for A leaves room in the budget; the closed form stays the far range and the no-grid path |

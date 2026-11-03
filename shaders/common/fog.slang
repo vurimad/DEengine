@@ -4,8 +4,10 @@
 // valleys don't fill without limit. Light scattered into the view: the sun, through a forward and a back
 // colour (looking toward it or away from it) and dimmed by the fog column above, plus an ambient
 // colour. Extinction can be coloured per channel, so blue fades first and the sun reddens through
-// haze. Along a ray the height fog has a closed form, so this is exact for the medium as modelled,
-// at any distance: the far range of the froxel fog to come, and all of the fog until then.
+// haze. Along a ray the height fog has a closed form, so that is exact for the medium as modelled, at
+// any distance. Near the camera, a froxel grid (scene/fog_inject, scene/fog_integrate) takes the same
+// medium and adds what no closed form can: the sun's shadows in the fog. Past the grid, the ray goes
+// on in closed form.
 
 // The medium and its light, in render-origin space (the CPU's render::SceneFog, packed).
 public struct FogMedium
@@ -17,7 +19,8 @@ public struct FogMedium
                                // sun's height attenuation
     public float4 sun_back;    // rgb: looking away from it, w: where sun haze starts (m)
     public float4 ambient;     // rgb: isotropic in-scatter, w: where fog starts (m)
-    public float4 range;       // x: where it ends (m): the sky's distance
+    public float4 range;       // x: where it ends (m): the sky's distance, y: how far the froxel grid
+                               // reaches (m, view depth; 0: no grid), z: its slice offset (m), w: its slices
 };
 
 // What a ray through the fog leaves of the light behind it, and adds: colour * transmittance + in_scatter.
@@ -57,7 +60,7 @@ float column_above(float h, float falloff)
 }
 
 // Optical depth (before the per-channel scale) along the ray from distance t0 to t1.
-float optical_depth(FogMedium medium, float camera_height, float direction_y, float t0, float t1)
+public float optical_depth(FogMedium medium, float camera_height, float direction_y, float t0, float t1)
 {
     const float falloff = max(medium.density.z, 1e-6);
     const float u0 = falloff * (camera_height + direction_y * t0 - medium.density.w);
@@ -65,15 +68,58 @@ float optical_depth(FogMedium medium, float camera_height, float direction_y, fl
     return (medium.density.x + medium.density.y * mean_profile(u0, u1)) * (t1 - t0);
 }
 
-// The fog between camera and a point distance meters along direction (unit), from start to end.
-// sun_direction (unit) points toward the sun.
-public FogResult fog_along_ray(FogMedium medium, float3 camera, float3 direction, float distance,
-                               float3 sun_direction, float3 sun_color)
+// Extinction at a height relative to the base, before the per-channel scale (1/m).
+public float fog_density(FogMedium medium, float height)
+{
+    return medium.density.x + medium.density.y * height_profile(max(medium.density.z, 1e-6) * height);
+}
+
+// The light one unit of extinction scatters toward the camera at a height relative to the base,
+// looking along direction: the sun's (through the fog column above, by its forward and back colours)
+// and the ambient's (through the same column).
+public float3 fog_sun_light(FogMedium medium, float height, float3 direction, float3 sun_direction, float3 sun_color)
+{
+    const float3 extinction = max(medium.extinction.rgb, float3(0.01));
+    const float column = medium.density.y * column_above(height, max(medium.density.z, 1e-6));
+    const float mu = dot(direction, sun_direction);
+    const float3 phase = lerp(medium.sun_back.rgb, medium.sun_forward.rgb, mu * 0.5 + 0.5);
+    return sun_color * phase * exp(-extinction * column * medium.sun_forward.w / max(sun_direction.y, 0.05));
+}
+
+public float3 fog_ambient_light(FogMedium medium, float height)
+{
+    const float3 extinction = max(medium.extinction.rgb, float3(0.01));
+    const float column = medium.density.y * column_above(height, max(medium.density.z, 1e-6));
+    return medium.ambient.rgb * exp(-extinction * column * medium.extinction.w);
+}
+
+// The grid stores extinction (1/m) times this: thin fog stays a normal half float (a subnormal may
+// flush to zero on some GPUs), and extinction up to twice the limit of 1 per meter still fits.
+public static const float kFroxelDensityScale = 4096.0;
+
+// The froxel grid's slices: view depth from 0 to its reach, spaced exponentially with an offset (no
+// slices vanishingly thin at the camera). t runs 0 to 1 across the grid.
+public float froxel_depth(FogMedium medium, float t)
+{
+    const float offset = medium.range.z;
+    return offset * (pow(medium.range.y / offset + 1.0, t) - 1.0);
+}
+
+public float froxel_t(FogMedium medium, float depth)
+{
+    const float offset = medium.range.z;
+    return log(depth / offset + 1.0) / log(medium.range.y / offset + 1.0);
+}
+
+// The fog along a ray (direction unit, sun_direction unit and toward the sun) from from_distance to
+// distance meters, within where fog starts and ends.
+public FogResult fog_between(FogMedium medium, float3 camera, float3 direction, float from_distance, float distance,
+                             float3 sun_direction, float3 sun_color)
 {
     FogResult result;
     result.transmittance = float3(1.0);
     result.in_scatter = float3(0.0);
-    const float near = medium.ambient.w;
+    const float near = max(medium.ambient.w, from_distance);
     const float far = min(distance, medium.range.x);
     if (far <= near)
     {
@@ -90,11 +136,8 @@ public FogResult fog_along_ray(FogMedium medium, float3 camera, float3 direction
     const float transmitted = exp(-depth);
     const float mean_t = depth < 1e-3 ? 0.5 * span : clamp(span / depth - span * transmitted / (1.0 - transmitted), 0.0, span);
     const float height = camera.y + direction.y * (near + mean_t) - medium.density.w;
-    const float column = medium.density.y * column_above(height, max(medium.density.z, 1e-6));
-    const float mu = dot(direction, sun_direction);
-    const float3 phase = lerp(medium.sun_back.rgb, medium.sun_forward.rgb, mu * 0.5 + 0.5);
-    const float3 sun = sun_color * phase * exp(-extinction * column * medium.sun_forward.w / max(sun_direction.y, 0.05));
-    const float3 ambient = medium.ambient.rgb * exp(-extinction * column * medium.extinction.w);
+    const float3 sun = fog_sun_light(medium, height, direction, sun_direction, sun_color);
+    const float3 ambient = fog_ambient_light(medium, height);
 
     // Scattering is extinction before the per-channel scale: what a channel loses to it, it gains of
     // the light in that proportion. Sun haze only from where it starts: the in-scatter past it is

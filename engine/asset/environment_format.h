@@ -28,8 +28,9 @@ struct FogLimits {
     static constexpr float kMaxBaseHeightM = 1e5f; // either side of 0
     static constexpr float kMinExtinctionTint = 0.01f;
     static constexpr float kMaxExtinctionTint = 100.0f;
-    static constexpr float kMaxAttenuation = 100.0f; // sun and ambient height attenuation
-    static constexpr float kMaxDistanceM = 1e6f;     // start, sun start and end
+    static constexpr float kMaxAttenuation = 100.0f;      // sun and ambient height attenuation
+    static constexpr float kMaxDistanceM = 1e6f;          // start, sun start and end
+    static constexpr float kMaxVolumeDistanceM = 2000.0f; // the froxel grid's reach (0: no grid)
 };
 
 // .deenv: the binary form of a .environment text source. How a place is lit (docs/design.md,
@@ -39,7 +40,7 @@ struct FogLimits {
 // reads it as render::SceneLighting (render::scene_lighting()).
 struct EnvironmentAsset {
     static constexpr AssetType kType = AssetType::Environment;
-    static constexpr uint16_t kFormatVersion = 2;
+    static constexpr uint16_t kFormatVersion = 3;
 
     AssetHeader header;
     float sun_direction[3] = {0, 1, 0}; // toward the sun, unit length
@@ -69,12 +70,14 @@ struct EnvironmentAsset {
     float fog_ambient_height_attenuation = 1.0f;
     float fog_start_m = 0.0f;
     float fog_sun_start_m = 0.0f;
-    float fog_end_m = 20000.0f; // past fog_start_m
+    float fog_end_m = 20000.0f;         // past fog_start_m
+    float fog_volume_distance_m = 0.0f; // the froxel grid's reach; 0: no grid
+    uint32_t reserved = 0;
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
     // within ShadowLimits, the fog's within FogLimits.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(EnvironmentAsset) == 240);
+static_assert(sizeof(EnvironmentAsset) == 248);
 
 } // namespace de::asset

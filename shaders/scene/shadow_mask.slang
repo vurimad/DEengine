@@ -55,13 +55,6 @@ float gradient_noise(float2 pixel)
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
-// A cascade's uv in the atlas, kept inside its tile (a texel of border) so filters don't bleed.
-float2 atlas_uv(SceneFrame* frame, uint cascade, float2 tile_uv)
-{
-    const float border = frame.shadow_params.y * 2.0;
-    return cascade_tile(cascade) + clamp(tile_uv, border, 1.0 - border) * 0.5;
-}
-
 [shader("fragment")]
 float2 fragment_main(VertexOutput input) : SV_Target
 {
@@ -76,23 +69,13 @@ float2 fragment_main(VertexOutput input) : SV_Target
     const float distance = dot(position - frame.camera_position.xyz, frame.camera_forward.xyz);
 
     // The cascade: the first that reaches this far; the dithered band hands some pixels on.
-    uint cascade = kCascadeCount;
-    for (uint c = 0; c < kCascadeCount; ++c)
-    {
-        if (distance < frame.cascade_far[c])
-        {
-            cascade = c;
-            break;
-        }
-    }
+    uint cascade = cascade_at(frame, distance);
     if (cascade == kCascadeCount)
     {
         return float2(1.0, 1.0); // beyond the shadow distance: lit
     }
     const float noise = gradient_noise(input.position.xy);
-    const float start = cascade == 0 ? 0.0 : frame.cascade_far[cascade - 1];
-    const float band_start = lerp(start, frame.cascade_far[cascade], 1.0 - frame.shadow_params.x);
-    const float into_band = saturate((distance - band_start) / max(frame.cascade_far[cascade] - band_start, 1e-4));
+    const float into_band = cascade_band(frame, cascade, distance);
     // The last cascade fades to lit over its band, so the shadow distance has no hard line (only
     // pixels in it to begin with: one handed on from the cascade before isn't in its band).
     const float fade_out = cascade == kCascadeCount - 1 ? into_band : 0.0;
