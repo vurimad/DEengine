@@ -11,6 +11,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | `mesh_format.h` | `.demesh`: 32-byte vertices, 32-bit indices, LODs, parts, material slots, bounds |
 | `texture_format.h` | `.detex`: a 2D texture with its mip chain, BCn or RGBA8 |
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
+| `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, name, flags); its meshes are its dependencies |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |
 | `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload |
 
@@ -27,6 +28,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 
 - `load(ref)` holds an asset and returns its handle at once; the read goes straight into the asset's memory (VFS, with the IO priority asked for), is checked with `load_in_place` on a job, and is committed by `update()` with the other finished reads, once per frame, on the registry's thread. Its header's dependencies are then loaded and held for it.
 - States: `Loading`, then `Ready` once its file is in and every dependency is `Ready` or `Failed`; `Failed` when the file is missing, unreadable, corrupt or of another type, with an error naming the asset and its file. A failed dependency doesn't fail what uses it: the renderer draws a placeholder.
+- `revision(handle)` counts the contents committed (Ready, then each reload swapped in): what was built from an asset is up to date while it's unchanged.
 - Every `load()` needs a `release()`. An asset nobody holds is unloaded at the next `update()`, and lets go of its dependencies, which may go too. One let go while its read is in flight goes once the read is in.
 - Listeners hear `Ready`, `Failed`, `Reloaded` and `Unloaded`, in order, from `update()`. Pointers from `get()` and `file()` stay valid until an `update()` reports `Reloaded` or `Unloaded` for that asset.
 - Assets are keyed by ID and type: the same ID asked for as another type is another (failed) asset, and a file whose header holds another ID is refused.

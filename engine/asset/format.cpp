@@ -16,6 +16,8 @@ const char* asset_type_extension(AssetType type) {
         return ".demat";
     case AssetType::Shader:
         return ".deshader";
+    case AssetType::Cell:
+        return ".decell";
     case AssetType::Unknown:
         break;
     }
@@ -32,6 +34,8 @@ const char* asset_type_name(AssetType type) {
         return "material";
     case AssetType::Shader:
         return "shader";
+    case AssetType::Cell:
+        return "cell";
     case AssetType::Unknown:
         break;
     }

@@ -3,6 +3,8 @@
 add_library(de_asset STATIC
     asset_id.cpp
     asset_id.h
+    cell_format.cpp
+    cell_format.h
     format.cpp
     format.h
     material_format.cpp

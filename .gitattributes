@@ -18,6 +18,7 @@
 # Meshes and scenes
 *.fbx  filter=lfs diff=lfs merge=lfs -text
 *.glb  filter=lfs diff=lfs merge=lfs -text
+*.bin  filter=lfs diff=lfs merge=lfs -text
 # Audio
 *.wav  filter=lfs diff=lfs merge=lfs -text
 *.ogg  filter=lfs diff=lfs merge=lfs -text

@@ -22,6 +22,7 @@ enum class SourceKind : uint8_t {
     Gltf,     // .gltf .glb
     Fbx,      // .fbx
     Material, // .material: our own text material (JSON)
+    Cell,     // .cell: the entities placed in one cell of the world (JSON)
 };
 
 const char* source_kind_name(SourceKind kind);
