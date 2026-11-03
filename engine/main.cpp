@@ -189,6 +189,8 @@ int main(int argc, char** argv) {
     bind(move_y, "gamepad:lefty", -1.0f); // stick up is negative y
     const ActionId toggle_stats = input.add_action("toggle_stats"_sid, ActionKind::Button);
     bind(toggle_stats, "key:F1");
+    const ActionId next_view = input.add_action("debug.next_view"_sid, ActionKind::Button); // G-buffer views
+    bind(next_view, "key:F2");
     if (!bound) {
         return EXIT_FAILURE;
     }
@@ -280,10 +282,6 @@ int main(int argc, char** argv) {
     // The scene's light, and what the window shows: F2 steps through the G-buffer's channels.
     const de::render::SceneLighting scene_lighting;
     de::render::SceneView scene_view = de::render::SceneView::Lit;
-    const ActionId next_view = input.add_action("debug.next_view"_sid, ActionKind::Button);
-    if (!input.bind(next_view, "key:F2").ok()) {
-        DE_LOG_ERROR("input", "can't bind F2");
-    }
     const flecs::entity camera = world->ecs().entity("free_camera").set(de::world::Camera{.vertical_fov_rad = 1.0f});
     world->ecs().set(de::world::ActiveCamera{.entity = camera.id()});
 
@@ -378,10 +376,11 @@ int main(int argc, char** argv) {
                                                                          .state = de::rhi::ResourceState::Present,
                                                                          .final_state = de::rhi::ResourceState::Present,
                                                                          .discard = true});
-            static constexpr de::rhi::Color kDusk{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f}; // no shaders
+            // Without shaders (no SceneRenderer), the window is cleared to the scene's empty color.
+            static constexpr de::rhi::Color kDusk{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
             if (scene_renderer) {
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
-                                           scene_lighting, scene_view);
+                                           scene_lighting, scene_view, kDusk);
             } else {
                 graph->add_pass(
                     "clear",

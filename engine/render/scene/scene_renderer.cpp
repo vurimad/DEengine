@@ -2,10 +2,14 @@
 
 #include "core/allocator.h"
 #include "core/log.h"
+#include "core/math.h"
 #include "core/profile.h"
 #include "render/rhi/device.h"
 #include "render/scene/gpu_assets.h"
 #include "world/render_extract.h"
+
+#include <glm/gtc/matrix_access.hpp>
+#include <glm/mat4x4.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -62,6 +66,7 @@ struct TonemapPush {
     uint32_t gb2 = 0;
     float exposure = 1.0f;
     uint32_t view = 0;
+    uint32_t srgb_target = 0;
 };
 
 constexpr uint64_t kInstancesOffset = 256; // after the SceneFrame
@@ -92,6 +97,7 @@ struct SceneRendererState {
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
     SceneRendererStats stats;
+    bool frame_written = false; // this frame's SceneFrame: set by the G-buffer pass, read by the light pass
 
     ~SceneRendererState() {
         for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap}) {
@@ -108,13 +114,8 @@ struct SceneRendererState {
         return program ? *program : shader::ProgramHandle{};
     }
 
-    void make_programs(rhi::Format target_format) {
-        if (target_format == programs_format) {
-            return;
-        }
-        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap}) {
-            shaders->destroy(program);
-        }
+    // The G-buffer and light programs: their formats are the renderer's own, so made once.
+    void make_scene_programs() {
         rhi::GraphicsPipelineDesc gbuffer{.color_count = 4,
                                           .depth_format = kDepthFormat,
                                           .depth_test = true,
@@ -134,7 +135,14 @@ struct SceneRendererState {
         light.color_formats[0] = kHdrFormat;
         light.blend[0] = rhi::BlendMode::Additive;
         deferred_light = make("scene.deferred_light", light);
+    }
 
+    // The tonemap writes the caller's target: made again when its format changes.
+    void make_tonemap(rhi::Format target_format) {
+        if (target_format == programs_format) {
+            return;
+        }
+        shaders->destroy(tonemap);
         rhi::GraphicsPipelineDesc post{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "tonemap"};
         post.color_formats[0] = target_format;
         tonemap = make("scene.tonemap", post);
@@ -246,45 +254,20 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
 }
 
 bool invert_4x4(const float (&m)[16], float (&out)[16]) {
-    // Gauss-Jordan with partial pivoting, in doubles.
-    double a[4][8] = {};
+    // glm is column-major: element [column][row].
+    glm::dmat4 matrix;
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
-            a[r][c] = m[r * 4 + c];
-        }
-        a[r][4 + r] = 1.0;
-    }
-    for (int col = 0; col < 4; ++col) {
-        int pivot = col;
-        for (int r = col + 1; r < 4; ++r) {
-            if (std::abs(a[r][col]) > std::abs(a[pivot][col])) {
-                pivot = r;
-            }
-        }
-        if (std::abs(a[pivot][col]) < 1e-12) {
-            return false;
-        }
-        if (pivot != col) {
-            for (int c = 0; c < 8; ++c) {
-                std::swap(a[col][c], a[pivot][c]);
-            }
-        }
-        const double scale = 1.0 / a[col][col];
-        for (double& value : a[col]) {
-            value *= scale;
-        }
-        for (int r = 0; r < 4; ++r) {
-            if (r != col && a[r][col] != 0.0) {
-                const double factor = a[r][col];
-                for (int c = 0; c < 8; ++c) {
-                    a[r][c] -= factor * a[col][c];
-                }
-            }
+            matrix[c][r] = m[r * 4 + c];
         }
     }
+    if (std::abs(glm::determinant(matrix)) < 1e-30) {
+        return false;
+    }
+    const glm::dmat4 inverse = glm::inverse(matrix);
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
-            out[r * 4 + c] = static_cast<float>(a[r][4 + c]);
+            out[r * 4 + c] = static_cast<float>(inverse[c][r]);
         }
     }
     return true;
@@ -299,6 +282,7 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->device = desc.device;
     state->shaders = desc.shaders;
     state->gpu_assets = desc.gpu_assets;
+    state->make_scene_programs();
     return SceneRenderer(state);
 }
 
@@ -320,10 +304,11 @@ SceneRenderer& SceneRenderer::operator=(SceneRenderer&& other) noexcept {
 }
 
 void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format,
-                               const world::RenderFrame& frame, const SceneLighting& lighting, SceneView view) {
+                               const world::RenderFrame& frame, const SceneLighting& lighting, SceneView view,
+                               rhi::Color empty) {
     DE_PROFILE_ZONE("scene passes setup");
     SceneRendererState& state = *state_;
-    state.make_programs(target_format);
+    state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
     const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);
     const rhi::PipelineHandle gbuffer_none = state.shaders->pipeline(state.gbuffer_cull_none);
@@ -335,8 +320,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
             "scene (cleared)", [&](PassBuilder& pass) { pass.use(target, rhi::ResourceState::RenderTarget); },
-            [target](PassContext& context) {
-                const rhi::ColorAttachment color{.texture = context.texture(target)};
+            [target, empty](PassContext& context) {
+                const rhi::ColorAttachment color{.texture = context.texture(target), .clear = empty};
                 context.list.begin_rendering({.colors = std::span(&color, 1)});
                 context.list.end_rendering();
             });
@@ -390,8 +375,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.begin_rendering({.colors = colors, .depth = &depth});
             const rhi::TextureDesc& size = context.desc(data.targets.hdr);
             const float aspect = static_cast<float>(size.width) / static_cast<float>(std::max(size.height, 1U));
-            if (data.frame_buffer.is_valid() &&
-                renderer.write_frame(data.frame_buffer, extracted, data.lighting, aspect)) {
+            renderer.frame_written = data.frame_buffer.is_valid() &&
+                                     renderer.write_frame(data.frame_buffer, extracted, data.lighting, aspect);
+            if (renderer.frame_written) {
                 const uint64_t address = context.device.buffer_address(data.frame_buffer);
                 GBufferPush push{.frame = address,
                                  .instances = address + kInstancesOffset,
@@ -435,11 +421,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
         },
-        [targets, frame_buffer, light](PassContext& context) {
+        [&state, targets, frame_buffer, light](PassContext& context) {
             DE_PROFILE_ZONE("deferred light pass");
             const rhi::ColorAttachment color{.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
-            if (frame_buffer.is_valid()) {
+            if (state.frame_written) { // the G-buffer pass ran just before, in this execute()
                 context.list.bind_pipeline(light);
                 context.list.push_constants(DeferredLightPush{
                     .frame = context.device.buffer_address(frame_buffer),
@@ -455,6 +441,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
 
     const float exposure = std::exp2(lighting.exposure_ev);
     const auto view_index = static_cast<uint32_t>(view);
+    const uint32_t srgb_target = rhi::format_info(target_format).srgb ? 1 : 0;
     graph.add_pass(
         "tonemap",
         [&](PassBuilder& pass) {
@@ -464,7 +451,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             }
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
-        [targets, target, tonemap, exposure, view_index](PassContext& context) {
+        [targets, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
             DE_PROFILE_ZONE("tonemap pass");
             const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
@@ -476,6 +463,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
                 .exposure = exposure,
                 .view = view_index,
+                .srgb_target = srgb_target,
             });
             context.list.draw(3);
             context.list.end_rendering();

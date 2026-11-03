@@ -75,9 +75,11 @@ public:
     SceneRenderer& operator=(const SceneRenderer&) = delete;
 
     // Adds the passes that draw frame into target (frame must stay valid until the graph
-    // executes). Without a camera, or while the shaders are missing, the target is cleared.
+    // executes). Without a camera, or while the shaders are missing, the target is cleared to
+    // empty.
     void add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format, const world::RenderFrame& frame,
-                    const SceneLighting& lighting, SceneView view = SceneView::Lit);
+                    const SceneLighting& lighting, SceneView view = SceneView::Lit,
+                    rhi::Color empty = {.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f});
 
     SceneRendererStats stats() const;
 
@@ -91,7 +93,7 @@ private:
 // with an infinite reverse-Z perspective: rows of a 4x4, so clip = rows . (p, 1).
 void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect, float (&out)[16]);
 
-// The inverse of a 4x4 (rows); false (out untouched) if it's singular.
+// The inverse of a 4x4 (rows), through glm in doubles; false (out untouched) if it's singular.
 bool invert_4x4(const float (&m)[16], float (&out)[16]);
 
 } // namespace de::render

@@ -29,7 +29,8 @@ core::Result<FreeCameraActions> add_free_camera_actions(platform::Input& input);
 // A fly camera for looking around a scene (a debug tool, not the game's camera). Each frame,
 // update() moves it by the actions over the real frame time and places its entity there at once
 // (place(): no interpolation lag). It looks down its -Z; yaw turns about world up, pitch is
-// clamped short of straight up and down.
+// clamped short of straight up and down. Stick drift is the input's deadzone's job
+// (Input::set_stick_deadzone, deengine --deadzone).
 class FreeCamera {
 public:
     FreeCamera(const DVec3& position, float yaw_rad, float pitch_rad)
@@ -43,7 +44,6 @@ public:
     float speed_mps = 6.0f;          // walking pace; fast is 6 times this
     float mouse_rad_per_px = 0.003f; // look sensitivity
     float stick_rad_per_s = 2.5f;
-    static constexpr float kAxisDeadzone = 0.3f; // stick values below it are ignored (drift)
 
 private:
     DVec3 position_;

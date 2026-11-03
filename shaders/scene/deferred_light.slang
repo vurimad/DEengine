@@ -27,14 +27,11 @@ struct VertexOutput
     float2 ndc : TEXCOORD;
 };
 
-// A triangle covering the screen.
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 {
-    const float2 corner = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));
     VertexOutput output;
-    output.ndc = corner * 2.0 - 1.0;
-    output.position = float4(output.ndc, 0.0, 1.0);
+    output.position = fullscreen_triangle(vertex_id, output.ndc);
     return output;
 }
 
@@ -98,14 +95,16 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const float3 v = normalize(to_camera);
     if (depth <= 0.0)
     {
-        return float4(sky(frame, -v), 1.0);
+        return float4(min(sky(frame, -v), kHalfMax), 1.0);
     }
 
     const GBufferSample s = unpack_gbuffer(load_texture(push.gb0, texel), load_texture(push.gb1, texel).xy,
                                            load_texture(push.gb2, texel));
     const float3 n = s.normal;
     const float3 l = frame.sun_direction.xyz;
-    const float3 h = normalize(l + v);
+    // Looking straight at the sun from under the surface, l + v is zero: the normal stands in.
+    const float3 half_vector = l + v;
+    const float3 h = dot(half_vector, half_vector) > 1e-8 ? normalize(half_vector) : n;
     const float n_dot_v = max(dot(n, v), 1e-4);
     const float n_dot_l_raw = dot(n, l);
     const float n_dot_l = saturate(n_dot_l_raw);
@@ -130,5 +129,6 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const float3 r = reflect(-v, n);
     const float3 ambient = (albedo * hemisphere(frame, n) + env_brdf(f0, s.roughness, n_dot_v) * hemisphere(frame, r)) *
                            s.occlusion;
-    return float4(sun + ambient, 1.0);
+    // Mirror-smooth highlights overflow half floats (+inf, then NaN in the tonemap): kept finite.
+    return float4(min(sun + ambient, kHalfMax), 1.0);
 }

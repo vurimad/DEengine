@@ -2,6 +2,7 @@
 // an sRGB target (the hardware encodes). Debug views show a G-buffer channel instead.
 
 import common.bindless;
+import common.color;
 import scene.scene_common;
 
 struct TonemapPush
@@ -10,8 +11,9 @@ struct TonemapPush
     uint gb0;
     uint gb1;
     uint gb2;
-    float exposure; // multiplier: 2^EV
-    uint view;      // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency
+    float exposure;    // multiplier: 2^EV
+    uint view;         // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency
+    uint srgb_target;  // the target encodes to sRGB: data views are decoded first, so they show as stored
 };
 
 [[vk::push_constant]]
@@ -25,10 +27,16 @@ struct VertexOutput
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 {
-    const float2 corner = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));
+    float2 ndc;
     VertexOutput output;
-    output.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
+    output.position = fullscreen_triangle(vertex_id, ndc);
     return output;
+}
+
+// A data value (a normal, a roughness) shown as itself: an sRGB target would encode it brighter.
+float4 show_data(float3 value)
+{
+    return float4(push.srgb_target != 0 ? srgb_to_linear(value) : value, 1.0);
 }
 
 // Narkowicz's fit of the ACES filmic curve.
@@ -48,13 +56,13 @@ float4 fragment_main(VertexOutput input) : SV_Target
         switch (push.view)
         {
         case 1: return float4(s.base_color, 1.0);
-        case 2: return float4(s.normal * 0.5 + 0.5, 1.0);
-        case 3: return float4(s.roughness.xxx, 1.0);
-        case 4: return float4(s.metalness.xxx, 1.0);
-        case 5: return float4(s.occlusion.xxx, 1.0);
-        default: return float4(s.translucency.xxx, 1.0);
+        case 2: return show_data(s.normal * 0.5 + 0.5);
+        case 3: return show_data(s.roughness.xxx);
+        case 4: return show_data(s.metalness.xxx);
+        case 5: return show_data(s.occlusion.xxx);
+        default: return show_data(s.translucency.xxx);
         }
     }
-    const float3 hdr = load_texture(push.hdr, texel).rgb;
+    const float3 hdr = clamp(load_texture(push.hdr, texel).rgb, 0.0, kHalfMax);
     return float4(aces(hdr * push.exposure), 1.0);
 }

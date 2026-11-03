@@ -7,7 +7,6 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
-#include <cmath>
 
 namespace de::tools {
 
@@ -66,12 +65,7 @@ void FreeCamera::update(const platform::Input& input, const FreeCameraActions& a
                         flecs::entity camera) {
     DE_PROFILE_ZONE("free camera");
     // Look: the stick as a rate, mouse motion in pixels while its button is held.
-    // Sticks that don't rest at zero (drift above the input deadzone) mustn't fly the camera off:
-    // small values are dropped here (keys give 1).
-    const auto axis = [&](platform::ActionId action) {
-        const float value = input.state(action).value;
-        return std::abs(value) < kAxisDeadzone ? 0.0f : value;
-    };
+    const auto axis = [&](platform::ActionId action) { return input.state(action).value; };
     const bool mouse = input.state(actions.look_hold).down;
     const float stick = stick_rad_per_s * frame_s;
     const float yaw =

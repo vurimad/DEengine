@@ -79,6 +79,17 @@ public float2 octahedral_encode(float3 n)
     return n.xy;
 }
 
+// A triangle covering the screen, for full-screen passes: draw(3). ndc in [-1, 1], +Y up.
+public float4 fullscreen_triangle(uint vertex_id, out float2 ndc)
+{
+    const float2 corner = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));
+    ndc = corner * 2.0 - 1.0;
+    return float4(ndc, 0.0, 1.0);
+}
+
+// The largest finite value an RGBA16 float target holds, with a little room.
+public static const float kHalfMax = 60000.0;
+
 public float4 mul_rows(float4 rows[4], float4 v)
 {
     return float4(dot(rows[0], v), dot(rows[1], v), dot(rows[2], v), dot(rows[3], v));

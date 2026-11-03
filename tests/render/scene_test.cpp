@@ -239,6 +239,14 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         CHECK(lit_center[0] > 2 * lit_center[2]);
         const uint8_t* lit_sky = texel(lit, 1, 1);
         CHECK(lit_sky[2] > lit_sky[0]); // bluish
+        // Nothing to look through: cleared to the empty color (0.10, 0.11, 0.15 by default).
+        frame.camera.valid = false;
+        const de::core::Array<std::byte> cleared = render(de::render::SceneView::Lit);
+        const uint8_t* empty = texel(cleared, kSize / 2, kSize / 2);
+        CHECK(empty[0] == doctest::Approx(26).epsilon(0.05));
+        CHECK(empty[1] == doctest::Approx(28).epsilon(0.05));
+        CHECK(empty[2] == doctest::Approx(38).epsilon(0.05));
+        frame.camera.valid = true;
         const uint8_t* center = texel(pixels, kSize / 2, kSize / 2);
         CHECK(center[0] == 255);
         CHECK(center[1] == 0);
