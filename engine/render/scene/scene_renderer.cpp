@@ -223,13 +223,7 @@ struct SceneRendererState {
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render))};
-    SceneShadows shadows; // this frame's, within limits
-    // Last frame's camera, for motion vectors: what it was relative to the render origin then.
-    float previous_camera[12] = {};
-    float previous_fov_rad = 0.0f;
-    float previous_near_m = 0.0f;
-    DVec3 previous_origin{0.0};
-    bool has_previous_camera = false;
+    SceneShadows shadows;                               // this frame's, within limits
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
@@ -363,22 +357,13 @@ struct SceneRendererState {
         if (!invert_4x4(scene.view_proj, scene.inv_view_proj)) {
             return false;
         }
-        // Last frame's camera, moved to this frame's render origin; the same as this one's at first.
-        if (has_previous_camera) {
-            for (const int row : {0, 1, 2}) {
-                const double shifted =
-                    static_cast<double>(previous_camera[row * 4 + 3]) + previous_origin[row] - frame.origin[row];
-                previous_camera[row * 4 + 3] = static_cast<float>(shifted);
-            }
-            camera_view_proj(previous_camera, previous_fov_rad, previous_near_m, aspect, scene.previous_view_proj);
+        // Last frame's view (at this frame's render origin); after a cut, or at first, this one's.
+        if (frame.camera.previous_valid) {
+            camera_view_proj(frame.camera.previous_transform, frame.camera.previous_vertical_fov_rad,
+                             frame.camera.previous_near_m, aspect, scene.previous_view_proj);
         } else {
             std::memcpy(scene.previous_view_proj, scene.view_proj, sizeof(scene.view_proj));
         }
-        std::memcpy(previous_camera, frame.camera.transform, sizeof(previous_camera));
-        previous_fov_rad = frame.camera.vertical_fov_rad;
-        previous_near_m = frame.camera.near_m;
-        previous_origin = frame.origin;
-        has_previous_camera = true;
         scene.camera_position[0] = frame.camera.transform[3];
         scene.camera_position[1] = frame.camera.transform[7];
         scene.camera_position[2] = frame.camera.transform[11];
@@ -432,9 +417,10 @@ struct SceneRendererState {
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         for (size_t i = 0; i < frame.instances.size(); ++i) {
-            static_assert(offsetof(world::RenderInstance, previous_transform) == 48); // right after transform
-            std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
-                        kInstanceBytes);
+            static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
+            std::byte* const rows = mapped.data() + kInstancesOffset + i * kInstanceBytes;
+            std::memcpy(rows, frame.instances[i].transform, kInstanceBytes / 2);
+            std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
         device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
         return true;

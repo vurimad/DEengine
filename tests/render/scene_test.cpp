@@ -1022,6 +1022,11 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
             renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {}, de::render::SceneView::Motion);
             graph->execute();
             device->end_frame();
+            // As extraction does: what was drawn is the next frame's previous view.
+            std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
+            frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
+            frame.camera.previous_near_m = frame.camera.near_m;
+            frame.camera.previous_valid = true;
             return de::test::read_texture(*device, *target);
         };
         const auto level = [](float uv_motion) { return (uv_motion * 5.0f + 0.5f) * 255.0f; };
@@ -1048,11 +1053,21 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
         check_center(0.2f * uv_per_m, -0.1f * uv_per_m);
         frame.instances[0] = square;
         check_center(0.0f, 0.0f); // the camera didn't move, and the square says it didn't
-        // The render origin jumps 1 km and everything is given relative to it: nothing moved.
-        frame.origin.x = 1024.0;
-        frame.camera.transform[3] -= 1024.0f;
-        frame.instances[0].transform[3] -= 1024.0f;
-        frame.instances[0].previous_transform[3] -= 1024.0f;
+        // A cut: the camera jumped, and this frame says not to look back.
+        frame.camera.transform[3] = 40.0f;
+        frame.camera.previous_valid = false;
+        check_center(0.0f, 0.0f);
+        frame.camera.transform[3] = 0.1f;
+        frame.camera.previous_valid = false;
+        check_center(0.0f, 0.0f);
+        // A surface that was behind last frame's camera (past the square, looking away from it): no
+        // previous position. A motion off the screen, down and right, whatever its clip w's sign said.
+        frame.camera.transform[11] = -4.0f;
+        static_cast<void>(shown());
+        frame.camera.transform[11] = 3.0f;
+        const de::core::Array<std::byte> behind = shown();
+        CHECK(texel(behind, kSize / 2, kSize / 2)[0] == 255);
+        CHECK(texel(behind, kSize / 2, kSize / 2)[1] == 255);
         check_center(0.0f, 0.0f);
 
         frame.instances.clear();

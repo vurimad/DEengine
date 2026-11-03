@@ -180,7 +180,9 @@ FrameStep World::advance(double real_dt_s) {
         step.dropped_time = true;
     }
     state.alpha = static_cast<float>(state.accumulator_s / state.tick_dt_s);
-    state.alpha_step = static_cast<float>(std::max(real_dt_s, 0.0) / state.tick_dt_s);
+    // Bounded by what the ticks cover: a hitch's dropped time is motion nothing went through.
+    state.alpha_step = static_cast<float>(
+        std::min(std::max(real_dt_s, 0.0) / state.tick_dt_s, static_cast<double>(state.max_ticks_per_frame)));
     step.alpha = state.alpha;
     {
         DE_PROFILE_ZONE("world frame");

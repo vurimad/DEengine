@@ -43,6 +43,14 @@ WorldTransform compose(const WorldTransform& parent, const Transform& local);
 // Equal transforms (most of a world: static) come back as they are, without a slerp.
 WorldTransform interpolate(const WorldTransform& previous, const WorldTransform& current, float alpha);
 
+// Where the same motion had it at alpha, which may lie before the previous tick (below 0): the
+// position and rotation carry on backward; the scale stays the previous tick's (extrapolated, a
+// growing thing would pass through zero and mirror). For motion vectors.
+WorldTransform pose_at(const WorldTransform& previous, const WorldTransform& current, float alpha);
+
+// Whether two transforms are equal: what doesn't move needs no second look.
+bool same_transform(const WorldTransform& a, const WorldTransform& b);
+
 // A float 3x4 matrix (rows: x, y, z; translation in the last column) of a world transform,
 // relative to origin: where doubles become floats, for the GPU.
 void to_matrix_3x4(const WorldTransform& transform, const DVec3& origin, float (&out)[12]);

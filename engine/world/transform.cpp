@@ -40,6 +40,18 @@ WorldTransform interpolate(const WorldTransform& previous, const WorldTransform&
     };
 }
 
+WorldTransform pose_at(const WorldTransform& previous, const WorldTransform& current, float alpha) {
+    WorldTransform pose = interpolate(previous, current, alpha);
+    if (alpha < 0.0f) {
+        pose.scale = previous.scale;
+    }
+    return pose;
+}
+
+bool same_transform(const WorldTransform& a, const WorldTransform& b) {
+    return same(a, b);
+}
+
 void to_matrix_3x4(const WorldTransform& transform, const DVec3& origin, float (&out)[12]) {
     const Mat3 rotation = glm::mat3_cast(transform.rotation);
     const Vec3 position = Vec3(transform.position - origin);
