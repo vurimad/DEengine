@@ -810,7 +810,24 @@ The world is one seamless space streamed around the player in a grid of cells, w
 4. Unload reverses the order and frees the cell arena in one shot.
 5. Budgets per category with hysteresis prevent load/unload thrashing at cell borders.
 
-**Large-world precision.** World coordinates in double precision on the CPU, camera-relative floats on the GPU, so a 10+ km world has no jitter.
+**Large-world precision.** World coordinates in double precision on the CPU, floats relative to a render origin near the camera on the GPU, so a 10+ km world has no jitter.
+
+- Positions are doubles everywhere on the CPU (`Transform.position`); rotation and scale stay float. The simulation never rebases: physics, AI, saves and distances all see one fixed world space. At 60k entities this costs about 2 MB.
+- The GPU sees floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Extraction is the only place doubles become floats; moving the origin re-uploads instances once, and nothing outside extraction knows it exists. Static instances otherwise upload once, so change-only uploads keep working. Within 1 km of the origin, float precision is about 0.06 mm.
+
+**World model: one owner per thing, data flowing one way.** No system keeps its own copy of what exists in the world; the flecs world is the only list.
+
+```
+.cell (text) --cooker--> .decell asset --registry--> cell entity --spawn--> entities --extract--> GPU
+```
+
+- **A cell is an asset.** Its cooked `.decell` lists every asset its entities use as dependencies, so the registry makes it Ready only when they're resident: the activation rule above, with nothing added.
+- **A cell is an entity.** When the cell asset is Ready, its entities are created in one batch on the main thread, each with an `(InCell, cell)` pair. `InCell` is `DontFragment` (cells don't create tables) with `(OnDeleteTarget, Delete)`: unloading a cell is deleting its entity, which deletes its members; an observer on the cell's component releases its asset, which releases what it held. No lists, no manual cleanup.
+- **Lifetime and transforms are separate.** Placed entities are roots with world-space transforms; the non-fragmenting `Parent` hierarchy is for things actually attached (a sword in a hand, a prefab's parts), and world transforms are computed down it once per tick.
+- **Entities hold non-owning asset handles.** A `MeshInstance` names its mesh by handle without a reference: the cell holds the references, and a member never outlives its cell, so a handle can't dangle.
+- **The renderer owns no entity list.** RenderExtract queries the world each frame and writes what is visible into instance data. When instances become persistent (GPU-driven), the slot lives in a component on the entity, given and freed by observers, so it lives and dies with the entity.
+- **Mechanism now, policy later.** M0b loads cells explicitly; M1 adds the streamer that picks cells (ranking, budgets, hysteresis). The cell format and lifetime don't change between the two.
+- **Cell grid:** 128 m cells with integer coordinates; dungeons are grids of their own (M1). Cell contents in v1 are a fixed set (name, transform, parent, mesh; lights and cameras next); any reflected component comes with the editor.
 
 **World state.** A flat, saveable set of flags and counters keyed by stable IDs: opened shortcuts, killed bosses, picked-up items, NPC quest stages, discovered graces. Streamed entities consult world state when they spawn, so a looted chest stays looted.
 
@@ -1121,3 +1138,5 @@ Decisions so far:
 | 2026-11-02 | Cloth is a primary system: XPBD character cloth (Jolt soft bodies first), GPU environment cloth, spring bones | Moving capes, robes and banners are central to the look; cosmetic only, so determinism is untouched |
 | 2026-11-02 | Cooker libraries: yyjson (JSON), cgltf, ufbx, stb_image(_resize2), meshoptimizer, bc7enc_rdo (BC1-BC7), xxHash; ufbx and bc7enc_rdo through overlay vcpkg ports | Small, fast, permissive, with allocator hooks; no Assimp, no closed encoders |
 | 2026-11-02 | Cooked files named by asset ID in game:/, not by source path | Runtime loads by ID; one source makes several assets; the archive packer works by ID anyway |
+| 2026-11-03 | Double-precision world positions on the CPU; floats relative to a render origin on the GPU | No rebasing of simulation state; about 2 MB at 60k entities; change-only uploads keep working |
+| 2026-11-03 | Cells are assets and entities: members carry a non-fragmenting `(InCell, cell)` that deletes them with the cell; entities hold non-owning asset handles | One owner per thing, no mirrored lists between world, assets and renderer; streaming mechanism built in M0b, policy in M1 |
