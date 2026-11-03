@@ -282,14 +282,6 @@ int main(int argc, char** argv) {
         device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
-    // Cooked assets by ID (nothing loads them yet; the renderer will): reads, reference counts and,
-    // in dev builds, hot reload of files the cooker rewrites.
-    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs});
-    if (!assets) {
-        DE_LOG_ERROR("asset", "%s", assets.error().message);
-        device->destroy(*quad_texture);
-        return EXIT_FAILURE;
-    }
 
     // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
     // device, uploader and graph, so it goes before them.
