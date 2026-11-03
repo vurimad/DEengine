@@ -293,16 +293,16 @@ TEST_CASE("bindings read from text") {
     const ActionId roll = input.add_action("roll"_sid, ActionKind::Button);
     const ActionId move_x = input.add_action("move_x"_sid, ActionKind::Axis);
     const ActionId sprint = input.add_action("sprint"_sid, ActionKind::Button);
-    uint32_t skipped = 99;
-    const char* const text = "# a comment, then a blank line\n"
+    const char* const text = "\xEF\xBB\xBF# a byte order mark, a comment, then a blank line\n"
                              "\n"
                              "roll      key:Space\r\n"
                              "move_x    key:D\n"
                              "  move_x  key:A   -1   # left\n"
                              "sprint    \"key:Left Shift\"\n"
                              "jump      key:J\n"; // no such action: skipped
-    REQUIRE(input.bind_text(text, &skipped).ok());
-    CHECK(skipped == 1);
+    const de::core::Result<uint32_t> skipped = input.bind_text(text);
+    REQUIRE(skipped.ok());
+    CHECK(*skipped == 1);
     input.push(event("key:Space", 1.0f));
     input.push(event("key:A", 1.0f));
     input.push(event("key:Left Shift", 1.0f));
@@ -312,19 +312,68 @@ TEST_CASE("bindings read from text") {
     CHECK(input.state(sprint).down);
 }
 
-TEST_CASE("malformed bindings text is rejected") {
+TEST_CASE("a player's bindings replace the defaults of the actions they name") {
+    Input input;
+    const ActionId roll = input.add_action("roll"_sid, ActionKind::Button);
+    const ActionId look_x = input.add_action("look_x"_sid, ActionKind::Axis);
+    REQUIRE(input.bind_text("roll key:Space\nroll gamepad:b\nlook_x mouse:x 0.5\n").ok());
+    // The player's file: roll moves to R and gamepad Y (both kept), and a copy of the default look
+    // line doesn't double it.
+    REQUIRE(input.bind_text("roll key:R\nroll gamepad:y\nlook_x mouse:x 0.5\n", {.replace = true, .warn_unknown = true})
+                .ok());
+    input.push(event("key:Space", 1.0f));
+    input.push(event("gamepad:b", 1.0f));
+    input.push(event("mouse:x", 4.0f));
+    input.sample();
+    CHECK_FALSE(input.state(roll).down);
+    CHECK(input.state(look_x).value == doctest::Approx(2.0f));
+    input.push(event("key:R", 1.0f));
+    input.sample();
+    CHECK(input.state(roll).pressed);
+    input.push(event("key:R", 0.0f));
+    input.push(event("gamepad:y", 1.0f));
+    input.sample();
+    CHECK(input.state(roll).pressed);
+}
+
+TEST_CASE("unbinding a held action releases it") {
+    Input input;
+    const ActionId roll = button(input, "roll"_sid, "key:Space");
+    input.push(event("key:Space", 1.0f));
+    input.sample();
+    REQUIRE(input.state(roll).down);
+    input.unbind_all(roll);
+    input.sample();
+    CHECK(input.state(roll).released);
+    CHECK_FALSE(input.state(roll).down);
+    input.push(event("key:Space", 1.0f));
+    input.sample();
+    CHECK_FALSE(input.state(roll).down);
+}
+
+TEST_CASE("malformed bindings text is rejected and changes nothing") {
     const de::core::LogLevel saved = de::core::log_level();
     de::core::set_log_level(de::core::LogLevel::Fatal); // the rejections log errors by design
     Input input;
-    input.add_action("roll"_sid, ActionKind::Button);
+    const ActionId roll = button(input, "roll"_sid, "key:Space");
     input.add_action("move_x"_sid, ActionKind::Axis);
-    CHECK_FALSE(input.bind_text("roll\n").ok());                       // no binding
-    CHECK_FALSE(input.bind_text("move_x key:A -1 extra\n").ok());      // too many tokens
-    CHECK_FALSE(input.bind_text("move_x key:A minus\n").ok());         // the scale isn't a number
-    CHECK_FALSE(input.bind_text("move_x key:A 1.5x\n").ok());          // nor is this
-    CHECK_FALSE(input.bind_text("roll key:NotAKey\n").ok());           // an unknown binding
-    CHECK_FALSE(input.bind_text("roll key:Space\nroll Space\n").ok()); // stops at line 2
+    CHECK_FALSE(input.bind_text("roll\n").ok());                  // no binding
+    CHECK_FALSE(input.bind_text("move_x key:A -1 extra\n").ok()); // too many tokens
+    CHECK_FALSE(input.bind_text("move_x key:A minus\n").ok());    // the scale isn't a number
+    CHECK_FALSE(input.bind_text("move_x key:A 1.5x\n").ok());     // nor is this
+    CHECK_FALSE(input.bind_text("move_x key:A nan\n").ok());      // nor this, for a scale
+    CHECK_FALSE(input.bind_text("roll key:NotAKey\n").ok());      // an unknown binding
+    CHECK_FALSE(input.bind_text("roll mouse:x\n").ok());          // motion can't drive a button
+    // A bad line late in a player's file: the lines before it don't apply either.
+    CHECK_FALSE(input.bind_text("roll key:R\nroll Space\n", {.replace = true, .warn_unknown = false}).ok());
     de::core::set_log_level(saved);
+    input.push(event("key:Space", 1.0f));
+    input.push(event("key:R", 1.0f));
+    input.sample();
+    CHECK(input.state(roll).pressed);
+    input.push(event("key:Space", 0.0f));
+    input.sample();
+    CHECK_FALSE(input.state(roll).down); // R isn't bound: Space was the only thing holding it
 }
 
 TEST_CASE("release_all lets go of everything") {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/allocator.h"
+#include "core/array.h"
 #include "core/function_ref.h"
 #include "core/job_system.h"
 #include "core/result.h"
@@ -130,6 +131,8 @@ public:
 
     // Blocking: the whole file into dest (which must be large enough). Returns the bytes read.
     core::Result<size_t> read_file(const char* path, std::span<std::byte> dest) const;
+    // Blocking: the whole file, in memory from allocator. Fails if it changes size while read.
+    core::Result<core::Array<std::byte>> read_whole_file(const char* path, core::Allocator& allocator) const;
 
     // Blocking and atomic (temp file, then rename); creates missing folders. user:/, temp:/ and
     // src:/, and game:/ for the cooker (VfsDesc::game_writable).

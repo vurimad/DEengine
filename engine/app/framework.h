@@ -91,13 +91,14 @@ public:
     // Once the engine is up, before the first frame: add input actions (their bindings are read
     // after this), load the world. False stops the run.
     virtual bool startup(Engine& engine, const FrameworkArgs& args) = 0;
-    // Every frame, after input is sampled and before the world advances.
-    virtual void update(Engine& engine, float frame_s) = 0;
+    // Every frame, after input is sampled and before the world advances. False ends the run (the
+    // application's quit: the framework has no quit of its own, so the game can ask first).
+    virtual bool update(Engine& engine, float frame_s) = 0;
 };
 
-// Brings the engine up, runs the application in the frame loop until the window closes (or quit, or
-// --frames), and takes it down. The process's exit code: failure if anything couldn't start, or
-// validation reported errors.
+// Brings the engine up, runs the application in the frame loop until the window closes, the
+// application ends the run or --frames are done, and takes it down. The process's exit code: failure if anything
+// couldn't start, or validation reported errors.
 int run_framework(Application& application, const FrameworkArgs& args);
 
 } // namespace de::app

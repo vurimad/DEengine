@@ -37,6 +37,7 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     // its meshes are loaded.
     world::load_cell(engine.world.ecs(), cell);
 
+    quit_ = engine.input.add_action("quit"_sid, platform::ActionKind::Button);
     camera_actions_ = tools::add_free_camera_actions(engine.input);
     camera_ = engine.world.ecs().entity("free_camera").set(world::Camera{.vertical_fov_rad = 1.0f});
     engine.world.ecs().set(world::ActiveCamera{.entity = camera_.id()});
@@ -46,8 +47,11 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     return true;
 }
 
-void Viewer::update(Engine& engine, float frame_s) {
+bool Viewer::update(Engine& engine, float frame_s) {
     DE_PROFILE_ZONE("Viewer::update");
+    if (engine.input.state(quit_).pressed) {
+        return false;
+    }
     free_camera_.update(engine.input, camera_actions_, frame_s, camera_);
 #if DE_BUILD_DEV
     if (engine.input.state(next_view_).pressed) {
@@ -56,6 +60,7 @@ void Viewer::update(Engine& engine, float frame_s) {
         DE_LOG_INFO("render", "view: %s", render::scene_view_name(engine.view));
     }
 #endif
+    return true;
 }
 
 } // namespace de::app

@@ -289,10 +289,6 @@ const ActionState& Input::state(ActionId action) const {
     return actions_[action.index].published;
 }
 
-} // namespace de::platform
-
-namespace de::platform {
-
 namespace {
 
 bool is_space(char c) {
@@ -323,54 +319,112 @@ std::string_view next_token(std::string_view& line) {
     return token;
 }
 
+// One line of bindings text, split: the action's name empty for a blank line or a comment.
+struct BindingLine {
+    std::string_view action;
+    char binding[64] = {};
+    float scale = 1.0f;
+};
+
+bool parse_binding_line(std::string_view line, uint32_t line_number, BindingLine& out) {
+    out.action = next_token(line);
+    if (out.action.empty()) {
+        return true;
+    }
+    const std::string_view binding = next_token(line);
+    const std::string_view scale = next_token(line);
+    char scale_text[32] = {};
+    if (binding.empty() || binding.size() >= sizeof(out.binding) || scale.size() >= sizeof(scale_text) ||
+        !next_token(line).empty()) {
+        DE_LOG_ERROR("input", "bindings line %u: expected an action, a binding and an optional scale", line_number);
+        return false;
+    }
+    std::memcpy(out.binding, binding.data(), binding.size());
+    out.scale = 1.0f;
+    if (!scale.empty()) {
+        std::memcpy(scale_text, scale.data(), scale.size());
+        char* parsed_end = nullptr;
+        out.scale = std::strtof(scale_text, &parsed_end);
+        if (parsed_end != scale_text + scale.size() || !std::isfinite(out.scale)) {
+            DE_LOG_ERROR("input", "bindings line %u: '%s' isn't a number", line_number, scale_text);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
-core::Result<void> Input::bind_text(std::string_view text, uint32_t* skipped) {
-    uint32_t line_number = 0;
-    uint32_t unknown = 0;
-    while (!text.empty()) {
-        const size_t end = text.find('\n');
-        std::string_view line = text.substr(0, end);
-        text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1);
-        ++line_number;
-        const std::string_view action_name = next_token(line);
-        if (action_name.empty()) {
-            continue; // blank or a comment
-        }
-        const std::string_view binding = next_token(line);
-        const std::string_view scale_text = next_token(line);
-        char binding_text[64] = {};
-        char scale_buffer[32] = {};
-        if (binding.empty() || binding.size() >= sizeof(binding_text) || scale_text.size() >= sizeof(scale_buffer) ||
-            !next_token(line).empty()) {
-            DE_LOG_ERROR("input", "bindings line %u: expected an action, a binding and an optional scale", line_number);
-            return core::fail(core::ErrorCode::InvalidArgument, "malformed bindings line");
-        }
-        std::memcpy(binding_text, binding.data(), binding.size());
-        float scale = 1.0f;
-        if (!scale_text.empty()) {
-            std::memcpy(scale_buffer, scale_text.data(), scale_text.size());
-            char* parsed_end = nullptr;
-            scale = std::strtof(scale_buffer, &parsed_end);
-            if (parsed_end != scale_buffer + scale_text.size()) {
-                DE_LOG_ERROR("input", "bindings line %u: '%s' isn't a number", line_number, scale_buffer);
-                return core::fail(core::ErrorCode::InvalidArgument, "malformed bindings line");
+void Input::unbind_all(ActionId action) {
+    DE_ASSERT_MSG(action.is_valid() && action.index < actions_.size(), "unbind_all() on an unknown action");
+    Action& target = actions_[action.index];
+    for (const uint32_t index : target.bindings) {
+        // Released and taken off its source's list, it stays in bindings_, inert: nothing reaches it.
+        Binding& binding = bindings_[index];
+        update_binding(binding, 0.0f, 0);
+        binding.motion = 0.0f;
+        BindingList* list = bindings_by_source_.find(source_key(binding.source, binding.code));
+        for (size_t i = 0; list != nullptr && i < list->size(); ++i) {
+            if ((*list)[i] == index) {
+                list->remove_swap(i);
+                break;
             }
         }
-        const ActionId action = find_action(core::StringId(action_name.data(), action_name.size()));
-        if (!action.is_valid()) {
-            ++unknown;
-            continue;
-        }
-        if (const core::Result<void> bound = bind(action, binding_text, scale); !bound) {
-            DE_LOG_ERROR("input", "bindings line %u: %s (%s)", line_number, bound.error().message, binding_text);
-            return core::fail(bound.error());
+    }
+    target.bindings.clear();
+}
+
+core::Result<uint32_t> Input::bind_text(std::string_view text, const BindTextOptions& options) {
+    if (text.starts_with("\xEF\xBB\xBF")) {
+        text.remove_prefix(3); // a byte order mark, from an editor on Windows
+    }
+    core::Array<uint8_t> replaced(*allocator_); // per action: its old bindings are already dropped
+    replaced.resize(actions_.size(), 0);
+    uint32_t unknown = 0;
+    // Two passes: check every line, then bind, so a bad file changes nothing.
+    for (const bool apply : {false, true}) {
+        std::string_view rest = text;
+        uint32_t line_number = 0;
+        while (!rest.empty()) {
+            const size_t end = rest.find('\n');
+            const std::string_view line = rest.substr(0, end);
+            rest.remove_prefix(end == std::string_view::npos ? rest.size() : end + 1);
+            ++line_number;
+            BindingLine parsed;
+            if (!parse_binding_line(line, line_number, parsed)) {
+                return core::fail(core::ErrorCode::InvalidArgument, "malformed bindings line");
+            }
+            if (parsed.action.empty()) {
+                continue; // blank or a comment
+            }
+            const ActionId action = find_action(core::StringId(parsed.action.data(), parsed.action.size()));
+            if (!action.is_valid()) {
+                if (apply) {
+                    ++unknown;
+                    if (options.warn_unknown) {
+                        DE_LOG_WARN("input", "bindings line %u: no action '%.*s'", line_number,
+                                    static_cast<int>(parsed.action.size()), parsed.action.data());
+                    }
+                }
+                continue;
+            }
+            if (!apply) {
+                const core::Result<BindingSource> source = resolve_binding(parsed.binding);
+                if (!source || (actions_[action.index].kind == ActionKind::Button && is_motion(source->source))) {
+                    DE_LOG_ERROR("input", "bindings line %u: '%s' can't drive '%.*s'", line_number, parsed.binding,
+                                 static_cast<int>(parsed.action.size()), parsed.action.data());
+                    return core::fail(core::ErrorCode::InvalidArgument, "bad binding");
+                }
+                continue;
+            }
+            if (options.replace && replaced[action.index] == 0) {
+                unbind_all(action);
+                replaced[action.index] = 1;
+            }
+            DE_VERIFY(bind(action, parsed.binding, parsed.scale).ok()); // checked in the first pass
         }
     }
-    if (skipped != nullptr) {
-        *skipped = unknown;
-    }
-    return {};
+    return unknown;
 }
 
 } // namespace de::platform

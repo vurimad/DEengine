@@ -30,6 +30,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string_view>
 
 namespace de::app {
 
@@ -37,39 +38,39 @@ using namespace core::literals;
 
 namespace {
 
-// A text file read whole; empty if it isn't there.
-core::Array<char> read_text(const platform::Vfs& vfs, const char* path) {
-    core::Array<char> text(core::heap_allocator(core::MemoryTag::Platform));
-    const core::Result<uint64_t> size = vfs.file_size(path);
-    if (!size) {
-        return text;
-    }
-    text.resize(static_cast<size_t>(*size));
-    if (!vfs.read_file(path, std::as_writable_bytes(text.span())).ok()) {
-        text.clear();
-    }
-    return text;
+std::string_view as_text(const core::Array<std::byte>& bytes) {
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
 // Input bindings are text (docs/design.md, Input): the engine's (from the source tree in dev
-// builds, so edits apply on the next run without a cook), then the player's, which add to them.
+// builds, so edits apply on the next run without a cook), then the player's, whose lines replace
+// the engine's for the actions they name. In dev builds every action is added, so a line naming
+// none is a typo, and logged.
 bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_src) {
     const char* const engine_path = has_src ? "src:/config/input.bindings" : "game:/config/input.bindings";
-    const core::Array<char> engine_bindings = read_text(vfs, engine_path);
-    if (engine_bindings.empty()) {
-        DE_LOG_ERROR("input", "no bindings at %s (run the cooker)", engine_path);
+    const auto engine_bindings = vfs.read_whole_file(engine_path, core::heap_allocator(core::MemoryTag::Platform));
+    if (!engine_bindings) {
+        DE_LOG_ERROR("input", "%s: %s%s", engine_path, engine_bindings.error().message,
+                     vfs.exists(engine_path) ? "" : " (run the cooker)");
         return false;
     }
-    uint32_t skipped = 0;
-    if (!input.bind_text({engine_bindings.data(), engine_bindings.size()}, &skipped)) {
+    const core::Result<uint32_t> skipped =
+        input.bind_text(as_text(*engine_bindings), {.replace = false, .warn_unknown = DE_BUILD_DEV != 0});
+    if (!skipped) {
         return false; // logged, with the line
     }
-    const core::Array<char> player = read_text(vfs, "user:/input.bindings");
-    if (!player.empty() && !input.bind_text({player.data(), player.size()})) {
-        DE_LOG_WARN("input", "user:/input.bindings stopped at an error (logged)");
+    constexpr const char* kPlayerPath = "user:/input.bindings";
+    const bool has_player = vfs.exists(kPlayerPath);
+    if (has_player) {
+        const auto player = vfs.read_whole_file(kPlayerPath, core::heap_allocator(core::MemoryTag::Platform));
+        if (!player) {
+            DE_LOG_WARN("input", "%s: %s; the defaults stand", kPlayerPath, player.error().message);
+        } else if (!input.bind_text(as_text(*player), {.replace = true, .warn_unknown = true})) {
+            DE_LOG_WARN("input", "%s has an error (logged); the defaults stand", kPlayerPath);
+        }
     }
     DE_LOG_INFO("input", "bindings from %s%s (%u for actions this build doesn't have)", engine_path,
-                player.empty() ? "" : " and user:/input.bindings", skipped);
+                has_player ? " and user:/input.bindings" : "", *skipped);
     return true;
 }
 
@@ -89,8 +90,11 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
     if (const char* deadzone = flag_value(out, "--deadzone")) {
-        out.deadzone = std::strtof(deadzone, nullptr);
-        if (out.deadzone < 0.0f || out.deadzone > platform::Input::kMaxStickDeadzone) {
+        char* end = nullptr;
+        out.deadzone = std::strtof(deadzone, &end);
+        // The range test is negated, so NaN fails it too.
+        if (end == deadzone || *end != '\0' ||
+            !(out.deadzone >= 0.0f && out.deadzone <= platform::Input::kMaxStickDeadzone)) {
             DE_LOG_ERROR("input", "--deadzone must be between 0 and %.1f",
                          static_cast<double>(platform::Input::kMaxStickDeadzone));
             return false;
@@ -170,25 +174,40 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
     }
     auto uploader = rhi::Uploader::create(*device, {.staging_bytes = uint64_t{8} << 20U});
+    if (!uploader) {
+        DE_LOG_ERROR("render", "uploader: %s", uploader.error().message);
+        return EXIT_FAILURE;
+    }
     auto graph = render::RenderGraph::create(*device);
+    if (!graph) {
+        DE_LOG_ERROR("render", "render graph: %s", graph.error().message);
+        return EXIT_FAILURE;
+    }
     // Cooked assets by ID; made before the world, which releases what its cells hold through it,
     // and before GPU copies of what loads (they mirror it from then on).
     auto assets = asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs});
-    if (!uploader || !graph || !assets) {
-        DE_LOG_ERROR("engine", "the uploader, render graph or asset registry didn't start");
+    if (!assets) {
+        DE_LOG_ERROR("asset", "%s", assets.error().message);
         return EXIT_FAILURE;
     }
     auto world = world::World::create({.jobs = &jobs, .assets = &*assets});
+    if (!world) {
+        DE_LOG_ERROR("world", "%s", world.error().message);
+        return EXIT_FAILURE;
+    }
     auto gpu_assets = render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
-    if (!world || !gpu_assets) {
-        DE_LOG_ERROR("engine", "the world or GPU assets didn't start");
+    if (!gpu_assets) {
+        DE_LOG_ERROR("render", "gpu assets: %s", gpu_assets.error().message);
         return EXIT_FAILURE;
     }
     std::optional<render::SceneRenderer> scene_renderer;
     if (shaders) {
-        if (auto created = render::SceneRenderer::create(
-                {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}})) {
+        auto created = render::SceneRenderer::create(
+            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        if (created) {
             scene_renderer.emplace(std::move(*created));
+        } else {
+            DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }
     }
 
@@ -196,7 +215,6 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     if (args.deadzone >= 0.0f) {
         input.set_stick_deadzone(args.deadzone);
     }
-    const platform::ActionId quit = input.add_action("quit"_sid, platform::ActionKind::Button);
     Engine engine{.jobs = jobs,
                   .vfs = *vfs,
                   .window = *window,
@@ -249,9 +267,6 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 
         platform::pump_events(*window, input);
         input.sample();
-        if (input.state(quit).pressed) {
-            break;
-        }
         if (window->minimized() != was_minimized) {
             was_minimized = window->minimized();
             DE_LOG_INFO("platform", was_minimized ? "minimized" : "restored");
@@ -262,7 +277,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (shaders) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
-        application.update(engine, static_cast<float>(frame_s));
+        if (!application.update(engine, static_cast<float>(frame_s))) {
+            break; // the application is done (quit)
+        }
         assets->update();        // commits finished reads, unloads what nobody holds, reloads re-cooked files
         gpu_assets->update();    // meshes whose uploads are in become drawable
         world->advance(frame_s); // fixed ticks, then RenderExtract
@@ -301,12 +318,12 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
                                            engine.lighting, engine.view);
             } else {
-                // No shaders: the window is cleared to the scene's empty colour.
+                // No scene renderer: the window is cleared.
                 graph->add_pass(
                     "clear", [&](render::PassBuilder& pass) { pass.use(back, rhi::ResourceState::RenderTarget); },
                     [back](render::PassContext& context) {
                         const rhi::ColorAttachment color{.texture = context.texture(back),
-                                                         .clear = {.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f}};
+                                                         .clear = render::kEmptySceneColor};
                         context.list.begin_rendering({.colors = std::span(&color, 1)});
                         context.list.end_rendering();
                     });

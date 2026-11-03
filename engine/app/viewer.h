@@ -15,9 +15,10 @@ class Viewer final : public Application {
 public:
     Viewer();
     bool startup(Engine& engine, const FrameworkArgs& args) override;
-    void update(Engine& engine, float frame_s) override;
+    bool update(Engine& engine, float frame_s) override;
 
 private:
+    platform::ActionId quit_{}; // Escape, gamepad Back: no game to pause yet
     tools::FreeCameraActions camera_actions_{};
     tools::FreeCamera free_camera_;
     flecs::entity camera_;

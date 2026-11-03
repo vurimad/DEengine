@@ -1,6 +1,7 @@
 # Input bindings (docs/design.md, Input): action, binding, optional scale. Actions are added by code;
 # a line naming an action this build doesn't have (a dev tool's, in ship) is skipped. A player's
-# user:/input.bindings, in the same form, is read after this file and adds to it.
+# user:/input.bindings, in the same form, is read after this file: its lines replace these for the
+# actions they name.
 #
 # Bindings: key:<SDL key name> (in quotes when it has a space), mouse:left|right|middle|x|y,
 # gamepad:<SDL button or axis>. On an axis, the scale weights the input (-1 for the opposite way).
