@@ -13,19 +13,7 @@ constexpr int kStateVersion = 1;
 // Hashes are written like asset IDs: 16 hex digits (JSON numbers lose bits above 2^53). 0 is a
 // valid value here: a failed source's input hash, which never matches, so it cooks again.
 bool parse_hash(yyjson_val* value, uint64_t& out) {
-    if (!yyjson_is_str(value) || yyjson_get_len(value) != asset::kAssetIdTextLength) {
-        return false;
-    }
-    uint64_t hash = 0;
-    for (const char c : std::string_view(yyjson_get_str(value), yyjson_get_len(value))) {
-        const int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
-        if (digit < 0) {
-            return false;
-        }
-        hash = (hash << 4U) | static_cast<uint64_t>(digit);
-    }
-    out = hash;
-    return true;
+    return yyjson_is_str(value) && asset::parse_hex64({yyjson_get_str(value), yyjson_get_len(value)}, out);
 }
 
 void add_hash(yyjson_mut_doc* doc, yyjson_mut_val* object, const char* key, uint64_t hash) {
@@ -96,7 +84,7 @@ CookState CookState::load(const platform::Vfs& vfs, Diagnostics& diagnostics) {
         diagnostics.warning("", "%s could not be read: cooking everything", kPath);
         return state;
     }
-    Diagnostics ignored; // a broken state is reported once, below
+    Diagnostics ignored(false); // a broken state is reported once, below, as a warning
     const core::Result<JsonDoc> doc = JsonDoc::parse(text->span(), kPath, ignored);
     yyjson_val* root = doc ? doc->root() : nullptr;
     if (root == nullptr || yyjson_get_int(yyjson_obj_get(root, "version")) != kStateVersion) {
@@ -160,14 +148,6 @@ core::Result<void> CookState::save(const platform::Vfs& vfs) const {
     }
     return vfs.write_file(kPath, std::as_bytes(text.span()));
 }
-
-namespace {
-
-uint64_t path_key(std::string_view path) {
-    return core::fnv1a_64(path.data(), path.size());
-}
-
-} // namespace
 
 const CookRecord* CookState::find(std::string_view path) const {
     const uint32_t* index = by_path_.find(path_key(path));

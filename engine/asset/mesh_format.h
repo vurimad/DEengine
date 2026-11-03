@@ -67,8 +67,7 @@ struct MeshAsset {
     OffsetSpan<MeshPart> parts;
     OffsetSpan<MeshMaterialSlot> materials;
 
-    // Arrays inside the file; LODs, parts and slots refer to each other in range. Index values
-    // aren't checked (a pass over every index): the cooker guarantees them.
+    // Arrays inside the file; LODs, parts, slots and every index refer to each other in range.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
 static_assert(sizeof(MeshAsset) == 152);

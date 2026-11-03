@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 namespace de::cooker {
@@ -47,16 +48,21 @@ cgltf_result read_external(const cgltf_memory_options* /*memory*/, const cgltf_f
         context.diagnostics->error(context.path, "refers to '%s', outside content/", path);
         return cgltf_result_file_not_found;
     }
-    core::Result<core::Array<std::byte>> bytes = read_whole_file(*context.vfs, src_path(relative.view()).c_str());
-    if (!bytes) {
-        context.diagnostics->error(context.path, "its buffer %s could not be read: %s", relative.c_str(),
-                                   bytes.error().message);
+    // Read straight into the memory cgltf keeps (and frees through release_external).
+    const auto buffer_path = src_path(relative.view());
+    const core::Result<uint64_t> length = context.vfs->file_size(buffer_path.c_str());
+    void* memory = length ? core::tagged_malloc(core::MemoryTag::Tools, static_cast<size_t>(*length)) : nullptr;
+    const core::Result<size_t> read =
+        memory != nullptr ? context.vfs->read_file(buffer_path.c_str(), std::span(static_cast<std::byte*>(memory),
+                                                                                  static_cast<size_t>(*length)))
+                          : core::Result<size_t>(core::fail(core::ErrorCode::NotFound, "missing"));
+    if (!read || *read != *length) {
+        core::tagged_free(core::MemoryTag::Tools, memory);
+        context.diagnostics->error(context.path, "its buffer %s could not be read", relative.c_str());
         return cgltf_result_file_not_found;
     }
-    void* copy = core::tagged_malloc(core::MemoryTag::Tools, bytes->size());
-    std::memcpy(copy, bytes->data(), bytes->size());
-    *size = bytes->size();
-    *data = copy;
+    *size = static_cast<cgltf_size>(*length);
+    *data = memory;
     context.model->dependencies.push(relative);
     return cgltf_result_success;
 }
@@ -188,6 +194,12 @@ private:
             for (size_t i = base64.size(); i > 0 && base64[i - 1] == '='; --i) {
                 ++padding;
             }
+            // Whole groups of four, padding at most two: anything else isn't base64 (and would make
+            // the size wrap below).
+            if (base64.empty() || base64.size() % 4 != 0 || padding > 2) {
+                diagnostics_.error(source_.path.view(), "has a data: image URI that isn't valid base64");
+                return false;
+            }
             const size_t size = base64.size() / 4 * 3 - padding;
             void* decoded = nullptr;
             if (cgltf_load_buffer_base64(&options_, size, comma + 1, &decoded) != cgltf_result_success) {
@@ -197,6 +209,7 @@ private:
             embedded.encoded.assign(std::span(static_cast<const std::byte*>(decoded), size));
             options_.memory.free_func(options_.memory.user_data, decoded);
         }
+        embedded.key = static_cast<uint32_t>(index);
         image_slots_[index] = static_cast<uint32_t>(model_->images.size() - 1);
         return true;
     }
@@ -333,8 +346,7 @@ private:
                 readable = cgltf_accessor_read_float(uvs, v, vertex.uv, 2) && readable;
             }
             if (colors != nullptr) {
-                readable =
-                    cgltf_accessor_read_float(colors, v, vertex.color, cgltf_num_components(colors->type)) && readable;
+                readable = cgltf_accessor_read_float(colors, v, vertex.color, std::size(vertex.color)) && readable;
             }
         }
         if (primitive.indices != nullptr) {
@@ -380,21 +392,16 @@ private:
 } // namespace
 
 core::Result<ModelData> import_gltf(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
-                                    Diagnostics& diagnostics) {
+                                    std::span<const std::byte> bytes, Diagnostics& diagnostics) {
     DE_PROFILE_ZONE("import gltf");
     const auto path = src_path(source.path.view());
-    const core::Result<core::Array<std::byte>> bytes = read_whole_file(vfs, path.c_str());
-    if (!bytes) {
-        diagnostics.error(source.path.view(), "could not be read: %s", bytes.error().message);
-        return core::fail(bytes.error());
-    }
     ModelData model;
     ReadContext context{.vfs = &vfs, .model = &model, .path = source.path.view(), .diagnostics = &diagnostics};
     cgltf_options options{};
     options.memory = {.alloc_func = &gltf_alloc, .free_func = &gltf_free, .user_data = nullptr};
     options.file = {.read = &read_external, .release = &release_external, .user_data = &context};
     cgltf_data* data = nullptr;
-    cgltf_result result = cgltf_parse(&options, bytes->data(), bytes->size(), &data);
+    cgltf_result result = cgltf_parse(&options, bytes.data(), bytes.size(), &data);
     struct Free {
         cgltf_data* data;
         ~Free() { cgltf_free(data); }

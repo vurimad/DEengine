@@ -35,6 +35,10 @@ core::Result<void> ShaderAsset::validate(std::span<const std::byte> file) const 
                 !span_in_file(entry.code, size) || !span_in_file(entry.push_constants, size)) {
                 return core::fail(ErrorCode::CorruptData, "shader entry point is broken");
             }
+            // Drivers needn't reject what isn't SPIR-V; some crash on it.
+            if (entry.code.get(file.data())[0] != kSpirvMagic) {
+                return core::fail(ErrorCode::CorruptData, "shader code isn't SPIR-V");
+            }
             for (const ShaderPushConstant& field : entry.push_constants.get(file.data())) {
                 if (!terminated(field.name)) {
                     return core::fail(ErrorCode::CorruptData, "shader push constant name is broken");

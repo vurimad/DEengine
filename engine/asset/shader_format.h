@@ -15,7 +15,8 @@ enum class ShaderStageKind : uint8_t {
     Compute = 2,
 };
 
-inline constexpr size_t kShaderNameSize = 64; // 63 characters and the terminator, as in the compiler
+inline constexpr size_t kShaderNameSize = 64;       // 63 characters and the terminator, as in the compiler
+inline constexpr uint32_t kSpirvMagic = 0x07230203; // the first word of SPIR-V
 
 // One field of the push constant block.
 struct ShaderPushConstant {

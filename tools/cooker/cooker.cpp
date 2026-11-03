@@ -16,6 +16,7 @@
 #include "core/log.h"
 #include "core/profile.h"
 #include "platform/vfs.h"
+#include "render/shader/shader_asset.h"
 
 #include <algorithm>
 #include <utility>
@@ -29,10 +30,6 @@ namespace {
 constexpr uint64_t kCookerVersion = 1;
 
 constexpr std::string_view kShaderTests = "shaders/tests/";
-
-uint64_t path_key(std::string_view path) {
-    return core::fnv1a_64(path.data(), path.size());
-}
 
 // Chained content hashes.
 class Hasher {
@@ -83,6 +80,11 @@ public:
 
 private:
     void cook_all() {
+        // Sources the scan left out (broken meta, a GUID another file has): failed, so what was
+        // cooked from them stays until they're sorted out.
+        for (const SourcePath& path : tree_.skipped()) {
+            failed(path.view());
+        }
         cook_shaders();
         // Models and materials first: how they use textures picks the textures' defaults.
         for (const Source& source : tree_.sources()) {
@@ -189,6 +191,11 @@ private:
     }
 
     bool write(CookRecord& record, asset::AssetId id, asset::AssetType type, const core::Array<std::byte>& bytes) {
+        if (std::ranges::any_of(record.outputs, [&](const CookedOutput& output) { return output.id == id; })) {
+            diagnostics_.error(record.path.view(), "makes asset %s twice (two sub-assets with one name)",
+                               asset::format_asset_id(id).c_str());
+            return false;
+        }
         if (!claim(record.path.view(), id)) {
             return false;
         }
@@ -221,12 +228,23 @@ private:
     }
 
     // Each file's path and bytes (a missing file hashes as missing).
-    void hash_files(Hasher& hasher, std::span<const SourcePath> files) const {
+    void hash_files(Hasher& hasher, std::span<const SourcePath> files) {
         for (const SourcePath& file : files) {
             hasher.add(file.view());
-            const core::Result<core::Array<std::byte>> bytes = read_whole_file(vfs_, src_path(file.view()).c_str());
-            hasher.add(bytes ? core::hash_bytes(bytes->data(), bytes->size()) : 0);
+            hasher.add(file_hash(file.view()));
         }
+    }
+
+    // A file's content hash, read once per run however many sources depend on it (shader imports);
+    // 0 for a missing file.
+    uint64_t file_hash(std::string_view path) {
+        if (const uint64_t* known = file_hashes_.find(path_key(path)); known != nullptr) {
+            return *known;
+        }
+        const core::Result<core::Array<std::byte>> bytes = read_whole_file(vfs_, src_path(path).c_str());
+        const uint64_t hash = bytes ? core::hash_bytes(bytes->data(), bytes->size()) : 0;
+        file_hashes_.set(path_key(path), hash);
+        return hash;
     }
 
     // --- Shaders -----------------------------------------------------------------------------
@@ -250,13 +268,17 @@ private:
             (options_.shader_debug_info ? asset::ShaderFlags::DebugInfo : asset::ShaderFlags::None) |
             (options_.shader_checks ? asset::ShaderFlags::Checks : asset::ShaderFlags::None);
         for (const SourcePath& file : files) {
-            core::FixedString<asset::kShaderNameSize - 1> module;
+            shader::ShaderName module;
             if ((!options_.test_shaders && file.view().starts_with(kShaderTests)) ||
-                !shader_module_of(file.view(), module)) {
+                !shader::shader_module_name(file.view(), module)) {
                 continue;
             }
             const core::Result<core::Array<std::byte>> bytes = read_source(file.view());
-            if (!bytes || !defines_entry_points(bytes->span())) {
+            if (!bytes) {
+                failed(file.view()); // keeps what was cooked from it
+                continue;
+            }
+            if (!defines_entry_points(bytes->span())) {
                 continue;
             }
             const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
@@ -302,11 +324,14 @@ private:
         }
         JsonBuilder mesh_json;
         tree_.resolve_settings(source, "mesh", mesh_json);
-        JsonBuilder texture_json; // for its embedded images, over their usage defaults
-        tree_.resolve_settings(source, "texture", texture_json);
+        // For its embedded images, over their usage defaults: the meta's own section only, since
+        // folder rules match file names, and this is the model's ("gas_mask.glb" isn't a mask).
+        JsonBuilder texture_json;
+        tree_.resolve_settings(source, "texture", texture_json, false);
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
         const auto input_hash = [&](std::span<const SourcePath> dependencies, std::span<const TextureUse> uses) {
             Hasher hasher(source_kind_name(source.kind));
+            hasher.add(source.id.value()); // a new GUID means new IDs for everything it makes
             hasher.add(asset::MeshAsset::kFormatVersion);
             hasher.add(asset::MaterialAsset::kFormatVersion);
             hasher.add(asset::TextureAsset::kFormatVersion);
@@ -329,8 +354,8 @@ private:
         const size_t errors_before = diagnostics_.error_count();
         const MeshSettings mesh_settings = read_mesh_settings(mesh_json.freeze().root(), path, diagnostics_);
         core::Result<ModelData> imported = source.kind == SourceKind::Gltf
-                                               ? import_gltf(vfs_, tree_, source, diagnostics_)
-                                               : import_fbx(vfs_, tree_, source, diagnostics_);
+                                               ? import_gltf(vfs_, tree_, source, bytes->span(), diagnostics_)
+                                               : import_fbx(tree_, source, bytes->span(), diagnostics_);
         if (!imported || diagnostics_.error_count() != errors_before) {
             failed(path);
             return;
@@ -349,7 +374,7 @@ private:
                 continue;
             }
             core::FixedString<32> name("image/");
-            static_cast<void>(name.append(number_text(texture.embedded).view()));
+            static_cast<void>(name.append(number_text(model.images[texture.embedded].key).view()));
             const asset::AssetId id = asset::sub_asset_id(source.id, name.view());
             texture_ids.push(id);
             ok = ok && cook_embedded_image(record, model.images[texture.embedded], texture.usage, texture_json, id);
@@ -359,7 +384,8 @@ private:
         core::Array<asset::AssetId> material_ids(tools_heap());
         for (size_t i = 0; i < model.materials.size(); ++i) {
             const ModelMaterial& material = model.materials[i];
-            bool unique = !material.name.empty();
+            // "#<index>" is the form for unnamed and repeated names, so names can't take it.
+            bool unique = !material.name.empty() && !material.name.view().starts_with('#');
             for (size_t j = 0; j < model.materials.size() && unique; ++j) {
                 unique = j == i || model.materials[j].name != material.name.view();
             }
@@ -377,6 +403,9 @@ private:
         core::Result<core::Array<std::byte>> mesh =
             ok ? cook_mesh(model, material_ids.span(), mesh_settings, source.id, path, diagnostics_)
                : core::Result<core::Array<std::byte>>(core::fail(core::ErrorCode::Unknown, ""));
+        if (mesh && diagnostics_.error_count() != errors_before) {
+            mesh = core::fail(core::ErrorCode::InvalidArgument, "the model has errors"); // reported above
+        }
         if (!mesh || !write(record, source.id, asset::AssetType::Mesh, *mesh)) {
             failed(path, &record);
             return;
@@ -395,7 +424,11 @@ private:
         JsonBuilder settings_json;
         texture_usage_defaults(usage, settings_json);
         settings_json.merge(overrides.freeze().root());
+        const size_t errors_before = diagnostics_.error_count();
         const TextureSettings settings = read_texture_settings(settings_json.freeze().root(), path, diagnostics_);
+        if (diagnostics_.error_count() != errors_before) {
+            return false;
+        }
         const core::Result<Image> decoded = decode_image(image.encoded.span(), path, diagnostics_);
         if (!decoded) {
             return false;
@@ -417,6 +450,7 @@ private:
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
         const auto input_hash = [&](std::span<const TextureUse> uses) {
             Hasher hasher("material");
+            hasher.add(source.id.value());
             hasher.add(asset::MaterialAsset::kFormatVersion);
             hasher.add(source_hash);
             hash_texture_ids(hasher, uses);
@@ -430,7 +464,7 @@ private:
         }
         CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
         core::Result<MaterialBuild> build =
-            import_text_material(vfs_, tree_, source, record.texture_uses, diagnostics_);
+            import_text_material(tree_, source, bytes->span(), record.texture_uses, diagnostics_);
         if (!build || !write(record, source.id, asset::AssetType::Material, cook_material(*build, source.id))) {
             failed(path, &record);
             return;
@@ -460,6 +494,7 @@ private:
         }
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
         Hasher hasher("texture");
+        hasher.add(source.id.value());
         hasher.add(asset::TextureAsset::kFormatVersion);
         hasher.add(source_hash);
         hasher.add(std::as_bytes(settings_json.write(false).span()));
@@ -515,8 +550,9 @@ private:
     CookState previous_;
     CookState next_;
     SourceTree tree_;
-    core::HashMap<uint64_t, TextureUsage> usages_{tools_heap()}; // texture path -> how it is used
-    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};    // asset ID -> source path key, this run
+    core::HashMap<uint64_t, TextureUsage> usages_{tools_heap()};  // texture path -> how it is used
+    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};     // asset ID -> source path key, this run
+    core::HashMap<uint64_t, uint64_t> file_hashes_{tools_heap()}; // path key -> content hash, this run
 };
 
 } // namespace

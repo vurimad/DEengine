@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 namespace de::cooker {
@@ -83,29 +84,41 @@ private:
             } else {
                 ModelImage& image = model_->images.emplace();
                 image.encoded.assign(std::span(static_cast<const std::byte*>(map->content.data), map->content.size));
+                image.key = map->typed_id;
                 reference.embedded = static_cast<uint32_t>(model_->images.size() - 1);
                 embedded_.set(map->content.data, reference.embedded);
             }
             return add_texture(*model_, reference, source_.path.view(), diagnostics_);
         }
         // DCCs write paths with backslashes, and often absolute ones from the artist's machine:
-        // the relative path first, then the file name beside the model.
-        char relative[kMaxSourcePath + 1] = {};
-        std::memcpy(relative, map->relative_filename.data, std::min(map->relative_filename.length, kMaxSourcePath));
-        std::replace(relative, relative + std::strlen(relative), '\\', '/');
+        // the relative path first, then the file's name beside the model, taken from the relative,
+        // plain and absolute paths in turn. Paths too long for the tree can't be one of its files.
         const std::string_view folder = folder_of(source_.path.view());
+        const ufbx_string* const names[] = {&map->relative_filename, &map->filename, &map->absolute_filename};
         const Source* found = nullptr;
-        if (join_relative(folder, relative, reference.file)) {
-            found = tree_.find(reference.file.view());
+        for (size_t i = 0; i < std::size(names) && found == nullptr; ++i) {
+            if (names[i]->length == 0 || names[i]->length > kMaxSourcePath) {
+                continue;
+            }
+            char name[kMaxSourcePath + 1] = {};
+            std::memcpy(name, names[i]->data, names[i]->length);
+            std::replace(name, name + names[i]->length, '\\', '/');
+            const auto lookup = [&](std::string_view candidate) {
+                if (found == nullptr && join_relative(folder, candidate, reference.file)) {
+                    const Source* source = tree_.find(reference.file.view());
+                    found = source != nullptr && source->kind == SourceKind::Texture ? source : nullptr;
+                }
+            };
+            if (i == 0) {
+                lookup(name);
+            }
+            lookup(file_name_of(name));
         }
-        if (found == nullptr && join_relative(folder, file_name_of(relative), reference.file)) {
-            found = tree_.find(reference.file.view());
-        }
-        if (found == nullptr || found->kind != SourceKind::Texture) {
+        if (found == nullptr) {
             diagnostics_.error(source_.path.view(),
                                "uses texture '%s', which isn't a texture source beside it or at its relative path "
                                "(missing, misnamed, or outside content/)",
-                               map->relative_filename.data);
+                               map->relative_filename.length != 0 ? map->relative_filename.data : map->filename.data);
             return kNoTexture;
         }
         return add_texture(*model_, reference, source_.path.view(), diagnostics_);
@@ -229,14 +242,9 @@ private:
 
 } // namespace
 
-core::Result<ModelData> import_fbx(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
+core::Result<ModelData> import_fbx(const SourceTree& tree, const Source& source, std::span<const std::byte> bytes,
                                    Diagnostics& diagnostics) {
     DE_PROFILE_ZONE("import fbx");
-    const core::Result<core::Array<std::byte>> bytes = read_whole_file(vfs, src_path(source.path.view()).c_str());
-    if (!bytes) {
-        diagnostics.error(source.path.view(), "could not be read: %s", bytes.error().message);
-        return core::fail(bytes.error());
-    }
     ufbx_load_opts options{};
     const ufbx_allocator allocator{.alloc_fn = &fbx_alloc,
                                    .realloc_fn = &fbx_realloc,
@@ -251,7 +259,7 @@ core::Result<ModelData> import_fbx(const platform::Vfs& vfs, const SourceTree& t
     options.space_conversion = UFBX_SPACE_CONVERSION_MODIFY_GEOMETRY;
     options.generate_missing_normals = true;
     ufbx_error error{};
-    ufbx_scene* scene = ufbx_load_memory(bytes->data(), bytes->size(), &options, &error);
+    ufbx_scene* scene = ufbx_load_memory(bytes.data(), bytes.size(), &options, &error);
     if (scene == nullptr) {
         diagnostics.error(source.path.view(), "can't be read as FBX: %.*s", static_cast<int>(error.description.length),
                           error.description.data);

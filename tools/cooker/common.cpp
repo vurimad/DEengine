@@ -42,7 +42,9 @@ void Diagnostics::add(Severity severity, std::string_view path, const char* form
     char text[kMaxMessageLength + 1];
     std::vsnprintf(text, sizeof(text), format, args); // cut short if long: messages are for people
     diagnostic.message.assign(text);
-    if (severity == Severity::Error) {
+    if (!log_) {
+        // Collected only.
+    } else if (severity == Severity::Error) {
         DE_LOG_ERROR("cooker", "%s: %s", diagnostic.path.empty() ? "cook" : diagnostic.path.c_str(), text);
     } else {
         DE_LOG_WARN("cooker", "%s: %s", diagnostic.path.empty() ? "cook" : diagnostic.path.c_str(), text);

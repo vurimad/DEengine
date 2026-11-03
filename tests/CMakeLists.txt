@@ -6,6 +6,7 @@ find_package(unofficial-bc7enc-rdo CONFIG REQUIRED)
 
 add_executable(de_tests
     main.cpp
+    asset/asset_fuzz_test.cpp
     asset/asset_test.cpp
     cooker/cooker_test.cpp
     core/allocator_test.cpp

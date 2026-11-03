@@ -75,9 +75,11 @@ core::Result<void> TextureAsset::validate(std::span<const std::byte> file) const
     if (!span_in_file(mips, file.size())) {
         return core::fail(ErrorCode::CorruptData, "texture mip table lies outside the file");
     }
-    if (width == 0 || height == 0 || mips.count == 0 || mips.count > kMaxTextureMips ||
-        (std::max(width, height) >> (mips.count - 1)) == 0) {
-        return core::fail(ErrorCode::CorruptData, "texture has no texels, or more mips than texels");
+    // Sizes are bounded first: the block arithmetic below wraps for sides near 2^32.
+    if (width == 0 || height == 0 || width > kMaxTextureSize || height > kMaxTextureSize || mips.count == 0 ||
+        mips.count > kMaxTextureMips || (std::max(width, height) >> (mips.count - 1)) == 0) {
+        return core::fail(ErrorCode::CorruptData,
+                          "texture has no texels, more than 32768 on a side, or more mips than texels");
     }
     for (uint32_t i = 0; i < mips.count; ++i) {
         const TextureMip& mip = mips.get(file.data())[i];

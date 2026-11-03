@@ -12,9 +12,11 @@ namespace de::cooker {
 
 namespace {
 
-constexpr std::string_view kShaders = "shaders/";
-constexpr std::string_view kSlang = ".slang";
 constexpr std::string_view kSrcPrefix = "src:/";
+
+bool is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
 
 void copy_name(char (&out)[asset::kShaderNameSize], std::string_view name) {
     const size_t length = std::min(name.size(), asset::kShaderNameSize - 1);
@@ -24,25 +26,44 @@ void copy_name(char (&out)[asset::kShaderNameSize], std::string_view name) {
 
 } // namespace
 
-bool shader_module_of(std::string_view path, core::FixedString<asset::kShaderNameSize - 1>& module) {
-    if (!path.starts_with(kShaders) || !path.ends_with(kSlang)) {
-        return false;
-    }
-    const std::string_view name = path.substr(kShaders.size(), path.size() - kShaders.size() - kSlang.size());
-    if (name.empty() || !module.assign(name)) {
-        return false;
-    }
-    for (size_t i = 0; i < module.size(); ++i) {
-        if (module[i] == '/') {
-            module[i] = '.';
-        }
-    }
-    return true;
-}
-
 bool defines_entry_points(std::span<const std::byte> source) {
     const std::string_view text(reinterpret_cast<const char*>(source.data()), source.size());
-    return text.find("[shader(") != std::string_view::npos;
+    // '[' 'shader' '(' with any whitespace between, outside comments and strings.
+    enum class Expect : uint8_t { Bracket, Name, Paren };
+    Expect expect = Expect::Bracket;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '/' && i + 1 < text.size() && (text[i + 1] == '/' || text[i + 1] == '*')) {
+            const bool line = text[i + 1] == '/';
+            const size_t end = line ? text.find('\n', i + 2) : text.find("*/", i + 2);
+            if (end == std::string_view::npos) {
+                return false;
+            }
+            i = line ? end : end + 1;
+            continue;
+        }
+        if (c == '"') {
+            const size_t end = text.find('"', i + 1);
+            if (end == std::string_view::npos) {
+                return false;
+            }
+            i = end;
+            expect = Expect::Bracket;
+            continue;
+        }
+        if (is_space(c)) {
+            continue;
+        }
+        if (expect == Expect::Name && text.substr(i).starts_with("shader")) {
+            i += 5;
+            expect = Expect::Paren;
+        } else if (expect == Expect::Paren && c == '(') {
+            return true;
+        } else {
+            expect = c == '[' ? Expect::Name : Expect::Bracket;
+        }
+    }
+    return false;
 }
 
 core::Result<core::Array<std::byte>> cook_shader(shader::ShaderCompiler& compiler, std::string_view module,

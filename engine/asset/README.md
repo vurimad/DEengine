@@ -16,7 +16,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 ## Rules and invariants
 
 - A cooked file is read into 16-byte aligned memory and used where it lies. Arrays are `OffsetSpan`s (offsets from the start of the file, 16-byte aligned), so nothing is fixed up and a file can be read anywhere.
-- `load_in_place<T>()` checks before anything is used: the header (magic, type, format version, platform, size, ID) and that every array lies inside the file. It doesn't hash the file or walk every element: `verify_content_hash()` is the corruption check, and the cooker guarantees index ranges.
+- `load_in_place<T>()` checks before anything is used: the header (magic, type, format version, platform, size, ID), that every array lies inside the file, and what consumers size or address things by (texture sides at most 32768, mesh indices below the vertex count, SPIR-V's magic word). A fuzz test (`tests/asset/asset_fuzz_test.cpp`) holds it to that. It doesn't hash the file: `verify_content_hash()` is the corruption check.
 - Every file starts with `AssetHeader`: magic `DEAS`, type, format version, platform, file size, asset ID, content hash (of every byte after the header) and its dependencies (asset IDs).
 - A format change bumps that type's `kFormatVersion`: old files are refused (`Unsupported`) and cooked again, never patched.
 - Numbers stored in files (`AssetType`, `TextureFormat`, `ShaderStageKind`...) are never renumbered, only added to.

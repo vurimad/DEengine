@@ -11,11 +11,8 @@ class ShaderCompiler;
 
 namespace de::cooker {
 
-// "shaders/common/color.slang" -> "common.color"; false for a path outside shaders/ or not .slang.
-bool shader_module_of(std::string_view path, core::FixedString<asset::kShaderNameSize - 1>& module);
-
-// Whether a module defines entry points ([shader("...")]); modules without any are libraries that
-// others import, and aren't cooked on their own.
+// Whether a module defines entry points ([shader("...")], spaced any way, outside comments);
+// modules without any are libraries that others import, and aren't cooked on their own.
 bool defines_entry_points(std::span<const std::byte> source);
 
 // The .deshader of a module: every entry point compiled to SPIR-V with no defines, with its

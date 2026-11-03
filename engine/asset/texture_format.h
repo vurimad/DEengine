@@ -43,7 +43,8 @@ struct TextureMip {
     uint32_t rows = 0;      // rows of blocks
 };
 
-inline constexpr uint32_t kMaxTextureMips = 16; // 32768 texels on a side
+inline constexpr uint32_t kMaxTextureMips = 16;
+inline constexpr uint32_t kMaxTextureSize = 1U << (kMaxTextureMips - 1); // texels on a side
 
 // .detex (docs/design.md, Asset formats): a 2D texture with its full mip chain, GPU-ready (block
 // compressed by the cooker, which also filters the mips).

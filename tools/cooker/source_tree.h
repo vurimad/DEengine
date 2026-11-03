@@ -57,8 +57,9 @@ struct ScanStats {
 //   content hash finds it and the meta moves along (re-linked); otherwise it's reported. A new
 //   file that might be an unresolved orphan's (same extension) gets no GUID until that's settled:
 //   the cooker never silently mints a new GUID for an existing asset;
-// - names that break the path rules (uppercase, spaces), broken metas and repeated GUIDs are
-//   reported, and those files left out.
+// - names that break the path rules (uppercase, spaces), broken metas and folder rules, and
+//   repeated GUIDs are reported, and those files left out. When two metas share a GUID, the file
+//   the last cook knew by it keeps it: the copy is the one reported.
 class SourceTree {
 public:
     static SourceTree scan(const platform::Vfs& vfs, const CookState& previous, const ScanOptions& options,
@@ -66,12 +67,17 @@ public:
 
     // Sorted by path.
     std::span<const Source> sources() const { return sources_.span(); }
+    // Sources left out for a broken meta, a GUID another file has, or no meta yet: what was cooked
+    // from them stays until they're sorted out.
+    std::span<const SourcePath> skipped() const { return skipped_.span(); }
     const Source* find(std::string_view path) const;
 
     // Layers one settings section ("texture", "mesh") onto settings, which holds the defaults:
     // folder rules from the root down (each file's rules in order, those whose pattern matches the
-    // file's name), then the meta's own section.
-    void resolve_settings(const Source& source, const char* section, JsonBuilder& settings) const;
+    // file's name), then the meta's own section. folder_rules false: the meta's section only (a
+    // model's embedded images, which the rules' name patterns don't describe).
+    void resolve_settings(const Source& source, const char* section, JsonBuilder& settings,
+                          bool folder_rules = true) const;
 
 private:
     struct FolderRules {
@@ -81,6 +87,7 @@ private:
     };
 
     core::Array<Source> sources_{tools_heap()};
+    core::Array<SourcePath> skipped_{tools_heap()};
     core::Array<FolderRules> rules_{tools_heap()}; // root first
     core::HashMap<uint64_t, uint32_t> by_path_{tools_heap()};
 };

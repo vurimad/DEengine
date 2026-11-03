@@ -4,6 +4,7 @@
 #include "asset/texture_format.h"
 #include "cooker/cooker.h"
 #include "cooker/mesh_cooker.h"
+#include "cooker/shader_cooker.h"
 #include "core/job_system.h"
 #include "platform/file.h"
 #include "platform/vfs.h"
@@ -492,11 +493,56 @@ TEST_CASE("metas follow files moved outside the tools; orphans, copies and bad n
     CHECK(report.ok());
     CHECK(report.stats.metas_created == 1);
 
-    // A copied meta: two files, one GUID.
+    // A copied meta: two files, one GUID. The copy sorts first ("a/twin" < "b/rock"), yet the
+    // original keeps its GUID and its cooked file (the last cook knew it by that GUID), and the copy
+    // is the one reported.
+    const CookedPath rock_file = cooked_path(asset_id(rock), AssetType::Texture);
+    const std::string rock_bytes = read_text(vfs, rock_file.c_str());
     write_src(sandbox, "content/a/twin.png", png(8, 8, color_texels(8, 7)));
     write_src(sandbox, "meta/a/twin.png.json", read_text(vfs, "src:/meta/b/rock.png.json"));
     report = run_cook(vfs);
-    CHECK(has_message(report, "content/b/rock.png", "same GUID"));
+    CHECK(has_message(report, "content/a/twin.png", "same GUID as content/b/rock.png"));
+    CHECK_FALSE(has_message(report, "content/b/rock.png", "same GUID"));
+    CHECK(read_text(vfs, rock_file.c_str()) == rock_bytes);
+    // Following the advice gives the copy a GUID of its own; the original's stays.
+    remove_src(sandbox, "meta/a/twin.png.json");
+    report = run_cook(vfs);
+    CHECK(report.ok());
+    CHECK(guid_of(vfs, "src:/meta/b/rock.png.json") == rock);
+    CHECK(guid_of(vfs, "src:/meta/a/twin.png.json") != rock);
+
+    // A broken meta (a merge conflict, say): reported, and what was cooked from it stays.
+    const std::string fern_meta = read_text(vfs, "src:/meta/a/fern.png.json");
+    const Guid fern = guid_of(vfs, "src:/meta/a/fern.png.json");
+    write_src(sandbox, "meta/a/fern.png.json", "<<<<<<< HEAD\n" + fern_meta);
+    report = run_cook(vfs);
+    CHECK(report.stats.failed == 1);
+    CHECK(report.stats.removed == 0);
+    CHECK(vfs.exists(cooked_path(asset_id(fern), AssetType::Texture).c_str()));
+    write_src(sandbox, "meta/a/fern.png.json", fern_meta);
+    CHECK(run_cook(vfs).ok());
+
+    // A meta deleted (as the message for copies says): the file gets a new GUID, cooks under its
+    // new ID, and the old ID's file goes.
+    remove_src(sandbox, "meta/a/fern.png.json");
+    report = run_cook(vfs);
+    CHECK(report.ok());
+    const Guid new_fern = guid_of(vfs, "src:/meta/a/fern.png.json");
+    REQUIRE(new_fern != fern);
+    CHECK(report.stats.cooked == 1);
+    CHECK(report.stats.removed == 1);
+    CHECK(vfs.exists(cooked_path(asset_id(new_fern), AssetType::Texture).c_str()));
+    CHECK_FALSE(vfs.exists(cooked_path(asset_id(fern), AssetType::Texture).c_str()));
+
+    // A settings section that isn't an object would replace every default below it: refused.
+    write_src(sandbox, "meta/a/fern.png.json",
+              std::string(R"({"guid": ")") + format_guid(new_fern).c_str() + R"(", "texture": "bc5"})");
+    report = run_cook(vfs);
+    CHECK(has_message(report, "meta/a/fern.png.json", "should be an object"));
+    CHECK(report.stats.failed == 1);
+    write_src(sandbox, "meta/_folder.json", R"({"rules": [{"texture": {"compression": "bc4"}}]})");
+    report = run_cook(vfs);
+    CHECK(has_message(report, "meta/_folder.json", "needs a \"match\" pattern"));
 
     // Names that break the path rules.
     write_src(sandbox, "content/a/Big Rock.png", png(8, 8, color_texels(8, 1)));
@@ -681,6 +727,21 @@ Connections:  {
     CHECK(color->value[1] == doctest::Approx(0.2f));
 }
 
+TEST_CASE("a malformed embedded image is reported, not trusted") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    quad(vertices, indices);
+    // Only padding: a size computed from it would wrap around.
+    write_src(sandbox, "content/broken/bad.gltf",
+              gltf(vertices, indices, 0.0f, R"([{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}])",
+                   R"([{"uri": "data:image/png;base64,=="}])", R"([{"source": 0}])"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    CHECK(report.stats.failed == 1);
+    CHECK(has_message(report, "content/broken/bad.gltf", "isn't valid base64"));
+}
+
 TEST_CASE("LODs keep material seams closed") {
     const Sandbox sandbox;
     // One wavy grid, its left half in one material and its right half in another: the halves
@@ -850,6 +911,151 @@ Connections:  {
     CHECK(tangent_sign("mirrored.fbx", "-1") == 1);
 }
 
+TEST_CASE("embedded images follow how they're used, not rules meant for file names") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    quad(vertices, indices);
+    const std::vector<std::byte> color = png(8, 8, color_texels(8, 4));
+    const std::string color_uri = "data:image/png;base64," + base64(color.data(), color.size());
+    // "gas_mask" matches the mask rule, which is for mask textures, not for a model's images.
+    write_src(sandbox, "meta/_folder.json",
+              R"({"rules": [{"match": "*_mask.*", "texture": {"compression": "bc4", "srgb": false}}]})");
+    write_src(sandbox, "content/props/gas_mask.gltf",
+              gltf(vertices, indices, 0.0f, R"([{"pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}}])",
+                   R"([{"uri": ")" + color_uri + R"("}])", R"([{"source": 0}])"));
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const Guid mask = guid_of(vfs, "src:/meta/props/gas_mask.gltf.json");
+    Cooked image(vfs, sub_asset_id(asset_id(mask), "image/0"), AssetType::Texture);
+    CHECK(image.load<TextureAsset>().format == TextureFormat::BC7Srgb);
+
+    // A bad setting in the model's meta fails the model, every time, until it's fixed.
+    write_src(sandbox, "meta/props/gas_mask.gltf.json",
+              std::string(R"({"guid": ")") + format_guid(mask).c_str() + R"(", "texture": {"compression": "bc9"}})");
+    CookReport report = run_cook(vfs);
+    CHECK(report.stats.failed == 1);
+    CHECK(has_message(report, "content/props/gas_mask.gltf", "bc9"));
+    report = run_cook(vfs);
+    CHECK(report.stats.failed == 1);
+    CHECK_FALSE(report.ok());
+}
+
+TEST_CASE("data textures filter each channel on its own") {
+    const Sandbox sandbox;
+    // Columns of transparent black and opaque white. Color filtering weights by alpha (white
+    // wins); data keeps channels apart (gray).
+    std::vector<uint8_t> texels(size_t{4} * 4 * 4);
+    for (uint32_t i = 0; i < 16; ++i) {
+        const uint8_t value = (i % 4) % 2 == 0 ? 0 : 255;
+        for (uint32_t c = 0; c < 4; ++c) {
+            texels[i * 4 + c] = value;
+        }
+    }
+    write_src(sandbox, "meta/_folder.json",
+              R"({"rules": [{"match": "*_data.png", "texture": {"compression": "none", "srgb": false}},
+                            {"match": "*_color.png", "texture": {"compression": "none"}}]})");
+    write_src(sandbox, "content/a/packed_data.png", png(4, 4, texels));
+    write_src(sandbox, "content/a/leaf_color.png", png(4, 4, texels));
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const auto mip1_red = [&](const char* meta) {
+        Cooked file(vfs, asset_id(guid_of(vfs, meta)), AssetType::Texture);
+        const auto& texture = file.load<TextureAsset>();
+        return static_cast<int>(texture.mip_data(file.data(), 1)[0]);
+    };
+    const int data = mip1_red("src:/meta/a/packed_data.png.json");
+    CHECK(data > 90);
+    CHECK(data < 165);
+    CHECK(mip1_red("src:/meta/a/leaf_color.png.json") > 240);
+}
+
+TEST_CASE("materials named like the index form don't collide with it") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    quad(vertices, indices);
+    // Material 0 is named "#1", material 1 has no name: "material/#1" would be both.
+    write_src(sandbox, "content/a/pair.gltf",
+              gltf(vertices, {0, 1, 2}, 0.0f, R"([{"name": "#1"}, {}])", "[]", "[]", {0, 2, 3}));
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const AssetId pair = asset_id(guid_of(vfs, "src:/meta/a/pair.gltf.json"));
+    Cooked file(vfs, pair, AssetType::Mesh);
+    const auto slots = file.load<MeshAsset>().materials.get(file.data());
+    REQUIRE(slots.size() == 2);
+    CHECK(slots[0].material == sub_asset_id(pair, "material/#0"));
+    CHECK(slots[1].material == sub_asset_id(pair, "material/#1"));
+}
+
+TEST_CASE("FBX textures are found by name when only an absolute path was saved") {
+    const Sandbox sandbox;
+    write_src(sandbox, "content/props/card_albedo.png", png(8, 8, color_texels(8, 3)));
+    write_src(sandbox, "content/props/card.fbx", R"(; FBX 7.4.0 project file
+FBXHeaderExtension:  {
+	FBXHeaderVersion: 1003
+	FBXVersion: 7400
+}
+GlobalSettings:  {
+	Version: 1000
+	Properties70:  {
+		P: "UnitScaleFactor", "double", "Number", "",100
+	}
+}
+Objects:  {
+	Geometry: 1000, "Geometry::card", "Mesh" {
+		Vertices: *12 {
+			a: 0,0,0,1,0,0,1,1,0,0,1,0
+		}
+		PolygonVertexIndex: *4 {
+			a: 0,1,2,-4
+		}
+		GeometryVersion: 124
+	}
+	Model: 2000, "Model::card", "Mesh" {
+		Version: 232
+	}
+	Material: 3000, "Material::paint", "" {
+		Version: 102
+		ShadingModel: "lambert"
+	}
+	Texture: 4000, "Texture::albedo", "" {
+		Type: "TextureVideoClip"
+		Version: 202
+		TextureName: "Texture::albedo"
+		FileName: "C:/Users/artist/props/card_albedo.png"
+		RelativeFilename: ""
+	}
+}
+Connections:  {
+	C: "OO",1000,2000
+	C: "OO",2000,0
+	C: "OO",3000,2000
+	C: "OP",4000,3000, "DiffuseColor"
+}
+)");
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const AssetId card = asset_id(guid_of(vfs, "src:/meta/props/card.fbx.json"));
+    Cooked file(vfs, sub_asset_id(card, "material/paint"), AssetType::Material);
+    const auto& material = file.load<MaterialAsset>();
+    CHECK(material.find_texture(file.data(), material::kBaseColorTexture) ==
+          asset_id(guid_of(vfs, "src:/meta/props/card_albedo.png.json")));
+}
+
+TEST_CASE("modules with entry points are told from libraries however the attribute is spaced") {
+    const auto defines = [](std::string_view text) {
+        return de::cooker::defines_entry_points(std::as_bytes(std::span(text.data(), text.size())));
+    };
+    CHECK(defines(R"([shader("vertex")] float4 main() {})"));
+    CHECK(defines(R"([ shader ( "compute" ) ] [numthreads(8, 1, 1)] void main() {})"));
+    CHECK(defines("[numthreads(8, 1, 1)]\n[shader(\"compute\")]\nvoid main() {}"));
+    CHECK_FALSE(defines(R"(float4 helper() { return 0; })"));
+    CHECK_FALSE(defines("// call it from [shader(\"vertex\")] entry points\nfloat4 helper();"));
+    CHECK_FALSE(defines("/* [shader(\"vertex\")] */ float4 helper();"));
+    CHECK_FALSE(defines(R"([shaders("x")] float4 helper();)"));
+}
+
 TEST_CASE("text materials name their textures by path and set how they are used") {
     const Sandbox sandbox;
     write_src(sandbox, "content/rock/rock_albedo.png", png(8, 8, color_texels(8, 1)));
@@ -858,7 +1064,7 @@ TEST_CASE("text materials name their textures by path and set how they are used"
   // comments are fine
   "alpha_mode": "masked",
   "double_sided": true,
-  "params": {"base_color": [0.9, 0.8, 0.7, 1], "alpha_cutoff": 0.3, "wetness": 0.5},
+  "params": {"base_color": [0.9, 0.8, 0.7], "alpha_cutoff": 0.3, "wetness": 0.5},
   "textures": {"base_color": "rock_albedo.png", "normal": "rock_nrm.png"},
 })");
     write_src(sandbox, "content/rock/broken.material", R"({"textures": {"base_color": "missing.png"}, "colour": 1})");
@@ -877,6 +1083,11 @@ TEST_CASE("text materials name their textures by path and set how they are used"
     const MaterialParam* wetness = material.find_param(file.data(), de::core::StringId("wetness", 7));
     REQUIRE(wetness != nullptr);
     CHECK(wetness->value[0] == 0.5f);
+    // An rgb color is opaque: w defaults to 1 (a masked material would otherwise vanish).
+    const MaterialParam* base_color = material.find_param(file.data(), material::kBaseColor);
+    REQUIRE(base_color != nullptr);
+    CHECK(base_color->value[2] == doctest::Approx(0.7f));
+    CHECK(base_color->value[3] == 1.0f);
     const AssetId normal = asset_id(guid_of(vfs, "src:/meta/rock/rock_nrm.png.json"));
     CHECK(material.find_texture(file.data(), material::kNormalTexture) == normal);
     Cooked normal_file(vfs, normal, AssetType::Texture);

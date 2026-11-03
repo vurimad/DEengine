@@ -4,6 +4,7 @@
 #include "core/array.h"
 #include "core/compiler.h"
 #include "core/fixed_string.h"
+#include "core/hash.h"
 #include "core/result.h"
 
 #include <cstdarg>
@@ -28,6 +29,11 @@ inline core::Allocator& tools_heap() {
 inline constexpr size_t kMaxSourcePath = 255;
 using SourcePath = core::FixedString<kMaxSourcePath>;
 
+// A path's key in the cooker's hash maps (paths are compared on a hit).
+inline uint64_t path_key(std::string_view path) {
+    return core::fnv1a_64(path.data(), path.size());
+}
+
 // "src:/" + path; fails (empty) if it doesn't fit, which a SourcePath always does.
 core::FixedString<kMaxSourcePath + 8> src_path(std::string_view relative);
 
@@ -50,6 +56,9 @@ struct Diagnostic {
 // model cooks report from jobs.
 class Diagnostics {
 public:
+    // log: also log each finding as it comes (off for findings only collected, then summarized).
+    explicit Diagnostics(bool log = true) : log_(log) {}
+
     // NOLINTBEGIN(modernize-avoid-variadic-functions): printf-style by design, checked by DE_PRINTF_FORMAT
     void error(std::string_view path, const char* format, ...) DE_PRINTF_FORMAT(3, 4);
     void warning(std::string_view path, const char* format, ...) DE_PRINTF_FORMAT(3, 4);
@@ -63,6 +72,7 @@ public:
 private:
     void add(Severity severity, std::string_view path, const char* format, va_list args);
 
+    bool log_ = true;
     mutable std::mutex mutex_;
     core::Array<Diagnostic> items_{tools_heap()};
     size_t errors_ = 0;

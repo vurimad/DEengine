@@ -1,5 +1,7 @@
 #include "asset/mesh_format.h"
 
+#include <algorithm>
+
 namespace de::asset {
 
 core::Result<void> MeshAsset::validate(std::span<const std::byte> file) const {
@@ -26,6 +28,15 @@ core::Result<void> MeshAsset::validate(std::span<const std::byte> file) const {
             part.material_slot >= materials.count) {
             return core::fail(ErrorCode::CorruptData, "mesh part refers to indices or a slot it doesn't have");
         }
+    }
+    // Shaders fetch vertices by pointer, where nothing catches a read past the buffer (a lost
+    // device at best). One pass at memory speed, small next to reading the file.
+    uint32_t largest = 0;
+    for (const uint32_t index : indices.get(file.data())) {
+        largest = std::max(largest, index);
+    }
+    if (indices.count != 0 && largest >= vertices.count) {
+        return core::fail(ErrorCode::CorruptData, "mesh index refers past its vertices");
     }
     return {};
 }

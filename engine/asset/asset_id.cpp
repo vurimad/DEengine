@@ -81,10 +81,19 @@ AssetIdText format_asset_id(AssetId id) {
 
 bool parse_asset_id(std::string_view text, AssetId& id) {
     uint64_t value = 0;
-    if (text.size() != kAssetIdTextLength || !parse_hex(text, value) || value == 0) {
+    if (!parse_hex64(text, value) || value == 0) {
         return false;
     }
     id = AssetId::from_value(value);
+    return true;
+}
+
+bool parse_hex64(std::string_view text, uint64_t& value) {
+    uint64_t parsed = 0;
+    if (text.size() != kAssetIdTextLength || !parse_hex(text, parsed)) {
+        return false;
+    }
+    value = parsed;
     return true;
 }
 

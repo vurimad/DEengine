@@ -131,10 +131,11 @@ bool resize(const Image& from, uint32_t width, uint32_t height, const TextureSet
     const int h = static_cast<int>(from.height);
     const int ow = static_cast<int>(width);
     const int oh = static_cast<int>(height);
-    const unsigned char* result =
-        settings.srgb
-            ? stbir_resize_uint8_srgb(in, w, h, 0, out, ow, oh, 0, STBIR_RGBA)
-            : stbir_resize_uint8_linear(in, w, h, 0, out, ow, oh, 0, settings.normal_map ? STBIR_4CHANNEL : STBIR_RGBA);
+    // Color is alpha-weighted (transparent texels don't bleed their color); data keeps every
+    // channel apart (roughness in G mustn't depend on a mask in A).
+    const unsigned char* result = settings.srgb
+                                      ? stbir_resize_uint8_srgb(in, w, h, 0, out, ow, oh, 0, STBIR_RGBA)
+                                      : stbir_resize_uint8_linear(in, w, h, 0, out, ow, oh, 0, STBIR_4CHANNEL);
     if (result == nullptr) {
         return false;
     }

@@ -297,13 +297,11 @@ ShaderDependency module_file(const LibraryState& state, const Program& program) 
         return cooked;
     }
     // Always fits: module names are at most 63 characters.
-    ShaderDependency file{.path = platform::PathString("src:/shaders/")};
-    bool fits_path = true;
-    for (size_t i = 0; i < program.module.size(); ++i) {
-        fits_path = file.path.append(program.module[i] == '.' ? '/' : program.module[i]) && fits_path;
-    }
-    fits_path = file.path.append(".slang") && fits_path;
+    platform::PathString relative;
+    ShaderDependency file{.path = platform::PathString("src:/")};
+    const bool fits_path = shader_module_path(program.module.view(), relative) && file.path.append(relative.view());
     DE_ASSERT(fits_path);
+    static_cast<void>(fits_path);
     const core::Result<platform::FileInfo> info = state.vfs->file_info(file.path.c_str());
     file.info = info.ok() ? *info : platform::FileInfo{};
     return file;
@@ -523,6 +521,34 @@ uint64_t defines_hash(std::span<const ShaderDefine> defines) {
                     .value = defines[i].value != nullptr ? defines[i].value : "1"};
     }
     return asset::shader_defines_hash(std::span(texts, count));
+}
+
+bool shader_module_path(std::string_view module, platform::PathString& path) {
+    path.assign("shaders/");
+    for (const char c : module) {
+        if (!path.append(c == '.' ? '/' : c)) {
+            return false;
+        }
+    }
+    return path.append(".slang");
+}
+
+bool shader_module_name(std::string_view path, ShaderName& module) {
+    constexpr std::string_view kFolder = "shaders/";
+    constexpr std::string_view kExtension = ".slang";
+    if (!path.starts_with(kFolder) || !path.ends_with(kExtension) ||
+        path.size() == kFolder.size() + kExtension.size()) {
+        return false;
+    }
+    if (!module.assign(path.substr(kFolder.size(), path.size() - kFolder.size() - kExtension.size()))) {
+        return false;
+    }
+    for (size_t i = 0; i < module.size(); ++i) {
+        if (module[i] == '/') {
+            module[i] = '.';
+        }
+    }
+    return true;
 }
 
 ShaderLibrary ShaderLibrary::make(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,

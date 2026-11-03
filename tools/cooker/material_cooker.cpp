@@ -92,15 +92,11 @@ MaterialBuild material_from_model(const ModelMaterial& source, std::span<const a
     return build;
 }
 
-core::Result<MaterialBuild> import_text_material(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
-                                                 core::Array<TextureUse>& uses, Diagnostics& diagnostics) {
+core::Result<MaterialBuild> import_text_material(const SourceTree& tree, const Source& source,
+                                                 std::span<const std::byte> bytes, core::Array<TextureUse>& uses,
+                                                 Diagnostics& diagnostics) {
     const std::string_view path = source.path.view();
-    const core::Result<core::Array<std::byte>> text = read_whole_file(vfs, src_path(path).c_str());
-    if (!text) {
-        diagnostics.error(path, "could not be read: %s", text.error().message);
-        return core::fail(text.error());
-    }
-    const core::Result<JsonDoc> doc = JsonDoc::parse(text->span(), path, diagnostics);
+    const core::Result<JsonDoc> doc = JsonDoc::parse(bytes, path, diagnostics);
     if (!doc) {
         return core::fail(doc.error());
     }
@@ -130,7 +126,7 @@ core::Result<MaterialBuild> import_text_material(const platform::Vfs& vfs, const
     yyjson_val* key = nullptr;
     yyjson_val* value = nullptr;
     yyjson_obj_foreach(yyjson_obj_get(doc->root(), "params"), index, count, key, value) {
-        float values[4] = {};
+        float values[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // an rgb color is opaque
         size_t components = 0;
         if (yyjson_is_num(value)) {
             values[0] = static_cast<float>(yyjson_get_num(value));

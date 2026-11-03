@@ -18,10 +18,6 @@ constexpr std::string_view kMeta = "meta";
 constexpr std::string_view kFolderRules = "_folder.json";
 constexpr std::string_view kMetaExtension = ".json";
 
-uint64_t path_key(std::string_view path) {
-    return core::fnv1a_64(path.data(), path.size());
-}
-
 bool path_less(const SourcePath& a, const SourcePath& b) {
     return a.view() < b.view();
 }
@@ -92,6 +88,45 @@ core::Result<asset::Guid> mint_guid() {
     return guid;
 }
 
+// Settings sections are objects: anything else would replace the layers below it whole (merge
+// patches), silently dropping every default.
+bool sections_are_objects(yyjson_val* object, std::string_view path, Diagnostics& diagnostics) {
+    bool ok = true;
+    for (const char* section : {"texture", "mesh"}) {
+        yyjson_val* value = yyjson_obj_get(object, section);
+        if (value != nullptr && !yyjson_is_obj(value)) {
+            diagnostics.error(path, "\"%s\" should be an object of settings", section);
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// A folder rules file: {"rules": [{"match": "<pattern>", "texture": {...}, "mesh": {...}}, ...]}.
+bool valid_rules(yyjson_val* root, std::string_view path, Diagnostics& diagnostics) {
+    yyjson_val* rules = yyjson_obj_get(root, "rules");
+    if (!yyjson_is_obj(root) || !yyjson_is_arr(rules)) {
+        diagnostics.error(path, "should be {\"rules\": [...]} (the file is ignored)");
+        return false;
+    }
+    bool ok = true;
+    size_t index = 0;
+    size_t count = 0;
+    yyjson_val* rule = nullptr;
+    yyjson_arr_foreach(rules, index, count, rule) {
+        if (!yyjson_is_obj(rule) || !yyjson_is_str(yyjson_obj_get(rule, "match"))) {
+            diagnostics.error(path, "rule %zu needs a \"match\" pattern (the file is ignored)", index + 1);
+            ok = false;
+            continue;
+        }
+        static constexpr const char* kKeys[] = {"match", "texture", "mesh"};
+        const JsonReader reader{.object = rule, .path = path, .diagnostics = &diagnostics};
+        reader.check_keys(kKeys, "rule");
+        ok = sections_are_objects(rule, path, diagnostics) && ok;
+    }
+    return ok;
+}
+
 // A meta's GUID, checked; its other sections are read when the source cooks.
 bool read_meta(const platform::Vfs& vfs, std::string_view meta_path, Diagnostics& diagnostics, JsonDoc& doc,
                asset::Guid& guid) {
@@ -112,6 +147,9 @@ bool read_meta(const platform::Vfs& vfs, std::string_view meta_path, Diagnostics
     static constexpr const char* kKeys[] = {"guid", "texture", "mesh"};
     const JsonReader reader{.object = parsed->root(), .path = meta_path, .diagnostics = &diagnostics};
     reader.check_keys(kKeys, "meta");
+    if (!sections_are_objects(parsed->root(), meta_path, diagnostics)) {
+        return false;
+    }
     doc = std::move(*parsed);
     return true;
 }
@@ -200,7 +238,7 @@ SourceTree SourceTree::scan(const platform::Vfs& vfs, const CookState& previous,
             const core::Result<core::Array<std::byte>> text = read_whole_file(vfs, src_path(path.view()).c_str());
             core::Result<JsonDoc> doc = text ? JsonDoc::parse(text->span(), path.view(), diagnostics)
                                              : core::Result<JsonDoc>(core::fail(text.error()));
-            if (!doc) {
+            if (!doc || !valid_rules(doc->root(), path.view(), diagnostics)) {
                 continue;
             }
             rules.depth =
@@ -245,6 +283,8 @@ SourceTree SourceTree::scan(const platform::Vfs& vfs, const CookState& previous,
         if (read_meta(vfs, meta.path.view(), diagnostics, source.meta, source.guid)) {
             source.id = asset::asset_id(source.guid);
             tree.sources_.push(std::move(source));
+        } else {
+            tree.skipped_.push(path);
         }
     }
 
@@ -324,10 +364,12 @@ SourceTree SourceTree::scan(const platform::Vfs& vfs, const CookState& previous,
         if (maybe_orphaned) {
             diagnostics.error(file.path.view(), "has no meta, and an orphaned meta of the same type is reported "
                                                 "above: settle that first (no GUID minted, so none is lost)");
+            tree.skipped_.push(file.path);
             continue;
         }
         if (!options.write_metas) {
             diagnostics.error(file.path.view(), "has no meta (%s): run the cooker to create it", meta_path.c_str());
+            tree.skipped_.push(file.path);
             continue;
         }
         const core::Result<asset::Guid> guid = mint_guid();
@@ -349,18 +391,30 @@ SourceTree SourceTree::scan(const platform::Vfs& vfs, const CookState& previous,
     }
 
     // One GUID, one source: a copied meta would make two files the same asset.
+    // The one the last cook knew by that GUID keeps it, so the copy is the one reported (deleting
+    // the original's meta instead would break every reference to it); with no history, the first.
     std::ranges::sort(tree.sources_, [](const Source& a, const Source& b) { return a.path.view() < b.path.view(); });
-    core::HashMap<uint64_t, uint32_t> by_id(tools_heap());
+    core::HashMap<uint64_t, uint32_t> owner(tools_heap()); // asset ID -> index in sources_
+    for (uint32_t i = 0; i < tree.sources_.size(); ++i) {
+        const Source& source = tree.sources_[i];
+        const uint32_t* first = owner.find(source.id.value());
+        const CookRecord* known = first != nullptr ? previous.find(source.guid) : nullptr;
+        if (first == nullptr || (known != nullptr && known->path == source.path.view())) {
+            owner.set(source.id.value(), i);
+        }
+    }
     core::Array<Source> unique(tools_heap());
-    for (Source& source : tree.sources_) {
-        if (const uint32_t* first = by_id.find(source.id.value()); first != nullptr) {
+    for (uint32_t i = 0; i < tree.sources_.size(); ++i) {
+        Source& source = tree.sources_[i];
+        const uint32_t kept = *owner.find(source.id.value());
+        if (kept != i) {
             diagnostics.error(source.path.view(),
-                              "its meta has the same GUID as %s's (a copied meta?): give it a new "
-                              "one by deleting its meta (skipped)",
-                              unique[*first].path.c_str());
+                              "its meta has the same GUID as %s's (a copied meta?): delete this file's meta to "
+                              "give it a new GUID (skipped)",
+                              tree.sources_[kept].path.c_str());
+            tree.skipped_.push(source.path);
             continue;
         }
-        by_id.set(source.id.value(), static_cast<uint32_t>(unique.size()));
         unique.push(std::move(source));
     }
     tree.sources_ = std::move(unique);
@@ -378,10 +432,11 @@ const Source* SourceTree::find(std::string_view path) const {
     return index != nullptr && sources_[*index].path == path ? &sources_[*index] : nullptr;
 }
 
-void SourceTree::resolve_settings(const Source& source, const char* section, JsonBuilder& settings) const {
+void SourceTree::resolve_settings(const Source& source, const char* section, JsonBuilder& settings,
+                                  bool folder_rules) const {
     const std::string_view path = source.path.view();
     const std::string_view name = file_name_of(path);
-    for (const FolderRules& rules : rules_) {
+    for (const FolderRules& rules : folder_rules ? rules_.span() : std::span<const FolderRules>()) {
         const std::string_view folder = rules.folder.view();
         if (!path.starts_with(folder) || path.size() <= folder.size() || path[folder.size()] != '/') {
             continue;

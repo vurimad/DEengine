@@ -39,13 +39,14 @@ core::StringId default_template(asset::AlphaMode mode);
 //       "alpha_mode": "opaque",              // opaque, masked or blend; picks the template
 //       "template": "pbr_opaque",            // optional: another template
 //       "double_sided": false,
-//       "params": {"base_color": [1, 0.8, 0.6, 1], "roughness": 0.7},
+//       "params": {"base_color": [1, 0.8, 0.6], "roughness": 0.7},   // missing y, z are 0 and w is 1
 //       "textures": {"base_color": "rock_albedo.png", "normal": "rock_normal.png"}
 //     }
 // Texture paths are relative to the material's folder and must be texture sources. Each texture
 // used is added to uses (the "normal" slot as a normal map, base_color and emissive as color, the
 // rest as data), which picks its compression defaults.
-core::Result<MaterialBuild> import_text_material(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
-                                                 core::Array<TextureUse>& uses, Diagnostics& diagnostics);
+core::Result<MaterialBuild> import_text_material(const SourceTree& tree, const Source& source,
+                                                 std::span<const std::byte> bytes, core::Array<TextureUse>& uses,
+                                                 Diagnostics& diagnostics);
 
 } // namespace de::cooker

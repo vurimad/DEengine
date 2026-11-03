@@ -38,6 +38,9 @@ struct ModelTexture {
 
 struct ModelImage {
     core::Array<std::byte> encoded{tools_heap()}; // PNG or JPEG bytes
+    // Names its sub-asset ("image/<key>"): stable while the model's images stay (the glTF image
+    // index, the FBX texture's ID), whatever order materials use them in.
+    uint32_t key = 0;
 };
 
 inline constexpr size_t kMaxMaterialName = 127;
@@ -73,12 +76,13 @@ struct ModelData {
 // glTF 2.0 (.gltf with its buffers and images beside it, or .glb). The default scene, flattened:
 // every mesh node's primitives in world space. Triangles only; missing normals and tangents are
 // generated. Images must be sources under content/ (or embedded).
+// bytes: the source file's contents; buffers beside it are read through vfs.
 core::Result<ModelData> import_gltf(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
-                                    Diagnostics& diagnostics);
+                                    std::span<const std::byte> bytes, Diagnostics& diagnostics);
 
 // FBX (ufbx), converted to meters, Y up, right-handed. The scene flattened like glTF's; materials
 // mapped to metal-roughness (base color, normal, emissive textures; metallic and roughness as values).
-core::Result<ModelData> import_fbx(const platform::Vfs& vfs, const SourceTree& tree, const Source& source,
+core::Result<ModelData> import_fbx(const SourceTree& tree, const Source& source, std::span<const std::byte> bytes,
                                    Diagnostics& diagnostics);
 
 // Fills in what an importer couldn't read: smooth normals where a primitive had none, then tangents

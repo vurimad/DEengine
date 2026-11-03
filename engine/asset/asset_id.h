@@ -81,6 +81,9 @@ using AssetIdText = core::FixedString<kAssetIdTextLength>;
 AssetIdText format_asset_id(AssetId id);
 bool parse_asset_id(std::string_view text, AssetId& id);
 
+// Exactly 16 hex digits (either case), any value including 0: hashes stored as text.
+bool parse_hex64(std::string_view text, uint64_t& value);
+
 } // namespace de::asset
 
 template <>
