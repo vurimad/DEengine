@@ -507,7 +507,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 11. Post: TAA, SSR, bloom, depth of field, motion blur, tonemapping, color grading LUT, film grain
 12. UI and editor overlays
 
-Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
+Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), analytic height fog over the scene and the sky (step 9's far range, ahead of the froxels), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
 
 GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
@@ -586,6 +586,11 @@ The sky is a core system, not a skybox: it drives the lighting, fog, mood and co
 - Physically based scattering (Rayleigh, Mie, ozone) using small precomputed LUTs (transmittance, multi-scattering, sky-view, aerial perspective), recomputed only when atmosphere parameters change. Cost: well under 0.5 ms.
 - Aerial perspective applied to every pixel, so distant mountains and castles fade into the sky color naturally; this is a large part of the Elden Ring look.
 - Artist controls on top of physics: tint, haze density, horizon glow, golden-hour boost, stored per region and per weather state.
+
+**Fog: one medium model, near and far.** Elden Ring's way (study 04): extinction is a constant plus a height fog around a base height, with a bounded exponential profile (thinning upward; below the base, rising only to twice its density, so valleys don't fill without limit), coloured per channel (blue fades first, the sun reddens through haze). Light scattered in: the sun through a colour looking toward it and another looking away (artists' controls in place of one phase parameter), dimmed by the fog column above, plus an ambient colour; a start distance, another for sun haze, and an end distance that is also the sky's. The sky is fogged like everything else, so the horizon takes the haze of the land below it.
+
+- v1 (built, `shaders/common/fog.slang`): the closed-form integral of that medium along each view ray, one full-screen pass after lighting (about 0.06 ms at 1600 x 900). Settings in the environment asset, hot reloaded.
+- v2: froxel volumetric fog for the near range, with the same medium: sun shadows in it (light shafts), local lights, fog volumes; v1's integral becomes its far range.
 
 **Volumetric clouds.**
 
@@ -1190,3 +1195,4 @@ Decisions so far:
 | 2026-11-03 | A world is an asset (`.world`: cells, start, environment) and the light is one too (`.environment`), both hot reloaded; the engine opens the world named in `config/engine.settings` | Nothing about a scene is in code; editing the light or the world shows in the running game, and the same assets carry over to the streamer, time of day and weather |
 | 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |
 | 2026-11-03 | Until GPU-driven v1 keeps instances on the GPU, render extraction writes every instance each frame; change-only uploads (and the render origin's one re-upload) arrive with it | The simplest correct path first; the per-frame cost is measured (GPU timers, Tracy) before it's optimized |
+| 2026-11-03 | Fog v1 is an analytic height fog (Elden Ring's medium: constant plus bounded exponential height fog, coloured extinction, two-colour sun lobe, ambient) in a full-screen pass over the scene and the sky; froxels come next with the same model | Most of the atmosphere for a few hundredths of a millisecond; the froxel fog needs this model and this far range anyway |

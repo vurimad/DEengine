@@ -42,6 +42,23 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
     if (!shadows) {
         return core::fail(ErrorCode::CorruptData, "environment's shadow settings are out of range");
     }
+    using F = FogLimits;
+    bool fog = within(fog_density_per_m, 0.0f, F::kMaxDensityPerM) &&
+               within(fog_height_density_per_m, 0.0f, F::kMaxDensityPerM) &&
+               within(fog_height_falloff_per_m, F::kMinFalloffPerM, F::kMaxFalloffPerM) &&
+               within(fog_base_height_m, -F::kMaxBaseHeightM, F::kMaxBaseHeightM) &&
+               within(fog_sun_height_attenuation, 0.0f, F::kMaxAttenuation) &&
+               within(fog_ambient_height_attenuation, 0.0f, F::kMaxAttenuation) &&
+               within(fog_start_m, 0.0f, F::kMaxDistanceM) && within(fog_sun_start_m, 0.0f, F::kMaxDistanceM) &&
+               within(fog_end_m, 0.0f, F::kMaxDistanceM) && fog_end_m > fog_start_m;
+    for (int i = 0; i < 3; ++i) {
+        fog = fog && within(fog_extinction_tint[i], F::kMinExtinctionTint, F::kMaxExtinctionTint) &&
+              finite_at_least(fog_sun_forward[i], 0.0f) && finite_at_least(fog_sun_back[i], 0.0f) &&
+              finite_at_least(fog_ambient[i], 0.0f);
+    }
+    if (!fog) {
+        return core::fail(ErrorCode::CorruptData, "environment's fog settings are out of range");
+    }
     return {};
 }
 

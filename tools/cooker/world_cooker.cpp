@@ -85,6 +85,86 @@ void read_light(const JsonReader& parent, const char* key, float (&out)[3]) {
     }
 }
 
+// The fog block: every setting required but the colours' intensities.
+void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
+    yyjson_val* fog = yyjson_obj_get(parent.object, "fog");
+    if (!yyjson_is_obj(fog)) {
+        parent.diagnostics->error(parent.path, "fog should be an object");
+        return;
+    }
+    const JsonReader reader{.object = fog, .path = parent.path, .diagnostics = parent.diagnostics};
+    static constexpr const char* kKeys[] = {"density",
+                                            "height_density",
+                                            "height_falloff",
+                                            "base_height_m",
+                                            "extinction_tint",
+                                            "sun_forward",
+                                            "sun_back",
+                                            "sun_height_attenuation",
+                                            "ambient",
+                                            "ambient_height_attenuation",
+                                            "start_m",
+                                            "sun_start_m",
+                                            "end_m"};
+    reader.check_keys(kKeys, "fog");
+    using F = asset::FogLimits;
+    struct Number {
+        const char* key;
+        double least;
+        double most;
+        float* out;
+    };
+    const Number numbers[] = {
+        {.key = "density", .least = 0.0, .most = F::kMaxDensityPerM, .out = &environment.fog_density_per_m},
+        {.key = "height_density",
+         .least = 0.0,
+         .most = F::kMaxDensityPerM,
+         .out = &environment.fog_height_density_per_m},
+        {.key = "height_falloff",
+         .least = F::kMinFalloffPerM,
+         .most = F::kMaxFalloffPerM,
+         .out = &environment.fog_height_falloff_per_m},
+        {.key = "base_height_m",
+         .least = -F::kMaxBaseHeightM,
+         .most = F::kMaxBaseHeightM,
+         .out = &environment.fog_base_height_m},
+        {.key = "sun_height_attenuation",
+         .least = 0.0,
+         .most = F::kMaxAttenuation,
+         .out = &environment.fog_sun_height_attenuation},
+        {.key = "ambient_height_attenuation",
+         .least = 0.0,
+         .most = F::kMaxAttenuation,
+         .out = &environment.fog_ambient_height_attenuation},
+        {.key = "start_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_start_m},
+        {.key = "sun_start_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_sun_start_m},
+        {.key = "end_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_end_m},
+    };
+    for (const Number& number : numbers) {
+        double value = 0.0;
+        if (required(reader, number.key, number.least, number.most, value)) {
+            *number.out = static_cast<float>(value);
+        }
+    }
+    if (environment.fog_end_m <= environment.fog_start_m) {
+        parent.diagnostics->error(parent.path, "fog's end_m should be past its start_m");
+    }
+    double tint[3] = {};
+    if (!read_numbers(yyjson_obj_get(fog, "extinction_tint"), tint, 3) ||
+        !std::ranges::all_of(tint, [](double t) { return t >= F::kMinExtinctionTint && t <= F::kMaxExtinctionTint; })) {
+        parent.diagnostics->error(parent.path, "fog's extinction_tint should be [r, g, b], each from %g to %g",
+                                  static_cast<double>(F::kMinExtinctionTint),
+                                  static_cast<double>(F::kMaxExtinctionTint));
+    } else {
+        for (int i = 0; i < 3; ++i) {
+            environment.fog_extinction_tint[i] = static_cast<float>(tint[i]);
+        }
+    }
+    read_light(reader, "sun_forward", environment.fog_sun_forward);
+    read_light(reader, "sun_back", environment.fog_sun_back);
+    read_light(reader, "ambient", environment.fog_ambient);
+}
+
 } // namespace
 
 core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& source, std::span<const std::byte> bytes,
@@ -189,7 +269,7 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }
     const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
-    static constexpr const char* kKeys[] = {"sun", "sky", "ground", "shadow_color", "exposure_ev", "shadows"};
+    static constexpr const char* kKeys[] = {"sun", "sky", "ground", "shadow_color", "exposure_ev", "shadows", "fog"};
     reader.check_keys(kKeys, "environment");
     asset::EnvironmentAsset environment;
 
@@ -248,6 +328,7 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         environment.shadow_penumbra_per_m = static_cast<float>(values[5]);
         environment.shadow_max_penumbra_texels = static_cast<float>(values[6]);
     }
+    read_fog(reader, environment);
     if (diagnostics.error_count() != errors_before) {
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }

@@ -13,7 +13,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
 | `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, name, flags); its meshes are its dependencies |
 | `world_format.h` | `.deworld`: a world's cells by coordinate (sorted, named but not dependencies: they stream), its start, its environment (the one dependency) |
-| `environment_format.h` | `.deenv`: sun direction and color, sky and ground ambient, shadow color, exposure, sun shadow settings |
+| `environment_format.h` | `.deenv`: sun direction and color, sky and ground ambient, shadow color, exposure, sun shadow settings (`ShadowLimits`), fog (`FogLimits`) |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |
 | `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload |
 

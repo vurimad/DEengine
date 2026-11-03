@@ -245,6 +245,48 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         CHECK(lit_center[0] > 2 * lit_center[2]);
         const uint8_t* lit_sky = texel(lit, 1, 1);
         CHECK(lit_sky[2] > lit_sky[0]); // bluish
+
+        // Fog: the same view through a thick green fog (constant, 0.5 per meter: about a fifth of
+        // the square's light gets through its 3 m), and the sky (as far as the fog reaches) behind it.
+        const auto render_lit = [&](const de::render::SceneFog& fog) {
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+            light.fog = fog;
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit);
+            graph->execute();
+            device->end_frame();
+            return de::test::read_texture(*device, *target);
+        };
+        de::render::SceneFog green{.density_per_m = 0.5f, .ambient = {0.0f, 2.0f, 0.0f}, .end_m = 1000.0f};
+        const de::core::Array<std::byte> fogged = render_lit(green);
+        const uint8_t* fogged_center = texel(fogged, kSize / 2, kSize / 2);
+        CHECK(fogged_center[0] < lit_center[0] - 40); // dimmed
+        CHECK(fogged_center[1] > fogged_center[0]);   // and green
+        CHECK(texel(fogged, 1, 1)[1] > 200);          // the sky behind 1 km of it: all fog
+        // Fog that starts past the square leaves it as it was (the sky behind it still fogged).
+        green.start_m = 10.0f;
+        const de::core::Array<std::byte> started = render_lit(green);
+        CHECK(texel(started, kSize / 2, kSize / 2)[0] == doctest::Approx(lit_center[0]).epsilon(0.02));
+        CHECK(texel(started, kSize / 2, kSize / 2)[1] == doctest::Approx(lit_center[1]).epsilon(0.05));
+        CHECK(texel(started, 1, 1)[1] > 200);
+        // Height fog far below the camera (its base 1 km down, thinning by e every 10 m up) is
+        // gone where the camera looks; the same fog based at the camera's height is thick.
+        const de::render::SceneFog low{.height_density_per_m = 0.5f,
+                                       .height_falloff_per_m = 0.1f,
+                                       .base_height_m = -1000.0,
+                                       .ambient = {0.0f, 2.0f, 0.0f},
+                                       .end_m = 1000.0f};
+        const de::core::Array<std::byte> below = render_lit(low);
+        CHECK(texel(below, kSize / 2, kSize / 2)[0] == doctest::Approx(lit_center[0]).epsilon(0.02));
+        de::render::SceneFog level = low;
+        level.base_height_m = 0.0;
+        level.ambient_height_attenuation = 0.0f; // the fog column above (optical depth 5) would darken it
+        const de::core::Array<std::byte> around = render_lit(level);
+        CHECK(texel(around, kSize / 2, kSize / 2)[1] > texel(around, kSize / 2, kSize / 2)[0]);
         // Nothing to look through: cleared to the empty color (0.10, 0.11, 0.15 by default).
         frame.camera.valid = false;
         const de::core::Array<std::byte> cleared = render(de::render::SceneView::Lit);
@@ -576,6 +618,13 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     environment.shadow_resolution = 1024;
     environment.shadow_distance_m = 90.0f;
     environment.shadow_max_penumbra_texels = 3.0f;
+    environment.fog_height_density_per_m = 0.002f;
+    environment.fog_base_height_m = -15.0f;
+    environment.fog_extinction_tint[2] = 1.3f;
+    environment.fog_sun_back[1] = 0.4f;
+    environment.fog_ambient_height_attenuation = 0.5f;
+    environment.fog_sun_start_m = 7.0f;
+    environment.fog_end_m = 9000.0f;
     const de::render::SceneLighting lighting = de::render::scene_lighting(environment);
     CHECK(lighting.sun_direction[0] == 0.6f);
     CHECK(lighting.sun_direction[1] == 0.8f);
@@ -586,6 +635,13 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     CHECK(lighting.shadows.resolution == 1024);
     CHECK(lighting.shadows.distance_m == 90.0f);
     CHECK(lighting.shadows.max_penumbra_texels == 3.0f);
+    CHECK(lighting.fog.height_density_per_m == 0.002f);
+    CHECK(lighting.fog.base_height_m == -15.0);
+    CHECK(lighting.fog.extinction_tint[2] == 1.3f);
+    CHECK(lighting.fog.sun_back[1] == 0.4f);
+    CHECK(lighting.fog.ambient_height_attenuation == 0.5f);
+    CHECK(lighting.fog.sun_start_m == 7.0f);
+    CHECK(lighting.fog.end_m == 9000.0f);
 }
 
 TEST_CASE("masked materials are cut out, double-sided ones seen from behind, each by its own pipeline") {

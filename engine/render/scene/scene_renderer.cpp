@@ -41,6 +41,13 @@ struct SceneFrame {
     float cascade_depth_per_m[kShadowCascadeCount] = {};
     float camera_forward[4] = {};
     float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
+    // FogMedium in shaders/common/fog.slang.
+    float fog_density[4] = {};     // constant, height base, falloff, base height (render-origin space)
+    float fog_extinction[4] = {};  // tint, ambient height attenuation
+    float fog_sun_forward[4] = {}; // colour, sun height attenuation
+    float fog_sun_back[4] = {};    // colour, sun start
+    float fog_ambient[4] = {};     // colour, start
+    float fog_range[4] = {};       // end
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -84,6 +91,13 @@ struct DeferredLightPush {
     uint32_t gb2 = 0;
     uint32_t depth = 0;
     uint32_t shadow_mask = 0;
+};
+
+// Matches FogPush in shaders/scene/fog.slang.
+struct FogPush {
+    uint64_t frame = 0;
+    uint32_t hdr = 0;
+    uint32_t depth = 0;
 };
 
 // Matches TonemapPush in shaders/scene/tonemap.slang.
@@ -169,6 +183,7 @@ struct SceneRendererState {
     shader::ProgramHandle shadow_caster_opaque; // depth only
     shader::ProgramHandle shadow_caster_masked; // alpha-tested
     shader::ProgramHandle shadow_mask;
+    shader::ProgramHandle fog_program;
     // This frame's mesh parts by kind, for the shadow and G-buffer passes: opaque first, so masked
     // pixels behind them fail early depth; each kind one pipeline state. Capacity kept between frames.
     core::Array<PartDraw> draws[kDrawKindCount] = {
@@ -183,8 +198,9 @@ struct SceneRendererState {
     SceneRendererStats stats;
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program : {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap,
-                                                    shadow_caster_opaque, shadow_caster_masked, shadow_mask}) {
+        for (const shader::ProgramHandle program :
+             {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
+              shadow_mask, fog_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -219,6 +235,9 @@ struct SceneRendererState {
         light.color_formats[0] = kHdrFormat;
         light.blend[0] = rhi::BlendMode::Additive;
         deferred_light = make("scene.deferred_light", light);
+        rhi::GraphicsPipelineDesc fogged{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "fog"};
+        fogged.color_formats[0] = kHdrFormat;
+        fog_program = make("scene.fog", fogged);
 
         // Casters: depth only, no culling (thin geometry casts from both sides).
         const rhi::GraphicsPipelineDesc caster{.depth_format = kDepthFormat,
@@ -332,6 +351,21 @@ struct SceneRendererState {
         scene.shadow_params[1] = 1.0f / static_cast<float>(shadows.resolution * 2);
         scene.shadow_params[2] = shadows.penumbra_per_m;
         scene.shadow_params[3] = shadows.max_penumbra_texels;
+        const SceneFog& fog = lighting.fog;
+        const auto base_height = static_cast<float>(fog.base_height_m - frame.origin.y);
+        scene.fog_density[0] = fog.density_per_m;
+        scene.fog_density[1] = fog.height_density_per_m;
+        scene.fog_density[2] = fog.height_falloff_per_m;
+        scene.fog_density[3] = base_height;
+        copy3(fog.extinction_tint, scene.fog_extinction);
+        scene.fog_extinction[3] = fog.ambient_height_attenuation;
+        copy3(fog.sun_forward, scene.fog_sun_forward);
+        scene.fog_sun_forward[3] = fog.sun_height_attenuation;
+        copy3(fog.sun_back, scene.fog_sun_back);
+        scene.fog_sun_back[3] = fog.sun_start_m;
+        copy3(fog.ambient, scene.fog_ambient);
+        scene.fog_ambient[3] = fog.start_m;
+        scene.fog_range[0] = fog.end_m;
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         for (size_t i = 0; i < frame.instances.size(); ++i) {
             std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
@@ -357,6 +391,20 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
                         .caster_reach_m = environment.shadow_caster_reach_m,
                         .penumbra_per_m = environment.shadow_penumbra_per_m,
                         .max_penumbra_texels = environment.shadow_max_penumbra_texels};
+    SceneFog& fog = lighting.fog;
+    fog.density_per_m = environment.fog_density_per_m;
+    fog.height_density_per_m = environment.fog_height_density_per_m;
+    fog.height_falloff_per_m = environment.fog_height_falloff_per_m;
+    fog.base_height_m = environment.fog_base_height_m;
+    std::copy_n(environment.fog_extinction_tint, 3, fog.extinction_tint);
+    std::copy_n(environment.fog_sun_forward, 3, fog.sun_forward);
+    std::copy_n(environment.fog_sun_back, 3, fog.sun_back);
+    std::copy_n(environment.fog_ambient, 3, fog.ambient);
+    fog.sun_height_attenuation = environment.fog_sun_height_attenuation;
+    fog.ambient_height_attenuation = environment.fog_ambient_height_attenuation;
+    fog.start_m = environment.fog_start_m;
+    fog.sun_start_m = environment.fog_sun_start_m;
+    fog.end_m = environment.fog_end_m;
     return lighting;
 }
 
@@ -551,6 +599,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle caster_opaque = state.shaders->pipeline(state.shadow_caster_opaque);
     const rhi::PipelineHandle caster_masked = state.shaders->pipeline(state.shadow_caster_masked);
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
+    const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
@@ -558,7 +607,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid();
+                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
+                       fog.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -739,26 +789,53 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.end_rendering();
         });
 
+    // Fog: the lit image into a new one, dimmed by the fog in front of each pixel, with its light added.
+    struct FogPass {
+        GraphTexture fogged;
+    };
+    const auto& fog_pass = graph.add_pass<FogPass>(
+        "fog",
+        [&](PassBuilder& pass, FogPass& data) {
+            data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+            pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(data.fogged, rhi::ResourceState::RenderTarget);
+        },
+        [targets, frame_address, fog](const FogPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("fog pass");
+            const rhi::ColorAttachment color{.texture = context.texture(data.fogged), .load = rhi::LoadOp::DontCare};
+            context.list.begin_rendering({.colors = std::span(&color, 1)});
+            context.list.bind_pipeline(fog);
+            context.list.push_constants(FogPush{
+                .frame = frame_address,
+                .hdr = context.device.texture_index(context.texture(targets.hdr)),
+                .depth = context.device.texture_index(context.texture(targets.depth)),
+            });
+            context.list.draw(3);
+            context.list.end_rendering();
+        });
+    const GraphTexture fogged = fog_pass.fogged;
+
     const float exposure = std::exp2(lighting.exposure_ev);
     const auto view_index = static_cast<uint32_t>(view);
     const uint32_t srgb_target = rhi::format_info(target_format).srgb ? 1 : 0;
     graph.add_pass(
         "tonemap",
         [&](PassBuilder& pass) {
-            pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(fogged, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             for (const GraphTexture gb : targets.gb) {
                 pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             }
             pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
-        [targets, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
+        [targets, fogged, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
             DE_PROFILE_ZONE("tonemap pass");
             const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
             context.list.bind_pipeline(tonemap);
             context.list.push_constants(TonemapPush{
-                .hdr = context.device.texture_index(context.texture(targets.hdr)),
+                .hdr = context.device.texture_index(context.texture(fogged)),
                 .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
                 .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
                 .gb2 = context.device.texture_index(context.texture(targets.gb[2])),

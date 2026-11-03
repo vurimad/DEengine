@@ -1,6 +1,8 @@
 // What the scene passes share: the frame's constants, the vertex and material layouts (mirrors of
 // the C++ structs), vertex decoding and the G-buffer's packing.
 
+import common.fog;
+
 // Matches render::SceneFrame (engine/render/scene/scene_renderer.cpp).
 public struct SceneFrame
 {
@@ -19,6 +21,7 @@ public struct SceneFrame
     public float4 cascade_depth_per_m;   // per cascade: depth units per meter toward the sun
     public float4 camera_forward;        // xyz: the view direction
     public float4 shadow_params;         // x: blend band (fraction of a cascade), y: atlas texel (uv), z: penumbra scale, w: max penumbra (texels)
+    public FogMedium fog;
 };
 
 public static const uint kCascadeCount = 4;
