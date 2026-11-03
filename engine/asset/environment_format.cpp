@@ -10,6 +10,10 @@ bool finite_at_least(float value, float least) {
     return std::isfinite(value) && value >= least;
 }
 
+bool within(float value, float least, float most) {
+    return finite_at_least(value, least) && value <= most;
+}
+
 } // namespace
 
 core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*/) const {
@@ -28,12 +32,13 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
     if (!colors) {
         return core::fail(ErrorCode::CorruptData, "environment has a negative or non-finite color");
     }
-    const bool shadows = shadow_resolution >= 64 && shadow_resolution <= 8192 &&
-                         finite_at_least(shadow_distance_m, 0.0f) && finite_at_least(shadow_split_lambda, 0.0f) &&
-                         shadow_split_lambda <= 1.0f && finite_at_least(shadow_blend_band, 0.0f) &&
-                         shadow_blend_band <= 0.5f && finite_at_least(shadow_caster_reach_m, 0.0f) &&
-                         finite_at_least(shadow_penumbra_per_m, 0.0f) &&
-                         finite_at_least(shadow_max_penumbra_texels, 1.0f);
+    using L = ShadowLimits;
+    const bool shadows = shadow_resolution >= L::kMinResolution && shadow_resolution <= L::kMaxResolution &&
+                         within(shadow_distance_m, L::kMinDistanceM, L::kMaxDistanceM) &&
+                         within(shadow_split_lambda, 0.0f, 1.0f) && within(shadow_blend_band, 0.0f, L::kMaxBlendBand) &&
+                         within(shadow_caster_reach_m, 0.0f, L::kMaxCasterReachM) &&
+                         within(shadow_penumbra_per_m, 0.0f, L::kMaxPenumbraPerM) &&
+                         within(shadow_max_penumbra_texels, L::kMinPenumbraTexels, L::kMaxPenumbraTexels);
     if (!shadows) {
         return core::fail(ErrorCode::CorruptData, "environment's shadow settings are out of range");
     }

@@ -467,9 +467,13 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                rhi::Color empty) {
     DE_PROFILE_ZONE("scene passes setup");
     SceneRendererState& state = *state_;
+    // An environment asset is within the limits already (validated when loaded); lighting made in code
+    // is held to them here: the resolution sizes the atlas (twice it), the penumbra a search.
+    using Limits = asset::ShadowLimits;
     state.shadows = lighting.shadows;
-    state.shadows.resolution = std::clamp(state.shadows.resolution, 64U, 8192U); // the atlas is twice that
-    state.shadows.max_penumbra_texels = std::max(state.shadows.max_penumbra_texels, 1.0f);
+    state.shadows.resolution = std::clamp(state.shadows.resolution, Limits::kMinResolution, Limits::kMaxResolution);
+    state.shadows.max_penumbra_texels =
+        std::clamp(state.shadows.max_penumbra_texels, Limits::kMinPenumbraTexels, Limits::kMaxPenumbraTexels);
     state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
     const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);

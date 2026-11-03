@@ -51,7 +51,9 @@ TEST_CASE("a deadzone that isn't a number in range is rejected") {
 }
 
 TEST_CASE("settings are read by name, past comments and blanks") {
-    const std::string_view text = "# engine settings\r\n"
+    const std::string_view text = "\xEF\xBB\xBF"
+                                  "first 1   # right after a byte order mark\r\n"
+                                  "# engine settings\n"
                                   "\n"
                                   "world_size  7   # not this one\n"
                                   "  world   76d76b87e8562965   # the test world\r\n"
@@ -59,6 +61,7 @@ TEST_CASE("settings are read by name, past comments and blanks") {
                                   "# world 0000000000000000\n";
     CHECK((de::app::setting(text, "world") == "76d76b87e8562965"));
     CHECK((de::app::setting(text, "world_size") == "7"));
+    CHECK((de::app::setting(text, "first") == "1"));
     CHECK(de::app::setting(text, "empty").empty());
     CHECK(de::app::setting(text, "missing").empty());
     CHECK(de::app::setting(text, "engine").empty()); // only in a comment

@@ -28,6 +28,7 @@ add_executable(de_tests
     core/result_test.cpp
     core/slot_map_test.cpp
     core/string_id_test.cpp
+    core/text_test.cpp
     core/test_support.h
     core/version_test.cpp
     core/work_stealing_deque_test.cpp

@@ -8,6 +8,7 @@
 #include "core/memory_stats.h"
 #include "core/profile.h"
 #include "core/string_id.h"
+#include "core/text.h"
 #include "core/version.h"
 #include "platform/events.h"
 #include "platform/input.h"
@@ -52,20 +53,6 @@ ConfigPath config_path(bool has_src, const char* name) {
     return path;
 }
 
-bool is_blank(char c) {
-    return c == ' ' || c == '\t' || c == '\r';
-}
-
-std::string_view trim(std::string_view text) {
-    while (!text.empty() && is_blank(text.front())) {
-        text.remove_prefix(1);
-    }
-    while (!text.empty() && is_blank(text.back())) {
-        text.remove_suffix(1);
-    }
-    return text;
-}
-
 // Input bindings are text (docs/design.md, Input): the engine's (from the source tree in dev
 // builds, so edits apply on the next run without a cook), then the player's, whose lines replace
 // the engine's for the actions they name. In dev builds every action is added, so a line naming
@@ -102,18 +89,15 @@ bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_sr
 } // namespace
 
 std::string_view setting(std::string_view settings, std::string_view name) {
-    std::string_view rest = settings;
+    std::string_view rest = core::skip_bom(settings);
     while (!rest.empty()) {
-        const size_t end = rest.find('\n');
-        std::string_view line = rest.substr(0, end);
-        rest.remove_prefix(end == std::string_view::npos ? rest.size() : end + 1);
-        line = trim(line.substr(0, line.find('#')));
+        const std::string_view line = core::strip_comment(core::next_line(rest));
         size_t split = 0;
-        while (split < line.size() && !is_blank(line[split])) {
+        while (split < line.size() && !core::is_blank(line[split])) {
             ++split;
         }
         if (line.substr(0, split) == name) {
-            return trim(line.substr(split));
+            return core::trim(line.substr(split));
         }
     }
     return {};
@@ -255,11 +239,16 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
 
     // Engine settings (text, like the bindings): read once, kept for setting().
+    // Missing, it's empty: whoever needs a setting says so.
     const ConfigPath settings_path = config_path(src_root != nullptr, "engine.settings");
-    const auto settings = vfs->read_whole_file(settings_path.c_str(), core::heap_allocator(core::MemoryTag::Platform));
-    if (!settings) {
-        DE_LOG_ERROR("engine", "%s: %s", settings_path.c_str(), settings.error().message);
-        return EXIT_FAILURE;
+    core::Array<std::byte> settings(core::heap_allocator(core::MemoryTag::Platform));
+    if (vfs->exists(settings_path.c_str())) {
+        auto read = vfs->read_whole_file(settings_path.c_str(), core::heap_allocator(core::MemoryTag::Platform));
+        if (!read) {
+            DE_LOG_ERROR("engine", "%s: %s", settings_path.c_str(), read.error().message);
+            return EXIT_FAILURE;
+        }
+        settings = std::move(*read);
     }
 
     platform::Input input;
@@ -277,7 +266,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .assets = *assets,
                   .world = *world,
                   .gpu_assets = *gpu_assets,
-                  .settings = as_text(*settings),
+                  .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit};
 
@@ -301,6 +290,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #endif
 
     if (!application.startup(engine, args) || !load_bindings(*vfs, input, src_root != nullptr)) {
+        application.shutdown(engine); // what startup got before it failed
         return EXIT_FAILURE;
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));

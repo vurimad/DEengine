@@ -36,6 +36,7 @@ add_library(de_core STATIC
     result.h
     slot_map.h
     string_id.h
+    text.h
     version.cpp
     version.h)
 add_library(de::core ALIAS de_core)

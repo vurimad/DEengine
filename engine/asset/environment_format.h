@@ -6,6 +6,20 @@
 
 namespace de::asset {
 
+// The range of each sun shadow setting: what the cooker accepts, loading checks, and the renderer
+// holds lighting made in code to.
+struct ShadowLimits {
+    static constexpr uint32_t kMinResolution = 64; // per cascade
+    static constexpr uint32_t kMaxResolution = 8192;
+    static constexpr float kMinDistanceM = 1.0f;
+    static constexpr float kMaxDistanceM = 1e5f;
+    static constexpr float kMaxBlendBand = 0.5f; // split_lambda is 0 to 1
+    static constexpr float kMaxCasterReachM = 1e5f;
+    static constexpr float kMaxPenumbraPerM = 10.0f;
+    static constexpr float kMinPenumbraTexels = 1.0f;
+    static constexpr float kMaxPenumbraTexels = 64.0f;
+};
+
 // .deenv: the binary form of a .environment text source. How a place is lit (docs/design.md,
 // Rendering; Sky, atmosphere & weather): the sun, the ambient from sky and ground, the tint of
 // shadowed sunlight, exposure, and the sun's shadows. Colors are linear, multiplied by their
@@ -33,7 +47,7 @@ struct EnvironmentAsset {
     uint32_t reserved = 0;
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
-    // within their limits.
+    // within ShadowLimits.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
 static_assert(sizeof(EnvironmentAsset) == 160);

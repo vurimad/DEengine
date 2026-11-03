@@ -35,7 +35,7 @@ bool cell_coord(const Source& cell, std::string_view world, SourceReader read, i
     if (!bytes) {
         return false; // reported by read
     }
-    Diagnostics ignored; // the cell's own cook reports its errors
+    Diagnostics ignored(false); // the cell's own cook reports its errors
     const core::Result<JsonDoc> doc = JsonDoc::parse(bytes->span(), cell.path.view(), ignored);
     double read_coord[2] = {};
     if (!doc || !read_numbers(yyjson_obj_get(doc->root(), "coord"), read_coord, 2) ||
@@ -226,7 +226,14 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
                                                       "max_penumbra_texels"};
         shadow_reader.check_keys(kShadowKeys, "shadows");
         double values[7] = {};
-        const double limits[7][2] = {{64, 8192}, {1, 1e5}, {0, 1}, {0, 0.5}, {0, 1e5}, {0, 10}, {1, 64}};
+        using L = asset::ShadowLimits;
+        const double limits[7][2] = {{L::kMinResolution, L::kMaxResolution},
+                                     {L::kMinDistanceM, L::kMaxDistanceM},
+                                     {0, 1},
+                                     {0, L::kMaxBlendBand},
+                                     {0, L::kMaxCasterReachM},
+                                     {0, L::kMaxPenumbraPerM},
+                                     {L::kMinPenumbraTexels, L::kMaxPenumbraTexels}};
         for (size_t k = 0; k < 7; ++k) {
             required(shadow_reader, kShadowKeys[k], limits[k][0], limits[k][1], values[k]);
         }

@@ -23,7 +23,7 @@ inline constexpr uint32_t kShadowCascadeCount = 4;
 // The sun's shadows (renderer step 3): cascaded shadow maps in one atlas, resolved per pixel into
 // a screen-space mask.
 struct SceneShadows {
-    uint32_t resolution = 2048;       // per cascade (64 to 8192); the atlas is 2 x 2 of them
+    uint32_t resolution = 2048;       // per cascade (asset::ShadowLimits); the atlas is 2 x 2 of them
     float distance_m = 140.0f;        // along the view; shadows fade out over the last cascade's band
     float split_lambda = 0.75f;       // 0: even cascade splits, 1: logarithmic
     float blend_band = 0.12f;         // of each cascade, dithered into the next

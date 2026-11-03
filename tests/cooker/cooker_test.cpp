@@ -1477,4 +1477,11 @@ TEST_CASE("broken worlds and environments are refused when loaded") {
     environment.shadow_resolution = 2048;
     environment.shadow_max_penumbra_texels = 0.5f;
     CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.shadow_max_penumbra_texels = 1e9f; // an unbounded search
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.shadow_max_penumbra_texels = 4.0f;
+    environment.shadow_distance_m = 0.0f; // no cascades
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.shadow_distance_m = 100.0f;
+    CHECK(check(de::cooker::cook_environment(environment, id), load_environment));
 }

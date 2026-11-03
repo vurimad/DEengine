@@ -38,8 +38,9 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
 // The .deworld; its environment is its dependency.
 core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 
-// A .environment text source (JSON): how a place is lit. Every setting is required, so a file says
-// all of its look; colors are linear.
+// A .environment text source (JSON): how a place is lit. Every setting but the intensities (1 when
+// left out) is required, so a file says all of its look; colors are linear. Shadow settings are
+// held to asset::ShadowLimits.
 //     {
 //       "sun": {"elevation_deg": 19, "azimuth_deg": 324,   // above the horizon; clockwise from
 //               "color": [1, 0.78, 0.52], "intensity": 4.6}, // north (-Z) toward east (+X)

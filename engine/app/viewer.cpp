@@ -81,11 +81,15 @@ void Viewer::apply_world(Engine& engine) {
         for (const LoadedCell& have : cells_) {
             loaded = loaded || have.id == cell.cell;
         }
-        if (!loaded) {
-            cells_.push({.id = cell.cell, .entity = world::load_cell(engine.world.ecs(), cell.cell)});
+        if (const flecs::entity entity = loaded ? flecs::entity() : world::load_cell(engine.world.ecs(), cell.cell);
+            entity.is_valid()) {
+            cells_.push({.id = cell.cell, .entity = entity}); // load_cell logged an invalid one
         }
     }
-    environment_ = engine.assets.find(world->header.dependencies.get(file.data())[world->environment]);
+    // No environment: the lighting stays as it is (the engine's defaults at first).
+    environment_ = world->environment == asset::WorldAsset::kNone
+                       ? asset::AssetHandle{}
+                       : engine.assets.find(world->header.dependencies.get(file.data())[world->environment]);
     environment_revision_ = 0; // applied by the next update()
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
@@ -118,7 +122,9 @@ bool Viewer::update(Engine& engine, float frame_s) {
 }
 
 void Viewer::shutdown(Engine& engine) {
-    engine.assets.release(world_);
+    if (world_.is_valid()) {
+        engine.assets.release(world_);
+    }
     world_ = {};
     environment_ = {};
 }
