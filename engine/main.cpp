@@ -267,18 +267,18 @@ int main(int argc, char** argv) {
         }
     }
 
-    // The game world: flecs, ticking at a fixed 60 Hz (nothing lives in it yet).
-    auto world = de::world::World::create({.jobs = &jobs});
-    if (!world) {
-        DE_LOG_ERROR("world", "%s", world.error().message);
-        device->destroy(*quad_texture);
-        return EXIT_FAILURE;
-    }
-    // Cooked assets by ID (nothing loads them yet; the renderer will): reads, reference counts and,
-    // in dev builds, hot reload of files the cooker rewrites.
+    // Cooked assets by ID: reads, reference counts and, in dev builds, hot reload of files the cooker
+    // rewrites. Made before the world, which releases what its cells hold through it.
     auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs});
     if (!assets) {
         DE_LOG_ERROR("asset", "%s", assets.error().message);
+        device->destroy(*quad_texture);
+        return EXIT_FAILURE;
+    }
+    // The game world: flecs, ticking at a fixed 60 Hz (nothing lives in it yet; cells come next).
+    auto world = de::world::World::create({.jobs = &jobs, .assets = &*assets});
+    if (!world) {
+        DE_LOG_ERROR("world", "%s", world.error().message);
         device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }

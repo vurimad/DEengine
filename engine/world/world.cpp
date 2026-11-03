@@ -5,6 +5,7 @@
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "world/cell.h"
 #include "world/flecs_os.h"
 #include "world/transform.h"
 
@@ -47,6 +48,8 @@ flecs::entity make_pipeline(flecs::world& ecs, const char* name) {
 } // namespace
 
 struct WorldState {
+    // Before ecs, so it outlives the world's systems, which write into it.
+    RenderFrame render_frame;
     flecs::world ecs;
     flecs::entity phases[static_cast<size_t>(Phase::Count)];
     flecs::entity simulation; // the pipelines
@@ -72,6 +75,8 @@ core::Result<World> World::create(const WorldDesc& desc) {
     state->jobs = desc.jobs;
     flecs::world& ecs = state->ecs;
     register_transform(ecs);
+    register_cells(ecs, desc.assets);
+    register_render_components(ecs);
 
     // The phases: the simulation ones in a DependsOn chain, RenderExtract on its own. Only our tags,
     // not flecs::Phase: flecs' built-in pipeline (progress()) must never run them.
@@ -91,27 +96,9 @@ core::Result<World> World::create(const WorldDesc& desc) {
     state->simulation = make_pipeline<SimulationPhase>(ecs, "de::SimulationPipeline");
     state->frame = make_pipeline<FramePhase>(ecs, "de::FramePipeline");
 
-    // First of every tick: PreviousTransform catches up with Transform, for the tables whose
-    // Transform changed since (static ones cost nothing).
-    ecs.system<const Transform, PreviousTransform>("de::KeepPreviousTransform")
-        .kind(state->phases[static_cast<size_t>(Phase::Input)])
-        .term_at(1)
-        .out() // written only: changes to it alone don't make a table "changed"
-        .detect_changes()
-        .run([](flecs::iter& it) {
-            DE_PROFILE_ZONE("keep previous transforms");
-            while (it.next()) {
-                if (!it.changed()) {
-                    it.skip();
-                    continue;
-                }
-                const auto current = it.field<const Transform>(0);
-                const auto kept = it.field<PreviousTransform>(1);
-                for (const size_t i : it) {
-                    kept[i].value = current[i];
-                }
-            }
-        });
+    add_transform_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)],
+                          state->phases[static_cast<size_t>(Phase::PostSim)]);
+    add_render_extract(ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)], state->render_frame, desc.jobs);
     return World(state);
 }
 
@@ -134,6 +121,10 @@ World& World::operator=(World&& other) noexcept {
 
 flecs::world& World::ecs() {
     return state_->ecs;
+}
+
+const RenderFrame& World::render_frame() const {
+    return state_->render_frame;
 }
 
 core::JobSystem* World::jobs() const {
@@ -175,6 +166,7 @@ FrameStep World::advance(double real_dt_s) {
     {
         DE_PROFILE_ZONE("world frame");
         const auto frame_dt = static_cast<ecs_ftime_t>(std::max(real_dt_s, 1e-6)); // 0 would mean "measure it"
+        state.render_frame.alpha = state.alpha;
         state.ecs.frame_begin(frame_dt);
         state.ecs.run_pipeline(state.frame, frame_dt);
         state.ecs.frame_end();

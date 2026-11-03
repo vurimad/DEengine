@@ -12,13 +12,16 @@
 #include <cstring>
 #include <string_view>
 
+using de::DVec3;
 using de::Quat;
 using de::Vec3;
 using de::world::FrameStep;
+using de::world::MeshInstance;
 using de::world::Phase;
-using de::world::PreviousTransform;
+using de::world::PreviousWorldTransform;
 using de::world::Transform;
 using de::world::World;
+using de::world::WorldTransform;
 
 namespace {
 
@@ -40,12 +43,12 @@ void add_movement(World& world) {
         .system<Transform, const Velocity>("move")
         .kind(world.phase(Phase::PreSim))
         .each([](flecs::iter& it, size_t, Transform& transform, const Velocity& velocity) {
-            transform.position += velocity.meters_per_s * static_cast<float>(it.delta_time());
+            transform.position += DVec3(velocity.meters_per_s) * static_cast<double>(it.delta_time());
         });
 }
 
-bool near(float a, float b) {
-    return std::fabs(a - b) <= 1e-4f;
+bool near(double a, double b) {
+    return std::fabs(a - b) <= 1e-4;
 }
 
 } // namespace
@@ -87,43 +90,49 @@ TEST_CASE("fixed ticks: time adds up across frames, long frames drop what doesn'
     CHECK(world->alpha() < 1.0f);
 }
 
-TEST_CASE("transforms interpolate between ticks, and static tables aren't copied") {
+TEST_CASE("world transforms interpolate between ticks, and static tables aren't copied") {
     auto world = World::create();
     REQUIRE(world.ok());
     const flecs::world& ecs = world->ecs();
     add_movement(*world);
-    const flecs::entity mover = ecs.entity()
-                                    .set(Transform{})
-                                    .set(PreviousTransform{})
-                                    .set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}}); // 1 m per tick
-    const flecs::entity statue = ecs.entity().set(Transform{.position = {5.0f, 0.0f, 0.0f}}).set(PreviousTransform{});
+    // Transform brings WorldTransform and PreviousWorldTransform with it.
+    const flecs::entity mover = ecs.entity().set(Transform{}).set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}});
+    CHECK(mover.has<WorldTransform>());
+    CHECK(mover.has<PreviousWorldTransform>());
+    // place(): where it should be at once, previous included (no slide in from the origin).
+    const flecs::entity statue = ecs.entity();
+    de::world::place(statue, Transform{.position = {5.0, 0.0, 0.0}});
+    CHECK(near(statue.get<WorldTransform>().position.x, 5.0));
+    CHECK(near(statue.get<PreviousWorldTransform>().value.position.x, 5.0));
 
     world->tick();
     world->tick();
-    CHECK(near(mover.get<Transform>().position.x, 2.0f));
-    CHECK(near(mover.get<PreviousTransform>().value.position.x, 1.0f)); // as the second tick began
-    CHECK(near(de::world::interpolate(mover.get<PreviousTransform>().value, mover.get<Transform>(), 0.25f).position.x,
-               1.25f));
-    CHECK(near(statue.get<PreviousTransform>().value.position.x, 5.0f));
+    CHECK(near(mover.get<Transform>().position.x, 2.0));
+    CHECK(near(mover.get<WorldTransform>().position.x, 2.0));               // computed at the end of PostSim
+    CHECK(near(mover.get<PreviousWorldTransform>().value.position.x, 1.0)); // as the second tick began
+    CHECK(near(de::world::interpolate(mover.get<PreviousWorldTransform>().value, mover.get<WorldTransform>(), 0.25f)
+                   .position.x,
+               1.25));
+    CHECK(near(statue.get<PreviousWorldTransform>().value.position.x, 5.0));
 
-    // The statue's table: nothing writes its Transform, so its PreviousTransform is left alone
+    // The statue's table: nothing writes its transforms, so its PreviousWorldTransform is left alone
     // (a marker shows it). The mover's table keeps being copied.
-    statue.set(PreviousTransform{.value = {.position = {-1.0f, 0.0f, 0.0f}}});
+    statue.set(PreviousWorldTransform{.value = {.position = {-1.0, 0.0, 0.0}}});
     world->tick();
-    CHECK(near(statue.get<PreviousTransform>().value.position.x, -1.0f));
-    CHECK(near(mover.get<PreviousTransform>().value.position.x, 2.0f));
+    CHECK(near(statue.get<PreviousWorldTransform>().value.position.x, -1.0));
+    CHECK(near(mover.get<PreviousWorldTransform>().value.position.x, 2.0));
 
     // Rotations take the short way round.
-    const Transform half = de::world::interpolate(
-        Transform{}, Transform{.rotation = glm::angleAxis(glm::radians(90.0f), de::kWorldUp)}, 0.5f);
-    CHECK(near(glm::degrees(glm::angle(half.rotation)), 45.0f));
+    const WorldTransform half = de::world::interpolate(
+        WorldTransform{}, WorldTransform{.rotation = glm::angleAxis(glm::radians(90.0f), de::kWorldUp)}, 0.5f);
+    CHECK(near(glm::degrees(glm::angle(half.rotation)), 45.0));
 }
 
 TEST_CASE("components are reflected: inspectable and serializable") {
     auto world = World::create();
     REQUIRE(world.ok());
     const flecs::entity entity =
-        world->ecs().entity("thing").set(Transform{.position = {1.0f, 2.0f, 3.0f}, .scale = {2.0f, 2.0f, 2.0f}});
+        world->ecs().entity("thing").set(Transform{.position = {1.0, 2.0, 3.0}, .scale = {2.0f, 2.0f, 2.0f}});
     const flecs::string json = entity.to_json();
     const std::string_view text(json.c_str());
     CAPTURE(text);
@@ -152,7 +161,7 @@ TEST_CASE("flecs runs on the engine: its memory tagged World, none per tick in s
             world->ecs()
                 .entity()
                 .set(Transform{})
-                .set(PreviousTransform{})
+                .set(MeshInstance{})
                 .set(Velocity{.meters_per_s = {1.0f, 0.0f, 0.0f}});
         }
         for (int i = 0; i < 30; ++i) {
@@ -162,7 +171,8 @@ TEST_CASE("flecs runs on the engine: its memory tagged World, none per tick in s
         for (int i = 0; i < 120; ++i) {
             world->advance(1.0 / 60.0);
         }
-        CHECK(de::core::heap_allocation_count() - before == 0); // flecs' allocations included
+        CHECK(de::core::heap_allocation_count() - before == 0); // flecs' and extraction's included
+        CHECK(world->render_frame().instances.size() == 1000);
     }
     // Every block given back.
     CHECK(de::core::memory_stats(de::core::MemoryTag::World).live_allocations == before_world.live_allocations);
@@ -197,7 +207,7 @@ TEST_CASE("systems split their rows across the JobSystem, each with the fixed st
                 const auto velocities = it.field<const Velocity>(1);
                 const auto dt = static_cast<float>(it.delta_time());
                 de::world::for_each_row_parallel(pool, it.count(), 512, [&](size_t i) {
-                    transforms[i].position += velocities[i].meters_per_s * dt;
+                    transforms[i].position += DVec3(velocities[i].meters_per_s * dt);
                 });
             }
         });
@@ -210,12 +220,13 @@ TEST_CASE("systems split their rows across the JobSystem, each with the fixed st
     }
     // Every entity moved once per tick, by the fixed step.
     int wrong = 0;
-    world->ecs().each([&wrong](const Transform& transform) { wrong += near(transform.position.x, 10.0f) ? 0 : 1; });
+    world->ecs().each([&wrong](const Transform& transform) { wrong += near(transform.position.x, 10.0) ? 0 : 1; });
     CHECK(wrong == 0);
 }
 
 TEST_CASE("benchmark: 10k entities in typical shapes, ticked and extracted") {
-    auto world = World::create();
+    de::core::JobSystem jobs;
+    auto world = World::create({.jobs = &jobs});
     REQUIRE(world.ok());
     const flecs::world& ecs = world->ecs();
     add_movement(*world);
@@ -232,34 +243,17 @@ TEST_CASE("benchmark: 10k entities in typical shapes, ticked and extracted") {
     for (int i = 0; i < 6000; ++i) {
         ecs.entity()
             .is_a(kinds[i % 4])
-            .set(Transform{.position = {static_cast<float>(i), 0.0f, 0.0f}})
-            .set(PreviousTransform{})
+            .set(Transform{.position = {static_cast<double>(i), 0.0, 0.0}})
+            .set(MeshInstance{})
             .set(Velocity{.meters_per_s = {0.0f, 0.0f, 1.0f}});
     }
     for (int i = 0; i < 4000; ++i) {
-        ecs.entity().set(Transform{.position = {0.0f, 0.0f, static_cast<float>(i)}}).set(PreviousTransform{});
+        ecs.entity().set(Transform{.position = {0.0, 0.0, static_cast<double>(i)}}).set(MeshInstance{});
     }
-    // Extraction: every entity's interpolated matrix, written once into one flat output.
-    static de::Mat4 extracted[10000];
-    size_t extracted_count = 0;
-    flecs::query<const Transform, const PreviousTransform> renderable =
-        ecs.query_builder<const Transform, const PreviousTransform>().cached().build();
-    ecs.system(nullptr).kind(world->phase(Phase::RenderExtract)).run([&](flecs::iter& it) {
-        while (it.next()) {
-        }
-        extracted_count = 0;
-        const float alpha = world->alpha();
-        renderable.run([&](flecs::iter& table) {
-            while (table.next()) {
-                const auto current = table.field<const Transform>(0);
-                const auto previous = table.field<const PreviousTransform>(1);
-                for (const size_t i : table) {
-                    extracted[extracted_count++] =
-                        de::world::to_matrix(de::world::interpolate(previous[i].value, current[i], alpha));
-                }
-            }
-        });
-    });
+    // Extraction is the world's own (render_frame()): every MeshInstance's interpolated matrix,
+    // relative to the render origin, written once into one flat array.
+    const flecs::query<const WorldTransform, const MeshInstance> renderable =
+        ecs.query_builder<const WorldTransform, const MeshInstance>().cached().build();
 
     for (int i = 0; i < 10; ++i) {
         world->advance(1.0 / 60.0);
@@ -274,6 +268,6 @@ TEST_CASE("benchmark: 10k entities in typical shapes, ticked and extracted") {
     // stats stored once on the prefabs), and the props one more.
     const int32_t tables = renderable.c_ptr() != nullptr ? ecs_query_count(renderable.c_ptr()).tables : 0;
     MESSAGE("10k entities: ", ms / kFrames, " ms per frame (tick + extraction), ", tables, " tables extracted");
-    CHECK(extracted_count == 10000);
+    CHECK(world->render_frame().instances.size() == 10000);
     CHECK(tables == 5);
 }

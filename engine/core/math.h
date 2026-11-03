@@ -13,6 +13,9 @@
 namespace de {
 
 using Vec2 = glm::vec2;
+// World positions: doubles on the CPU, so a 10+ km world has no jitter (docs/design.md, Large-world
+// precision). Rotations and scales stay float.
+using DVec3 = glm::dvec3;
 using Vec3 = glm::vec3;
 using Vec4 = glm::vec4;
 using Quat = glm::quat; // x, y, z, w in memory

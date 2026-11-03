@@ -2,6 +2,7 @@
 
 #include "core/job_system.h"
 #include "core/result.h"
+#include "world/render_extract.h"
 
 #include <flecs.h>
 
@@ -34,6 +35,9 @@ struct WorldDesc {
     // flecs' own threads stay off: its workers wait on each other at every merge, which a job system
     // can't promise.
     core::JobSystem* jobs = nullptr;
+    // Cells release the assets they hold through it (docs/design.md, World model); it must outlive
+    // the world. Null: cells hold nothing (tests of the world alone).
+    asset::AssetRegistry* assets = nullptr;
 };
 
 // What one advance() did.
@@ -63,6 +67,9 @@ public:
 
     flecs::world& ecs();
     core::JobSystem* jobs() const;
+    // What the last advance() extracted for the renderer: the camera and every MeshInstance,
+    // interpolated, relative to the render origin. Valid until the next advance().
+    const RenderFrame& render_frame() const;
     // The phase entity a system goes in: .kind(world.phase(Phase::Combat)).
     flecs::entity phase(Phase phase) const;
 
