@@ -49,6 +49,12 @@ Run the engine (a window with input logging until the frame loop lands; Escape q
 build/<preset>/bin/<config>/deengine            # --frames N exits after N frames
 ```
 
+Cook assets (`content/` with its `meta/` tree, and the shaders) into `cooked/`, which the engine mounts as `game:/`. Ship builds have no source tree and draw with these cooked shaders. See `tools/cooker/README.md`.
+
+```sh
+build/<preset>/bin/<config>/cooker              # --check validates and writes nothing; --force cooks everything
+```
+
 Each configure preset has three build and test presets:
 
 | Preset suffix | CMake config | Build kind |

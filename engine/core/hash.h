@@ -27,6 +27,10 @@ constexpr uint64_t fnv1a_64(const char* data, size_t length) {
     return hash;
 }
 
+// XXH3, 64-bit: for content (files, cooked assets, blobs), at memory speed. Not for keys of hash
+// tables (use Hash<T>) and not for anything security-sensitive.
+uint64_t hash_bytes(const void* data, size_t size, uint64_t seed = 0);
+
 // Hash<T> is specialized per key type. Integers, enums and pointers are provided here;
 // other key types specialize it next to their definition.
 template <typename T>

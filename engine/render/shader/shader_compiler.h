@@ -29,6 +29,8 @@ struct ShaderDefine {
 
 inline constexpr size_t kMaxShaderDefines = 16;
 inline constexpr size_t kMaxShaderEntries = 4;
+// A compile of every entry point of a module (the cooker's): at most this many.
+inline constexpr size_t kMaxModuleEntries = 32;
 
 struct ShaderEntry {
     const char* name = nullptr; // the entry point function, e.g. "vertex_main"
@@ -41,6 +43,7 @@ struct CompileRequest {
     // A module under src:/shaders/, by Slang module name: "triangle" is shaders/triangle.slang,
     // "common.color" is shaders/common/color.slang.
     const char* module = nullptr;
+    // Empty: every entry point the module marks with [shader("...")], in the order it defines them.
     std::span<const ShaderEntry> entries{};
     std::span<const ShaderDefine> defines{};
 };
@@ -69,6 +72,7 @@ struct ShaderReflection {
 };
 
 struct CompiledStage {
+    ShaderName entry;           // the entry point's name
     core::Array<uint32_t> code; // the backend's bytecode (SPIR-V words)
     ShaderReflection reflection;
 };

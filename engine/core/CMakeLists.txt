@@ -1,6 +1,7 @@
 find_package(Threads REQUIRED)
 find_package(Tracy CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
+find_package(xxHash CONFIG REQUIRED)
 
 add_library(de_core STATIC
     allocator.cpp
@@ -18,6 +19,7 @@ add_library(de_core STATIC
     frame_allocator.cpp
     frame_allocator.h
     function_ref.h
+    hash.cpp
     hash.h
     hash_map.h
     inline_array.h
@@ -55,6 +57,9 @@ target_compile_definitions(de_core PRIVATE
 if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_link_options(de_core INTERFACE "/NATVIS:${CMAKE_CURRENT_SOURCE_DIR}/core.natvis")
 endif()
+
+# Content hashes (hash_bytes): xxHash, inlined into hash.cpp, so only its header is used.
+target_include_directories(de_core PRIVATE $<TARGET_PROPERTY:xxHash::xxhash,INTERFACE_INCLUDE_DIRECTORIES>)
 
 # Math: GLM with the engine's conventions (core/math.h).
 target_link_libraries(de_core PUBLIC glm::glm)

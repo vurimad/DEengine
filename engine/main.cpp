@@ -83,10 +83,10 @@ int main(int argc, char** argv) {
         .on_worker_start = [](uint32_t /*index*/, const char* name) { de::platform::set_current_thread_name(name); }});
     DE_LOG_INFO("engine", "job system: %u workers", jobs.worker_count());
 
-    // game:/ is the cooked data folder (the cooker arrives in M0b): ./cooked unless --game-dir says otherwise.
+    // game:/ is the cooked data folder (tools/cooker writes it): ./cooked unless --game-dir says otherwise.
     const char* game_dir = flag_value(argc, argv, "--game-dir");
-    // src:/ is the source tree, in dev builds only: shaders compile from it and hot reload. Ship
-    // builds will load the cooker's .deshader files (M0b) instead.
+    // src:/ is the source tree, in dev builds only: shaders compile from it and hot reload. Without
+    // it (ship builds), shaders load from the cooker's .deshader files in game:/.
     const char* src_dir = flag_value(argc, argv, "--src-dir");
     const char* src_root = DE_BUILD_DEV != 0 ? (src_dir != nullptr ? src_dir : DE_SOURCE_DIR) : nullptr;
     auto vfs =
@@ -142,11 +142,15 @@ int main(int argc, char** argv) {
     if (src_root != nullptr) {
         compiler = de::shader::ShaderCompiler::create(*vfs);
     }
-    de::core::Result<de::shader::ShaderLibrary> shaders = de::core::fail(de::core::ErrorCode::Unsupported, "");
-    if (compiler) {
-        shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler);
-    } else {
-        DE_LOG_WARN("engine", "no shaders (%s): the window is only cleared", compiler.error().message);
+    de::core::Result<de::shader::ShaderLibrary> shaders =
+        compiler ? de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler)
+                 : de::shader::ShaderLibrary::create_cooked(*device, *vfs, jobs);
+    if (!compiler && src_root != nullptr) {
+        // Sources are there but can't be compiled: no hot reload, and cooked shaders may be stale.
+        DE_LOG_WARN("engine", "the shader compiler didn't start (%s): using cooked shaders from game:/",
+                    compiler.error().message);
+    } else if (!compiler) {
+        DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
     }
     // Built once the swapchain format is known, and again if it changes. If the shader has an
     // error at startup, the library keeps watching it, and the triangle appears once it's fixed.

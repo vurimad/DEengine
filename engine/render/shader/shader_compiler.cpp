@@ -278,6 +278,58 @@ bool fits(const char* text) {
     return text != nullptr && std::strlen(text) <= kMaxShaderNameLength;
 }
 
+bool from_slang(SlangStage stage, rhi::ShaderStage& out) {
+    switch (stage) {
+    case SLANG_STAGE_VERTEX:
+        out = rhi::ShaderStage::Vertex;
+        return true;
+    case SLANG_STAGE_FRAGMENT:
+        out = rhi::ShaderStage::Fragment;
+        return true;
+    case SLANG_STAGE_COMPUTE:
+        out = rhi::ShaderStage::Compute;
+        return true;
+    default:
+        return false;
+    }
+}
+
+// Every entry point the module marks with [shader("...")]: what the cooker compiles.
+template <typename EntryPoints, typename Names, typename Entries>
+bool find_module_entries(slang::IModule* module, EntryPoints& entry_points, Names& names, Entries& entries,
+                         Diagnostics& messages) {
+    const SlangInt32 count = module->getDefinedEntryPointCount();
+    if (count <= 0 || std::cmp_greater(count, kMaxModuleEntries)) {
+        messages.add_text(count <= 0 ? "the module has no [shader(\"...\")] entry points"
+                                     : "the module has more entry points than a compile takes (32)",
+                          true);
+        return false;
+    }
+    for (SlangInt32 i = 0; i < count; ++i) {
+        Slang::ComPtr<slang::IEntryPoint>& entry_point = entry_points.emplace();
+        if (SLANG_FAILED(module->getDefinedEntryPoint(i, entry_point.writeRef())) || entry_point == nullptr) {
+            messages.add_text("an entry point of the module couldn't be read", true);
+            return false;
+        }
+        slang::FunctionReflection* function = entry_point->getFunctionReflection();
+        const char* name = function != nullptr ? function->getName() : nullptr;
+        Slang::ComPtr<ISlangBlob> diagnostic;
+        slang::ProgramLayout* layout = entry_point->getLayout(0, diagnostic.writeRef());
+        messages.add(diagnostic, layout == nullptr);
+        slang::EntryPointReflection* reflection = layout != nullptr ? layout->getEntryPointByIndex(0) : nullptr;
+        rhi::ShaderStage stage = rhi::ShaderStage::Vertex;
+        if (name == nullptr || !fits(name) || reflection == nullptr || !from_slang(reflection->getStage(), stage)) {
+            messages.add_text("an entry point has no name, a name over 63 characters, or a stage other than vertex, "
+                              "fragment or compute",
+                              true);
+            return false;
+        }
+        names.push(ShaderName(name));
+        entries.push(ShaderEntry{.name = nullptr, .stage = stage});
+    }
+    return true;
+}
+
 } // namespace
 
 struct CompilerState {
@@ -328,14 +380,14 @@ ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&& other) noexcept {
 
 core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& request, CompileReport* report) {
     DE_PROFILE_ZONE("shader compile");
-    if (!fits(request.module) || request.entries.empty() || request.entries.size() > kMaxShaderEntries ||
+    if (!fits(request.module) || request.entries.size() > kMaxShaderEntries ||
         request.defines.size() > kMaxShaderDefines) {
         return core::fail(
             core::ErrorCode::InvalidArgument,
-            "a compile needs a module name of at most 63 characters, 1 to 4 entry points and at most 16 defines");
+            "a compile needs a module name of at most 63 characters, at most 4 entry points and at most 16 defines");
     }
     for (const ShaderEntry& entry : request.entries) {
-        if (!fits(entry.name)) {
+        if (entry.name == nullptr || entry.name[0] == '\0' || !fits(entry.name)) {
             return core::fail(core::ErrorCode::InvalidArgument, "entry point names are 1 to 63 characters");
         }
     }
@@ -415,8 +467,8 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
 
     // The module and every entry point, linked into one program: the front end runs once.
     core::InlineArray<Slang::ComPtr<slang::IEntryPoint>, kMaxShaderEntries> entry_points(render_heap());
-    core::InlineArray<slang::IComponentType*, kMaxShaderEntries + 1> components(render_heap());
-    components.push(module);
+    core::InlineArray<ShaderEntry, kMaxShaderEntries> entries(render_heap());
+    core::InlineArray<ShaderName, kMaxShaderEntries> entry_names(render_heap());
     for (const ShaderEntry& entry : request.entries) {
         Slang::ComPtr<slang::IEntryPoint>& entry_point = entry_points.emplace();
         diagnostic = nullptr;
@@ -429,6 +481,15 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
             }
             return core::fail(core::ErrorCode::NotFound, "a shader entry point is missing or invalid");
         }
+        entries.push(entry);
+        entry_names.push(ShaderName(entry.name));
+    }
+    if (request.entries.empty() && !find_module_entries(module, entry_points, entry_names, entries, messages)) {
+        return core::fail(core::ErrorCode::InvalidArgument, "the module's entry points can't be compiled");
+    }
+    core::InlineArray<slang::IComponentType*, kMaxShaderEntries + 1> components(render_heap());
+    components.push(module);
+    for (const Slang::ComPtr<slang::IEntryPoint>& entry_point : entry_points) {
         components.push(entry_point);
     }
 
@@ -454,8 +515,8 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
     }
 
     CompiledProgram result{.stages = core::Array<CompiledStage>(render_heap())};
-    result.stages.reserve(request.entries.size());
-    for (uint32_t i = 0; i < request.entries.size(); ++i) {
+    result.stages.reserve(entries.size());
+    for (uint32_t i = 0; i < entries.size(); ++i) {
         Slang::ComPtr<ISlangBlob> code;
         diagnostic = nullptr;
         status = linked->getEntryPointCode(i, 0, code.writeRef(), diagnostic.writeRef());
@@ -464,13 +525,14 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
             return core::fail(core::ErrorCode::InvalidArgument, "the shader failed to generate code");
         }
         CompiledStage& stage = result.stages.emplace(CompiledStage{
+            .entry = entry_names[i],
             .code = core::Array<uint32_t>(render_heap()),
-            .reflection = reflect(layout, i, request.entries[i].stage),
+            .reflection = reflect(layout, i, entries[i].stage),
         });
         stage.code.resize_uninit(code->getBufferSize() / 4);
         std::memcpy(stage.code.data(), code->getBufferPointer(), code->getBufferSize());
     }
-    DE_LOG_DEBUG("shader", "compiled %s (%zu entry points) in %.1f ms", request.module, request.entries.size(),
+    DE_LOG_DEBUG("shader", "compiled %s (%zu entry points) in %.1f ms", request.module, entries.size(),
                  static_cast<double>(platform::time_ns() - start_ns) / 1e6);
     return result;
 }

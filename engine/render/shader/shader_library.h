@@ -59,6 +59,10 @@ struct ShaderLibraryStats {
 // and its programs rebuild in the background while the game keeps rendering with the last good
 // version; errors are logged with file and line, and the old pipeline stays until a fix compiles.
 //
+// Builds without src:/ (ship) use create_cooked() instead: programs come from the cooker's
+// .deshader files in game:/, compiled ahead of time with the same compiler. With hot reload on,
+// a re-cooked file is picked up the same way an edited source is.
+//
 // Create programs at load time (the first compile blocks). Call update() once per frame on the
 // render thread. Pipelines are created and destroyed on that thread only; rebuilds run one at a
 // time as background jobs, which only idle workers pick up, so they never stall a frame.
@@ -67,6 +71,10 @@ class ShaderLibrary {
 public:
     static core::Result<ShaderLibrary> create(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
                                               ShaderCompiler& compiler, const ShaderLibraryDesc& desc = {});
+    // Programs from cooked .deshader files (game:/), with the permutation that matches each
+    // program's defines. A module or permutation that wasn't cooked fails like a compile error.
+    static core::Result<ShaderLibrary> create_cooked(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
+                                                     const ShaderLibraryDesc& desc = {});
 
     ~ShaderLibrary();
     ShaderLibrary(ShaderLibrary&& other) noexcept;
@@ -103,8 +111,14 @@ public:
 
 private:
     explicit ShaderLibrary(LibraryState* state) : state_(state) {}
+    static ShaderLibrary make(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs, ShaderCompiler* compiler,
+                              const ShaderLibraryDesc& desc);
 
     LibraryState* state_ = nullptr;
 };
+
+// Whether a descriptor binding is one of the bindless tables of shaders/common/bindless.slang: the
+// only descriptor bindings the engine's pipelines have (the library refuses programs with others).
+bool is_bindless_binding(const ResourceBinding& binding);
 
 } // namespace de::shader
