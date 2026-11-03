@@ -1,4 +1,4 @@
-// Deferred lighting (renderer step 2): one full-screen pass over the G-buffer, added onto the HDR
+// Deferred lighting: one full-screen pass over the G-buffer, added onto the HDR
 // target (which holds the emissive light). The sun: GGX specular (height-correlated Smith,
 // Schlick Fresnel) and Lambert diffuse, wrapped and with backlight transmission for translucent
 // surfaces. Ambient: a sky/ground hemisphere, the placeholder for image-based lighting. Where

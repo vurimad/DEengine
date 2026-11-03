@@ -17,6 +17,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | `debug.h` | Debugger detection, break, and the debugger output log sink |
 | `random.h` | Random bytes from the OS: GUIDs for new assets, seeds (not gameplay randomness) |
 | `imgui_platform.h` | Dear ImGui's platform side: display size, time step and input events, so SDL stays here |
+| `imgui_events.h` | Inside `platform/` only: how `pump_events()` hands each SDL event to ImGui |
 
 ## Rules and invariants
 

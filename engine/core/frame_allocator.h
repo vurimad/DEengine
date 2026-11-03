@@ -12,7 +12,7 @@ namespace de::core {
 //
 // One buffer per frame in flight rotates, so data allocated during frame N stays valid until
 // begin_frame() has been called frames_in_flight times. Choose the count from who reads the data:
-//   2: the render thread consumes frame N's data during frame N+1 (game -> render handoff)
+//   2: a render thread (planned) consumes frame N's data during frame N+1 (game -> render handoff)
 //   3: a three-stage pipeline (game N+1, render N, GPU N-1) where the data lives until the GPU
 //      has finished with its frame
 // This is the renderer's frames-in-flight count, not the swapchain image count: those often

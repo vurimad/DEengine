@@ -1,6 +1,6 @@
 # render/scene
 
-The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the registry has loaded, and the passes that draw what the world extracts each frame: deferred (renderer step 2), a G-buffer, a full-screen lighting pass (the sun, a hemisphere ambient, the sky) and a tonemap, with the sun's shadows (step 3) from cascaded shadow maps resolved into a screen-space mask.
+The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the registry has loaded, and the passes that draw what the world extracts each frame: deferred: a G-buffer, a full-screen lighting pass (the sun, a hemisphere ambient, the sky) and a tonemap, with the sun's shadows from cascaded shadow maps resolved into a screen-space mask.
 
 ## Contents
 
@@ -37,7 +37,7 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 - **Reloads replace GPU copies.** A reloaded texture gets a new GPU texture (and bindless index); every material is rewritten, and the old texture stays until the table no longer points at it. A reloaded mesh gets new buffers and is drawable again once they're uploaded. The old resources go when the frames using them are done (the device's deferred destruction).
 - **The renderer owns no entity list.** `SceneRenderer::add_passes` reads `world::RenderFrame`: the camera and every instance, relative to the render origin. Per-frame data (view, lighting, instance transforms) goes through a mapped buffer per frame in flight, grown when needed: no allocation per frame once settled.
 - **Cameras look down their -Z**; projection is infinite reverse Z (depth = near / distance, cleared to 0, tested Greater).
-- Without a camera, or while a scene shader is missing (a failed first build), the passes are replaced by one that clears the target.
+- Without a camera, while a scene shader is missing (a failed first build), or when the frame's constants can't be written (no per-frame buffer, or a camera transform that can't be inverted), the passes are replaced by one that clears the target.
 
 ## Not yet
 

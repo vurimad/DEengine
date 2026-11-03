@@ -61,6 +61,6 @@ device.end_frame();                                      // one submit for all l
 
 ## Not yet
 
-- Async compute submission (render graph v3), multi-threaded command recording, sampled views of single mips or layers, stencil copies.
+- Async compute submission (render graph v3), multi-threaded command recording, sampled views and render targets of single mips or layers (attachments use mip 0 and layer 0 of single-mip, single-layer textures for now), stencil copies.
 - Driver and VMA CPU-side allocations don't go through our tagged heaps yet (`VkAllocationCallbacks`).
 - GPU timestamps and Tracy GPU zones.

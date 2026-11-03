@@ -20,7 +20,7 @@ A module's name is its path with dots: `common.color` is `common/color.slang`. D
 
 ## Conventions
 
-- Entry points are marked with their stage: `[shader("vertex")] vertex_main`, `[shader("fragment")] fragment_main`, `[shader("compute")] compute_main` (the library's default names). A program can name others: the G-buffer's are `fragment_opaque` and `fragment_masked`.
+- Entry points are marked with their stage: `[shader("vertex")] vertex_main`, `[shader("fragment")] fragment_main`, `[shader("compute")] compute_main` (the library's default names). A program can name others: the G-buffer's and the shadow casters' are `fragment_opaque` and `fragment_masked`.
 - Push constants are one `[[vk::push_constant]] ConstantBuffer<T>`, at most 128 bytes, matched by a C++ struct where the program is used. Reflection reports each field's offset and size.
 - Per-frame structs (`SceneFrame`) are read through their pointer, never copied whole into a local: a copy indexed at run time (by cascade) can land in scratch memory.
 - No descriptor slots of their own: buffers are reached through pointers in push constants (`uint* output`), textures and samplers through `import common.bindless;` and indices in push constants. A shader that binds anything else to a slot compiles, but the library rejects it.

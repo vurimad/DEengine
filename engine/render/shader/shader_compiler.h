@@ -110,7 +110,7 @@ struct ShaderCompilerDesc {
 // in one [[vk::push_constant]] ConstantBuffer, resources reached bindlessly (by index or pointer).
 //
 // Thread-safe: compiles run one at a time (Slang's global session is single-threaded), so run
-// them as background jobs to keep long compiles off the render thread. Move-only.
+// them as background jobs to keep long compiles off the thread that renders. Move-only.
 class ShaderCompiler {
 public:
     // Fails if Slang can't start (its runtime library or standard modules are missing).
