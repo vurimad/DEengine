@@ -181,8 +181,8 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         auto gpu_assets =
             de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
         REQUIRE(gpu_assets.ok());
-        auto renderer = de::render::SceneRenderer::create(
-            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         REQUIRE(renderer.ok());
 
         const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
@@ -399,13 +399,8 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
         auto gpu_assets =
             de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
         REQUIRE(gpu_assets.ok());
-        auto renderer = de::render::SceneRenderer::create(
-            {.device = &*device,
-             .shaders = &*shaders,
-             .gpu_assets = &*gpu_assets,
-             // Even 2 m cascades: the back square (3 m away) is in cascade 1, clear of its dithered band,
-             // so the atlas tiles count.
-             .shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f}});
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         REQUIRE(renderer.ok());
         const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
         assets->wait_all();
@@ -436,7 +431,10 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
         graph->begin(kSize, kSize);
         const de::render::GraphTexture color = graph->import_texture(
             {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-        const de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
+        // Even 2 m cascades: the back square (3 m away) is in cascade 1, clear of its dithered band, so
+        // the atlas tiles count.
+        de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
         renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light,
                              de::render::SceneView::ShadowMask);
         graph->execute();
@@ -497,8 +495,8 @@ TEST_CASE("a material whose texture was missing picks it up when it appears") {
         auto gpu_assets =
             de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
         REQUIRE(gpu_assets.ok());
-        auto renderer = de::render::SceneRenderer::create(
-            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         REQUIRE(renderer.ok());
         auto graph = de::render::RenderGraph::create(*device);
         REQUIRE(graph.ok());
@@ -559,4 +557,28 @@ TEST_CASE("a material whose texture was missing picks it up when it appears") {
     }
     device->wait_idle();
     de::test::check_clean(*device);
+}
+
+TEST_CASE("an environment becomes the renderer's lighting") {
+    de::asset::EnvironmentAsset environment;
+    environment.sun_direction[0] = 0.6f;
+    environment.sun_direction[1] = 0.8f;
+    environment.sun_direction[2] = 0.0f;
+    environment.sun_color[2] = 3.0f;
+    environment.shadow_color[1] = 0.25f;
+    environment.ground_color[0] = 0.5f;
+    environment.exposure_ev = -2.0f;
+    environment.shadow_resolution = 1024;
+    environment.shadow_distance_m = 90.0f;
+    environment.shadow_max_penumbra_texels = 3.0f;
+    const de::render::SceneLighting lighting = de::render::scene_lighting(environment);
+    CHECK(lighting.sun_direction[0] == 0.6f);
+    CHECK(lighting.sun_direction[1] == 0.8f);
+    CHECK(lighting.sun_color[2] == 3.0f);
+    CHECK(lighting.shadow_color[1] == 0.25f);
+    CHECK(lighting.ground_color[0] == 0.5f);
+    CHECK(lighting.exposure_ev == -2.0f);
+    CHECK(lighting.shadows.resolution == 1024);
+    CHECK(lighting.shadows.distance_m == 90.0f);
+    CHECK(lighting.shadows.max_penumbra_texels == 3.0f);
 }

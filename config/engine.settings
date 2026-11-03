@@ -1,0 +1,5 @@
+# Engine settings: a name and a value a line; '#' starts a comment. Read from src:/config in dev
+# builds, from game:/config (the cooker copies it) in ship.
+
+# The world deengine opens (--world overrides): content/world/test/test.world
+world   76d76b87e8562965

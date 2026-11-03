@@ -2,6 +2,7 @@
 
 #include "asset/registry.h"
 #include "core/array.h"
+#include "core/fixed_string.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/memory_stats.h"
@@ -42,12 +43,36 @@ std::string_view as_text(const core::Array<std::byte>& bytes) {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+// config/ is read from the source tree in dev builds (edits apply on the next run, no cook), and
+// from game:/config/ (the cooker copies it there) in ship.
+using ConfigPath = core::FixedString<64>;
+ConfigPath config_path(bool has_src, const char* name) {
+    ConfigPath path(has_src ? "src:/config/" : "game:/config/");
+    static_cast<void>(path.append(name));
+    return path;
+}
+
+bool is_blank(char c) {
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+std::string_view trim(std::string_view text) {
+    while (!text.empty() && is_blank(text.front())) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && is_blank(text.back())) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+
 // Input bindings are text (docs/design.md, Input): the engine's (from the source tree in dev
 // builds, so edits apply on the next run without a cook), then the player's, whose lines replace
 // the engine's for the actions they name. In dev builds every action is added, so a line naming
 // none is a typo, and logged.
 bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_src) {
-    const char* const engine_path = has_src ? "src:/config/input.bindings" : "game:/config/input.bindings";
+    const ConfigPath path = config_path(has_src, "input.bindings");
+    const char* const engine_path = path.c_str();
     const auto engine_bindings = vfs.read_whole_file(engine_path, core::heap_allocator(core::MemoryTag::Platform));
     if (!engine_bindings) {
         DE_LOG_ERROR("input", "%s: %s%s", engine_path, engine_bindings.error().message,
@@ -75,6 +100,24 @@ bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_sr
 }
 
 } // namespace
+
+std::string_view setting(std::string_view settings, std::string_view name) {
+    std::string_view rest = settings;
+    while (!rest.empty()) {
+        const size_t end = rest.find('\n');
+        std::string_view line = rest.substr(0, end);
+        rest.remove_prefix(end == std::string_view::npos ? rest.size() : end + 1);
+        line = trim(line.substr(0, line.find('#')));
+        size_t split = 0;
+        while (split < line.size() && !is_blank(line[split])) {
+            ++split;
+        }
+        if (line.substr(0, split) == name) {
+            return trim(line.substr(split));
+        }
+    }
+    return {};
+}
 
 bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.argc = argc;
@@ -202,13 +245,21 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
     std::optional<render::SceneRenderer> scene_renderer;
     if (shaders) {
-        auto created = render::SceneRenderer::create(
-            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        auto created =
+            render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         if (created) {
             scene_renderer.emplace(std::move(*created));
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }
+    }
+
+    // Engine settings (text, like the bindings): read once, kept for setting().
+    const ConfigPath settings_path = config_path(src_root != nullptr, "engine.settings");
+    const auto settings = vfs->read_whole_file(settings_path.c_str(), core::heap_allocator(core::MemoryTag::Platform));
+    if (!settings) {
+        DE_LOG_ERROR("engine", "%s: %s", settings_path.c_str(), settings.error().message);
+        return EXIT_FAILURE;
     }
 
     platform::Input input;
@@ -226,6 +277,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .assets = *assets,
                   .world = *world,
                   .gpu_assets = *gpu_assets,
+                  .settings = as_text(*settings),
                   .lighting = {},
                   .view = render::SceneView::Lit};
 
@@ -369,6 +421,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
 
     // --- Down -------------------------------------------------------------------------------------
+    application.shutdown(engine);
     device->log_memory_report(5);
     device->wait_idle();
     const asset::AssetRegistryStats asset_stats = assets->stats();

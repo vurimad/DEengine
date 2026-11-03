@@ -1,10 +1,12 @@
 #include "asset/registry.h"
 
 #include "asset/cell_format.h"
+#include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/texture_format.h"
+#include "asset/world_format.h"
 #include "core/allocator.h"
 #include "core/array.h"
 #include "core/hash_map.h"
@@ -64,6 +66,10 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<ShaderAsset>(file));
     case AssetType::Cell:
         return checked(load_in_place<CellAsset>(file));
+    case AssetType::World:
+        return checked(load_in_place<WorldAsset>(file));
+    case AssetType::Environment:
+        return checked(load_in_place<EnvironmentAsset>(file));
     case AssetType::Unknown:
         break;
     }

@@ -1,11 +1,14 @@
 #include "asset/cell_format.h"
+#include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/texture_format.h"
+#include "asset/world_format.h"
 #include "cooker/cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/shader_cooker.h"
+#include "cooker/world_cooker.h"
 #include "core/job_system.h"
 #include "platform/file.h"
 #include "platform/vfs.h"
@@ -1314,4 +1317,164 @@ TEST_CASE("a glTF buffer shorter than the glTF says is reported, not read past")
     const CookReport report = run_cook(vfs);
     CHECK(has_message(report, "content/props/rock.gltf", "shorter than the 4096 the glTF says"));
     CHECK(report.stats.failed == 1);
+}
+
+namespace {
+
+constexpr const char* kEvening = R"({
+  "sun": {"elevation_deg": 30, "azimuth_deg": 90, "color": [1, 0.5, 0.25], "intensity": 4},
+  "sky": {"color": [0.3, 0.4, 0.6]},
+  "ground": {"color": [0.1, 0.1, 0.1], "intensity": 0.5},
+  "shadow_color": [0.05, 0.06, 0.09],
+  "exposure_ev": -1,
+  "shadows": {"resolution": 1024, "distance_m": 100, "split_lambda": 0.5, "blend_band": 0.1,
+              "caster_reach_m": 150, "penumbra_per_m": 0.05, "max_penumbra_texels": 4}
+})";
+
+} // namespace
+
+TEST_CASE("worlds list their cells by coord, with an environment, and cook again when a cell moves") {
+    const Sandbox sandbox;
+    write_src(sandbox, "content/world/a/cell_0_0.cell", R"({"coord": [0, 0], "entities": []})");
+    write_src(sandbox, "content/world/a/cell_1_0.cell", R"({"coord": [1, 0], "entities": []})");
+    write_src(sandbox, "content/world/a/cell_0_1.cell", R"({"coord": [0, 1], "entities": []})");
+    write_src(sandbox, "content/world/a/evening.environment", kEvening);
+    // Listed out of order: the cooked list is by coord, z then x.
+    write_src(sandbox, "content/world/a/a.world", R"({
+  "environment": "evening.environment",
+  "start": {"position": [10, 2, -3.5], "yaw_deg": 90, "pitch_deg": -10},
+  "cells": ["cell_0_1.cell", "cell_1_0.cell", "cell_0_0.cell"],
+})");
+    write_src(sandbox, "content/world/a/broken.world", R"({
+  "environment": "cell_0_0.cell",
+  "start": {"position": [0, 0], "roll_deg": 3},
+  "cells": ["cell_0_0.cell", "nowhere.cell", "same_place.cell"],
+})");
+    write_src(sandbox, "content/world/a/same_place.cell", R"({"coord": [0, 0], "entities": []})");
+    write_src(sandbox, "content/world/a/broken.environment", R"({
+  "sun": {"elevation_deg": 120, "azimuth_deg": 0, "color": [1, 1, 1]},
+  "sky": {"color": [0.3, -0.4, 0.6]},
+  "shadow_color": [0, 0, 0],
+  "exposure": 0,
+  "shadows": {"resolution": 1000.5, "distance_m": 100, "split_lambda": 2, "blend_band": 0.1,
+              "caster_reach_m": 150, "penumbra_per_m": 0.05}
+})");
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    const char* broken_world = "content/world/a/broken.world";
+    CHECK(has_message(report, broken_world, "'cell_0_0.cell' should name an environment source"));
+    CHECK(has_message(report, broken_world, "start should have a position"));
+    CHECK(has_message(report, broken_world, "'nowhere.cell' should name a cell source"));
+    CHECK(has_message(report, broken_world, "two cells at [0, 0]"));
+    const char* broken_environment = "content/world/a/broken.environment";
+    CHECK(has_message(report, broken_environment, "elevation_deg should be a number from -90 to 90"));
+    CHECK(has_message(report, broken_environment, "sky should have a color"));
+    CHECK(has_message(report, broken_environment, "ground should have a color"));
+    CHECK(has_message(report, broken_environment, "unknown environment setting 'exposure'"));
+    CHECK(has_message(report, broken_environment, "exposure_ev should be a number"));
+    CHECK(has_message(report, broken_environment, "resolution should be a whole number"));
+    CHECK(has_message(report, broken_environment, "split_lambda should be a number from 0 to 1"));
+    CHECK(has_message(report, broken_environment, "max_penumbra_texels should be a number from 1 to 64"));
+    CHECK(report.stats.failed == 2);
+    CHECK_FALSE(has_message(report, "content/world/a/a.world", ""));
+    CHECK_FALSE(has_message(report, "content/world/a/evening.environment", ""));
+
+    const AssetId world_id = asset_id(guid_of(vfs, "src:/meta/world/a/a.world.json"));
+    const AssetId environment_id = asset_id(guid_of(vfs, "src:/meta/world/a/evening.environment.json"));
+    const AssetId cell_00 = asset_id(guid_of(vfs, "src:/meta/world/a/cell_0_0.cell.json"));
+    const AssetId cell_10 = asset_id(guid_of(vfs, "src:/meta/world/a/cell_1_0.cell.json"));
+    const AssetId cell_01 = asset_id(guid_of(vfs, "src:/meta/world/a/cell_0_1.cell.json"));
+    {
+        Cooked file(vfs, world_id, AssetType::World);
+        const auto& world = file.load<WorldAsset>();
+        CHECK(world.start_position[0] == 10.0);
+        CHECK(world.start_position[2] == -3.5);
+        CHECK(world.start_yaw_rad == doctest::Approx(1.5707963));
+        CHECK(world.start_pitch_rad == doctest::Approx(-0.1745329));
+        const auto dependencies = world.header.dependencies.get(file.data());
+        REQUIRE(dependencies.size() == 1);
+        CHECK(dependencies[world.environment] == AssetRef{.id = environment_id, .type = AssetType::Environment});
+        const auto cells = world.cells.get(file.data());
+        REQUIRE(cells.size() == 3);
+        CHECK(cells[0].cell == cell_00);
+        CHECK(cells[1].cell == cell_10);
+        CHECK(cells[1].coord_x == 1);
+        CHECK(cells[2].cell == cell_01);
+        CHECK(cells[2].coord_z == 1);
+    }
+    {
+        Cooked file(vfs, environment_id, AssetType::Environment);
+        const auto& environment = file.load<EnvironmentAsset>();
+        // 30 degrees up, due east (+X).
+        CHECK(environment.sun_direction[0] == doctest::Approx(0.8660254));
+        CHECK(environment.sun_direction[1] == doctest::Approx(0.5));
+        CHECK(environment.sun_direction[2] == doctest::Approx(0.0).epsilon(1e-6));
+        CHECK(environment.sun_color[1] == doctest::Approx(2.0f)); // times its intensity
+        CHECK(environment.sky_color[2] == doctest::Approx(0.6f)); // intensity 1 by default
+        CHECK(environment.ground_color[0] == doctest::Approx(0.05f));
+        CHECK(environment.exposure_ev == -1.0f);
+        CHECK(environment.shadow_resolution == 1024);
+        CHECK(environment.shadow_split_lambda == 0.5f);
+        CHECK(environment.shadow_max_penumbra_texels == 4.0f);
+    }
+    // A cell moved to another coord cooks the world again; new light only cooks the environment.
+    CHECK(run_cook(vfs).stats.cooked == 0);
+    write_src(sandbox, "content/world/a/evening.environment",
+              std::string(kEvening).replace(std::string(kEvening).find("-1"), 2, "-2"));
+    CHECK(run_cook(vfs).stats.cooked == 1);
+    write_src(sandbox, "content/world/a/cell_1_0.cell", R"({"coord": [2, 0], "entities": []})");
+    CHECK(run_cook(vfs).stats.cooked == 2); // the cell and the world
+    Cooked file(vfs, world_id, AssetType::World);
+    CHECK(file.load<WorldAsset>().cells.get(file.data())[1].coord_x == 2);
+}
+
+TEST_CASE("broken worlds and environments are refused when loaded") {
+    struct alignas(16) Aligned {
+        std::byte bytes[512];
+    };
+    const auto check = [](const de::core::Array<std::byte>& cooked, auto loader) {
+        Aligned aligned{};
+        REQUIRE(cooked.size() <= sizeof(aligned.bytes));
+        std::memcpy(aligned.bytes, cooked.data(), cooked.size());
+        return loader(std::span(aligned.bytes, cooked.size())).ok();
+    };
+    const auto load_world = [](std::span<const std::byte> bytes) { return load_in_place<WorldAsset>(bytes); };
+    const auto load_environment = [](std::span<const std::byte> bytes) {
+        return load_in_place<EnvironmentAsset>(bytes);
+    };
+    const AssetId id = AssetId::from_value(0x77);
+    de::cooker::WorldBuild world;
+    world.environment = {.id = AssetId::from_value(0x78), .type = AssetType::Environment};
+    world.cells.push({.cell = AssetId::from_value(1), .coord_x = 0, .coord_z = 0});
+    world.cells.push({.cell = AssetId::from_value(2), .coord_x = 1, .coord_z = 0});
+    CHECK(check(de::cooker::cook_world(world, id), load_world));
+    world.cells[1].coord_x = 0; // two cells at one coord
+    CHECK_FALSE(check(de::cooker::cook_world(world, id), load_world));
+    world.cells[1].coord_x = -1; // out of order along x
+    CHECK_FALSE(check(de::cooker::cook_world(world, id), load_world));
+    world.cells[1].coord_x = 5; // along z: a later x, an earlier row
+    world.cells[1].coord_z = -1;
+    CHECK_FALSE(check(de::cooker::cook_world(world, id), load_world));
+    world.cells[1].coord_x = 1;
+    world.cells[1].coord_z = 0;
+    world.environment.type = AssetType::Cell; // the environment isn't one
+    CHECK_FALSE(check(de::cooker::cook_world(world, id), load_world));
+    world.environment.type = AssetType::Environment;
+    world.start_position[1] = std::nan("");
+    CHECK_FALSE(check(de::cooker::cook_world(world, id), load_world));
+
+    EnvironmentAsset environment;
+    environment.shadow_distance_m = 100.0f;
+    CHECK(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.sun_direction[1] = 2.0f; // not unit length
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.sun_direction[1] = 1.0f;
+    environment.sky_color[2] = -0.1f;
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.sky_color[2] = 0.0f;
+    environment.shadow_resolution = 16;
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.shadow_resolution = 2048;
+    environment.shadow_max_penumbra_texels = 0.5f;
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
 }

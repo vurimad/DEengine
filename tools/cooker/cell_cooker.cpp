@@ -18,24 +18,6 @@ namespace {
 
 using asset::CellEntity;
 
-// count numbers from an array of exactly that many; false otherwise.
-template <typename T>
-bool read_numbers(yyjson_val* value, T* out, size_t count) {
-    if (!yyjson_is_arr(value) || yyjson_arr_size(value) != count) {
-        return false;
-    }
-    size_t i = 0;
-    size_t n = 0;
-    yyjson_val* item = nullptr;
-    yyjson_arr_foreach(value, i, n, item) {
-        if (!yyjson_is_num(item)) {
-            return false;
-        }
-        out[i] = static_cast<T>(yyjson_get_num(item));
-    }
-    return true;
-}
-
 enum class StaticSetting : uint8_t { Unset, Yes, No };
 
 // One entity as read, before parents are put first.

@@ -128,7 +128,7 @@ struct SceneRendererState {
     core::Array<const GpuMesh*> shadow_meshes{
         core::heap_allocator(core::MemoryTag::Render)}; // per instance, this frame
     shader::ProgramHandle shadow_mask;
-    SceneShadows shadows;
+    SceneShadows shadows;                               // this frame's, within limits
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
@@ -273,6 +273,24 @@ struct SceneRendererState {
         return true;
     }
 };
+
+SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
+    SceneLighting lighting;
+    std::copy_n(environment.sun_direction, 3, lighting.sun_direction);
+    std::copy_n(environment.sun_color, 3, lighting.sun_color);
+    std::copy_n(environment.sky_color, 3, lighting.sky_color);
+    std::copy_n(environment.ground_color, 3, lighting.ground_color);
+    std::copy_n(environment.shadow_color, 3, lighting.shadow_color);
+    lighting.exposure_ev = environment.exposure_ev;
+    lighting.shadows = {.resolution = environment.shadow_resolution,
+                        .distance_m = environment.shadow_distance_m,
+                        .split_lambda = environment.shadow_split_lambda,
+                        .blend_band = environment.shadow_blend_band,
+                        .caster_reach_m = environment.shadow_caster_reach_m,
+                        .penumbra_per_m = environment.shadow_penumbra_per_m,
+                        .max_penumbra_texels = environment.shadow_max_penumbra_texels};
+    return lighting;
+}
 
 const char* scene_view_name(SceneView view) {
     switch (view) {
@@ -423,9 +441,6 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->device = desc.device;
     state->shaders = desc.shaders;
     state->gpu_assets = desc.gpu_assets;
-    state->shadows = desc.shadows;
-    state->shadows.resolution = std::clamp(state->shadows.resolution, 64U, 8192U); // the atlas is twice that
-    state->shadows.max_penumbra_texels = std::max(state->shadows.max_penumbra_texels, 1.0f);
     state->make_scene_programs();
     return SceneRenderer(state);
 }
@@ -452,6 +467,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                rhi::Color empty) {
     DE_PROFILE_ZONE("scene passes setup");
     SceneRendererState& state = *state_;
+    state.shadows = lighting.shadows;
+    state.shadows.resolution = std::clamp(state.shadows.resolution, 64U, 8192U); // the atlas is twice that
+    state.shadows.max_penumbra_texels = std::max(state.shadows.max_penumbra_texels, 1.0f);
     state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
     const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);

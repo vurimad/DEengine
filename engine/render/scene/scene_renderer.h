@@ -1,5 +1,6 @@
 #pragma once
 
+#include "asset/environment_format.h"
 #include "core/result.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
@@ -14,34 +15,6 @@ struct RenderFrame;
 namespace de::render {
 
 class GpuAssets;
-
-// The scene's light (renderer step 2), linear. Values are relative to exposure: a sun of 4 with
-// an exposure of 1 is a bright day.
-struct SceneLighting {
-    float sun_direction[3] = {-0.55f, 0.32f, -0.75f}; // toward the sun, normalized when used: low, ahead
-    float sun_color[3] = {4.6f, 3.6f, 2.4f};          // late afternoon gold
-    float sky_color[3] = {0.30f, 0.40f, 0.62f};       // ambient from above
-    float ground_color[3] = {0.12f, 0.10f, 0.07f};    // ambient from below
-    float shadow_color[3] = {0.05f, 0.06f, 0.09f};    // what shadowed sunlight keeps: a cool tint, not black
-    float exposure_ev = 0.0f;
-};
-
-// What the window shows: the lit image, or one G-buffer channel.
-// What a frame shows with no scene (and the window without shaders): a dusk blue.
-inline constexpr rhi::Color kEmptySceneColor{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
-
-enum class SceneView : uint32_t {
-    Lit,
-    BaseColor,
-    Normal,
-    Roughness,
-    Metalness,
-    Occlusion,
-    Translucency,
-    ShadowMask, // sunlight seen
-    Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
-    Count,
-};
 
 // The number of sun shadow cascades: tiles of a 2 x 2 atlas (shaders/scene/scene_common.slang's
 // kCascadeCount mirrors it).
@@ -59,13 +32,45 @@ struct SceneShadows {
     float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels (at least 1)
 };
 
+// The scene's light (renderer step 2), linear: what an environment asset gives (scene_lighting()).
+// Values are relative to exposure: a sun of 4 with an exposure of 1 is a bright day. The defaults
+// are a late afternoon, for tests and tools without an environment.
+struct SceneLighting {
+    float sun_direction[3] = {-0.55f, 0.32f, -0.75f}; // toward the sun, normalized when used: low, ahead
+    float sun_color[3] = {4.6f, 3.6f, 2.4f};          // late afternoon gold
+    float sky_color[3] = {0.30f, 0.40f, 0.62f};       // ambient from above
+    float ground_color[3] = {0.12f, 0.10f, 0.07f};    // ambient from below
+    float shadow_color[3] = {0.05f, 0.06f, 0.09f};    // what shadowed sunlight keeps: a cool tint, not black
+    float exposure_ev = 0.0f;
+    SceneShadows shadows{}; // the sun's
+};
+
+// An environment asset (.deenv) as the renderer's lighting.
+SceneLighting scene_lighting(const asset::EnvironmentAsset& environment);
+
+// What a frame shows with no scene (and the window without shaders): a dusk blue.
+inline constexpr rhi::Color kEmptySceneColor{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
+
+// What the window shows: the lit image, or one G-buffer channel.
+enum class SceneView : uint32_t {
+    Lit,
+    BaseColor,
+    Normal,
+    Roughness,
+    Metalness,
+    Occlusion,
+    Translucency,
+    ShadowMask, // sunlight seen
+    Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
+    Count,
+};
+
 const char* scene_view_name(SceneView view);
 
 struct SceneRendererDesc {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
-    SceneShadows shadows;
 };
 
 struct SceneRendererStats {
