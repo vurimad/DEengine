@@ -36,6 +36,8 @@ add_library(de_cooker STATIC
     source_tree.h
     texture_cooker.cpp
     texture_cooker.h
+    world_cooker.cpp
+    world_cooker.h
     third_party.cpp
     third_party.h)
 add_library(de::cooker ALIAS de_cooker)

@@ -387,6 +387,8 @@ meta/characters/knight/
 | Shader | `.deshader` | SPIR-V per permutation + reflection |
 | Cloth | `.decloth` | Simulation mesh, constraints, painted limits, render-mesh mapping, LODs |
 | Cell / prefab | `.decell` | Binary form of the text scene data |
+| World | `.deworld` | A world's cells by grid coordinate (named, not loaded with it), where the player starts, its environment |
+| Environment | `.deenv` | How a place is lit: sun, sky and ground ambient, shadow tint, exposure, sun shadows |
 
 **Rules for every cooked format.**
 
@@ -406,6 +408,7 @@ The editor browses source assets but always loads their cooked versions, so prev
 - Texture defaults follow from use: a texture a material samples as a normal map compresses to BC5, color to sRGB BC7, other maps to linear BC7. Folder rules and metas override them (JSON merge patches, root to leaf).
 - Our text material source is `.material` (JSON): a template, named parameters and textures by relative path.
 - Cells are `.cell` (JSON): the cell's grid coordinates and its entities (name, mesh by relative path to a model source, position, rotation, scale, parent by name, static). The `.decell` lists the meshes as dependencies, puts parents before children, and is cooked again when a model it names gets a new ID, not when a model is cooked again.
+- Worlds are `.world` (JSON): the environment and the cells by relative path, and the start position and view. The cooker reads each cell's coordinates into the `.deworld` (sorted, one cell per coordinate), so streaming can find cells without loading them; the environment is its one dependency. Environments are `.environment` (JSON): the sun by elevation and azimuth (degrees, clockwise from north, -Z), colors with intensities (1 when left out), exposure and shadow settings, every other one required so a file states the whole look. Editing the light cooks only the environment; moving a cell cooks the world again.
 - The cooker keeps its state in `game:/cook_state.json`: per source, the hash of every input (bytes, settings, files it reads, versions) and what it made. Unchanged sources are skipped, outputs of deleted sources removed, and metas of files moved outside the tools re-linked by the last content hash.
 - `cooker --check` validates the source and meta trees and writes nothing, for CI.
 
@@ -1179,4 +1182,5 @@ Decisions so far:
 | 2026-11-03 | Match Elden Ring's feel, atmosphere and art controls, not its low-level renderer; our own G-buffer, lighting core, shadows and upscaling | Their look comes from art direction on dated tech; a modern, consistent core with their art levers on top looks as good and ages better |
 | 2026-11-03 | G-buffer v1: three targets (base color + lighting group, RG16 octahedral normal, roughness/metalness/occlusion/translucency) and emissive into HDR, 20 bytes a pixel | Room for the look's art levers (groups, translucency) at the bandwidth of a lean layout; emissive needs no target of its own |
 | 2026-11-03 | The entry point only parses arguments, declares the application and calls `run_framework`; the framework owns the engine and the frame loop, the application (`startup`, `update`) says what to load, does its frame's work and decides when to quit; bindings and settings are text in `config/`, not code | Platform entry, engine and game stay apart; what a build loads and binds is data, so it changes without a rebuild |
+| 2026-11-03 | A world is an asset (`.world`: cells, start, environment) and the light is one too (`.environment`), both hot reloaded; the engine opens the world named in `config/engine.settings` | Nothing about a scene is in code; editing the light or the world shows in the running game, and the same assets carry over to the streamer, time of day and weather |
 | 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |

@@ -1,10 +1,12 @@
 #include "cooker/cooker.h"
 
 #include "asset/cell_format.h"
+#include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/texture_format.h"
+#include "asset/world_format.h"
 #include "cooker/cell_cooker.h"
 #include "cooker/cook_state.h"
 #include "cooker/material_cooker.h"
@@ -14,6 +16,7 @@
 #include "cooker/source_tree.h"
 #include "cooker/texture_cooker.h"
 #include "cooker/third_party.h"
+#include "cooker/world_cooker.h"
 #include "core/hash.h"
 #include "core/log.h"
 #include "core/profile.h"
@@ -103,6 +106,10 @@ private:
                 cook_text_material(source);
             } else if (source.kind == SourceKind::Cell) {
                 cook_cell_source(source);
+            } else if (source.kind == SourceKind::World) {
+                cook_world_source(source);
+            } else if (source.kind == SourceKind::Environment) {
+                cook_environment_source(source);
             }
         }
         for (const Source& source : tree_.sources()) {
@@ -572,6 +579,80 @@ private:
         }
         record.dependencies.assign(build->mesh_sources.span());
         record.input_hash = input_hash(record.dependencies.span());
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
+
+    // --- Worlds and environments --------------------------------------------------------------
+
+    // A world reads its cells' coords: their bytes are its inputs, with their IDs and its
+    // environment's (a re-minted one changes it). The environment's bytes aren't: a world names it,
+    // so editing the light doesn't cook the world again.
+    void cook_world_source(const Source& source) {
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        const auto input_hash = [&](std::span<const SourcePath> read) {
+            Hasher hasher("world");
+            hasher.add(source.id.value());
+            hasher.add(asset::WorldAsset::kFormatVersion);
+            hasher.add(source_hash);
+            for (const SourcePath& file : read) {
+                if (extension_of(file.view()) == ".cell") {
+                    hash_files(hasher, std::span(&file, 1));
+                }
+            }
+            hash_source_ids(hasher, read);
+            return hasher.value();
+        };
+        if (const CookRecord* last = previous_.find(path); last != nullptr) {
+            if (const CookRecord* same = unchanged(path, input_hash(last->dependencies.span())); same != nullptr) {
+                keep(*same);
+                return;
+            }
+        }
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
+        const auto read = [this](std::string_view source_path) { return read_source(source_path); };
+        const core::Result<WorldBuild> build = import_world(tree_, source, bytes->span(), read, diagnostics_);
+        if (!build || !write(record, source.id, asset::AssetType::World, cook_world(*build, source.id))) {
+            failed(path, &record);
+            return;
+        }
+        record.dependencies.assign(build->read.span());
+        record.input_hash = input_hash(record.dependencies.span());
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
+
+    void cook_environment_source(const Source& source) {
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        Hasher hasher("environment");
+        hasher.add(source.id.value());
+        hasher.add(asset::EnvironmentAsset::kFormatVersion);
+        hasher.add(source_hash);
+        if (const CookRecord* same = unchanged(path, hasher.value()); same != nullptr) {
+            keep(*same);
+            return;
+        }
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
+        const core::Result<asset::EnvironmentAsset> environment =
+            import_environment(source, bytes->span(), diagnostics_);
+        if (!environment ||
+            !write(record, source.id, asset::AssetType::Environment, cook_environment(*environment, source.id))) {
+            failed(path, &record);
+            return;
+        }
+        record.input_hash = hasher.value();
         next_.put(std::move(record));
         ++stats_.cooked;
     }

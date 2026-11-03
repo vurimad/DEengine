@@ -29,13 +29,14 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `texture_cooker.h` | `.detex`: mips filtered with stb_image_resize2, then BC1/BC4/BC5 (rgbcx) or BC7 (bc7enc) |
 | `material_cooker.h` | `.demat`: from model materials and `.material` text sources |
 | `cell_cooker.h` | `.decell`: from `.cell` text sources (the format is described there) |
+| `world_cooker.h` | `.deworld` and `.deenv`: from `.world` and `.environment` text sources (the formats are described there) |
 | `shader_cooker.h` | `.deshader`: every entry point of a Slang module, with reflection |
 | `blob_writer.h` | `BlobWriter`: the load-in-place layout and common header of every cooked file |
 | `json.h`, `settings.h` | yyjson on the Tools heap; the `texture` and `mesh` settings |
 
 ## Sources, metas and settings
 
-- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials, `.cell` cells. `.bin` files (glTF buffers) are read by their models; other files are ignored with a warning.
+- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials, `.cell` cells, `.world` worlds, `.environment` environments. `.bin` files (glTF buffers) are read by their models; other files are ignored with a warning.
 - Every source has a meta at the same path under `meta/`, plus `.json`: `content/rocks/rock.png` has `meta/rocks/rock.png.json`. A meta holds the source's GUID, and the settings sections (`texture`, `mesh`) that differ from the folder rules. New sources get a meta with a fresh GUID on the next cook. Metas are committed with their sources.
 - A source moved without its meta is found again by content (the last cook's hash) and its meta moved after it. A meta whose source can't be found is reported, and a new file that may be that source gets no GUID until it's settled: a GUID is never silently replaced, so references never break.
 - Two metas with one GUID (a copied meta): the file the last cook knew by that GUID keeps it, and the other is reported; deleting that one's meta gives it a GUID of its own. Deleting a meta re-cooks its source under the new ID and removes the old ID's files.
@@ -76,6 +77,8 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
 | `.cell` | a `.decell`: its entities, parents first, with the meshes of the models they name (relative paths) as its dependencies |
+| `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment as its dependency; cooked again when a cell it lists changes (its coordinate may have), not when the environment does |
+| `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth |
 | `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings: what ship builds read) |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
 

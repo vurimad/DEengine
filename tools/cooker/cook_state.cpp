@@ -22,8 +22,9 @@ void add_hash(yyjson_mut_doc* doc, yyjson_mut_val* object, const char* key, uint
 }
 
 asset::AssetType parse_type(std::string_view name) {
-    for (const asset::AssetType type : {asset::AssetType::Mesh, asset::AssetType::Texture, asset::AssetType::Material,
-                                        asset::AssetType::Shader, asset::AssetType::Cell}) {
+    for (const asset::AssetType type :
+         {asset::AssetType::Mesh, asset::AssetType::Texture, asset::AssetType::Material, asset::AssetType::Shader,
+          asset::AssetType::Cell, asset::AssetType::World, asset::AssetType::Environment}) {
         if (name == asset::asset_type_name(type)) {
             return type;
         }

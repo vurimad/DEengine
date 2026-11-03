@@ -2,6 +2,7 @@
 
 #include "core/log.h"
 #include "core/profile.h"
+#include "core/text.h"
 
 #include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
@@ -291,13 +292,9 @@ const ActionState& Input::state(ActionId action) const {
 
 namespace {
 
-bool is_space(char c) {
-    return c == ' ' || c == '\t' || c == '\r';
-}
-
 // The next token of a line: quoted (spaces allowed) or up to the next space. Empty at the end.
 std::string_view next_token(std::string_view& line) {
-    while (!line.empty() && is_space(line.front())) {
+    while (!line.empty() && core::is_blank(line.front())) {
         line.remove_prefix(1);
     }
     if (line.empty() || line.front() == '#') {
@@ -311,7 +308,7 @@ std::string_view next_token(std::string_view& line) {
         return token;
     }
     size_t end = 0;
-    while (end < line.size() && !is_space(line[end]) && line[end] != '#') {
+    while (end < line.size() && !core::is_blank(line[end]) && line[end] != '#') {
         ++end;
     }
     const std::string_view token = line.substr(0, end);
@@ -375,9 +372,7 @@ void Input::unbind_all(ActionId action) {
 }
 
 core::Result<uint32_t> Input::bind_text(std::string_view text, const BindTextOptions& options) {
-    if (text.starts_with("\xEF\xBB\xBF")) {
-        text.remove_prefix(3); // a byte order mark, from an editor on Windows
-    }
+    text = core::skip_bom(text);
     core::Array<uint8_t> replaced(*allocator_); // per action: its old bindings are already dropped
     replaced.resize(actions_.size(), 0);
     uint32_t unknown = 0;
@@ -386,9 +381,7 @@ core::Result<uint32_t> Input::bind_text(std::string_view text, const BindTextOpt
         std::string_view rest = text;
         uint32_t line_number = 0;
         while (!rest.empty()) {
-            const size_t end = rest.find('\n');
-            const std::string_view line = rest.substr(0, end);
-            rest.remove_prefix(end == std::string_view::npos ? rest.size() : end + 1);
+            const std::string_view line = core::next_line(rest);
             ++line_number;
             BindingLine parsed;
             if (!parse_binding_line(line, line_number, parsed)) {

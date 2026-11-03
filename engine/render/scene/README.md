@@ -7,7 +7,7 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 | File | What it gives |
 | --- | --- |
 | `gpu_assets.h` | `GpuAssets`: meshes as vertex and index buffers, textures with their bindless index, materials in one table (`GpuMaterial`), mirrored from the registry's events |
-| `scene_renderer.h` | `SceneRenderer`: the passes drawing a `world::RenderFrame`, `SceneLighting`, `SceneView` (debug views); `camera_view_proj` (infinite reverse-Z, looking down -Z), `invert_4x4` |
+| `scene_renderer.h` | `SceneRenderer`: the passes drawing a `world::RenderFrame`, `SceneLighting` (with the sun's `SceneShadows`, per frame) and `scene_lighting()` (from an environment asset), `SceneView` (debug views); `camera_view_proj` (infinite reverse-Z, looking down -Z), `invert_4x4` |
 
 ## The G-buffer (v1)
 

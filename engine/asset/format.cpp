@@ -18,6 +18,10 @@ const char* asset_type_extension(AssetType type) {
         return ".deshader";
     case AssetType::Cell:
         return ".decell";
+    case AssetType::World:
+        return ".deworld";
+    case AssetType::Environment:
+        return ".deenv";
     case AssetType::Unknown:
         break;
     }
@@ -36,6 +40,10 @@ const char* asset_type_name(AssetType type) {
         return "shader";
     case AssetType::Cell:
         return "cell";
+    case AssetType::World:
+        return "world";
+    case AssetType::Environment:
+        return "environment";
     case AssetType::Unknown:
         break;
     }

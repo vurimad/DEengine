@@ -191,6 +191,10 @@ const char* source_kind_name(SourceKind kind) {
         return "material";
     case SourceKind::Cell:
         return "cell";
+    case SourceKind::World:
+        return "world";
+    case SourceKind::Environment:
+        return "environment";
     }
     return "unknown";
 }
@@ -202,11 +206,18 @@ bool source_kind_of(std::string_view path, SourceKind& kind) {
         SourceKind kind;
     };
     static constexpr Entry kKinds[] = {
-        {.extension = ".png", .kind = SourceKind::Texture},       {.extension = ".jpg", .kind = SourceKind::Texture},
-        {.extension = ".jpeg", .kind = SourceKind::Texture},      {.extension = ".tga", .kind = SourceKind::Texture},
-        {.extension = ".bmp", .kind = SourceKind::Texture},       {.extension = ".gltf", .kind = SourceKind::Gltf},
-        {.extension = ".glb", .kind = SourceKind::Gltf},          {.extension = ".fbx", .kind = SourceKind::Fbx},
-        {.extension = ".material", .kind = SourceKind::Material}, {.extension = ".cell", .kind = SourceKind::Cell},
+        {.extension = ".png", .kind = SourceKind::Texture},
+        {.extension = ".jpg", .kind = SourceKind::Texture},
+        {.extension = ".jpeg", .kind = SourceKind::Texture},
+        {.extension = ".tga", .kind = SourceKind::Texture},
+        {.extension = ".bmp", .kind = SourceKind::Texture},
+        {.extension = ".gltf", .kind = SourceKind::Gltf},
+        {.extension = ".glb", .kind = SourceKind::Gltf},
+        {.extension = ".fbx", .kind = SourceKind::Fbx},
+        {.extension = ".material", .kind = SourceKind::Material},
+        {.extension = ".cell", .kind = SourceKind::Cell},
+        {.extension = ".world", .kind = SourceKind::World},
+        {.extension = ".environment", .kind = SourceKind::Environment},
     };
     for (const Entry& entry : kKinds) {
         if (entry.extension == extension) {

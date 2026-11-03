@@ -1,0 +1,6 @@
+{
+  // The test world: one cell, a camp in a clearing, seen from its south side.
+  "environment": "evening.environment",
+  "start": {"position": [64, 2, 74], "yaw_deg": 0, "pitch_deg": -7},
+  "cells": ["cell_0_0.cell"]
+}

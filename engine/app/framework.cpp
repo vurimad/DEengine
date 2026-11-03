@@ -2,11 +2,13 @@
 
 #include "asset/registry.h"
 #include "core/array.h"
+#include "core/fixed_string.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/memory_stats.h"
 #include "core/profile.h"
 #include "core/string_id.h"
+#include "core/text.h"
 #include "core/version.h"
 #include "platform/events.h"
 #include "platform/input.h"
@@ -42,12 +44,22 @@ std::string_view as_text(const core::Array<std::byte>& bytes) {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
 
+// config/ is read from the source tree in dev builds (edits apply on the next run, no cook), and
+// from game:/config/ (the cooker copies it there) in ship.
+using ConfigPath = core::FixedString<64>;
+ConfigPath config_path(bool has_src, const char* name) {
+    ConfigPath path(has_src ? "src:/config/" : "game:/config/");
+    static_cast<void>(path.append(name));
+    return path;
+}
+
 // Input bindings are text (docs/design.md, Input): the engine's (from the source tree in dev
 // builds, so edits apply on the next run without a cook), then the player's, whose lines replace
 // the engine's for the actions they name. In dev builds every action is added, so a line naming
 // none is a typo, and logged.
 bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_src) {
-    const char* const engine_path = has_src ? "src:/config/input.bindings" : "game:/config/input.bindings";
+    const ConfigPath path = config_path(has_src, "input.bindings");
+    const char* const engine_path = path.c_str();
     const auto engine_bindings = vfs.read_whole_file(engine_path, core::heap_allocator(core::MemoryTag::Platform));
     if (!engine_bindings) {
         DE_LOG_ERROR("input", "%s: %s%s", engine_path, engine_bindings.error().message,
@@ -75,6 +87,21 @@ bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_sr
 }
 
 } // namespace
+
+std::string_view setting(std::string_view settings, std::string_view name) {
+    std::string_view rest = core::skip_bom(settings);
+    while (!rest.empty()) {
+        const std::string_view line = core::strip_comment(core::next_line(rest));
+        size_t split = 0;
+        while (split < line.size() && !core::is_blank(line[split])) {
+            ++split;
+        }
+        if (line.substr(0, split) == name) {
+            return core::trim(line.substr(split));
+        }
+    }
+    return {};
+}
 
 bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.argc = argc;
@@ -202,13 +229,26 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
     std::optional<render::SceneRenderer> scene_renderer;
     if (shaders) {
-        auto created = render::SceneRenderer::create(
-            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        auto created =
+            render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         if (created) {
             scene_renderer.emplace(std::move(*created));
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }
+    }
+
+    // Engine settings (text, like the bindings): read once, kept for setting().
+    // Missing, it's empty: whoever needs a setting says so.
+    const ConfigPath settings_path = config_path(src_root != nullptr, "engine.settings");
+    core::Array<std::byte> settings(core::heap_allocator(core::MemoryTag::Platform));
+    if (vfs->exists(settings_path.c_str())) {
+        auto read = vfs->read_whole_file(settings_path.c_str(), core::heap_allocator(core::MemoryTag::Platform));
+        if (!read) {
+            DE_LOG_ERROR("engine", "%s: %s", settings_path.c_str(), read.error().message);
+            return EXIT_FAILURE;
+        }
+        settings = std::move(*read);
     }
 
     platform::Input input;
@@ -226,6 +266,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .assets = *assets,
                   .world = *world,
                   .gpu_assets = *gpu_assets,
+                  .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit};
 
@@ -249,6 +290,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #endif
 
     if (!application.startup(engine, args) || !load_bindings(*vfs, input, src_root != nullptr)) {
+        application.shutdown(engine); // what startup got before it failed
         return EXIT_FAILURE;
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
@@ -369,6 +411,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
 
     // --- Down -------------------------------------------------------------------------------------
+    application.shutdown(engine);
     device->log_memory_report(5);
     device->wait_idle();
     const asset::AssetRegistryStats asset_stats = assets->stats();

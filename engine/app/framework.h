@@ -3,6 +3,7 @@
 #include "render/scene/scene_renderer.h"
 
 #include <cstdint>
+#include <string_view>
 
 namespace de::core {
 class JobSystem;
@@ -55,7 +56,7 @@ struct FrameworkArgs {
 
 // False (logged) on a malformed flag.
 bool parse_args(int argc, char** argv, FrameworkArgs& out);
-// The value after a flag ("--cell 3f8a..."), or null if it isn't there.
+// The value after a flag ("--world 3f8a..."), or null if it isn't there.
 const char* flag_value(const FrameworkArgs& args, const char* flag);
 bool has_flag(const FrameworkArgs& args, const char* flag);
 
@@ -72,10 +73,16 @@ struct Engine {
     asset::AssetRegistry& assets;
     world::World& world;
     render::GpuAssets& gpu_assets;
+    // config/engine.settings, as text (read with setting(engine.settings, "name")).
+    std::string_view settings;
     // What each frame draws, as the application sets it.
     render::SceneLighting lighting;
     render::SceneView view = render::SceneView::Lit;
 };
+
+// A value from settings text like config/engine.settings (Engine::settings): one setting a line, a
+// name and a value; '#' starts a comment. Empty if it isn't there.
+std::string_view setting(std::string_view settings, std::string_view name);
 
 // What runs inside the framework: the game, or a tool. The framework owns the engine and the frame
 // loop; the application says what to load and does its per-frame work.
@@ -94,6 +101,9 @@ public:
     // Every frame, after input is sampled and before the world advances. False ends the run (the
     // application's quit: the framework has no quit of its own, so the game can ask first).
     virtual bool update(Engine& engine, float frame_s) = 0;
+    // After the last frame (or a failed start: whenever startup() ran), while the engine is still
+    // up: let go of what it holds.
+    virtual void shutdown(Engine& /*engine*/) {}
 };
 
 // Brings the engine up, runs the application in the frame loop until the window closes, the

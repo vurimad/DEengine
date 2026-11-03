@@ -5,6 +5,8 @@ add_library(de_asset STATIC
     asset_id.h
     cell_format.cpp
     cell_format.h
+    environment_format.cpp
+    environment_format.h
     format.cpp
     format.h
     material_format.cpp
@@ -16,7 +18,9 @@ add_library(de_asset STATIC
     shader_format.cpp
     shader_format.h
     texture_format.cpp
-    texture_format.h)
+    texture_format.h
+    world_format.cpp
+    world_format.h)
 add_library(de::asset ALIAS de_asset)
 
 target_link_libraries(de_asset PUBLIC de::core de::platform de::compile_options)
