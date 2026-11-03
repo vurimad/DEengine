@@ -33,6 +33,8 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `shader_cooker.h` | `.deshader`: every entry point of a Slang module, with reflection |
 | `blob_writer.h` | `BlobWriter`: the load-in-place layout and common header of every cooked file |
 | `json.h`, `settings.h` | yyjson on the Tools heap; the `texture` and `mesh` settings |
+| `common.h` | What every step shares: source paths, `Diagnostics` (the findings, each with its file), the Tools heap |
+| `third_party.h` | Routes the libraries with process-wide allocator hooks (meshoptimizer) to the Tools heap |
 
 ## Sources, metas and settings
 
@@ -79,7 +81,7 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | `.cell` | a `.decell`: its entities, parents first, with the meshes of the models they name (relative paths) as its dependencies |
 | `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment as its dependency; cooked again when a cell it lists changes (its coordinate may have), not when the environment does |
 | `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth |
-| `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings: what ship builds read) |
+| `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings and engine settings: what ship builds read) |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
 
 ## Rules and invariants

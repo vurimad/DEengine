@@ -88,7 +88,7 @@ struct GpuAssetsState;
 //
 // A mesh is drawable once its buffers are uploaded (mesh() returns null before); a material whose
 // textures are still uploading uses default textures until they're in (update() rewrites it). A
-// missing or failed material is drawn with material 0, the default. On the render thread, once
+// missing or failed material is drawn with material 0, the default. On the thread that renders, once
 // per frame, after the registry's update() and before rendering. The device, uploader and registry
 // must outlive it; it stops listening when it goes.
 class GpuAssets {

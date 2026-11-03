@@ -8,7 +8,9 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 | --- | --- |
 | `rhi.h` | Formats and `format_info`, texture, buffer and pipeline descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` / `PipelineHandle` |
 | `device.h` | `Device`: creation (windowed or headless), resources, deferred destruction, frames, swapchain, stats |
-| `command_list.h` | `CommandList`: barriers, dynamic rendering, pipelines, push constants, draws, dispatches, copies, debug labels; `BarrierBatch`, `ScopedDebugLabel` |
+| `command_list.h` | `CommandList`: barriers (queue ownership transfers included), dynamic rendering, pipelines, cull mode, push constants, index buffers, draws, dispatches, copies, fills, blits, debug labels; `BarrierBatch`, `ScopedDebugLabel` |
+| `upload.h` | `Uploader`: CPU data into textures and buffers through a staging ring, within a byte budget per frame, on the transfer queue when there is one (docs/design.md, Rendering: GPU uploads) |
+| `mips.h` | `generate_mips`: mips of textures made at runtime, a filtered blit per mip |
 | `vulkan/` | The backend: volk, VMA, vk-bootstrap. Nothing outside this folder includes it. The window surface comes from `platform::create_vulkan_surface`, so no SDL here |
 
 ## How a frame runs
@@ -27,17 +29,18 @@ device.end_frame();                                      // one submit for all l
 ## Rules and invariants
 
 - No Vulkan type, enum or header above `vulkan/`. The public headers name no graphics API; a D3D12 or console backend would implement the same headers in its own folder, picked by CMake (no virtual calls).
-- One `Device` per process, used from one thread (the render thread). Command lists are recorded on that thread too, for now.
+- One `Device` per process, used from one thread: the one that renders (the main thread today; there is no render thread yet). Command lists are recorded on that thread too, for now.
 - Clip space is +Y up with depth 0..1 on every backend; the Vulkan backend flips the viewport. Depth is reverse Z: clear to 0 (far), test greater.
-- Barriers name states (`RenderTarget`, `ShaderRead`, `CopyDst`...), not pipeline stages or layouts. The render graph will emit them from what passes declare.
+- Barriers name states (`RenderTarget`, `ShaderRead`, `CopyDst`...), not pipeline stages or layouts. The render graph emits them from what passes declare.
   - States are flags: read states combine (`IndirectArgument | ShaderRead`), a write state stands alone; textures combine only reads that share a layout (`DepthRead | ShaderRead`). `is_valid_state()` checks, and barriers assert it.
   - Shader states name the stages that use them (`ShaderStages::Compute`, `Fragment`...), so unrelated work overlaps the barrier. The default is every stage: correct, wider than needed.
   - `Undefined` means nothing on the GPU still uses the resource (just created, or its frame was waited for); it waits for nothing. A resource that may still be in flight names its real previous state, with `discard` for a texture whose contents will be overwritten: the barrier waits for the previous use but skips preserving the contents. The swapchain goes `Present` -> `RenderTarget` with discard every frame.
   - Buffer barriers can cover a range; a `GlobalBarrier` orders every buffer access at once, cheaper than many buffer barriers in GPU-driven passes.
-  - One barrier command per `barriers()` call. `BarrierBatch` collects them on the stack and flushes them as one; the render graph will flush one batch per pass boundary.
+  - One barrier command per `barriers()` call. `BarrierBatch` collects them on the stack and flushes them as one; the render graph flushes one batch per pass boundary.
   - Synchronization validation runs in the tests: a barrier that is too weak shows up as a `SYNC-HAZARD` error.
 - Destroying a resource invalidates its handle at once; the GPU memory is freed when the frames in flight that may use it are done (`kFramesInFlight` = 2). Using a stale handle is a `DE_VERIFY` failure in every build.
 - Frame pacing uses one timeline semaphore: frame N signals N. Swapchain present semaphores are per image, acquire semaphores per frame slot.
+- Command lists go to the graphics queue or, when `Capabilities::transfer_queue`, the transfer queue (copies and barriers only). A frame's transfer lists run alongside the GPU's previous frame, and its graphics work waits for them; a transfer list started `AfterPreviousFrame` waits for the previous frame to finish first (it overwrites what that frame may read). `FrameStart` graphics lists are submitted before the frame's other graphics lists. What a transfer list wrote reaches the graphics queue through a queue ownership release and acquire.
 - The swapchain is recreated on resize, vsync change, or when the driver reports it out of date; suboptimal triggers one rebuild, not one per frame. A lost surface is recreated. Recreation waits for the GPU to go idle (rare, keeps it simple). Present semaphores live as long as the device, since nothing tells when a retired swapchain's present stopped using them.
 - Swapchain formats are sRGB, so shaders write linear color; a window without one gets a warning in the log.
 - Frames present from the graphics queue; a GPU whose graphics queue can't present to the window is rejected.
@@ -59,6 +62,6 @@ device.end_frame();                                      // one submit for all l
 
 ## Not yet
 
-- Async compute and transfer submission with cross-queue sync (render graph), multi-threaded command recording, per-mip and per-layer views, stencil copies.
+- Async compute submission (render graph v3), multi-threaded command recording, sampled views and render targets of single mips or layers (attachments use mip 0 and layer 0 of single-mip, single-layer textures for now), stencil copies.
 - Driver and VMA CPU-side allocations don't go through our tagged heaps yet (`VkAllocationCallbacks`).
 - Tracy GPU zones (timestamps are in: `CommandList::write_timestamp`, the render graph times each pass); timestamps on compute and transfer lists.

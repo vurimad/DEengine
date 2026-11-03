@@ -20,7 +20,7 @@ class GpuAssets;
 // kCascadeCount mirrors it).
 inline constexpr uint32_t kShadowCascadeCount = 4;
 
-// The sun's shadows (renderer step 3): cascaded shadow maps in one atlas, resolved per pixel into
+// The sun's shadows: cascaded shadow maps in one atlas, resolved per pixel into
 // a screen-space mask.
 struct SceneShadows {
     uint32_t resolution = 2048;       // per cascade (asset::ShadowLimits); the atlas is 2 x 2 of them
@@ -32,7 +32,7 @@ struct SceneShadows {
     float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels (at least 1)
 };
 
-// The scene's light (renderer step 2), linear: what an environment asset gives (scene_lighting()).
+// The scene's light, linear: what an environment asset gives (scene_lighting()).
 // Values are relative to exposure: a sun of 4 with an exposure of 1 is a bright day. The defaults
 // are a late afternoon, for tests and tools without an environment.
 struct SceneLighting {
@@ -98,12 +98,14 @@ void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, floa
 
 struct SceneRendererState;
 
-// Draws a world::RenderFrame, deferred (renderer step 2, docs/design.md, Rendering):
+// Draws a world::RenderFrame, deferred (docs/design.md, Rendering: frame passes):
+//   sun shadows     every instance into each cascade's tile of the shadow atlas, depth only
 //   gbuffer         every instance whose mesh is on the GPU, a draw per mesh part: the G-buffer
 //                   (base color + lighting group, octahedral normal, roughness/metalness/occlusion/
 //                   translucency), emissive into the HDR target, reverse-Z depth
-//   deferred light  a full-screen pass adding the sun and the ambient onto the HDR target, and the
-//                   sky where nothing was drawn
+//   shadow mask     a full-screen pass resolving the cascades: how much sun each pixel sees
+//   deferred light  a full-screen pass adding the sun (through the mask) and the ambient onto the
+//                   HDR target, and the sky where nothing was drawn
 //   tonemap         exposure and a filmic curve into the target (or a G-buffer channel: SceneView)
 // It looks through the frame's camera (down its -Z). Per-frame data (view, light, instance
 // transforms) goes through a mapped buffer per frame in flight, grown as needed: no allocation

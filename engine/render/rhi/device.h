@@ -97,8 +97,8 @@ struct DeviceStats {
 
 // The GPU: resources, frames and submission. The only door to the graphics API.
 //
-// One Device per process. Not thread-safe: create resources, record and submit from one thread
-// (the render thread). Move-only.
+// One Device per process. Not thread-safe: create resources, record and submit from one thread,
+// the one that renders (the main thread today). Move-only.
 //
 // A frame:
 //     device.begin_frame();

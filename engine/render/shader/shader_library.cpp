@@ -26,7 +26,7 @@ enum class Build : uint8_t {
     Idle,
     Queued,    // a source changed: waiting for its turn (one rebuild runs at a time)
     Compiling, // a background job owns Program::pending
-    Done,      // the job finished: the render thread swaps it in or drops it
+    Done,      // the job finished: the rendering thread swaps it in or drops it
 };
 
 struct StoredDefine {
@@ -34,7 +34,7 @@ struct StoredDefine {
     ShaderName value;
 };
 
-// A compile's outcome, kept until the render thread acts on it.
+// A compile's outcome, kept until the rendering thread acts on it.
 struct PendingBuild {
     bool ok = false;
     CompiledProgram program;
@@ -90,7 +90,7 @@ struct Program {
     ShaderReflection reflections[kMaxStages];
 
     // Every source file the program depends on, with the info its last build read, and what the
-    // last check saw. Render thread only.
+    // last check saw. Rendering thread only.
     core::Array<ShaderDependency> watched{render_heap()};
     core::Array<platform::FileInfo> seen{render_heap()};
 
@@ -373,7 +373,7 @@ bool sources_changed(const LibraryState& state, Program& program) {
     return changed;
 }
 
-// Takes a finished build: swaps in the new pipeline, or keeps the last good one. Render thread only.
+// Takes a finished build: swaps in the new pipeline, or keeps the last good one. Rendering thread only.
 void finish_build(LibraryState& state, Program& program) {
     PendingBuild& build = program.pending;
     core::Result<rhi::PipelineHandle> pipeline =

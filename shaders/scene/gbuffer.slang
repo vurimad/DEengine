@@ -1,4 +1,4 @@
-// The G-buffer pass (renderer step 2): every mesh instance writes its surface (base color, normal,
+// The G-buffer pass: every mesh instance writes its surface (base color, normal,
 // roughness, metalness, occlusion, translucency, lighting group) and its emissive light straight
 // into the HDR target. Vertices are pulled by address; materials come from the GpuAssets table.
 
