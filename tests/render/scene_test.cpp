@@ -638,6 +638,7 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     environment.fog_ambient_height_attenuation = 0.5f;
     environment.fog_sun_start_m = 7.0f;
     environment.fog_end_m = 9000.0f;
+    environment.fog_volume_distance_m = 100.0f;
     const de::render::SceneLighting lighting = de::render::scene_lighting(environment);
     CHECK(lighting.sun_direction[0] == 0.6f);
     CHECK(lighting.sun_direction[1] == 0.8f);
@@ -655,6 +656,7 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     CHECK(lighting.fog.ambient_height_attenuation == 0.5f);
     CHECK(lighting.fog.sun_start_m == 7.0f);
     CHECK(lighting.fog.end_m == 9000.0f);
+    CHECK(lighting.fog.volume_distance_m == 100.0f);
 }
 
 TEST_CASE("masked materials are cut out, double-sided ones seen from behind, each by its own pipeline") {
@@ -761,6 +763,170 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
         for (const de::asset::AssetHandle mesh : meshes) {
             assets->release(mesh);
         }
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}
+
+TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shadows to the fog") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    put_assets(*vfs);
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        REQUIRE(renderer.ok());
+        const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+
+        // The camera at the origin looking down -Z, the sun straight overhead.
+        de::world::RenderFrame frame;
+        frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .vertical_fov_rad = 1.0f, .valid = true};
+        const auto render = [&](const de::render::SceneFog& fog) {
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            de::render::SceneLighting light{.sun_direction = {0, 1, 0}};
+            light.fog = fog;
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit);
+            graph->execute();
+            device->end_frame();
+            return de::test::read_texture(*device, *target);
+        };
+        // Looking a little down, past anything: a fog of the sun's light alone, and of the sky's.
+        const uint32_t x = kSize / 2;
+        const uint32_t y = kSize - 2;
+        const de::render::SceneFog closed{.density_per_m = 0.1f,
+                                          .sun_forward = {0.05f, 0.1f, 0.05f},
+                                          .sun_back = {0.05f, 0.1f, 0.05f},
+                                          .sun_height_attenuation = 0.0f,
+                                          .ambient = {0.05f, 0.05f, 0.1f},
+                                          .end_m = 1000.0f};
+        de::render::SceneFog gridded = closed;
+        gridded.volume_distance_m = 60.0f;
+
+        // Nothing casts a shadow: the grid and the closed form give the same fog.
+        const de::core::Array<std::byte> closed_clear = render(closed);
+        const de::core::Array<std::byte> gridded_clear = render(gridded);
+        for (const uint32_t channel : {0U, 1U, 2U}) {
+            CHECK(static_cast<int>(texel(gridded_clear, x, y)[channel]) ==
+                  doctest::Approx(static_cast<int>(texel(closed_clear, x, y)[channel])).epsilon(0.05));
+        }
+        CHECK(texel(gridded_clear, x, y)[1] > 40); // and there is fog to see
+        // A height fog too, whose density changes along the ray: still the same.
+        de::render::SceneFog high = closed;
+        high.density_per_m = 0.0f;
+        high.height_density_per_m = 0.1f;
+        high.height_falloff_per_m = 0.05f;
+        high.ambient_height_attenuation = 0.0f;
+        de::render::SceneFog high_gridded = high;
+        high_gridded.volume_distance_m = 60.0f;
+        const de::core::Array<std::byte> high_closed = render(high);
+        const de::core::Array<std::byte> high_grid = render(high_gridded);
+        CHECK(static_cast<int>(texel(high_grid, x, y)[1]) ==
+              doctest::Approx(static_cast<int>(texel(high_closed, x, y)[1])).epsilon(0.05));
+
+        // Fog that starts 15 m out, and sun haze that starts 30 m out: the same again (thin fog, so
+        // that what's past those distances counts).
+        de::render::SceneFog started = closed;
+        started.density_per_m = 0.02f;
+        started.start_m = 15.0f;
+        started.sun_forward[1] = started.sun_back[1] = 0.4f;
+        de::render::SceneFog started_gridded = started;
+        started_gridded.volume_distance_m = 60.0f;
+        const de::core::Array<std::byte> started_closed_image = render(started);
+        const de::core::Array<std::byte> started_grid_image = render(started_gridded);
+        CHECK(static_cast<int>(texel(started_grid_image, x, y)[1]) ==
+              doctest::Approx(static_cast<int>(texel(started_closed_image, x, y)[1])).epsilon(0.05));
+        started.sun_start_m = 30.0f;
+        started_gridded.sun_start_m = 30.0f;
+        const de::core::Array<std::byte> late_closed_image = render(started);
+        const de::core::Array<std::byte> late_grid_image = render(started_gridded);
+        CHECK(texel(late_closed_image, x, y)[1] < texel(started_closed_image, x, y)[1]); // it matters here
+        CHECK(static_cast<int>(texel(late_grid_image, x, y)[1]) ==
+              doctest::Approx(static_cast<int>(texel(late_closed_image, x, y)[1])).epsilon(0.05));
+
+        // Thin fog ending past the grid, so the grid and what's beyond it both count; and at the corner
+        // of the view, where a ray is longer than its view depth. Then ending inside the grid.
+        const auto agree = [&](de::render::SceneFog fog, uint32_t at_x, uint32_t at_y) {
+            const de::core::Array<std::byte> closed_image = render(fog);
+            fog.volume_distance_m = 60.0f;
+            const de::core::Array<std::byte> grid_image = render(fog);
+            CHECK(texel(closed_image, at_x, at_y)[1] > 40);
+            CHECK(static_cast<int>(texel(grid_image, at_x, at_y)[1]) ==
+                  doctest::Approx(static_cast<int>(texel(closed_image, at_x, at_y)[1])).epsilon(0.05));
+        };
+        de::render::SceneFog thin = closed;
+        thin.density_per_m = 0.004f;
+        thin.sun_forward[1] = thin.sun_back[1] = 0.4f;
+        thin.end_m = 150.0f;
+        agree(thin, x, y);
+        agree(thin, 1, kSize - 2);
+        thin.density_per_m = 0.01f;
+        thin.end_m = 40.0f;
+        agree(thin, x, y);
+        agree(thin, 1, kSize - 2);
+        // A surface inside the grid, close by: the fog up to it, read from between two slices.
+        frame.instances.push({.transform = {5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}, .mesh = mesh});
+        thin.density_per_m = 0.2f;
+        thin.end_m = 1000.0f;
+        agree(thin, kSize / 2, kSize / 2);
+        frame.instances.clear();
+
+        // A roof 5 m up, 200 m wide (the square turned to lie flat), shadows the fog under it. The
+        // closed form can't know; the grid does: what's left is the sky's light, and the sun's past
+        // the roof's edge, behind nearly all of this fog.
+        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}, .mesh = mesh});
+        const de::core::Array<std::byte> closed_roofed = render(closed);
+        const de::core::Array<std::byte> gridded_roofed = render(gridded);
+        CHECK(static_cast<int>(texel(closed_roofed, x, y)[1]) ==
+              doctest::Approx(static_cast<int>(texel(closed_clear, x, y)[1])).epsilon(0.03));
+        CHECK(texel(gridded_roofed, x, y)[1] < texel(gridded_clear, x, y)[1] - 40);
+        CHECK(texel(gridded_roofed, x, y)[2] > texel(gridded_roofed, x, y)[1]); // the sky's blue is what's left
+        // The grid's two passes run only with one.
+        CHECK(graph->stats().culled_passes == 0);
+        const uint32_t with_grid = graph->stats().passes;
+        static_cast<void>(render(closed));
+        CHECK(graph->stats().passes == with_grid - 2);
+
+        assets->release(mesh);
         assets->update();
         device->wait_idle();
         device->destroy(*target);

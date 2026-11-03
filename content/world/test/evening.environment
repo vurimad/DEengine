@@ -27,6 +27,7 @@
     "ambient_height_attenuation": 1,
     "start_m": 0,
     "sun_start_m": 5,               // no sun haze on the camera's nose
-    "end_m": 20000                  // the sky is this far
+    "end_m": 20000,                 // the sky is this far
+    "volume_distance_m": 128        // the froxel grid's reach, for the sun's shadows in the fog; 0: none
   }
 }

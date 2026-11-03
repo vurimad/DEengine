@@ -35,7 +35,8 @@ struct SceneShadows {
 // Fog (shaders/common/fog.slang has the model): a constant extinction plus a height fog around a
 // base height, coloured per channel, lit by the sun (a colour looking toward it, another looking
 // away) and an ambient colour, from start_m to end_m along each view ray (the sky is at end_m).
-// The defaults are no fog.
+// Near the camera, a froxel grid out to volume_distance_m adds the sun's shadows to it (light shafts);
+// past the grid, or without one (0), the fog goes on in closed form. The defaults are no fog.
 struct SceneFog {
     float density_per_m = 0.0f;        // extinction everywhere
     float height_density_per_m = 0.0f; // the height fog's extinction at its base
@@ -50,6 +51,7 @@ struct SceneFog {
     float start_m = 0.0f;
     float sun_start_m = 0.0f; // where sun haze starts: none on the camera's nose
     float end_m = 20000.0f;
+    float volume_distance_m = 0.0f; // the froxel grid's reach, in view depth; 0: no grid
 };
 
 // The scene's light, linear: what an environment asset gives (scene_lighting()).

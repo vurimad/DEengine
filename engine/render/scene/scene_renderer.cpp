@@ -47,7 +47,7 @@ struct SceneFrame {
     float fog_sun_forward[4] = {}; // colour, sun height attenuation
     float fog_sun_back[4] = {};    // colour, sun start
     float fog_ambient[4] = {};     // colour, start
-    float fog_range[4] = {};       // end
+    float fog_range[4] = {};       // end, froxel grid reach, slice offset, slices
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -98,7 +98,34 @@ struct FogPush {
     uint64_t frame = 0;
     uint32_t hdr = 0;
     uint32_t depth = 0;
+    uint32_t integrated = 0;
+    uint32_t sampler = 0;
 };
+
+// Matches FogInjectPush in shaders/scene/fog_inject.slang.
+struct FogInjectPush {
+    uint64_t frame = 0;
+    uint32_t volume = 0;
+    uint32_t atlas = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// Matches FogIntegratePush in shaders/scene/fog_integrate.slang.
+struct FogIntegratePush {
+    uint64_t frame = 0;
+    uint32_t froxels = 0;
+    uint32_t integrated = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
+// The froxel grid: a column per this many pixels, and slices spaced exponentially from the camera with
+// this offset, so the first ones aren't vanishingly thin.
+constexpr uint32_t kFroxelTilePixels = 8;
+constexpr uint32_t kFroxelSlices = 64;
+constexpr float kFroxelSliceOffsetM = 2.0f;
+constexpr rhi::Format kFroxelFormat = rhi::Format::RGBA16Float;
 
 // Matches TonemapPush in shaders/scene/tonemap.slang.
 struct TonemapPush {
@@ -184,6 +211,8 @@ struct SceneRendererState {
     shader::ProgramHandle shadow_caster_masked; // alpha-tested
     shader::ProgramHandle shadow_mask;
     shader::ProgramHandle fog_program;
+    shader::ProgramHandle fog_inject;
+    shader::ProgramHandle fog_integrate;
     // This frame's mesh parts by kind, for the shadow and G-buffer passes: opaque first, so masked
     // pixels behind them fail early depth; each kind one pipeline state. Capacity kept between frames.
     core::Array<PartDraw> draws[kDrawKindCount] = {
@@ -200,7 +229,7 @@ struct SceneRendererState {
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program}) {
+              shadow_mask, fog_program, fog_inject, fog_integrate}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -238,6 +267,12 @@ struct SceneRendererState {
         rhi::GraphicsPipelineDesc fogged{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "fog"};
         fogged.color_formats[0] = kHdrFormat;
         fog_program = make("scene.fog", fogged);
+        const core::Result<shader::ProgramHandle> inject =
+            shaders->create_compute({.module = "scene.fog_inject", .debug_name = "fog inject"});
+        fog_inject = inject ? *inject : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> integrate =
+            shaders->create_compute({.module = "scene.fog_integrate", .debug_name = "fog integrate"});
+        fog_integrate = integrate ? *integrate : shader::ProgramHandle{};
 
         // Casters: depth only, no culling (thin geometry casts from both sides).
         const rhi::GraphicsPipelineDesc caster{.depth_format = kDepthFormat,
@@ -366,6 +401,9 @@ struct SceneRendererState {
         copy3(fog.ambient, scene.fog_ambient);
         scene.fog_ambient[3] = fog.start_m;
         scene.fog_range[0] = fog.end_m;
+        scene.fog_range[1] = fog.volume_distance_m;
+        scene.fog_range[2] = kFroxelSliceOffsetM;
+        scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         for (size_t i = 0; i < frame.instances.size(); ++i) {
             std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
@@ -405,6 +443,7 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
     fog.start_m = environment.fog_start_m;
     fog.sun_start_m = environment.fog_sun_start_m;
     fog.end_m = environment.fog_end_m;
+    fog.volume_distance_m = environment.fog_volume_distance_m;
     return lighting;
 }
 
@@ -600,6 +639,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle caster_masked = state.shaders->pipeline(state.shadow_caster_masked);
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
+    const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
+    const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
@@ -608,7 +649,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
-                       fog.is_valid();
+                       fog.is_valid() && fog_inject.is_valid() && fog_integrate.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -789,41 +830,111 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.end_rendering();
         });
 
+    const bool foggy =
+        view == SceneView::Lit && (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
+
+    // The froxel grid, near the camera: each froxel's fog and light, then each column walked front to
+    // back (so the composite reads the fog from the camera to any depth with one sample).
+    const bool froxels_on = foggy && lighting.fog.volume_distance_m > 0.0f;
+    GraphTexture integrated;
+    if (froxels_on) {
+        const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
+        const uint32_t grid_height =
+            std::max((graph.reference_height() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
+        const rhi::TextureDesc grid{.width = grid_width,
+                                    .height = grid_height,
+                                    .depth = kFroxelSlices,
+                                    .format = kFroxelFormat,
+                                    .dimension = rhi::TextureDimension::Texture3D};
+        struct GridPass {
+            GraphTexture volume;
+        };
+        const GraphTexture froxels =
+            graph
+                .add_pass<GridPass>(
+                    "fog inject",
+                    [&](PassBuilder& pass, GridPass& data) {
+                        data.volume = pass.create_texture({.desc = grid});
+                        pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                        pass.use(data.volume, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                    },
+                    [atlas, frame_address, fog_inject, grid_width, grid_height](const GridPass& data,
+                                                                                PassContext& context) {
+                        DE_PROFILE_ZONE("fog inject pass");
+                        context.list.bind_pipeline(fog_inject);
+                        context.list.push_constants(FogInjectPush{
+                            .frame = frame_address,
+                            .volume = context.device.storage_texture_index(context.texture(data.volume)),
+                            .atlas = context.device.texture_index(context.texture(atlas)),
+                            .width = grid_width,
+                            .height = grid_height,
+                        });
+                        context.list.dispatch((grid_width + 3) / 4, (grid_height + 3) / 4, (kFroxelSlices + 3) / 4);
+                    })
+                .volume;
+        integrated = graph
+                         .add_pass<GridPass>(
+                             "fog integrate",
+                             [&](PassBuilder& pass, GridPass& data) {
+                                 data.volume = pass.create_texture({.desc = grid});
+                                 pass.use(froxels, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                                 pass.use(data.volume, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                             },
+                             [froxels, frame_address, fog_integrate, grid_width, grid_height](const GridPass& data,
+                                                                                              PassContext& context) {
+                                 DE_PROFILE_ZONE("fog integrate pass");
+                                 context.list.bind_pipeline(fog_integrate);
+                                 context.list.push_constants(FogIntegratePush{
+                                     .frame = frame_address,
+                                     .froxels = context.device.texture_index(context.texture(froxels)),
+                                     .integrated = context.device.storage_texture_index(context.texture(data.volume)),
+                                     .width = grid_width,
+                                     .height = grid_height,
+                                 });
+                                 context.list.dispatch((grid_width + 7) / 8, (grid_height + 7) / 8, 1);
+                             })
+                         .volume;
+    }
+
     // Fog: the lit image into a new one, dimmed by the fog in front of each pixel, with its light added.
     // Without fog, or in a debug view (which shows no lit image), there is no pass: the tonemap reads
     // the lit image.
     struct FogPass {
         GraphTexture fogged;
     };
-    const bool foggy =
-        view == SceneView::Lit && (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
-    const GraphTexture fogged =
-        !foggy
-            ? targets.hdr
-            : graph
-                  .add_pass<FogPass>(
-                      "fog",
-                      [&](PassBuilder& pass, FogPass& data) {
-                          data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-                          pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
-                          pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
-                          pass.use(data.fogged, rhi::ResourceState::RenderTarget);
-                      },
-                      [targets, frame_address, fog](const FogPass& data, PassContext& context) {
-                          DE_PROFILE_ZONE("fog pass");
-                          const rhi::ColorAttachment color{.texture = context.texture(data.fogged),
-                                                           .load = rhi::LoadOp::DontCare};
-                          context.list.begin_rendering({.colors = std::span(&color, 1)});
-                          context.list.bind_pipeline(fog);
-                          context.list.push_constants(FogPush{
-                              .frame = frame_address,
-                              .hdr = context.device.texture_index(context.texture(targets.hdr)),
-                              .depth = context.device.texture_index(context.texture(targets.depth)),
-                          });
-                          context.list.draw(3);
-                          context.list.end_rendering();
-                      })
-                  .fogged;
+    GraphTexture fogged = targets.hdr;
+    if (foggy) {
+        fogged =
+            graph
+                .add_pass<FogPass>(
+                    "fog",
+                    [&](PassBuilder& pass, FogPass& data) {
+                        data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+                        pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        if (froxels_on) {
+                            pass.use(integrated, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        }
+                        pass.use(data.fogged, rhi::ResourceState::RenderTarget);
+                    },
+                    [targets, frame_address, fog, froxels_on, integrated](const FogPass& data, PassContext& context) {
+                        DE_PROFILE_ZONE("fog pass");
+                        const rhi::ColorAttachment color{.texture = context.texture(data.fogged),
+                                                         .load = rhi::LoadOp::DontCare};
+                        context.list.begin_rendering({.colors = std::span(&color, 1)});
+                        context.list.bind_pipeline(fog);
+                        context.list.push_constants(FogPush{
+                            .frame = frame_address,
+                            .hdr = context.device.texture_index(context.texture(targets.hdr)),
+                            .depth = context.device.texture_index(context.texture(targets.depth)),
+                            .integrated = froxels_on ? context.device.texture_index(context.texture(integrated)) : 0,
+                            .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
+                        });
+                        context.list.draw(3);
+                        context.list.end_rendering();
+                    })
+                .fogged;
+    }
 
     const float exposure = std::exp2(lighting.exposure_ev);
     const auto view_index = static_cast<uint32_t>(view);

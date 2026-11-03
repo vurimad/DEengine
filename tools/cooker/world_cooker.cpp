@@ -126,6 +126,10 @@ void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
         {.key = "start_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_start_m},
         {.key = "sun_start_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_sun_start_m},
         {.key = "end_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_end_m},
+        {.key = "volume_distance_m",
+         .least = 0.0,
+         .most = F::kMaxVolumeDistanceM,
+         .out = &environment.fog_volume_distance_m},
     };
     // The known keys: the numbers', and the colours'.
     constexpr size_t kNumberCount = std::size(numbers);

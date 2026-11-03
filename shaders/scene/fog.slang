@@ -1,6 +1,7 @@
 // Fog: one full-screen pass over the lit HDR image, into a new one. Each pixel's light is dimmed by
-// the fog between it and the camera and the fog's own light is added (common.fog). Where nothing
-// was drawn, the sky, as far as the fog reaches: the horizon takes the haze of the land below it.
+// the fog between it and the camera and the fog's own light is added: from the froxel grid as far as
+// it reaches (fog_integrate: with the sun's shadows), and past it in closed form (common.fog). Where
+// nothing was drawn, the sky, as far as the fog reaches: the horizon takes the haze of the land below it.
 
 import common.bindless;
 import common.fog;
@@ -9,8 +10,10 @@ import scene.scene_common;
 struct FogPush
 {
     SceneFrame* frame;
-    uint hdr;   // lit, unfogged
+    uint hdr;        // lit, unfogged
     uint depth;
+    uint integrated; // the froxel grid, integrated: (in-scatter, transmittance); unused without one
+    uint sampler;    // linear clamp
 };
 
 [[vk::push_constant]]
@@ -38,9 +41,36 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const float3 color = load_texture(push.hdr, texel).rgb;
     const float depth = load_texture(push.depth, texel).r;
     // The point (on the far plane for the sky: only its direction counts), and how far it is.
-    const float3 to_point = position_from_depth(frame, input.ndc, depth) - frame.camera_position.xyz;
+    const float3 camera = frame.camera_position.xyz;
+    const float3 to_point = position_from_depth(frame, input.ndc, depth) - camera;
+    const float3 direction = normalize(to_point);
     const float distance = depth > 0.0 ? length(to_point) : 1e30;
-    const FogResult fog = fog_along_ray(frame.fog, frame.camera_position.xyz, normalize(to_point), distance,
-                                        frame.sun_direction.xyz, frame.sun_color.rgb);
-    return float4(min(color * fog.transmittance + fog.in_scatter, kHalfMax), 1.0);
+    const float3 sun_direction = frame.sun_direction.xyz;
+    const float3 sun_color = frame.sun_color.rgb;
+
+    // The grid, up to the point or its reach.
+    const float reach = frame.fog.range.y;
+    float3 near_transmittance = float3(1.0);
+    float3 near_scatter = float3(0.0);
+    float from_distance = 0.0;
+    if (reach > 0.0)
+    {
+        const float view_per_ray = max(dot(direction, frame.camera_forward.xyz), 1e-3);
+        const float view_depth = min(distance * view_per_ray, reach);
+        // Slice k holds the integral through its far edge, at the texture's k + 0.5. Inside the first
+        // slice, a share of it: the integral starts at nothing.
+        const float slices = frame.fog.range.w;
+        const float slice = froxel_t(frame.fog, view_depth) * slices;
+        const float3 uvw = float3(input.ndc.x * 0.5 + 0.5, 0.5 - input.ndc.y * 0.5, (slice - 0.5) / slices);
+        float4 grid = texture_3d(push.integrated).SampleLevel(sampler_state(push.sampler), uvw, 0.0);
+        const float first = saturate(slice);
+        grid = float4(grid.rgb * first, lerp(1.0, grid.a, first));
+        near_transmittance = pow(max(grid.a, 1e-6), max(frame.fog.extinction.rgb, float3(0.01)));
+        near_scatter = grid.rgb;
+        from_distance = reach / view_per_ray;
+    }
+    // Then the rest of the way, in closed form.
+    const FogResult far = fog_between(frame.fog, camera, direction, from_distance, distance, sun_direction, sun_color);
+    const float3 result = color * near_transmittance * far.transmittance + near_scatter + near_transmittance * far.in_scatter;
+    return float4(min(result, kHalfMax), 1.0);
 }

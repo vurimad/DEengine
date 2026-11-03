@@ -1333,7 +1333,7 @@ constexpr const char* kEvening = R"({
           "extinction_tint": [0.8, 1, 1.25], "sun_forward": {"color": [1, 0.5, 0.25], "intensity": 2},
           "sun_back": {"color": [0.1, 0.2, 0.3]}, "sun_height_attenuation": 0.5,
           "ambient": {"color": [0.2, 0.3, 0.4], "intensity": 0.5}, "ambient_height_attenuation": 2,
-          "start_m": 1, "sun_start_m": 4, "end_m": 5000}
+          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90}
 })";
 
 } // namespace
@@ -1366,7 +1366,7 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
   "fog": {"density_per_m": 2, "height_density_per_m": 0.01, "height_falloff_per_m": 0.1, "base_height_m": 0,
           "extinction_tint": [0, 1, 1], "sun_forward": {"color": [1, 1, 1]}, "sun_back": {"color": [0, 0, 0]},
           "sun_height_attenuation": 1, "ambient": {"color": [0.1, 0.1, 0.1]}, "ambient_height_attenuation": 1,
-          "start_m": 100, "sun_start_m": 0, "end_m": 50, "colour": 1}
+          "start_m": 100, "sun_start_m": 0, "end_m": 50, "volume_distance_m": 5000, "colour": 1}
 })");
     // A typo in end_m: its own error, not also "end_m should be past start_m" against a default.
     std::string typo = kEvening;
@@ -1397,6 +1397,7 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
     CHECK(has_message(report, broken_environment, "extinction_tint should be [r, g, b]"));
     CHECK(has_message(report, broken_environment, "end_m should be past its start_m"));
     CHECK(has_message(report, broken_environment, "unknown fog setting 'colour'"));
+    CHECK(has_message(report, broken_environment, "volume_distance_m should be a number from 0 to 2000"));
     CHECK(report.stats.failed == 3);
     CHECK_FALSE(has_message(report, "content/world/a/a.world", ""));
     CHECK_FALSE(has_message(report, "content/world/a/evening.environment", ""));
@@ -1448,6 +1449,7 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
         CHECK(environment.fog_ambient_height_attenuation == 2.0f);
         CHECK(environment.fog_sun_start_m == 4.0f);
         CHECK(environment.fog_end_m == 5000.0f);
+        CHECK(environment.fog_volume_distance_m == 90.0f);
     }
     // A cell moved to another coord cooks the world again; new light only cooks the environment.
     CHECK(run_cook(vfs).stats.cooked == 0);
@@ -1525,5 +1527,8 @@ TEST_CASE("broken worlds and environments are refused when loaded") {
     environment.fog_height_density_per_m = 5.0f;
     CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
     environment.fog_height_density_per_m = 0.0f;
+    environment.fog_volume_distance_m = 3000.0f; // a grid that far is out of range
+    CHECK_FALSE(check(de::cooker::cook_environment(environment, id), load_environment));
+    environment.fog_volume_distance_m = 128.0f;
     CHECK(check(de::cooker::cook_environment(environment, id), load_environment));
 }
