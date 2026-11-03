@@ -508,6 +508,10 @@ core::Result<PathString> Vfs::resolve(const char* path) const {
     return join(root, parsed->relative);
 }
 
+core::JobSystem* Vfs::jobs() const {
+    return state_->jobs;
+}
+
 const char* Vfs::mount_root(Mount mount) const {
     return state_->roots[static_cast<size_t>(mount)].c_str();
 }

@@ -55,7 +55,7 @@ enum class MeshFlags : uint32_t {
 // overdraw and fetch order), a LOD chain, bounds, parts and material slots. Indices are 32-bit.
 struct MeshAsset {
     static constexpr AssetType kType = AssetType::Mesh;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2; // 2: typed dependencies
 
     AssetHeader header;
     MeshBounds bounds;

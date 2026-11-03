@@ -69,6 +69,11 @@ core::Result<void> validate_header(std::span<const std::byte> file, AssetType ty
     if (!span_in_file(header.dependencies, header.file_size)) {
         return core::fail(ErrorCode::CorruptData, "cooked file's dependency list lies outside it");
     }
+    for (const AssetRef& dependency : header.dependencies.get(file.data())) {
+        if (!dependency.id.is_valid() || asset_type_extension(dependency.type)[0] == '\0') {
+            return core::fail(ErrorCode::CorruptData, "cooked file depends on an invalid ID or an unknown type");
+        }
+    }
     return {};
 }
 

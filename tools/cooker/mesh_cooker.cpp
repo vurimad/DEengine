@@ -287,10 +287,13 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
                             extent);
     }
 
-    core::Array<asset::AssetId> dependencies(tools_heap());
+    core::Array<asset::AssetRef> dependencies(tools_heap());
     for (const asset::MeshMaterialSlot& slot : slots) {
         if (slot.material.is_valid()) {
-            dependencies.push(slot.material);
+            const asset::AssetRef ref{.id = slot.material, .type = asset::AssetType::Material};
+            if (std::ranges::find(dependencies, ref) == dependencies.end()) { // parts may share one
+                dependencies.push(ref);
+            }
         }
     }
     asset::MeshAsset mesh;

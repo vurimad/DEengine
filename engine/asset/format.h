@@ -53,6 +53,16 @@ struct OffsetSpan {
     }
 };
 
+// An asset another one needs: its ID, and its type, which names its file (cooked_path).
+struct AssetRef {
+    AssetId id;
+    AssetType type = AssetType::Unknown;
+    uint8_t reserved[6] = {};
+
+    constexpr bool operator==(const AssetRef& other) const { return id == other.id && type == other.type; }
+};
+static_assert(sizeof(AssetRef) == 16);
+
 // Starts every cooked file (docs/design.md, Asset formats: common header).
 struct AssetHeader {
     uint32_t magic = kAssetMagic;
@@ -65,7 +75,7 @@ struct AssetHeader {
     // Of every byte after this header: equal hashes mean equal assets (archives share them).
     uint64_t content_hash = 0;
     // Assets this one needs loaded with it (a material's textures, a mesh's materials).
-    OffsetSpan<AssetId> dependencies;
+    OffsetSpan<AssetRef> dependencies;
     uint8_t reserved1[16] = {};
 };
 static_assert(sizeof(AssetHeader) == 64);
@@ -82,7 +92,7 @@ bool span_in_file(const OffsetSpan<T>& span, uint64_t file_size) {
 }
 
 // The checks every format shares: alignment of the memory, magic, type, version, platform, size, and
-// the dependency list.
+// the dependency list (inside the file, every entry a valid ID of a known type).
 core::Result<void> validate_header(std::span<const std::byte> file, AssetType type, uint16_t format_version);
 
 // The hash a header stores for these bytes.
@@ -118,3 +128,10 @@ core::Result<const T*> load_in_place(std::span<const std::byte> file) {
 }
 
 } // namespace de::asset
+
+template <>
+struct de::core::Hash<de::asset::AssetRef> {
+    constexpr uint64_t operator()(const de::asset::AssetRef& ref) const {
+        return mix64(ref.id.value() ^ (static_cast<uint64_t>(ref.type) << 56U));
+    }
+};
