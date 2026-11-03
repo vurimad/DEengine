@@ -125,6 +125,7 @@ struct UploaderState {
 
     core::HashMap<TextureHandle, MipStates> texture_states{render_heap()};
     core::HashMap<BufferHandle, BufferState> buffer_states{render_heap()};
+    core::HashMap<BufferHandle, uint32_t> buffer_queued{render_heap()}; // uploads waiting to be recorded
     size_t purge_at = 256;
 
     uint64_t batch = 0; // record batches so far
@@ -626,6 +627,7 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
     state.device->flush_mapped(pending.staging, pending.staging_offset, data.size());
     state.queued_bytes += data.size();
     state.queue.push(pending);
+    ++state.buffer_queued.find_or_insert(buffer);
     return {};
 }
 
@@ -786,6 +788,14 @@ void Uploader::record() {
         state.queued_bytes -= upload.bytes;
     }
 
+    for (size_t i = first; i < last; ++i) {
+        if (!state.queue[i].texture) {
+            uint32_t* queued = state.buffer_queued.find(state.queue[i].buffer_handle);
+            if (queued != nullptr && --*queued == 0) {
+                state.buffer_queued.remove(state.queue[i].buffer_handle);
+            }
+        }
+    }
     state.queue_head = last;
     if (state.queue_head == state.queue.size()) {
         state.queue.clear(); // drained: start over, keeping the memory
@@ -810,6 +820,14 @@ void Uploader::flush_and_wait() {
 bool Uploader::ready(TextureHandle texture) const {
     const MipStates* mips = state_->texture_states.find(texture);
     return mips != nullptr && mips->initialized;
+}
+
+bool Uploader::ready(BufferHandle buffer) const {
+    const UploaderState& state = *state_;
+    if (state.device->buffer_desc(buffer) == nullptr) {
+        return false;
+    }
+    return state.buffer_queued.find(buffer) == nullptr;
 }
 
 bool Uploader::idle() const {

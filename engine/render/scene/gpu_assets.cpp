@@ -1,0 +1,553 @@
+#include "render/scene/gpu_assets.h"
+
+#include "asset/material_format.h"
+#include "asset/mesh_format.h"
+#include "asset/texture_format.h"
+#include "core/allocator.h"
+#include "core/log.h"
+#include "core/profile.h"
+#include "render/rhi/device.h"
+#include "render/rhi/upload.h"
+
+#include <algorithm>
+#include <cstring>
+#include <new>
+#include <utility>
+
+namespace de::render {
+
+namespace {
+
+core::Allocator& render_heap() {
+    return core::heap_allocator(core::MemoryTag::Render);
+}
+
+uint64_t key_of(asset::AssetHandle handle) {
+    return (static_cast<uint64_t>(handle.index) << 32U) | handle.generation;
+}
+
+rhi::Format format_of(asset::TextureFormat format) {
+    switch (format) {
+    case asset::TextureFormat::RGBA8Unorm:
+        return rhi::Format::RGBA8Unorm;
+    case asset::TextureFormat::RGBA8Srgb:
+        return rhi::Format::RGBA8Srgb;
+    case asset::TextureFormat::BC1Unorm:
+        return rhi::Format::BC1Unorm;
+    case asset::TextureFormat::BC1Srgb:
+        return rhi::Format::BC1Srgb;
+    case asset::TextureFormat::BC4Unorm:
+        return rhi::Format::BC4Unorm;
+    case asset::TextureFormat::BC5Unorm:
+        return rhi::Format::BC5Unorm;
+    case asset::TextureFormat::BC7Unorm:
+        return rhi::Format::BC7Unorm;
+    case asset::TextureFormat::BC7Srgb:
+        return rhi::Format::BC7Srgb;
+    case asset::TextureFormat::Unknown:
+        break;
+    }
+    return rhi::Format::Unknown;
+}
+
+struct TextureEntry {
+    rhi::TextureHandle texture;
+    uint64_t bytes = 0;
+};
+
+struct MaterialEntry {
+    asset::AssetHandle handle;
+    uint32_t slot = 0;
+    bool queued = false; // in GpuAssetsState::dirty_materials
+};
+
+struct MeshEntry {
+    GpuMesh gpu;
+    core::Array<GpuMeshPart> parts{render_heap()};
+    uint64_t bytes = 0;
+    bool ready = false;
+};
+
+enum DefaultTexture : uint32_t { White, FlatNormal, DefaultCount };
+
+} // namespace
+
+struct GpuAssetsState {
+    rhi::Device* device = nullptr;
+    rhi::Uploader* uploader = nullptr;
+    asset::AssetRegistry* assets = nullptr;
+    core::HashMap<uint64_t, TextureEntry> textures{render_heap()};
+    core::HashMap<uint64_t, MaterialEntry> materials{render_heap()};
+    core::HashMap<uint64_t, MeshEntry> meshes{render_heap()};
+    core::Array<uint64_t> dirty_materials{render_heap()}; // keys of materials to (re)write
+    core::Array<uint64_t> pending_meshes{render_heap()};  // keys of meshes waiting for their uploads
+    core::Array<uint32_t> free_slots{render_heap()};      // material table slots, reused last first
+    rhi::BufferHandle material_table;
+    uint64_t material_table_address = 0;
+    uint32_t max_materials = 0;
+    rhi::TextureHandle defaults[DefaultCount];
+    uint32_t default_index[DefaultCount] = {};
+    uint64_t bytes = 0;
+    // The table as last written, and the slots changed since it was last uploaded: one upload per
+    // update() (the uploader takes one upload per resource per frame).
+    core::Array<GpuMaterial> table{render_heap()};
+    uint32_t dirty_first = UINT32_MAX;
+    uint32_t dirty_end = 0;
+    uint64_t table_uploads = 0; // queued so far
+    // Textures replaced by a reload, kept until the table no longer points at them: once a table
+    // upload queued after the replacement is recorded.
+    struct Retired {
+        rhi::TextureHandle texture;
+        uint64_t after_upload = 0; // destroyed once table_uploads passed this and the table is recorded
+    };
+    core::Array<Retired> retired{render_heap()};
+    core::Array<std::byte> texels{render_heap()}; // a texture's mips back to back, for one upload
+
+    ~GpuAssetsState() {
+        assets->remove_listener(&GpuAssetsState::on_notice, this);
+        for (const auto& [key, texture] : textures) {
+            device->destroy(texture.texture);
+        }
+        for (const auto& [key, mesh] : meshes) {
+            device->destroy(mesh.gpu.vertices);
+            device->destroy(mesh.gpu.indices);
+        }
+        for (const rhi::TextureHandle texture : defaults) {
+            device->destroy(texture);
+        }
+        for (const Retired& old : retired) {
+            device->destroy(old.texture);
+        }
+        device->destroy(material_table);
+    }
+
+    static void on_notice(void* context, const asset::AssetNotice& notice) {
+        static_cast<GpuAssetsState*>(context)->handle(notice);
+    }
+
+    void handle(const asset::AssetNotice& notice) {
+        const bool loaded = notice.event == asset::AssetEvent::Ready || notice.event == asset::AssetEvent::Reloaded;
+        const bool unloaded = notice.event == asset::AssetEvent::Unloaded;
+        switch (notice.asset.type) {
+        case asset::AssetType::Texture:
+            if (loaded) {
+                load_texture(notice.handle);
+            } else if (unloaded) {
+                unload_texture(notice.handle);
+            }
+            break;
+        case asset::AssetType::Material:
+            if (loaded) {
+                queue_material(notice.handle);
+            } else if (unloaded) {
+                unload_material(notice.handle);
+            }
+            break;
+        case asset::AssetType::Mesh:
+            if (loaded) {
+                load_mesh(notice.handle);
+            } else if (unloaded) {
+                unload_mesh(notice.handle);
+            }
+            break;
+        default:
+            break;
+        }
+    }
+
+    // --- Textures ----------------------------------------------------------------------------
+
+    void load_texture(asset::AssetHandle handle) {
+        const auto* asset = assets->get<asset::TextureAsset>(handle);
+        const rhi::Format format = asset != nullptr ? format_of(asset->format) : rhi::Format::Unknown;
+        if (format == rhi::Format::Unknown) {
+            return;
+        }
+        const core::Result<rhi::TextureHandle> created = device->create_texture({
+            .width = asset->width,
+            .height = asset->height,
+            .mip_count = asset->mips.count,
+            .format = format,
+            .usage = rhi::TextureUsage::Sampled | rhi::TextureUsage::CopyDst,
+            .debug_name = "asset texture",
+        });
+        if (!created) {
+            DE_LOG_ERROR("render", "texture %s: %s", asset::format_asset_id(asset->header.id).c_str(),
+                         created.error().message);
+            return;
+        }
+        // Every mip in one upload (the uploader takes one upload per texture per frame): the file
+        // pads mips to 16 bytes, the upload wants them back to back.
+        texels.clear();
+        for (uint32_t mip = 0; mip < asset->mips.count; ++mip) {
+            const std::span<const std::byte> data = asset->mip_data(asset, mip);
+            const size_t at = texels.size();
+            texels.resize(at + data.size());
+            std::memcpy(texels.data() + at, data.data(), data.size());
+        }
+        const uint64_t texel_bytes = texels.size();
+        if (const core::Result<void> queued = uploader->upload_texture(*created, texels.span()); !queued) {
+            // Not registered: its materials use the default instead of waiting for it forever.
+            DE_LOG_ERROR("render", "texture %s: %s", asset::format_asset_id(asset->header.id).c_str(),
+                         queued.error().message);
+            device->destroy(*created);
+            return;
+        }
+        TextureEntry& entry = textures.find_or_insert(key_of(handle));
+        if (entry.texture.is_valid()) {
+            // Reloaded: the old texture stays until the table stops pointing at it.
+            retired.push({.texture = entry.texture, .after_upload = table_uploads});
+            bytes -= entry.bytes;
+            queue_all_materials();
+        }
+        entry = {.texture = *created, .bytes = texel_bytes};
+        bytes += texel_bytes;
+    }
+
+    void unload_texture(asset::AssetHandle handle) {
+        if (const TextureEntry* entry = textures.find(key_of(handle)); entry != nullptr) {
+            device->destroy(entry->texture);
+            bytes -= entry->bytes;
+            textures.remove(key_of(handle));
+        }
+    }
+
+    // The bindless index of a material's texture: the default while it's missing or uploading
+    // (still_waiting tells which, so the material is written again once it's in).
+    uint32_t texture_index(asset::AssetId id, DefaultTexture fallback, bool& still_waiting) const {
+        if (!id.is_valid()) {
+            return default_index[fallback];
+        }
+        const asset::AssetHandle handle = assets->find({.id = id, .type = asset::AssetType::Texture});
+        const TextureEntry* entry = handle.is_valid() ? textures.find(key_of(handle)) : nullptr;
+        if (entry == nullptr) {
+            // Loading (it will be Ready before the material is), or failed: the default.
+            still_waiting = still_waiting || assets->state(handle) == asset::AssetState::Loading;
+            return default_index[fallback];
+        }
+        if (!uploader->ready(entry->texture)) {
+            still_waiting = true;
+            return default_index[fallback];
+        }
+        return device->texture_index(entry->texture);
+    }
+
+    // --- Materials ---------------------------------------------------------------------------
+
+    void queue_material(asset::AssetHandle handle) {
+        const uint64_t key = key_of(handle);
+        MaterialEntry* entry = materials.find(key);
+        if (entry == nullptr) {
+            if (free_slots.empty()) {
+                DE_LOG_ERROR("render", "the material table is full (%u): drawn with the default", max_materials);
+                return;
+            }
+            entry = &materials.find_or_insert(key);
+            *entry = {.handle = handle, .slot = free_slots.back()};
+            free_slots.pop();
+        }
+        if (!entry->queued) {
+            entry->queued = true;
+            dirty_materials.push(key);
+        }
+    }
+
+    void queue_all_materials() {
+        for (auto [key, entry] : materials) {
+            if (!entry.queued) {
+                entry.queued = true;
+                dirty_materials.push(key);
+            }
+        }
+    }
+
+    void unload_material(asset::AssetHandle handle) {
+        if (const MaterialEntry* entry = materials.find(key_of(handle)); entry != nullptr) {
+            free_slots.push(entry->slot);
+            materials.remove(key_of(handle)); // a queued key that's gone is skipped
+        }
+    }
+
+    // Writes the material's table entry; false if a texture is still uploading (try again).
+    bool write_material(const MaterialEntry& entry) {
+        const auto* asset = assets->get<asset::MaterialAsset>(entry.handle);
+        if (asset == nullptr) {
+            return true; // not loaded any more: its unload is on the way
+        }
+        namespace m = asset::material;
+        GpuMaterial gpu;
+        const auto param = [&](core::StringId name, float* out, uint32_t count) {
+            if (const asset::MaterialParam* found = asset->find_param(asset, name); found != nullptr) {
+                for (uint32_t i = 0; i < count; ++i) {
+                    out[i] = found->value[i];
+                }
+            }
+        };
+        param(m::kBaseColor, gpu.base_color, 4);
+        param(m::kEmissive, gpu.emissive, 3);
+        param(m::kMetallic, &gpu.metallic, 1);
+        param(m::kRoughness, &gpu.roughness, 1);
+        param(m::kNormalScale, &gpu.normal_scale, 1);
+        param(m::kOcclusionStrength, &gpu.occlusion_strength, 1);
+        param(m::kAlphaCutoff, &gpu.alpha_cutoff, 1);
+        bool waiting = false;
+        gpu.base_color_texture = texture_index(asset->find_texture(asset, m::kBaseColorTexture), White, waiting);
+        gpu.normal_texture = texture_index(asset->find_texture(asset, m::kNormalTexture), FlatNormal, waiting);
+        gpu.metallic_roughness_texture =
+            texture_index(asset->find_texture(asset, m::kMetallicRoughnessTexture), White, waiting);
+        gpu.occlusion_texture = texture_index(asset->find_texture(asset, m::kOcclusionTexture), White, waiting);
+        gpu.emissive_texture = texture_index(asset->find_texture(asset, m::kEmissiveTexture), White, waiting);
+        gpu.flags =
+            (asset->alpha_mode == asset::AlphaMode::Masked ? GpuMaterialFlags::Masked : GpuMaterialFlags::None) |
+            (core::has_any(asset->flags, asset::MaterialFlags::DoubleSided) ? GpuMaterialFlags::DoubleSided
+                                                                            : GpuMaterialFlags::None);
+        set_material(entry.slot, gpu);
+        return !waiting;
+    }
+
+    // Changes a slot in the mirror; the next upload_table() sends it.
+    void set_material(uint32_t slot, const GpuMaterial& gpu) {
+        if (table[slot] == gpu) {
+            return;
+        }
+        table[slot] = gpu;
+        dirty_first = std::min(dirty_first, slot);
+        dirty_end = std::max(dirty_end, slot + 1);
+    }
+
+    // The slots changed since the last upload, in one upload.
+    void upload_table() {
+        if (dirty_first >= dirty_end) {
+            return;
+        }
+        const std::span<const GpuMaterial> changed = table.span().subspan(dirty_first, dirty_end - dirty_first);
+        if (const core::Result<void> queued =
+                uploader->upload_buffer(material_table, uint64_t{dirty_first} * sizeof(GpuMaterial),
+                                        std::as_bytes(changed), rhi::ResourceState::ShaderRead);
+            !queued) {
+            DE_LOG_ERROR("render", "material table upload: %s", queued.error().message);
+            return; // still dirty: tried again next update
+        }
+        ++table_uploads;
+        dirty_first = UINT32_MAX;
+        dirty_end = 0;
+    }
+
+    uint32_t material_slot(asset::AssetId id) const {
+        const asset::AssetHandle handle = assets->find({.id = id, .type = asset::AssetType::Material});
+        const MaterialEntry* entry = handle.is_valid() ? materials.find(key_of(handle)) : nullptr;
+        return entry != nullptr ? entry->slot : 0;
+    }
+
+    // --- Meshes ------------------------------------------------------------------------------
+
+    rhi::BufferHandle make_buffer(std::span<const std::byte> data, rhi::BufferUsage usage, const char* name) {
+        const core::Result<rhi::BufferHandle> buffer = device->create_buffer(
+            {.size = data.size(), .usage = usage | rhi::BufferUsage::CopyDst, .debug_name = name});
+        if (!buffer) {
+            DE_LOG_ERROR("render", "%s: %s", name, buffer.error().message);
+            return {};
+        }
+        const rhi::ResourceState after = core::has_any(usage, rhi::BufferUsage::Index) ? rhi::ResourceState::IndexBuffer
+                                                                                       : rhi::ResourceState::ShaderRead;
+        if (const core::Result<void> queued = uploader->upload_buffer(*buffer, 0, data, after); !queued) {
+            DE_LOG_ERROR("render", "%s upload: %s", name, queued.error().message);
+        }
+        return *buffer;
+    }
+
+    void load_mesh(asset::AssetHandle handle) {
+        const auto* asset = assets->get<asset::MeshAsset>(handle);
+        if (asset == nullptr || asset->lods.count == 0 || asset->vertices.count == 0 || asset->indices.count == 0) {
+            return;
+        }
+        const uint64_t key = key_of(handle);
+        unload_mesh(handle); // reloaded: the old buffers go (after the frames using them)
+        MeshEntry& entry = meshes.find_or_insert(key);
+        const auto vertices = std::as_bytes(asset->vertices.get(asset));
+        const auto indices = std::as_bytes(asset->indices.get(asset));
+        entry.gpu.vertices = make_buffer(vertices, rhi::BufferUsage::Storage, "mesh vertices");
+        entry.gpu.indices = make_buffer(indices, rhi::BufferUsage::Index, "mesh indices");
+        entry.gpu.vertex_address = entry.gpu.vertices.is_valid() ? device->buffer_address(entry.gpu.vertices) : 0;
+        entry.bytes = vertices.size() + indices.size();
+        bytes += entry.bytes;
+        const asset::MeshLod& lod = asset->lods.get(asset)[0];
+        const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
+        const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
+        entry.parts.clear();
+        for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
+            const asset::MeshPart& part = parts[p];
+            entry.parts.push({.first_index = part.first_index,
+                              .index_count = part.index_count,
+                              .material = material_slot(slots[part.material_slot].material)});
+        }
+        entry.gpu.parts = entry.parts.span();
+        pending_meshes.push(key);
+    }
+
+    void unload_mesh(asset::AssetHandle handle) {
+        if (const MeshEntry* entry = meshes.find(key_of(handle)); entry != nullptr) {
+            device->destroy(entry->gpu.vertices);
+            device->destroy(entry->gpu.indices);
+            bytes -= entry->bytes;
+            meshes.remove(key_of(handle)); // a pending key that's gone is skipped
+        }
+    }
+};
+
+core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
+    if (desc.device == nullptr || desc.uploader == nullptr || desc.assets == nullptr || desc.max_materials == 0) {
+        return core::fail(core::ErrorCode::InvalidArgument, "GpuAssets needs a device, an uploader and a registry");
+    }
+    auto* state = ::new (render_heap().allocate(sizeof(GpuAssetsState), alignof(GpuAssetsState))) GpuAssetsState();
+    state->device = desc.device;
+    state->uploader = desc.uploader;
+    state->assets = desc.assets;
+    state->max_materials = desc.max_materials;
+    GpuAssets gpu_assets(state);
+
+    // The defaults: white (base color, metal-roughness, occlusion, emissive) and a flat normal.
+    constexpr uint8_t kTexels[DefaultCount][4] = {{255, 255, 255, 255}, {128, 128, 255, 255}};
+    for (uint32_t i = 0; i < DefaultCount; ++i) {
+        const core::Result<rhi::TextureHandle> texture =
+            desc.device->create_texture({.format = rhi::Format::RGBA8Unorm,
+                                         .usage = rhi::TextureUsage::Sampled | rhi::TextureUsage::CopyDst,
+                                         .debug_name = "default texture"});
+        if (!texture) {
+            return core::fail(texture.error());
+        }
+        state->defaults[i] = *texture;
+        state->default_index[i] = desc.device->texture_index(*texture);
+        if (const core::Result<void> queued =
+                desc.uploader->upload_texture(*texture, std::as_bytes(std::span(kTexels[i])));
+            !queued) {
+            return core::fail(queued.error());
+        }
+    }
+
+    const core::Result<rhi::BufferHandle> table =
+        desc.device->create_buffer({.size = uint64_t{desc.max_materials} * sizeof(GpuMaterial),
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "material table"});
+    if (!table) {
+        return core::fail(table.error());
+    }
+    state->material_table = *table;
+    state->material_table_address = desc.device->buffer_address(*table);
+    // Slot 0 is the default material; the rest are handed out from the front.
+    GpuMaterial fallback;
+    fallback.base_color_texture = state->default_index[White];
+    fallback.normal_texture = state->default_index[FlatNormal];
+    fallback.metallic_roughness_texture = state->default_index[White];
+    fallback.occlusion_texture = state->default_index[White];
+    fallback.emissive_texture = state->default_index[White];
+    state->table.resize(desc.max_materials);
+    state->table[0] = fallback;
+    state->dirty_first = 0;
+    state->dirty_end = 1;
+    state->upload_table();
+    for (uint32_t slot = desc.max_materials - 1; slot > 0; --slot) {
+        state->free_slots.push(slot);
+    }
+
+    if (const core::Result<void> listening = desc.assets->add_listener(&GpuAssetsState::on_notice, state); !listening) {
+        return core::fail(listening.error());
+    }
+    return gpu_assets;
+}
+
+GpuAssets::~GpuAssets() {
+    if (state_ == nullptr) {
+        return;
+    }
+    state_->~GpuAssetsState();
+    render_heap().deallocate(state_, sizeof(GpuAssetsState), alignof(GpuAssetsState));
+}
+
+GpuAssets::GpuAssets(GpuAssets&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
+
+GpuAssets& GpuAssets::operator=(GpuAssets&& other) noexcept {
+    if (this != &other) {
+        const GpuAssets discarded(std::exchange(state_, std::exchange(other.state_, nullptr)));
+    }
+    return *this;
+}
+
+void GpuAssets::update() {
+    DE_PROFILE_ZONE("gpu assets");
+    GpuAssetsState& state = *state_;
+    // Materials whose textures were uploading: written again; kept while any still is.
+    size_t kept = 0;
+    for (size_t i = 0; i < state.dirty_materials.size(); ++i) {
+        const uint64_t key = state.dirty_materials[i];
+        MaterialEntry* entry = state.materials.find(key);
+        if (entry == nullptr) {
+            continue;
+        }
+        if (state.write_material(*entry)) {
+            entry->queued = false;
+        } else {
+            state.dirty_materials[kept++] = key;
+        }
+    }
+    state.dirty_materials.resize(kept);
+    state.upload_table();
+    // The table as uploaded so far is on the GPU once its last upload is recorded: meshes (whose
+    // parts point into it) and retired textures (it no longer points at) wait for that.
+    const bool table_recorded = state.uploader->ready(state.material_table);
+    if (table_recorded) {
+        kept = 0;
+        for (size_t i = 0; i < state.retired.size(); ++i) {
+            if (state.table_uploads > state.retired[i].after_upload) {
+                state.device->destroy(state.retired[i].texture);
+            } else {
+                state.retired[kept++] = state.retired[i];
+            }
+        }
+        state.retired.resize(kept);
+    }
+    // Meshes whose buffers are uploaded become drawable.
+    kept = 0;
+    for (size_t i = 0; i < state.pending_meshes.size(); ++i) {
+        const uint64_t key = state.pending_meshes[i];
+        MeshEntry* entry = state.meshes.find(key);
+        if (entry == nullptr || entry->ready) {
+            continue;
+        }
+        if (table_recorded && state.uploader->ready(entry->gpu.vertices) && state.uploader->ready(entry->gpu.indices)) {
+            entry->ready = true;
+        } else {
+            state.pending_meshes[kept++] = key;
+        }
+    }
+    state.pending_meshes.resize(kept);
+}
+
+const GpuMesh* GpuAssets::mesh(asset::AssetHandle mesh) const {
+    const MeshEntry* entry = state_->meshes.find(key_of(mesh));
+    return entry != nullptr && entry->ready ? &entry->gpu : nullptr;
+}
+
+bool GpuAssets::double_sided(uint32_t material) const {
+    const GpuAssetsState& state = *state_;
+    return material < state.table.size() && core::has_any(state.table[material].flags, GpuMaterialFlags::DoubleSided);
+}
+
+uint64_t GpuAssets::material_table_address() const {
+    return state_->material_table_address;
+}
+
+GpuAssetsStats GpuAssets::stats() const {
+    const GpuAssetsState& state = *state_;
+    uint32_t meshes = 0;
+    for (const auto& [key, mesh] : state.meshes) {
+        meshes += mesh.ready ? 1 : 0;
+    }
+    return {.meshes = meshes,
+            .textures = static_cast<uint32_t>(state.textures.size()),
+            .materials = static_cast<uint32_t>(state.materials.size()),
+            .pending = static_cast<uint32_t>(state.dirty_materials.size() + state.pending_meshes.size()),
+            .bytes = state.bytes};
+}
+
+} // namespace de::render

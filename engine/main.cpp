@@ -16,9 +16,12 @@
 #include "render/graph/render_graph.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
+#include "render/scene/gpu_assets.h"
+#include "render/scene/scene_renderer.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
+#include "tools/free_camera.h"
 #include "tools/stats_panel.h"
 #include "world/cell.h"
 #include "world/world.h"
@@ -28,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -62,10 +66,10 @@ bool has_flag(int argc, char** argv, const char* flag) {
 
 } // namespace
 
-// Placeholder loop until the frame loop lands (M0b): opens the window, draws a triangle and a
-// textured quad (a bindless texture) through the RHI with hot-reloaded Slang shaders, pumps events,
-// samples input and logs actions, so the layers below can be tried by hand. Edit
-// shaders/triangle.slang or shaders/textured_quad.slang while it runs.
+// The engine's loop until the game's own lands: opens the window, loads a cell and draws it (renderer
+// step 1: GPU copies of the loaded assets, a placeholder lit pass) through a free camera (WASD/QE and
+// the right mouse button, or a gamepad), with hot-reloaded shaders and assets; pumps events,
+// samples input and logs actions.
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --cell ID        the cooked cell to load (asset ID, 16 hex digits; default: the test cell)
 //   --no-vsync       present without waiting for vertical blank (mailbox or immediate)
@@ -158,11 +162,6 @@ int main(int argc, char** argv) {
     } else if (!compiler) {
         DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
     }
-    // Built once the swapchain format is known, and again if it changes. If the shader has an
-    // error at startup, the library keeps watching it, and the triangle appears once it's fixed.
-    de::shader::ProgramHandle triangle;
-    de::shader::ProgramHandle quad;
-    de::rhi::Format programs_format = de::rhi::Format::Unknown;
 
     Input input;
     const ActionId quit = input.add_action("quit"_sid, ActionKind::Button);
@@ -233,58 +232,17 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // The quad's texture, made here until the cooker brings real ones (after every early return,
-    // so nothing leaks): a gold and stone checker darkening toward the bottom.
-    constexpr uint32_t kQuadTextureSize = 256;
-    constexpr size_t kQuadTextureBytes = size_t{kQuadTextureSize} * kQuadTextureSize * 4;
-    const auto quad_texture =
-        device->create_texture({.width = kQuadTextureSize,
-                                .height = kQuadTextureSize,
-                                .format = de::rhi::Format::RGBA8Srgb,
-                                .usage = de::rhi::TextureUsage::Sampled | de::rhi::TextureUsage::CopyDst,
-                                .debug_name = "quad texture"});
-    if (!quad_texture) {
-        return EXIT_FAILURE;
-    }
-    {
-        de::core::Array<std::byte> texels(de::core::heap_allocator(de::core::MemoryTag::Render));
-        texels.resize(kQuadTextureBytes);
-        for (uint32_t y = 0; y < kQuadTextureSize; ++y) {
-            for (uint32_t x = 0; x < kQuadTextureSize; ++x) {
-                const bool gold = ((x / 32) + (y / 32)) % 2 == 0;
-                const bool edge = x % 32 == 0 || y % 32 == 0;
-                const float shade = 1.0f - 0.5f * static_cast<float>(y) / kQuadTextureSize;
-                const float base[3] = {gold ? 0.85f : 0.20f, gold ? 0.65f : 0.17f, gold ? 0.30f : 0.15f};
-                std::byte* texel = &texels[(static_cast<size_t>(y) * kQuadTextureSize + x) * 4];
-                for (int c = 0; c < 3; ++c) {
-                    texel[c] = static_cast<std::byte>(edge ? 20 : static_cast<int>(base[c] * shade * 255.0f));
-                }
-                texel[3] = std::byte{255};
-            }
-        }
-        const auto queued = uploader->upload_texture(
-            *quad_texture, std::as_bytes(texels.span()),
-            {.after = de::rhi::ResourceState::ShaderRead, .after_stages = de::rhi::ShaderStages::Fragment});
-        if (!queued) {
-            DE_LOG_ERROR("render", "quad texture upload: %s", queued.error().message);
-            device->destroy(*quad_texture);
-            return EXIT_FAILURE;
-        }
-    }
-
     // Cooked assets by ID: reads, reference counts and, in dev builds, hot reload of files the cooker
     // rewrites. Made before the world, which releases what its cells hold through it.
     auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs});
     if (!assets) {
         DE_LOG_ERROR("asset", "%s", assets.error().message);
-        device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
     // The game world: flecs, ticking at a fixed 60 Hz.
     auto world = de::world::World::create({.jobs = &jobs, .assets = &*assets});
     if (!world) {
         DE_LOG_ERROR("world", "%s", world.error().message);
-        device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
     // One cell, loaded explicitly until the streamer picks cells around the player (M1). Its members
@@ -293,10 +251,33 @@ int main(int argc, char** argv) {
     if (const char* cell_flag = flag_value(argc, argv, "--cell");
         cell_flag != nullptr && !de::asset::parse_asset_id(cell_flag, cell_id)) {
         DE_LOG_ERROR("world", "--cell takes an asset ID, 16 hex digits: '%s'", cell_flag);
-        device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
+    // GPU copies of what the registry loads, from now on: made before anything loads.
+    auto gpu_assets = de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+    if (!gpu_assets) {
+        DE_LOG_ERROR("render", "gpu assets: %s", gpu_assets.error().message);
+        return EXIT_FAILURE;
+    }
+    std::optional<de::render::SceneRenderer> scene_renderer;
+    if (shaders) {
+        auto created =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        if (created) {
+            scene_renderer.emplace(std::move(*created));
+        }
+    }
     de::world::load_cell(world->ecs(), cell_id);
+
+    // A free camera, looking at the test camp from its south side.
+    const auto camera_actions = de::tools::add_free_camera_actions(input);
+    if (!camera_actions) {
+        DE_LOG_ERROR("input", "free camera bindings: %s", camera_actions.error().message);
+        return EXIT_FAILURE;
+    }
+    de::tools::FreeCamera free_camera({64.0, 2.0, 74.0}, 0.0f, -0.12f);
+    const flecs::entity camera = world->ecs().entity("free_camera").set(de::world::Camera{.vertical_fov_rad = 1.0f});
+    world->ecs().set(de::world::ActiveCamera{.entity = camera.id()});
 
     // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
     // device, uploader and graph, so it goes before them.
@@ -355,7 +336,9 @@ int main(int argc, char** argv) {
         if (shaders) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
-        assets->update(); // commits finished reads, unloads what nobody holds, reloads re-cooked files
+        free_camera.update(input, *camera_actions, static_cast<float>(frame_s), camera);
+        assets->update();     // commits finished reads, unloads what nobody holds, reloads re-cooked files
+        gpu_assets->update(); // meshes whose uploads are in become drawable
 
         world->advance(frame_s); // fixed ticks, then RenderExtract
 
@@ -373,90 +356,28 @@ int main(int argc, char** argv) {
         device->begin_frame();
         uploader->record(); // uploads land at the start of the frame
 
-        // Clear the window to a slowly breathing dusk color, then draw the triangle and the quad.
+        // The scene into the window, then the debug UI over it.
         const de::rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
-        if (backbuffer.is_valid() && shaders && programs_format != device->swapchain_format()) {
-            shaders->destroy(triangle);
-            shaders->destroy(quad);
-            de::rhi::GraphicsPipelineDesc state{.color_count = 1, .debug_name = "triangle"};
-            state.color_formats[0] = device->swapchain_format();
-            const auto created_triangle = shaders->create_graphics({.module = "triangle", .state = state});
-            triangle = created_triangle.ok() ? *created_triangle : de::shader::ProgramHandle{};
-            state.debug_name = "textured quad";
-            const auto created_quad = shaders->create_graphics({.module = "textured_quad", .state = state});
-            quad = created_quad.ok() ? *created_quad : de::shader::ProgramHandle{};
-            programs_format = device->swapchain_format();
-        }
         if (backbuffer.is_valid()) {
-            // The frame as a graph: one pass on the backbuffer, which comes in from the display (its
-            // old contents dropped) and goes back to it. One render pass clears and draws both: a
-            // pass per draw would reload the image from memory each time.
-            const float seconds = static_cast<float>(de::platform::time_ns() - start_ns) * 1e-9f;
-            const float glow = 0.5f + 0.5f * std::sin(seconds * 0.8f);
             graph->begin(device->swapchain_width(), device->swapchain_height());
             const de::render::GraphTexture back = graph->import_texture({.texture = backbuffer,
                                                                          .name = "backbuffer",
                                                                          .state = de::rhi::ResourceState::Present,
                                                                          .final_state = de::rhi::ResourceState::Present,
                                                                          .discard = true});
-            struct Scene {
-                de::render::GraphTexture back;
-                de::rhi::Color dusk; // a slowly breathing dusk color
-                de::rhi::PipelineHandle triangle;
-                de::rhi::PipelineHandle quad;
-                uint32_t quad_texture = 0;
-                float seconds = 0.0f;
-                float aspect = 1.0f;
-            };
-            graph->add_pass<Scene>(
-                "scene",
-                [&](de::render::PassBuilder& pass, Scene& scene) {
-                    pass.use(back, de::rhi::ResourceState::RenderTarget);
-                    scene = Scene{
-                        .back = back,
-                        .dusk = {.r = 0.05f + 0.10f * glow, .g = 0.04f + 0.05f * glow, .b = 0.06f, .a = 1.0f},
-                        .triangle = shaders ? shaders->pipeline(triangle) : de::rhi::PipelineHandle{},
-                        .quad = shaders ? shaders->pipeline(quad) : de::rhi::PipelineHandle{},
-                        .quad_texture = device->texture_index(*quad_texture),
-                        .seconds = seconds,
-                        .aspect = static_cast<float>(device->swapchain_width()) /
-                                  static_cast<float>(device->swapchain_height()),
-                    };
-                },
-                [](const Scene& scene, de::render::PassContext& context) {
-                    const de::rhi::ColorAttachment color{.texture = context.texture(scene.back), .clear = scene.dusk};
-                    context.list.begin_rendering({.colors = std::span(&color, 1)});
-                    if (scene.triangle.is_valid()) {
-                        // Matches TrianglePush in shaders/triangle.slang.
-                        struct TrianglePush {
-                            float time_s;
-                            float aspect;
-                        };
-                        context.list.bind_pipeline(scene.triangle);
-                        context.list.push_constants(TrianglePush{.time_s = scene.seconds, .aspect = scene.aspect});
-                        context.list.draw(3);
-                    }
-                    if (scene.quad.is_valid()) {
-                        // Matches TexturedQuadPush in shaders/textured_quad.slang.
-                        struct TexturedQuadPush {
-                            float center[2];
-                            float size[2];
-                            uint32_t texture;
-                            uint32_t sampler;
-                            float time_s;
-                        };
-                        context.list.bind_pipeline(scene.quad);
-                        context.list.push_constants(TexturedQuadPush{
-                            .center = {0.62f, 0.0f},
-                            .size = {0.7f / scene.aspect, 0.7f},
-                            .texture = scene.quad_texture,
-                            .sampler = de::rhi::sampler_index(de::rhi::DefaultSampler::AnisotropicWrap),
-                            .time_s = scene.seconds,
-                        });
-                        context.list.draw(6);
-                    }
-                    context.list.end_rendering();
-                });
+            static constexpr de::rhi::Color kDusk{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
+            if (scene_renderer) {
+                scene_renderer->add_pass(*graph, back, device->swapchain_format(), world->render_frame(), {}, kDusk);
+            } else {
+                graph->add_pass(
+                    "clear",
+                    [&](de::render::PassBuilder& pass) { pass.use(back, de::rhi::ResourceState::RenderTarget); },
+                    [back](de::render::PassContext& context) {
+                        const de::rhi::ColorAttachment color{.texture = context.texture(back), .clear = kDusk};
+                        context.list.begin_rendering({.colors = std::span(&color, 1)});
+                        context.list.end_rendering();
+                    });
+            }
             debug_ui.add_pass(*graph, back, device->swapchain_format());
             graph->execute();
         }
@@ -496,11 +417,18 @@ int main(int argc, char** argv) {
     }
 
     device->log_memory_report(5);
-    device->destroy(*quad_texture);
     device->wait_idle();
     const de::asset::AssetRegistryStats asset_stats = assets->stats();
     DE_LOG_INFO("asset", "%u assets held (%u failed), %llu bytes, %u reloads", asset_stats.assets, asset_stats.failed,
                 static_cast<unsigned long long>(asset_stats.bytes), asset_stats.reloads);
+    const de::render::GpuAssetsStats gpu_stats = gpu_assets->stats();
+    const de::render::SceneRendererStats scene_stats =
+        scene_renderer ? scene_renderer->stats() : de::render::SceneRendererStats{};
+    DE_LOG_INFO(
+        "render",
+        "gpu assets: %u meshes, %u textures, %u materials, %llu bytes; last frame drew %u of %u instances in %u draws",
+        gpu_stats.meshes, gpu_stats.textures, gpu_stats.materials, static_cast<unsigned long long>(gpu_stats.bytes),
+        scene_stats.drawn, scene_stats.instances, scene_stats.draws);
     const de::rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),

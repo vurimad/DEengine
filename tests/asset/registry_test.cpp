@@ -448,3 +448,19 @@ TEST_CASE("a registry needs a VFS that runs completions on jobs") {
     Vfs vfs = sandbox.make_vfs(); // no jobs
     CHECK_FALSE(AssetRegistry::create({.vfs = &vfs, .jobs = &jobs}).ok());
 }
+
+TEST_CASE("a listener taken off hears nothing more, and the others still do") {
+    Fixture fixture;
+    put_texture(fixture.vfs, kAlbedo, 4);
+    AssetRegistry registry = fixture.make({.hot_reload = false});
+    Recorder second;
+    REQUIRE(registry.add_listener(&Recorder::record, &second).ok());
+    registry.remove_listener(&Recorder::record, &fixture.recorder);
+    registry.remove_listener(&Recorder::record, &fixture.recorder); // not one any more: nothing
+    const AssetHandle texture = registry.load<TextureAsset>(kAlbedo);
+    registry.wait_all();
+    CHECK(fixture.recorder.notices.empty());
+    CHECK(second.count(AssetEvent::Ready, kAlbedo) == 1);
+    registry.release(texture);
+    registry.update();
+}

@@ -291,6 +291,7 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
     };
     const VkPhysicalDeviceVulkan13Features features13{
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        .shaderDemoteToHelperInvocation = VK_TRUE, // discard (alpha test) in Slang
         .synchronization2 = VK_TRUE,
         .dynamicRendering = VK_TRUE,
         .maintenance4 = VK_TRUE,

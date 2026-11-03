@@ -116,6 +116,9 @@ public:
     // True once the texture's first upload has been recorded (in this frame's record() or before):
     // its mips are out of Undefined, so it may be sampled. Until then, don't.
     [[nodiscard]] bool ready(TextureHandle texture) const;
+    // True once no upload to the buffer is waiting to be recorded (false for a stale handle): the
+    // GPU work recorded after this frame's record() sees every upload queued to it so far.
+    [[nodiscard]] bool ready(BufferHandle buffer) const;
     UploaderStats stats() const;
 
 private:
