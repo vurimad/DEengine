@@ -459,3 +459,104 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
     device->wait_idle();
     de::test::check_clean(*device);
 }
+
+TEST_CASE("a material whose texture was missing picks it up when it appears") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    const de::platform::PathString user_root = sandbox.folder("user");
+    const de::platform::PathString temp_root = sandbox.folder("temp");
+    auto vfs = de::platform::Vfs::create({.game_root = game_root.c_str(),
+                                          .user_root = user_root.c_str(),
+                                          .temp_root = temp_root.c_str(),
+                                          .src_root = DE_SOURCE_DIR,
+                                          .jobs = &jobs,
+                                          .game_writable = true});
+    REQUIRE(vfs.ok());
+    // The square with a material sampling a texture that isn't cooked yet.
+    put_assets(*vfs);
+    constexpr AssetId kGreen = AssetId::from_value(0x53);
+    de::cooker::MaterialBuild build;
+    build.set_texture(de::asset::material::kBaseColorTexture, kGreen);
+    const auto material = de::cooker::cook_material(build, kRed);
+    REQUIRE(vfs->write_file(de::asset::cooked_path(kRed, AssetType::Material).c_str(), material.span()).ok());
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create(
+        {.vfs = &*vfs, .jobs = &jobs, .hot_reload = true, .reload_checks_per_update = 64});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer = de::render::SceneRenderer::create(
+            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
+        REQUIRE(renderer.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        de::world::RenderFrame frame;
+        frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+        const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
+        frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+        // The engine's frame, a few times over: the registry, the GPU copies, the passes.
+        const auto run_frames = [&](int count) {
+            for (int i = 0; i < count; ++i) {
+                assets->update();
+                assets->wait_all();
+                gpu_assets->update();
+                device->begin_frame();
+                uploader->record();
+                graph->begin(kSize, kSize);
+                const de::render::GraphTexture color = graph->import_texture(
+                    {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+                renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {},
+                                     de::render::SceneView::BaseColor);
+                graph->execute();
+                device->end_frame();
+            }
+            return de::test::read_texture(*device, *target);
+        };
+        // The texture is missing: white, the default.
+        const de::core::Array<std::byte> before = run_frames(4);
+        REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+        CHECK(texel(before, kSize / 2, kSize / 2)[1] == 255);
+        CHECK(texel(before, kSize / 2, kSize / 2)[0] == 255);
+        // The texture is cooked: the registry picks it up, and the material with it.
+        de::cooker::Image image;
+        image.width = 8;
+        image.height = 8;
+        for (int i = 0; i < 64; ++i) {
+            for (const uint8_t channel : {uint8_t{0}, uint8_t{255}, uint8_t{0}, uint8_t{255}}) {
+                image.rgba.push(channel);
+            }
+        }
+        de::cooker::Diagnostics diagnostics;
+        const auto green = de::cooker::cook_texture(image, {}, kGreen, nullptr, "test", diagnostics);
+        REQUIRE(green.ok());
+        REQUIRE(vfs->write_file(de::asset::cooked_path(kGreen, AssetType::Texture).c_str(), green->span()).ok());
+        const de::core::Array<std::byte> after = run_frames(6);
+        CHECK(texel(after, kSize / 2, kSize / 2)[0] < 30);
+        CHECK(texel(after, kSize / 2, kSize / 2)[1] > 220);
+        assets->release(mesh);
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}

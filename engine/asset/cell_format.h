@@ -36,7 +36,7 @@ static_assert(sizeof(CellEntity) == 72);
 // .decell (docs/design.md, Open world & streaming: world model): the binary form of a .cell text
 // source, the entities placed in one cell of the world grid. The meshes they use are the header's
 // dependencies, so the registry makes the cell Ready only once they're loaded; an entity names its
-// mesh by its index there (AssetRegistry::dependencies gives the handles, in the same order).
+// mesh by its index there (look its handle up with AssetRegistry::find on that header entry).
 // Entities are in an order where every parent comes before its children.
 struct CellAsset {
     static constexpr AssetType kType = AssetType::Cell;

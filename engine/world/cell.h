@@ -47,6 +47,7 @@ struct Cell {
 // from (AssetRegistry::revision; 0: none yet). Its members always match the cell's loaded file:
 // spawned once it's Ready, spawned again when hot reload swaps in a new one.
 struct CellContents {
+    asset::AssetHandle asset; // which asset the revision is of: a Cell given another asset respawns
     uint32_t revision = 0;
 };
 

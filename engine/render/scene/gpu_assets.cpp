@@ -58,14 +58,18 @@ struct TextureEntry {
 struct MaterialEntry {
     asset::AssetHandle handle;
     uint32_t slot = 0;
-    bool queued = false; // in GpuAssetsState::dirty_materials
+    bool queued = false;  // in GpuAssetsState::dirty_materials
+    bool missing = false; // a texture it names failed: written again when a texture loads
 };
 
 struct MeshEntry {
+    asset::AssetHandle handle;
     GpuMesh gpu;
     core::Array<GpuMeshPart> parts{render_heap()};
     uint64_t bytes = 0;
+    uint64_t needs_table = UINT64_MAX; // the table upload its parts' materials are in (set in update)
     bool ready = false;
+    bool missing = false; // a material it names failed: its parts are resolved again when one loads
 };
 
 enum DefaultTexture : uint32_t { White, FlatNormal, DefaultCount };
@@ -93,7 +97,8 @@ struct GpuAssetsState {
     core::Array<GpuMaterial> table{render_heap()};
     uint32_t dirty_first = UINT32_MAX;
     uint32_t dirty_end = 0;
-    uint64_t table_uploads = 0; // queued so far
+    uint64_t table_uploads = 0;  // queued so far
+    uint64_t table_recorded = 0; // of those, recorded: the GPU sees the table as of that upload
     // Textures replaced by a reload, kept until the table no longer points at them: once a table
     // upload queued after the replacement is recorded.
     struct Retired {
@@ -202,6 +207,14 @@ struct GpuAssetsState {
         }
         entry = {.texture = *created, .bytes = texel_bytes};
         bytes += texel_bytes;
+        // A texture that failed before may be this one, back: materials that fell back try again.
+        for (auto [key, material] : materials) {
+            if (material.missing && !material.queued) {
+                material.missing = false;
+                material.queued = true;
+                dirty_materials.push(key);
+            }
+        }
     }
 
     void unload_texture(asset::AssetHandle handle) {
@@ -214,7 +227,7 @@ struct GpuAssetsState {
 
     // The bindless index of a material's texture: the default while it's missing or uploading
     // (still_waiting tells which, so the material is written again once it's in).
-    uint32_t texture_index(asset::AssetId id, DefaultTexture fallback, bool& still_waiting) const {
+    uint32_t texture_index(asset::AssetId id, DefaultTexture fallback, bool& still_waiting, bool& missing) const {
         if (!id.is_valid()) {
             return default_index[fallback];
         }
@@ -222,7 +235,9 @@ struct GpuAssetsState {
         const TextureEntry* entry = handle.is_valid() ? textures.find(key_of(handle)) : nullptr;
         if (entry == nullptr) {
             // Loading (it will be Ready before the material is), or failed: the default.
-            still_waiting = still_waiting || assets->state(handle) == asset::AssetState::Loading;
+            const bool loading = assets->state(handle) == asset::AssetState::Loading;
+            still_waiting = still_waiting || loading;
+            missing = missing || !loading;
             return default_index[fallback];
         }
         if (!uploader->ready(entry->texture)) {
@@ -245,6 +260,16 @@ struct GpuAssetsState {
             entry = &materials.find_or_insert(key);
             *entry = {.handle = handle, .slot = free_slots.back()};
             free_slots.pop();
+            // A material that failed before may be this one, back: meshes that fell back resolve
+            // their parts again (and wait for the table again).
+            for (auto [mesh_key, mesh] : meshes) {
+                if (mesh.missing) {
+                    resolve_parts(mesh);
+                    mesh.ready = false;
+                    mesh.needs_table = UINT64_MAX;
+                    pending_meshes.push(mesh_key);
+                }
+            }
         }
         if (!entry->queued) {
             entry->queued = true;
@@ -269,7 +294,7 @@ struct GpuAssetsState {
     }
 
     // Writes the material's table entry; false if a texture is still uploading (try again).
-    bool write_material(const MaterialEntry& entry) {
+    bool write_material(MaterialEntry& entry) {
         const auto* asset = assets->get<asset::MaterialAsset>(entry.handle);
         if (asset == nullptr) {
             return true; // not loaded any more: its unload is on the way
@@ -291,12 +316,16 @@ struct GpuAssetsState {
         param(m::kOcclusionStrength, &gpu.occlusion_strength, 1);
         param(m::kAlphaCutoff, &gpu.alpha_cutoff, 1);
         bool waiting = false;
-        gpu.base_color_texture = texture_index(asset->find_texture(asset, m::kBaseColorTexture), White, waiting);
-        gpu.normal_texture = texture_index(asset->find_texture(asset, m::kNormalTexture), FlatNormal, waiting);
-        gpu.metallic_roughness_texture =
-            texture_index(asset->find_texture(asset, m::kMetallicRoughnessTexture), White, waiting);
-        gpu.occlusion_texture = texture_index(asset->find_texture(asset, m::kOcclusionTexture), White, waiting);
-        gpu.emissive_texture = texture_index(asset->find_texture(asset, m::kEmissiveTexture), White, waiting);
+        bool missing = false;
+        const auto texture = [&](core::StringId slot, DefaultTexture fallback) {
+            return texture_index(asset->find_texture(asset, slot), fallback, waiting, missing);
+        };
+        gpu.base_color_texture = texture(m::kBaseColorTexture, White);
+        gpu.normal_texture = texture(m::kNormalTexture, FlatNormal);
+        gpu.metallic_roughness_texture = texture(m::kMetallicRoughnessTexture, White);
+        gpu.occlusion_texture = texture(m::kOcclusionTexture, White);
+        gpu.emissive_texture = texture(m::kEmissiveTexture, White);
+        entry.missing = missing;
         gpu.flags =
             (asset->alpha_mode == asset::AlphaMode::Masked ? GpuMaterialFlags::Masked : GpuMaterialFlags::None) |
             (core::has_any(asset->flags, asset::MaterialFlags::DoubleSided) ? GpuMaterialFlags::DoubleSided
@@ -351,7 +380,10 @@ struct GpuAssetsState {
         const rhi::ResourceState after = core::has_any(usage, rhi::BufferUsage::Index) ? rhi::ResourceState::IndexBuffer
                                                                                        : rhi::ResourceState::ShaderRead;
         if (const core::Result<void> queued = uploader->upload_buffer(*buffer, 0, data, after); !queued) {
+            // Not a buffer that never gets its contents: none, and the mesh isn't drawn.
             DE_LOG_ERROR("render", "%s upload: %s", name, queued.error().message);
+            device->destroy(*buffer);
+            return {};
         }
         return *buffer;
     }
@@ -366,23 +398,42 @@ struct GpuAssetsState {
         MeshEntry& entry = meshes.find_or_insert(key);
         const auto vertices = std::as_bytes(asset->vertices.get(asset));
         const auto indices = std::as_bytes(asset->indices.get(asset));
+        entry.handle = handle;
         entry.gpu.vertices = make_buffer(vertices, rhi::BufferUsage::Storage, "mesh vertices");
         entry.gpu.indices = make_buffer(indices, rhi::BufferUsage::Index, "mesh indices");
-        entry.gpu.vertex_address = entry.gpu.vertices.is_valid() ? device->buffer_address(entry.gpu.vertices) : 0;
+        if (!entry.gpu.vertices.is_valid() || !entry.gpu.indices.is_valid()) {
+            device->destroy(entry.gpu.vertices);
+            device->destroy(entry.gpu.indices);
+            meshes.remove(key); // never drawn (logged)
+            return;
+        }
+        entry.gpu.vertex_address = device->buffer_address(entry.gpu.vertices);
         entry.bytes = vertices.size() + indices.size();
         bytes += entry.bytes;
-        const asset::MeshLod& lod = asset->lods.get(asset)[0];
-        const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
-        const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
+        resolve_parts(entry);
+        entry.needs_table = UINT64_MAX;
+        pending_meshes.push(key);
+    }
+
+    // The mesh's LOD 0 parts and the table slots of their materials (the default for one that's
+    // missing, remembered so they're resolved again when it loads).
+    void resolve_parts(MeshEntry& entry) {
         entry.parts.clear();
-        for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
-            const asset::MeshPart& part = parts[p];
-            entry.parts.push({.first_index = part.first_index,
-                              .index_count = part.index_count,
-                              .material = material_slot(slots[part.material_slot].material)});
+        entry.missing = false;
+        const auto* asset = assets->get<asset::MeshAsset>(entry.handle);
+        if (asset != nullptr) {
+            const asset::MeshLod& lod = asset->lods.get(asset)[0];
+            const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
+            const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
+            for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
+                const asset::MeshPart& part = parts[p];
+                const asset::AssetId material = slots[part.material_slot].material;
+                const uint32_t slot = material_slot(material);
+                entry.missing = entry.missing || (slot == 0 && material.is_valid());
+                entry.parts.push({.first_index = part.first_index, .index_count = part.index_count, .material = slot});
+            }
         }
         entry.gpu.parts = entry.parts.span();
-        pending_meshes.push(key);
     }
 
     void unload_mesh(asset::AssetHandle handle) {
@@ -476,6 +527,11 @@ GpuAssets& GpuAssets::operator=(GpuAssets&& other) noexcept {
 void GpuAssets::update() {
     DE_PROFILE_ZONE("gpu assets");
     GpuAssetsState& state = *state_;
+    // Every table upload queued before this one is recorded once nothing is waiting: read before
+    // this frame's upload is queued, so steady streaming (an upload every frame) still moves on.
+    if (state.uploader->ready(state.material_table)) {
+        state.table_recorded = state.table_uploads;
+    }
     // Materials whose textures were uploading: written again; kept while any still is.
     size_t kept = 0;
     for (size_t i = 0; i < state.dirty_materials.size(); ++i) {
@@ -492,21 +548,17 @@ void GpuAssets::update() {
     }
     state.dirty_materials.resize(kept);
     state.upload_table();
-    // The table as uploaded so far is on the GPU once its last upload is recorded: meshes (whose
-    // parts point into it) and retired textures (it no longer points at) wait for that.
-    const bool table_recorded = state.uploader->ready(state.material_table);
-    if (table_recorded) {
-        kept = 0;
-        for (size_t i = 0; i < state.retired.size(); ++i) {
-            if (state.table_uploads > state.retired[i].after_upload) {
-                state.device->destroy(state.retired[i].texture);
-            } else {
-                state.retired[kept++] = state.retired[i];
-            }
+    // Retired textures go once the table that no longer points at them is recorded.
+    kept = 0;
+    for (size_t i = 0; i < state.retired.size(); ++i) {
+        if (state.table_recorded > state.retired[i].after_upload) {
+            state.device->destroy(state.retired[i].texture);
+        } else {
+            state.retired[kept++] = state.retired[i];
         }
-        state.retired.resize(kept);
     }
-    // Meshes whose buffers are uploaded become drawable.
+    state.retired.resize(kept);
+    // Meshes become drawable once their buffers and the table upload with their materials are in.
     kept = 0;
     for (size_t i = 0; i < state.pending_meshes.size(); ++i) {
         const uint64_t key = state.pending_meshes[i];
@@ -514,7 +566,11 @@ void GpuAssets::update() {
         if (entry == nullptr || entry->ready) {
             continue;
         }
-        if (table_recorded && state.uploader->ready(entry->gpu.vertices) && state.uploader->ready(entry->gpu.indices)) {
+        if (entry->needs_table == UINT64_MAX) {
+            entry->needs_table = state.table_uploads; // every material it names is written by now
+        }
+        if (state.table_recorded >= entry->needs_table && state.uploader->ready(entry->gpu.vertices) &&
+            state.uploader->ready(entry->gpu.indices)) {
             entry->ready = true;
         } else {
             state.pending_meshes[kept++] = key;
