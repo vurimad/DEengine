@@ -45,18 +45,14 @@ void fragment_opaque(VertexOutput input)
 {
 }
 
-// Masked casters: the alpha test.
+// Masked casters (the renderer picks this one by their flag): the alpha test.
 [shader("fragment")]
-void fragment_main(VertexOutput input)
+void fragment_masked(VertexOutput input)
 {
     const GpuMaterial material = push.materials[push.material];
-    if ((material.flags & kMaterialMasked) != 0)
+    const float alpha = sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
+    if (alpha < material.alpha_cutoff)
     {
-        const float alpha =
-            sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
-        if (alpha < material.alpha_cutoff)
-        {
-            discard;
-        }
+        discard;
     }
 }

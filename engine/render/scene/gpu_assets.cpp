@@ -584,14 +584,9 @@ const GpuMesh* GpuAssets::mesh(asset::AssetHandle mesh) const {
     return entry != nullptr && entry->ready ? &entry->gpu : nullptr;
 }
 
-bool GpuAssets::double_sided(uint32_t material) const {
+GpuMaterialFlags GpuAssets::material_flags(uint32_t material) const {
     const GpuAssetsState& state = *state_;
-    return material < state.table.size() && core::has_any(state.table[material].flags, GpuMaterialFlags::DoubleSided);
-}
-
-bool GpuAssets::masked(uint32_t material) const {
-    const GpuAssetsState& state = *state_;
-    return material < state.table.size() && core::has_any(state.table[material].flags, GpuMaterialFlags::Masked);
+    return material < state.table.size() ? state.table[material].flags : GpuMaterialFlags::None;
 }
 
 uint64_t GpuAssets::material_table_address() const {

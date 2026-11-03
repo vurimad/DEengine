@@ -420,10 +420,17 @@ void CommandList::bind_pipeline(PipelineHandle handle) {
                   "graphics pipelines bind inside begin_rendering, compute pipelines outside it");
     vkCmdBindPipeline(impl_->cmd, pipeline.bind_point, pipeline.pipeline);
     if (pipeline.bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        vkCmdSetCullMode(impl_->cmd, pipeline.cull);
         impl_->graphics_bound = true;
     } else {
         impl_->compute_bound = true;
     }
+}
+
+void CommandList::set_cull_mode(CullMode cull) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "set_cull_mode needs a bound graphics pipeline");
+    vkCmdSetCullMode(impl_->cmd, to_vk(cull));
 }
 
 void CommandList::push_constants(std::span<const std::byte> data, uint32_t offset) {

@@ -95,7 +95,7 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
 
     // Both stages of the scene's G-buffer pass in one compile.
     const ShaderEntry stages[] = {{.name = "vertex_main", .stage = ShaderStage::Vertex},
-                                  {.name = "fragment_main", .stage = ShaderStage::Fragment}};
+                                  {.name = "fragment_opaque", .stage = ShaderStage::Fragment}};
     CompileReport report;
     auto basic_lit = compiler.compile({.module = "scene.gbuffer", .entries = stages}, &report);
     REQUIRE(basic_lit.ok());
@@ -219,13 +219,16 @@ TEST_CASE("a graphics program draws through the RHI, culling by winding") {
                                                  .memory = de::rhi::MemoryLocation::Readback});
     REQUIRE((target.ok() && readback.ok()));
 
-    const auto draw = [&](ProgramHandle program) {
+    const auto draw = [&](ProgramHandle program, bool cull_none = false) {
         device->begin_frame();
         de::rhi::CommandList list = device->begin_command_list();
         list.barrier(*target, de::rhi::ResourceState::Undefined, de::rhi::ResourceState::RenderTarget);
         const de::rhi::ColorAttachment color{.texture = *target, .clear = {.r = 0, .g = 0, .b = 0, .a = 1}};
         list.begin_rendering({.colors = std::span(&color, 1)});
         list.bind_pipeline(library->pipeline(program));
+        if (cull_none) {
+            list.set_cull_mode(de::rhi::CullMode::None);
+        }
         const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
         list.push_constants(green);
         list.draw(3);
@@ -248,6 +251,10 @@ TEST_CASE("a graphics program draws through the RHI, culling by winding") {
     CHECK(pixel(kSize / 2, kSize - 4) == kGreen);
 
     draw(*back);
+    CHECK(pixel(kSize / 2, kSize / 2) == kBlack);
+    draw(*back, true); // culling off for this draw: the same pipeline shows its back face
+    CHECK(pixel(kSize / 2, kSize / 2) == kGreen);
+    draw(*back); // and binding the pipeline again culls again
     CHECK(pixel(kSize / 2, kSize / 2) == kBlack);
 
     library->destroy(*front);

@@ -39,8 +39,12 @@ public:
     void set_viewport(const Viewport& viewport);
     void set_scissor(const Rect& rect);
 
-    // Graphics pipelines bind inside begin_rendering, compute pipelines outside it.
+    // Graphics pipelines bind inside begin_rendering, compute pipelines outside it. A graphics
+    // pipeline's cull mode comes with it.
     void bind_pipeline(PipelineHandle pipeline);
+    // Overrides the bound graphics pipeline's cull mode until the next bind_pipeline: one pipeline
+    // for culled and double-sided draws.
+    void set_cull_mode(CullMode cull);
     // Push constants for the bound pipeline: offset + data.size() <= kMaxPushConstantBytes,
     // both multiples of 4. They stay set across pipeline binds within the list.
     void push_constants(std::span<const std::byte> data, uint32_t offset = 0);

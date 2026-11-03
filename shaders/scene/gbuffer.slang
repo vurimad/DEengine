@@ -96,13 +96,13 @@ GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFac
     return write_surface(input, front_face, material, base);
 }
 
-// Masked materials: the alpha test.
+// Masked materials (the renderer picks this one by their flag): the alpha test.
 [shader("fragment")]
-GBufferOutput fragment_main(VertexOutput input, bool front_face: SV_IsFrontFace)
+GBufferOutput fragment_masked(VertexOutput input, bool front_face: SV_IsFrontFace)
 {
     const GpuMaterial material = push.materials[push.material];
     const float4 base = sample_texture(material.base_color_texture, push.sampler, input.uv) * material.base_color;
-    if ((material.flags & kMaterialMasked) != 0 && base.a < material.alpha_cutoff)
+    if (base.a < material.alpha_cutoff)
     {
         discard;
     }

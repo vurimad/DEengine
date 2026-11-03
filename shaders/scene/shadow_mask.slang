@@ -111,9 +111,9 @@ float2 fragment_main(VertexOutput input) : SV_Target
 
     // Blocker search: the mean depth of what's nearer the sun, around the receiver: the receiver's
     // own texel, and 16 taps across the widest penumbra.
-    // IGN one step along its own sequence (Jimenez's 5.588238 pixel offset): a value unrelated to the
-    // dither's at the same pixel.
-    const float angle = gradient_noise(input.position.xy + 5.588238) * 6.2831853;
+    // IGN of the transposed pixel: its gradient runs another way, so the value isn't the dither's
+    // shifted by a constant (an offset pixel would be: IGN is linear inside its fracs).
+    const float angle = gradient_noise(input.position.yx) * 6.2831853;
     const float2x2 rotation = float2x2(cos(angle), -sin(angle), sin(angle), cos(angle));
     const float search = frame.shadow_params.w * atlas_texel;
     float blockers = 0.0;
