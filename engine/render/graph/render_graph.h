@@ -167,6 +167,9 @@ public:
     // reference_height size the transient textures with a reference_scale (the swapchain, or the
     // render resolution).
     void begin(uint32_t reference_width, uint32_t reference_height);
+    // This frame's, as begin() set them.
+    uint32_t reference_width() const;
+    uint32_t reference_height() const;
 
     GraphTexture import_texture(const ImportedTexture& texture);
     GraphBuffer import_buffer(const ImportedBuffer& buffer);

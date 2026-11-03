@@ -492,7 +492,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 **Frame passes, in order:**
 
 1. GPU culling (instances, lights) and Hi-Z build
-2. Shadows: cascaded sun shadows with cached far cascades; local shadow atlas for torches and spells
+2. Shadows: cascaded sun shadows (4 cascades in an atlas, stable fitting, a screen-space mask with contact-hardening filtering and a shadow tint; engine/render/scene/README.md), cached far cascades later; local shadow atlas for torches and spells
 3. G-buffer: base color + lighting group ID (RGBA8 sRGB), octahedral normal (RG16), roughness/metalness/occlusion/translucency (RGBA8), emissive straight into the HDR target, reverse-Z depth; motion vectors join with TAA (engine/render/scene/README.md)
 4. Terrain and grass write into the same G-buffer
 5. Deferred decals (blood, scorch, footprints) modify the G-buffer
@@ -1174,3 +1174,4 @@ Decisions so far:
 | 2026-11-03 | Elden Ring may be studied in full from an owned copy, shader code included (captures and dumps, offline only); own implementations, findings in our words, nothing extracted committed | Its techniques are the reference for the look; studying the real thing beats guessing, and clean implementations keep the engine ours |
 | 2026-11-03 | Match Elden Ring's feel, atmosphere and art controls, not its low-level renderer; our own G-buffer, lighting core, shadows and upscaling | Their look comes from art direction on dated tech; a modern, consistent core with their art levers on top looks as good and ages better |
 | 2026-11-03 | G-buffer v1: three targets (base color + lighting group, RG16 octahedral normal, roughness/metalness/occlusion/translucency) and emissive into HDR, 20 bytes a pixel | Room for the look's art levers (groups, translucency) at the bandwidth of a lean layout; emissive needs no target of its own |
+| 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |

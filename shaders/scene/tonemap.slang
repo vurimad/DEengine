@@ -12,8 +12,10 @@ struct TonemapPush
     uint gb1;
     uint gb2;
     float exposure;    // multiplier: 2^EV
-    uint view;         // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency
+    uint view;         // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency,
+                       // 7 shadow mask, 8 cascades
     uint srgb_target;  // the target encodes to sRGB: data views are decoded first, so they show as stored
+    uint shadow_mask;  // r: sunlight seen, g: cascade
 };
 
 [[vk::push_constant]]
@@ -49,6 +51,28 @@ float3 aces(float3 x)
 float4 fragment_main(VertexOutput input) : SV_Target
 {
     const int2 texel = int2(input.position.xy);
+    if (push.view >= 7)
+    {
+        const float2 mask = load_texture(push.shadow_mask, texel).rg;
+        if (push.view == 7)
+        {
+            return show_data(mask.rrr);
+        }
+        // Cascades: red, green, blue, yellow, darkened where shadowed; grey with no shadow lookup
+        // (the sky), white beyond the shadow distance.
+        if (mask.g < 0.1)
+        {
+            return float4(0.25, 0.25, 0.25, 1.0);
+        }
+        if (mask.g > 0.9)
+        {
+            return float4(1.0, 1.0, 1.0, 1.0);
+        }
+        const float3 colors[kCascadeCount] = { float3(1, 0.3, 0.3), float3(0.3, 1, 0.3), float3(0.3, 0.4, 1),
+                                               float3(1, 1, 0.3) };
+        const uint cascade = min(uint(mask.g * 5.0 + 0.5) - 1u, kCascadeCount - 1u);
+        return float4(colors[cascade] * (0.35 + 0.65 * mask.r), 1.0);
+    }
     if (push.view != 0)
     {
         const GBufferSample s = unpack_gbuffer(load_texture(push.gb0, texel), load_texture(push.gb1, texel).xy,

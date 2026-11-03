@@ -22,7 +22,7 @@ struct SceneLighting {
     float sun_color[3] = {4.6f, 3.6f, 2.4f};          // late afternoon gold
     float sky_color[3] = {0.30f, 0.40f, 0.62f};       // ambient from above
     float ground_color[3] = {0.12f, 0.10f, 0.07f};    // ambient from below
-    float shadow_color[3] = {0.0f, 0.0f, 0.0f};       // what shadowed sunlight keeps (no shadows yet)
+    float shadow_color[3] = {0.05f, 0.06f, 0.09f};    // what shadowed sunlight keeps: a cool tint, not black
     float exposure_ev = 0.0f;
 };
 
@@ -35,7 +35,25 @@ enum class SceneView : uint32_t {
     Metalness,
     Occlusion,
     Translucency,
+    ShadowMask, // sunlight seen
+    Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
     Count,
+};
+
+// The number of sun shadow cascades: tiles of a 2 x 2 atlas (shaders/scene/scene_common.slang's
+// kCascadeCount mirrors it).
+inline constexpr uint32_t kShadowCascadeCount = 4;
+
+// The sun's shadows (renderer step 3): cascaded shadow maps in one atlas, resolved per pixel into
+// a screen-space mask.
+struct SceneShadows {
+    uint32_t resolution = 2048;       // per cascade (64 to 8192); the atlas is 2 x 2 of them
+    float distance_m = 140.0f;        // along the view; shadows fade out over the last cascade's band
+    float split_lambda = 0.75f;       // 0: even cascade splits, 1: logarithmic
+    float blend_band = 0.12f;         // of each cascade, dithered into the next
+    float caster_reach_m = 200.0f;    // how far toward the sun casters are caught
+    float penumbra_per_m = 0.06f;     // penumbra width per meter between occluder and receiver
+    float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels (at least 1)
 };
 
 const char* scene_view_name(SceneView view);
@@ -44,13 +62,31 @@ struct SceneRendererDesc {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
+    SceneShadows shadows;
 };
 
 struct SceneRendererStats {
-    uint32_t instances = 0; // in the frame
-    uint32_t drawn = 0;     // with their mesh on the GPU
-    uint32_t draws = 0;     // draw calls (one per mesh part)
+    uint32_t instances = 0;    // in the frame
+    uint32_t drawn = 0;        // with their mesh on the GPU
+    uint32_t draws = 0;        // draw calls (one per mesh part)
+    uint32_t shadow_draws = 0; // into the shadow cascades
 };
+
+// A cascade of the sun's shadow map: where it reaches along the view, and its projection.
+struct ShadowCascade {
+    float far_m = 0.0f;       // its far edge, as distance along the view
+    float texel_m = 0.0f;     // a shadow texel's size
+    float depth_per_m = 0.0f; // depth units per meter toward the sun
+    float view_proj[16] = {}; // rows: render-origin space to the cascade's clip space
+};
+
+// Fits the cascades to a camera (3x4 rows, looking down -Z) and the sun (toward it; straight up if
+// it's zero):
+// splits between near_m and the shadow distance, a bounding sphere per slice (its size doesn't
+// change as the camera turns), centered on a texel grid (it doesn't swim as the camera moves).
+void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
+                         const float (&sun_direction)[3], const SceneShadows& shadows,
+                         ShadowCascade (&out)[kShadowCascadeCount]);
 
 struct SceneRendererState;
 
