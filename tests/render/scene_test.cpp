@@ -215,13 +215,15 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         REQUIRE(target.ok());
         auto graph = de::render::RenderGraph::create(*device);
         REQUIRE(graph.ok());
-        const auto render = [&](de::render::SceneView view) {
+        // The sun straight at the square (from behind the camera), and fog if asked for.
+        const auto render = [&](de::render::SceneView view, const de::render::SceneFog& fog = {}) {
             device->begin_frame();
             uploader->record(); // as the engine does each frame: the material's table entry lands first
             graph->begin(kSize, kSize);
             const de::render::GraphTexture color = graph->import_texture(
                 {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-            const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+            de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+            light.fog = fog;
             renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, view);
             graph->execute();
             device->end_frame();
@@ -248,28 +250,15 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
 
         // Fog: the same view through a thick green fog (constant, 0.5 per meter: about a fifth of
         // the square's light gets through its 3 m), and the sky (as far as the fog reaches) behind it.
-        const auto render_lit = [&](const de::render::SceneFog& fog) {
-            device->begin_frame();
-            uploader->record();
-            graph->begin(kSize, kSize);
-            const de::render::GraphTexture color = graph->import_texture(
-                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-            de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
-            light.fog = fog;
-            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit);
-            graph->execute();
-            device->end_frame();
-            return de::test::read_texture(*device, *target);
-        };
         de::render::SceneFog green{.density_per_m = 0.5f, .ambient = {0.0f, 2.0f, 0.0f}, .end_m = 1000.0f};
-        const de::core::Array<std::byte> fogged = render_lit(green);
+        const de::core::Array<std::byte> fogged = render(de::render::SceneView::Lit, green);
         const uint8_t* fogged_center = texel(fogged, kSize / 2, kSize / 2);
         CHECK(fogged_center[0] < lit_center[0] - 40); // dimmed
         CHECK(fogged_center[1] > fogged_center[0]);   // and green
         CHECK(texel(fogged, 1, 1)[1] > 200);          // the sky behind 1 km of it: all fog
         // Fog that starts past the square leaves it as it was (the sky behind it still fogged).
         green.start_m = 10.0f;
-        const de::core::Array<std::byte> started = render_lit(green);
+        const de::core::Array<std::byte> started = render(de::render::SceneView::Lit, green);
         CHECK(texel(started, kSize / 2, kSize / 2)[0] == doctest::Approx(lit_center[0]).epsilon(0.02));
         CHECK(texel(started, kSize / 2, kSize / 2)[1] == doctest::Approx(lit_center[1]).epsilon(0.05));
         CHECK(texel(started, 1, 1)[1] > 200);
@@ -280,13 +269,37 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
                                        .base_height_m = -1000.0,
                                        .ambient = {0.0f, 2.0f, 0.0f},
                                        .end_m = 1000.0f};
-        const de::core::Array<std::byte> below = render_lit(low);
+        const de::core::Array<std::byte> below = render(de::render::SceneView::Lit, low);
         CHECK(texel(below, kSize / 2, kSize / 2)[0] == doctest::Approx(lit_center[0]).epsilon(0.02));
         de::render::SceneFog level = low;
         level.base_height_m = 0.0;
         level.ambient_height_attenuation = 0.0f; // the fog column above (optical depth 5) would darken it
-        const de::core::Array<std::byte> around = render_lit(level);
+        const de::core::Array<std::byte> around = render(de::render::SceneView::Lit, level);
         CHECK(texel(around, kSize / 2, kSize / 2)[1] > texel(around, kSize / 2, kSize / 2)[0]);
+        const uint32_t foggy_passes = graph->stats().passes;
+        // Sun haze starts 5 m out: in fog this thick (0.5 per meter) the first 5 m scatter almost all
+        // of the light the camera gets, so the sky behind it gets almost none of the sun's colour.
+        de::render::SceneFog sunny{.density_per_m = 0.5f, .sun_back = {0.0f, 0.3f, 0.0f}, .end_m = 1000.0f};
+        const de::core::Array<std::byte> haze = render(de::render::SceneView::Lit, sunny);
+        CHECK(texel(haze, 1, 1)[1] > 180); // the sun lights the fog (looking away from it: sun_back)
+        sunny.sun_start_m = 5.0f;
+        const de::core::Array<std::byte> late = render(de::render::SceneView::Lit, sunny);
+        CHECK(texel(late, 1, 1)[1] < 110); // about a twelfth of the light: e^-2.5 gets past the first 5 m
+        // Far below the base of a thin fog (2 km down, falloff 1 per meter): twice its density, and
+        // no precision lost to it: the square is barely touched, not brightened or broken.
+        const de::render::SceneFog far_below{.height_density_per_m = 0.001f,
+                                             .height_falloff_per_m = 1.0f,
+                                             .base_height_m = 2000.0,
+                                             .ambient = {0.0f, 2.0f, 0.0f},
+                                             .end_m = 1000.0f};
+        const de::core::Array<std::byte> deep = render(de::render::SceneView::Lit, far_below);
+        CHECK(texel(deep, kSize / 2, kSize / 2)[0] == doctest::Approx(lit_center[0]).epsilon(0.03));
+        CHECK(texel(deep, kSize / 2, kSize / 2)[1] == doctest::Approx(lit_center[1]).epsilon(0.05));
+        // No fog, or a debug view: no fog pass.
+        static_cast<void>(render(de::render::SceneView::Lit));
+        CHECK(graph->stats().passes == foggy_passes - 1);
+        static_cast<void>(render(de::render::SceneView::BaseColor, green));
+        CHECK(graph->stats().passes == foggy_passes - 1);
         // Nothing to look through: cleared to the empty color (0.10, 0.11, 0.15 by default).
         frame.camera.valid = false;
         const de::core::Array<std::byte> cleared = render(de::render::SceneView::Lit);

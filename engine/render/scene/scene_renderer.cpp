@@ -790,31 +790,40 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         });
 
     // Fog: the lit image into a new one, dimmed by the fog in front of each pixel, with its light added.
+    // Without fog, or in a debug view (which shows no lit image), there is no pass: the tonemap reads
+    // the lit image.
     struct FogPass {
         GraphTexture fogged;
     };
-    const auto& fog_pass = graph.add_pass<FogPass>(
-        "fog",
-        [&](PassBuilder& pass, FogPass& data) {
-            data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-            pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
-            pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
-            pass.use(data.fogged, rhi::ResourceState::RenderTarget);
-        },
-        [targets, frame_address, fog](const FogPass& data, PassContext& context) {
-            DE_PROFILE_ZONE("fog pass");
-            const rhi::ColorAttachment color{.texture = context.texture(data.fogged), .load = rhi::LoadOp::DontCare};
-            context.list.begin_rendering({.colors = std::span(&color, 1)});
-            context.list.bind_pipeline(fog);
-            context.list.push_constants(FogPush{
-                .frame = frame_address,
-                .hdr = context.device.texture_index(context.texture(targets.hdr)),
-                .depth = context.device.texture_index(context.texture(targets.depth)),
-            });
-            context.list.draw(3);
-            context.list.end_rendering();
-        });
-    const GraphTexture fogged = fog_pass.fogged;
+    const bool foggy =
+        view == SceneView::Lit && (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
+    const GraphTexture fogged =
+        !foggy
+            ? targets.hdr
+            : graph
+                  .add_pass<FogPass>(
+                      "fog",
+                      [&](PassBuilder& pass, FogPass& data) {
+                          data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+                          pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                          pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                          pass.use(data.fogged, rhi::ResourceState::RenderTarget);
+                      },
+                      [targets, frame_address, fog](const FogPass& data, PassContext& context) {
+                          DE_PROFILE_ZONE("fog pass");
+                          const rhi::ColorAttachment color{.texture = context.texture(data.fogged),
+                                                           .load = rhi::LoadOp::DontCare};
+                          context.list.begin_rendering({.colors = std::span(&color, 1)});
+                          context.list.bind_pipeline(fog);
+                          context.list.push_constants(FogPush{
+                              .frame = frame_address,
+                              .hdr = context.device.texture_index(context.texture(targets.hdr)),
+                              .depth = context.device.texture_index(context.texture(targets.depth)),
+                          });
+                          context.list.draw(3);
+                          context.list.end_rendering();
+                      })
+                  .fogged;
 
     const float exposure = std::exp2(lighting.exposure_ev);
     const auto view_index = static_cast<uint32_t>(view);

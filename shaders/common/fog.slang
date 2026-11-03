@@ -33,17 +33,36 @@ float height_profile(float u)
     return u >= 0.0 ? exp(-u) : 2.0 - exp(u);
 }
 
-// Its antiderivative, continuous at 0.
-float height_profile_integral(float u)
+// The profile's mean over [u0, u1], in closed form. Each side of 0 is integrated on its own, so no
+// two large values are subtracted (far below the base, 2u - e^u would lose every digit).
+float mean_profile(float u0, float u1)
 {
-    return u >= 0.0 ? -exp(-u) : 2.0 * u - exp(u);
+    const float a = min(u0, u1);
+    const float b = max(u0, u1);
+    if (b - a < 1e-4)
+    {
+        return height_profile(0.5 * (a + b));
+    }
+    const float below = a < 0.0 ? 2.0 * (min(b, 0.0) - a) - (exp(min(b, 0.0)) - exp(a)) : 0.0;
+    const float above = b > 0.0 ? exp(-max(a, 0.0)) - exp(-b) : 0.0;
+    return (below + above) / (b - a);
 }
 
 // The height fog above height h (relative to the base), per unit of base extinction, in meters:
 // the column the sun and the sky shine down through.
 float column_above(float h, float falloff)
 {
-    return -height_profile_integral(falloff * h) / falloff;
+    const float u = falloff * h;
+    return (u >= 0.0 ? exp(-u) : exp(u) - 2.0 * u) / falloff;
+}
+
+// Optical depth (before the per-channel scale) along the ray from distance t0 to t1.
+float optical_depth(FogMedium medium, float camera_height, float direction_y, float t0, float t1)
+{
+    const float falloff = max(medium.density.z, 1e-6);
+    const float u0 = falloff * (camera_height + direction_y * t0 - medium.density.w);
+    const float u1 = falloff * (camera_height + direction_y * t1 - medium.density.w);
+    return (medium.density.x + medium.density.y * mean_profile(u0, u1)) * (t1 - t0);
 }
 
 // The fog between camera and a point distance meters along direction (unit), from start to end.
@@ -60,31 +79,28 @@ public FogResult fog_along_ray(FogMedium medium, float3 camera, float3 direction
     {
         return result;
     }
-    const float span = far - near;
-    const float falloff = max(medium.density.z, 1e-6);
-    const float h0 = camera.y + direction.y * near - medium.density.w;
-    const float h1 = camera.y + direction.y * far - medium.density.w;
-
-    // Optical depth: the constant part, and the height fog's integral along the ray (closed form;
-    // a level ray is constant density).
-    const float du = falloff * (h1 - h0);
-    const float height_path = abs(du) < 1e-4
-                                  ? height_profile(falloff * h0) * span
-                                  : span * (height_profile_integral(falloff * h1) - height_profile_integral(falloff * h0)) / du;
-    const float depth = medium.density.x * span + medium.density.y * height_path;
     const float3 extinction = max(medium.extinction.rgb, float3(0.01));
+    const float depth = optical_depth(medium, camera.y, direction.y, near, far);
     result.transmittance = exp(-depth * extinction);
 
-    // The light scattered in, taken as the light at the segment's middle height.
-    const float column = medium.density.y * column_above(0.5 * (h0 + h1), falloff);
+    // Where the light reaching the camera was scattered in: the mean distance weighted by what gets
+    // through (for a uniform medium, 1/sigma - span T / (1 - T); half way when the fog is thin). The
+    // sun and sky light the fog as they do there: through the column above that point.
+    const float span = far - near;
+    const float transmitted = exp(-depth);
+    const float mean_t = depth < 1e-3 ? 0.5 * span : clamp(span / depth - span * transmitted / (1.0 - transmitted), 0.0, span);
+    const float height = camera.y + direction.y * (near + mean_t) - medium.density.w;
+    const float column = medium.density.y * column_above(height, max(medium.density.z, 1e-6));
     const float mu = dot(direction, sun_direction);
     const float3 phase = lerp(medium.sun_back.rgb, medium.sun_forward.rgb, mu * 0.5 + 0.5);
-    const float3 sun_through = exp(-extinction * column * medium.sun_forward.w / max(sun_direction.y, 0.05));
-    const float sun_share = saturate((far - max(near, medium.sun_back.w)) / span); // past sun haze's start
-    const float3 sun = sun_color * phase * sun_through * sun_share;
-    const float3 ambient = medium.ambient.rgb * exp(-medium.extinction.w * column);
+    const float3 sun = sun_color * phase * exp(-extinction * column * medium.sun_forward.w / max(sun_direction.y, 0.05));
+    const float3 ambient = medium.ambient.rgb * exp(-extinction * column * medium.extinction.w);
+
     // Scattering is extinction before the per-channel scale: what a channel loses to it, it gains of
-    // the light in that proportion.
-    result.in_scatter = (1.0 - result.transmittance) * (sun + ambient) / extinction;
+    // the light in that proportion. Sun haze only from where it starts: the in-scatter past it is
+    // what the fog in front of it lets through, less what's left at the far end.
+    const float sun_start = clamp(medium.sun_back.w, near, far);
+    const float3 through_sun_start = exp(-optical_depth(medium, camera.y, direction.y, near, sun_start) * extinction);
+    result.in_scatter = ((through_sun_start - result.transmittance) * sun + (1.0 - result.transmittance) * ambient) / extinction;
     return result;
 }

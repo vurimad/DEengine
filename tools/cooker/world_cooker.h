@@ -50,7 +50,7 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //       "exposure_ev": 0,
 //       "shadows": {"resolution": 2048, "distance_m": 140, "split_lambda": 0.75, "blend_band": 0.12,
 //                   "caster_reach_m": 200, "penumbra_per_m": 0.06, "max_penumbra_texels": 6},
-//       "fog": {"density": 0.00008, "height_density": 0.004, "height_falloff": 0.08,  // per meter
+//       "fog": {"density_per_m": 0.00008, "height_density_per_m": 0.004, "height_falloff_per_m": 0.08,  // per meter
 //               "base_height_m": 0, "extinction_tint": [0.8, 1, 1.3],
 //               "sun_forward": {"color": [1, 0.85, 0.7], "intensity": 0.5},  // times the sun's
 //               "sun_back": {"color": [0.5, 0.6, 0.8], "intensity": 0.08},

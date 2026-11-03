@@ -93,34 +93,21 @@ void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
         return;
     }
     const JsonReader reader{.object = fog, .path = parent.path, .diagnostics = parent.diagnostics};
-    static constexpr const char* kKeys[] = {"density",
-                                            "height_density",
-                                            "height_falloff",
-                                            "base_height_m",
-                                            "extinction_tint",
-                                            "sun_forward",
-                                            "sun_back",
-                                            "sun_height_attenuation",
-                                            "ambient",
-                                            "ambient_height_attenuation",
-                                            "start_m",
-                                            "sun_start_m",
-                                            "end_m"};
-    reader.check_keys(kKeys, "fog");
     using F = asset::FogLimits;
     struct Number {
         const char* key;
         double least;
         double most;
         float* out;
+        bool read = false;
     };
-    const Number numbers[] = {
-        {.key = "density", .least = 0.0, .most = F::kMaxDensityPerM, .out = &environment.fog_density_per_m},
-        {.key = "height_density",
+    Number numbers[] = {
+        {.key = "density_per_m", .least = 0.0, .most = F::kMaxDensityPerM, .out = &environment.fog_density_per_m},
+        {.key = "height_density_per_m",
          .least = 0.0,
          .most = F::kMaxDensityPerM,
          .out = &environment.fog_height_density_per_m},
-        {.key = "height_falloff",
+        {.key = "height_falloff_per_m",
          .least = F::kMinFalloffPerM,
          .most = F::kMaxFalloffPerM,
          .out = &environment.fog_height_falloff_per_m},
@@ -140,13 +127,22 @@ void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
         {.key = "sun_start_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_sun_start_m},
         {.key = "end_m", .least = 0.0, .most = F::kMaxDistanceM, .out = &environment.fog_end_m},
     };
-    for (const Number& number : numbers) {
+    // The known keys: the numbers', and the colours'.
+    constexpr size_t kNumberCount = std::size(numbers);
+    const char* keys[kNumberCount + 4] = {"extinction_tint", "sun_forward", "sun_back", "ambient"};
+    for (size_t i = 0; i < kNumberCount; ++i) {
+        keys[4 + i] = numbers[i].key;
+    }
+    reader.check_keys(keys, "fog");
+    for (Number& number : numbers) {
         double value = 0.0;
-        if (required(reader, number.key, number.least, number.most, value)) {
+        number.read = required(reader, number.key, number.least, number.most, value);
+        if (number.read) {
             *number.out = static_cast<float>(value);
         }
     }
-    if (environment.fog_end_m <= environment.fog_start_m) {
+    // Compared only when both were read: a typo in one is its own error.
+    if (numbers[6].read && numbers[8].read && environment.fog_end_m <= environment.fog_start_m) {
         parent.diagnostics->error(parent.path, "fog's end_m should be past its start_m");
     }
     double tint[3] = {};
