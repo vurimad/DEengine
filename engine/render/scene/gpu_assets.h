@@ -107,11 +107,10 @@ public:
     // Null unless the mesh is uploaded (or for a stale handle).
     const GpuMesh* mesh(asset::AssetHandle mesh) const;
     uint64_t material_table_address() const;
-    // Whether a material table entry draws without back-face culling (as last written: a reloaded
-    // material changes it).
-    bool double_sided(uint32_t material) const;
-    // Whether it alpha-tests (its shadow casters need the material; opaque ones don't).
-    bool masked(uint32_t material) const;
+    // A material table entry's flags (as last written: a reloaded material changes them), which pick
+    // how it draws: alpha-tested (Masked) and without back-face culling (DoubleSided). None for an
+    // index past the table.
+    GpuMaterialFlags material_flags(uint32_t material) const;
 
     GpuAssetsStats stats() const;
 

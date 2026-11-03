@@ -81,7 +81,20 @@ struct Buffer {
 struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    VkCullModeFlags cull = VK_CULL_MODE_NONE; // graphics: dynamic state, set as the pipeline binds
 };
+
+inline VkCullModeFlags to_vk(CullMode cull) {
+    switch (cull) {
+    case CullMode::None:
+        return VK_CULL_MODE_NONE;
+    case CullMode::Front:
+        return VK_CULL_MODE_FRONT_BIT;
+    case CullMode::Back:
+        return VK_CULL_MODE_BACK_BIT;
+    }
+    return VK_CULL_MODE_NONE;
+}
 
 // GPU objects waiting for the frames that may use them to finish.
 // The driver's view of GPU-local memory (VMA budgets): totals, and the fullest heap.

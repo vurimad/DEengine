@@ -113,21 +113,69 @@ void copy3(const float (&from)[3], float (&to)[4]) {
     to[2] = from[2];
 }
 
+// A mesh part to draw this frame, and its kind: [masked][double-sided] as two bits.
+struct PartDraw {
+    uint64_t vertices = 0;
+    rhi::BufferHandle indices;
+    uint32_t instance = 0;
+    uint32_t material = 0;
+    uint32_t first_index = 0;
+    uint32_t index_count = 0;
+};
+
+constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, masked, masked double-sided
+
+constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
+    return (core::has_any(flags, GpuMaterialFlags::Masked) ? 2U : 0U) |
+           (core::has_any(flags, GpuMaterialFlags::DoubleSided) ? 1U : 0U);
+}
+constexpr bool is_masked(uint32_t kind) {
+    return (kind & 2U) != 0;
+}
+constexpr bool is_double_sided(uint32_t kind) {
+    return (kind & 1U) != 0;
+}
+
+// Draws parts with the bound pipeline, binding index buffers as they change. Returns the draws.
+template <typename Push>
+uint32_t draw_parts(rhi::CommandList& list, std::span<const PartDraw> parts, Push push) {
+    rhi::BufferHandle bound;
+    for (const PartDraw& part : parts) {
+        if (!(part.indices == bound)) {
+            list.bind_index_buffer(part.indices, 0, rhi::IndexType::Uint32);
+            bound = part.indices;
+        }
+        push.instance = part.instance;
+        push.vertices = part.vertices;
+        push.material = part.material;
+        list.push_constants(push);
+        list.draw_indexed(part.index_count, 1, part.first_index);
+    }
+    return static_cast<uint32_t>(parts.size());
+}
+
 } // namespace
 
 struct SceneRendererState {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
-    shader::ProgramHandle gbuffer_cull_back;
-    shader::ProgramHandle gbuffer_cull_none; // double-sided materials
+    // Opaque materials draw with a shader that has no discard (early depth testing holds), masked
+    // ones with the alpha test; double-sided ones turn culling off (dynamic state).
+    shader::ProgramHandle gbuffer_opaque;
+    shader::ProgramHandle gbuffer_masked;
     shader::ProgramHandle deferred_light;
     shader::ProgramHandle tonemap;
-    shader::ProgramHandle shadow_caster;        // masked: alpha-tested
     shader::ProgramHandle shadow_caster_opaque; // depth only
-    core::Array<const GpuMesh*> shadow_meshes{
-        core::heap_allocator(core::MemoryTag::Render)}; // per instance, this frame
+    shader::ProgramHandle shadow_caster_masked; // alpha-tested
     shader::ProgramHandle shadow_mask;
+    // This frame's mesh parts by kind, for the shadow and G-buffer passes: opaque first, so masked
+    // pixels behind them fail early depth; each kind one pipeline state. Capacity kept between frames.
+    core::Array<PartDraw> draws[kDrawKindCount] = {
+        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
+        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
+        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
+        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render))};
     SceneShadows shadows;                               // this frame's, within limits
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
@@ -135,8 +183,8 @@ struct SceneRendererState {
     SceneRendererStats stats;
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap,
-                                                    shadow_caster, shadow_caster_opaque, shadow_mask}) {
+        for (const shader::ProgramHandle program : {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap,
+                                                    shadow_caster_opaque, shadow_caster_masked, shadow_mask}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -144,9 +192,10 @@ struct SceneRendererState {
         }
     }
 
-    shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state) const {
+    shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state,
+                               const char* fragment_entry = "fragment_main") const {
         const core::Result<shader::ProgramHandle> program =
-            shaders->create_graphics({.module = module, .state = state});
+            shaders->create_graphics({.module = module, .fragment_entry = fragment_entry, .state = state});
         return program ? *program : shader::ProgramHandle{};
     }
 
@@ -162,10 +211,9 @@ struct SceneRendererState {
             gbuffer.color_formats[i] = kGBufferFormats[i];
         }
         gbuffer.color_formats[3] = kHdrFormat;
-        gbuffer_cull_back = make("scene.gbuffer", gbuffer);
-        gbuffer.cull = rhi::CullMode::None;
-        gbuffer.debug_name = "gbuffer (double-sided)";
-        gbuffer_cull_none = make("scene.gbuffer", gbuffer);
+        gbuffer_opaque = make("scene.gbuffer", gbuffer, "fragment_opaque");
+        gbuffer.debug_name = "gbuffer (masked)";
+        gbuffer_masked = make("scene.gbuffer", gbuffer, "fragment_masked");
 
         rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
         light.color_formats[0] = kHdrFormat;
@@ -179,13 +227,33 @@ struct SceneRendererState {
                                                .depth_compare = rhi::CompareOp::Greater,
                                                .cull = rhi::CullMode::None,
                                                .debug_name = "shadow caster"};
-        shadow_caster = make("scene.shadow_caster", caster);
-        const core::Result<shader::ProgramHandle> opaque = shaders->create_graphics(
-            {.module = "scene.shadow_caster", .fragment_entry = "fragment_opaque", .state = caster});
-        shadow_caster_opaque = opaque ? *opaque : shader::ProgramHandle{};
+        shadow_caster_opaque = make("scene.shadow_caster", caster, "fragment_opaque");
+        shadow_caster_masked = make("scene.shadow_caster", caster, "fragment_masked");
         rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
         mask.color_formats[0] = kShadowMaskFormat;
         shadow_mask = make("scene.shadow_mask", mask);
+    }
+
+    // The frame's parts whose meshes are on the GPU, by kind; one material lookup each.
+    void sort_draws(const world::RenderFrame& frame) {
+        for (core::Array<PartDraw>& list : draws) {
+            list.clear();
+        }
+        for (size_t i = 0; i < frame.instances.size(); ++i) {
+            const GpuMesh* mesh = gpu_assets->mesh(frame.instances[i].mesh);
+            if (mesh == nullptr) {
+                continue;
+            }
+            ++stats.drawn;
+            for (const GpuMeshPart& part : mesh->parts) {
+                draws[draw_kind(gpu_assets->material_flags(part.material))].push({.vertices = mesh->vertex_address,
+                                                                                  .indices = mesh->indices,
+                                                                                  .instance = static_cast<uint32_t>(i),
+                                                                                  .material = part.material,
+                                                                                  .first_index = part.first_index,
+                                                                                  .index_count = part.index_count});
+            }
+        }
     }
 
     // The tonemap writes the caller's target: made again when its format changes.
@@ -476,12 +544,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         std::clamp(state.shadows.max_penumbra_texels, Limits::kMinPenumbraTexels, Limits::kMaxPenumbraTexels);
     state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
-    const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);
-    const rhi::PipelineHandle gbuffer_none = state.shaders->pipeline(state.gbuffer_cull_none);
+    const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
+    const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
     const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
-    const rhi::PipelineHandle caster = state.shaders->pipeline(state.shadow_caster);
     const rhi::PipelineHandle caster_opaque = state.shaders->pipeline(state.shadow_caster_opaque);
+    const rhi::PipelineHandle caster_masked = state.shaders->pipeline(state.shadow_caster_masked);
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
@@ -489,8 +557,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const float aspect =
         static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
-    const bool ready = written && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster.is_valid() && caster_opaque.is_valid() && mask.is_valid();
+    const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
+                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -504,14 +572,14 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
+    state.sort_draws(frame);
 
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
     struct ShadowPass {
         SceneRendererState* state = nullptr;
-        const world::RenderFrame* frame = nullptr;
         GraphTexture atlas;
-        rhi::PipelineHandle caster;
-        rhi::PipelineHandle caster_opaque;
+        rhi::PipelineHandle opaque;
+        rhi::PipelineHandle masked;
         uint64_t frame_address = 0;
         uint32_t cascade_size = 0;
     };
@@ -519,10 +587,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         "sun shadows",
         [&](PassBuilder& pass, ShadowPass& data) {
             data = {.state = &state,
-                    .frame = &frame,
                     .atlas = {},
-                    .caster = caster,
-                    .caster_opaque = caster_opaque,
+                    .opaque = caster_opaque,
+                    .masked = caster_masked,
                     .frame_address = frame_address,
                     .cascade_size = cascade_size};
             data.atlas = pass.create_texture(
@@ -532,16 +599,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [](const ShadowPass& data, PassContext& context) {
             DE_PROFILE_ZONE("shadow pass");
             SceneRendererState& renderer = *data.state;
-            const world::RenderFrame& extracted = *data.frame;
             ShadowCasterPush push{.frame = data.frame_address,
                                   .instances = data.frame_address + kInstancesOffset,
                                   .materials = renderer.gpu_assets->material_table_address(),
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
-            // The meshes once, for every cascade.
-            renderer.shadow_meshes.clear();
-            for (const world::RenderInstance& instance : extracted.instances) {
-                renderer.shadow_meshes.push(renderer.gpu_assets->mesh(instance.mesh));
-            }
             for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
                 const rhi::DepthAttachment depth{.texture = context.texture(data.atlas)};
                 const rhi::Rect tile{.x = static_cast<int32_t>((cascade & 1U) * data.cascade_size),
@@ -550,26 +611,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
                 push.cascade = cascade;
-                rhi::PipelineHandle bound;
-                for (size_t i = 0; i < renderer.shadow_meshes.size(); ++i) {
-                    const GpuMesh* mesh = renderer.shadow_meshes[i];
-                    if (mesh == nullptr) {
-                        continue;
-                    }
-                    push.instance = static_cast<uint32_t>(i);
-                    push.vertices = mesh->vertex_address;
-                    context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
-                    for (const GpuMeshPart& part : mesh->parts) {
-                        const rhi::PipelineHandle pipeline =
-                            renderer.gpu_assets->masked(part.material) ? data.caster : data.caster_opaque;
-                        if (!(pipeline == bound)) {
-                            context.list.bind_pipeline(pipeline);
-                            bound = pipeline;
-                        }
-                        push.material = part.material;
-                        context.list.push_constants(push);
-                        context.list.draw_indexed(part.index_count, 1, part.first_index);
-                        ++renderer.stats.shadow_draws;
+                // Casters cull nothing (thin geometry casts from both sides): the kinds differ only
+                // by the alpha test.
+                for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+                    if (!renderer.draws[kind].empty()) {
+                        context.list.bind_pipeline(is_masked(kind) ? data.masked : data.opaque);
+                        renderer.stats.shadow_draws += draw_parts(context.list, renderer.draws[kind].span(), push);
                     }
                 }
                 context.list.end_rendering();
@@ -584,20 +631,18 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     };
     struct GBufferPass {
         SceneRendererState* state = nullptr;
-        const world::RenderFrame* frame = nullptr;
         Targets targets;
-        rhi::PipelineHandle cull_back;
-        rhi::PipelineHandle cull_none;
+        rhi::PipelineHandle opaque;
+        rhi::PipelineHandle masked;
         uint64_t frame_address = 0;
     };
     const auto& gbuffer = graph.add_pass<GBufferPass>(
         "gbuffer",
         [&](PassBuilder& pass, GBufferPass& data) {
             data = {.state = &state,
-                    .frame = &frame,
                     .targets = {},
-                    .cull_back = gbuffer_back,
-                    .cull_none = gbuffer_none,
+                    .opaque = gbuffer_opaque,
+                    .masked = gbuffer_masked,
                     .frame_address = frame_address};
             for (uint32_t i = 0; i < 3; ++i) {
                 data.targets.gb[i] =
@@ -612,7 +657,6 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
             SceneRendererState& renderer = *data.state;
-            const world::RenderFrame& extracted = *data.frame;
             rhi::ColorAttachment colors[4];
             for (uint32_t i = 0; i < 3; ++i) {
                 colors[i] = {.texture = context.texture(data.targets.gb[i])};
@@ -620,32 +664,19 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             colors[3] = {.texture = context.texture(data.targets.hdr)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
-            GBufferPush push{.frame = data.frame_address,
-                             .instances = data.frame_address + kInstancesOffset,
-                             .materials = renderer.gpu_assets->material_table_address(),
-                             .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
-            rhi::PipelineHandle bound;
-            for (size_t i = 0; i < extracted.instances.size(); ++i) {
-                const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
-                if (mesh == nullptr) {
+            const GBufferPush push{.frame = data.frame_address,
+                                   .instances = data.frame_address + kInstancesOffset,
+                                   .materials = renderer.gpu_assets->material_table_address(),
+                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
+            for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+                if (renderer.draws[kind].empty()) {
                     continue;
                 }
-                ++renderer.stats.drawn;
-                push.instance = static_cast<uint32_t>(i);
-                push.vertices = mesh->vertex_address;
-                context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
-                for (const GpuMeshPart& part : mesh->parts) {
-                    const rhi::PipelineHandle pipeline =
-                        renderer.gpu_assets->double_sided(part.material) ? data.cull_none : data.cull_back;
-                    if (!(pipeline == bound)) {
-                        context.list.bind_pipeline(pipeline);
-                        bound = pipeline;
-                    }
-                    push.material = part.material;
-                    context.list.push_constants(push);
-                    context.list.draw_indexed(part.index_count, 1, part.first_index);
-                    ++renderer.stats.draws;
+                context.list.bind_pipeline(is_masked(kind) ? data.masked : data.opaque); // culls back faces
+                if (is_double_sided(kind)) {
+                    context.list.set_cull_mode(rhi::CullMode::None);
                 }
+                renderer.stats.draws += draw_parts(context.list, renderer.draws[kind].span(), push);
             }
             context.list.end_rendering();
         });

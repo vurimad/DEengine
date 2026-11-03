@@ -34,7 +34,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
                                 dot(push.instances[push.instance * 3 + 1], local),
                                 dot(push.instances[push.instance * 3 + 2], local));
     VertexOutput output;
-    output.position = cascade_clip(*push.frame, push.cascade, world);
+    output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;
     return output;
 }
@@ -45,18 +45,14 @@ void fragment_opaque(VertexOutput input)
 {
 }
 
-// Masked casters: the alpha test.
+// Masked casters (the renderer picks this one by their flag): the alpha test.
 [shader("fragment")]
-void fragment_main(VertexOutput input)
+void fragment_masked(VertexOutput input)
 {
     const GpuMaterial material = push.materials[push.material];
-    if ((material.flags & kMaterialMasked) != 0)
+    const float alpha = sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
+    if (alpha < material.alpha_cutoff)
     {
-        const float alpha =
-            sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
-        if (alpha < material.alpha_cutoff)
-        {
-            discard;
-        }
+        discard;
     }
 }

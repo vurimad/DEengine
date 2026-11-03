@@ -32,8 +32,8 @@ constexpr AssetId kQuad = AssetId::from_value(0x51);
 constexpr AssetId kRed = AssetId::from_value(0x52);
 constexpr uint32_t kSize = 64;
 
-// A 2 x 2 m square in the XY plane, facing +Z, with one red material.
-void put_assets(const de::platform::Vfs& vfs) {
+// A 2 x 2 m square in the XY plane, facing +Z, drawn with one material.
+void put_quad(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
     de::cooker::ModelData model;
     de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
     primitive.material = 0;
@@ -52,10 +52,15 @@ void put_assets(const de::platform::Vfs& vfs) {
     }
     static_cast<void>(model.materials.emplace());
     de::cooker::Diagnostics diagnostics;
-    const AssetId materials[] = {kRed};
-    const auto mesh = de::cooker::cook_mesh(model, materials, {.lod_count = 1}, kQuad, "test", diagnostics);
+    const AssetId materials[] = {material};
+    const auto mesh = de::cooker::cook_mesh(model, materials, {.lod_count = 1}, mesh_id, "test", diagnostics);
     REQUIRE(mesh.ok());
-    REQUIRE(vfs.write_file(de::asset::cooked_path(kQuad, AssetType::Mesh).c_str(), mesh->span()).ok());
+    REQUIRE(vfs.write_file(de::asset::cooked_path(mesh_id, AssetType::Mesh).c_str(), mesh->span()).ok());
+}
+
+// The square with one red material.
+void put_assets(const de::platform::Vfs& vfs) {
+    put_quad(vfs, kQuad, kRed);
     de::cooker::MaterialBuild red;
     red.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, 1.0f);
     const auto cooked = de::cooker::cook_material(red, kRed);
@@ -581,4 +586,116 @@ TEST_CASE("an environment becomes the renderer's lighting") {
     CHECK(lighting.shadows.resolution == 1024);
     CHECK(lighting.shadows.distance_m == 90.0f);
     CHECK(lighting.shadows.max_penumbra_texels == 3.0f);
+}
+
+TEST_CASE("masked materials are cut out, double-sided ones seen from behind, each by its own pipeline") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    // A red square per material variant: its alpha mode, flags and base color alpha.
+    using de::asset::AlphaMode;
+    using de::asset::MaterialFlags;
+    struct Variant {
+        AlphaMode mode;
+        MaterialFlags flags;
+        float alpha;
+    };
+    const Variant variants[] = {
+        {.mode = AlphaMode::Opaque, .flags = MaterialFlags::None, .alpha = 0.2f},
+        {.mode = AlphaMode::Masked, .flags = MaterialFlags::None, .alpha = 0.2f},
+        {.mode = AlphaMode::Masked, .flags = MaterialFlags::None, .alpha = 0.8f},
+        {.mode = AlphaMode::Opaque, .flags = MaterialFlags::DoubleSided, .alpha = 1.0f},
+        {.mode = AlphaMode::Masked, .flags = MaterialFlags::DoubleSided, .alpha = 0.2f},
+        {.mode = AlphaMode::Masked, .flags = MaterialFlags::DoubleSided, .alpha = 0.8f},
+    };
+    constexpr uint32_t kVariants = 6;
+    for (uint32_t v = 0; v < kVariants; ++v) {
+        const AssetId material_id = AssetId::from_value(0x300 + v);
+        put_quad(*vfs, AssetId::from_value(0x400 + v), material_id);
+        de::cooker::MaterialBuild build;
+        build.alpha_mode = variants[v].mode;
+        build.flags = variants[v].flags;
+        build.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, variants[v].alpha);
+        const auto material = de::cooker::cook_material(build, material_id);
+        REQUIRE(
+            vfs->write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span()).ok());
+    }
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        REQUIRE(renderer.ok());
+        de::asset::AssetHandle meshes[kVariants];
+        for (uint32_t v = 0; v < kVariants; ++v) {
+            meshes[v] = assets->load<de::asset::MeshAsset>(AssetId::from_value(0x400 + v));
+        }
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+        // Whether variant v's square shows in the middle of the view: from 3 m in front of it, or
+        // behind it turned around (180 degrees about Y).
+        const auto draws = [&](uint32_t v, bool behind) {
+            REQUIRE(gpu_assets->mesh(meshes[v]) != nullptr);
+            de::world::RenderFrame frame;
+            frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+            if (behind) {
+                frame.camera.transform[0] = -1.0f;
+                frame.camera.transform[10] = -1.0f;
+                frame.camera.transform[11] = -3.0f;
+            }
+            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = meshes[v]});
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {},
+                                 de::render::SceneView::BaseColor);
+            graph->execute();
+            device->end_frame();
+            return texel(de::test::read_texture(*device, *target), kSize / 2, kSize / 2)[0] > 200;
+        };
+        CHECK(draws(0, false));       // opaque: alpha doesn't matter (and no alpha test runs)
+        CHECK_FALSE(draws(1, false)); // masked, below the cutoff
+        CHECK(draws(2, false));       // masked, above it
+        CHECK_FALSE(draws(0, true));  // back face culled
+        CHECK(draws(3, true));        // double-sided
+        CHECK_FALSE(draws(4, true));  // double-sided and masked, below the cutoff
+        CHECK(draws(5, true));
+        for (const de::asset::AssetHandle mesh : meshes) {
+            assets->release(mesh);
+        }
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
 }

@@ -6,7 +6,8 @@
 //     sun by a fraction of one (no acne on flat ground).
 //   - Contact-hardening filter: a blocker search finds how far the occluder is, which sets the
 //     filter's width (sharp at the contact, softer away from it), then 16 Poisson taps rotated per
-//     pixel by interleaved gradient noise.
+//     pixel by interleaved gradient noise (another value than the cascade dither's, so the two
+//     patterns don't line up).
 // Output: r = sunlight seen (0..1); g = the cascade used, for the debug view: 0 nothing (sky),
 // (cascade + 1) / 5 for a cascade, 1 beyond the shadow distance.
 
@@ -55,7 +56,7 @@ float gradient_noise(float2 pixel)
 }
 
 // A cascade's uv in the atlas, kept inside its tile (a texel of border) so filters don't bleed.
-float2 atlas_uv(SceneFrame frame, uint cascade, float2 tile_uv)
+float2 atlas_uv(SceneFrame* frame, uint cascade, float2 tile_uv)
 {
     const float border = frame.shadow_params.y * 2.0;
     return cascade_tile(cascade) + clamp(tile_uv, border, 1.0 - border) * 0.5;
@@ -64,7 +65,7 @@ float2 atlas_uv(SceneFrame frame, uint cascade, float2 tile_uv)
 [shader("fragment")]
 float2 fragment_main(VertexOutput input) : SV_Target
 {
-    const SceneFrame frame = *push.frame;
+    SceneFrame* frame = push.frame;
     const int2 texel = int2(input.position.xy);
     const float depth = load_texture(push.depth, texel).r;
     if (depth <= 0.0)
@@ -110,7 +111,9 @@ float2 fragment_main(VertexOutput input) : SV_Target
 
     // Blocker search: the mean depth of what's nearer the sun, around the receiver: the receiver's
     // own texel, and 16 taps across the widest penumbra.
-    const float angle = noise * 6.2831853;
+    // IGN of the transposed pixel: its gradient runs another way, so the value isn't the dither's
+    // shifted by a constant (an offset pixel would be: IGN is linear inside its fracs).
+    const float angle = gradient_noise(input.position.yx) * 6.2831853;
     const float2x2 rotation = float2x2(cos(angle), -sin(angle), sin(angle), cos(angle));
     const float search = frame.shadow_params.w * atlas_texel;
     float blockers = 0.0;

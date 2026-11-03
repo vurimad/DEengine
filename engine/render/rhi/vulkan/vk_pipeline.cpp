@@ -36,18 +36,6 @@ VkPrimitiveTopology to_vk(Topology topology) {
     return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 
-VkCullModeFlags to_vk(CullMode cull) {
-    switch (cull) {
-    case CullMode::None:
-        return VK_CULL_MODE_NONE;
-    case CullMode::Front:
-        return VK_CULL_MODE_FRONT_BIT;
-    case CullMode::Back:
-        return VK_CULL_MODE_BACK_BIT;
-    }
-    return VK_CULL_MODE_NONE;
-}
-
 VkCompareOp to_vk(CompareOp op) {
     switch (op) {
     case CompareOp::Never:
@@ -213,10 +201,13 @@ core::Result<PipelineHandle> Device::create_graphics_pipeline(const GraphicsPipe
         .attachmentCount = desc.color_count,
         .pAttachments = blends,
     };
-    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    // Cull mode is dynamic (core in Vulkan 1.3): bind_pipeline sets the pipeline's own, and
+    // set_cull_mode overrides it, so one shader serves culled and double-sided draws.
+    const VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
+                                             VK_DYNAMIC_STATE_CULL_MODE};
     const VkPipelineDynamicStateCreateInfo dynamic{
         .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-        .dynamicStateCount = 2,
+        .dynamicStateCount = 3,
         .pDynamicStates = dynamic_states,
     };
     const VkGraphicsPipelineCreateInfo info{
@@ -234,7 +225,7 @@ core::Result<PipelineHandle> Device::create_graphics_pipeline(const GraphicsPipe
         .pDynamicState = &dynamic,
         .layout = impl.pipeline_layout,
     };
-    Pipeline pipeline{.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS};
+    Pipeline pipeline{.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS, .cull = to_vk(desc.cull)};
     const VkResult result =
         vkCreateGraphicsPipelines(impl.device, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline.pipeline);
     if (result != VK_SUCCESS) {
