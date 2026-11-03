@@ -812,6 +812,19 @@ bool Uploader::ready(TextureHandle texture) const {
     return mips != nullptr && mips->initialized;
 }
 
+bool Uploader::ready(BufferHandle buffer) const {
+    const UploaderState& state = *state_;
+    if (state.device->buffer_desc(buffer) == nullptr) {
+        return false;
+    }
+    for (size_t i = state.queue_head; i < state.queue.size(); ++i) {
+        if (!state.queue[i].texture && state.queue[i].buffer_handle == buffer) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool Uploader::idle() const {
     return state_->queue_head == state_->queue.size();
 }

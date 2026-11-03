@@ -6,8 +6,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 
 | Path | What |
 | --- | --- |
-| `triangle.slang` | The sandbox triangle (M0a) |
-| `textured_quad.slang` | The sandbox's textured quad: a bindless texture (M0a) |
+| `scene/basic_lit.slang` | The scene's placeholder pass (renderer step 1): mesh instances lit by a sun and an ambient |
 | `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color` |
 | `tests/` | Shaders the unit tests run: a solid triangle, buffers through pointers, textures by bindless index |
 

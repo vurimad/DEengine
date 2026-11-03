@@ -137,6 +137,9 @@ public:
 
     static constexpr size_t kMaxListeners = 8;
     core::Result<void> add_listener(AssetListener listener, void* context);
+    // Stops telling a listener (added with the same function and context); nothing if it isn't
+    // one. For listeners that go before the registry. Not from inside a listener.
+    void remove_listener(AssetListener listener, void* context);
 
     AssetRegistryStats stats() const;
 

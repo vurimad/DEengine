@@ -93,27 +93,27 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     Vfs vfs = make_repo_vfs(sandbox);
     ShaderCompiler compiler = make_compiler(vfs);
 
-    // Both stages of the triangle in one compile.
+    // Both stages of the scene's placeholder pass in one compile.
     const ShaderEntry stages[] = {{.name = "vertex_main", .stage = ShaderStage::Vertex},
                                   {.name = "fragment_main", .stage = ShaderStage::Fragment}};
     CompileReport report;
-    auto triangle = compiler.compile({.module = "triangle", .entries = stages}, &report);
-    REQUIRE(triangle.ok());
-    REQUIRE(triangle->stages.size() == 2);
-    const CompiledStage& vertex = triangle->stages[0];
+    auto basic_lit = compiler.compile({.module = "scene.basic_lit", .entries = stages}, &report);
+    REQUIRE(basic_lit.ok());
+    REQUIRE(basic_lit->stages.size() == 2);
+    const CompiledStage& vertex = basic_lit->stages[0];
     REQUIRE(vertex.code.size() > 5);
     CHECK(vertex.code[0] == kSpirvMagic);
     CHECK(vertex.reflection.stage == ShaderStage::Vertex);
-    CHECK(vertex.reflection.push_constant_bytes == 8);
-    REQUIRE(field(vertex.reflection, "time_s") != nullptr);
-    CHECK(field(vertex.reflection, "time_s")->offset == 0);
-    REQUIRE(field(vertex.reflection, "aspect") != nullptr);
-    CHECK(field(vertex.reflection, "aspect")->offset == 4);
-    CHECK(vertex.reflection.bindings.empty());
-    CHECK(triangle->stages[1].code[0] == kSpirvMagic);
-    CHECK(triangle->stages[1].reflection.stage == ShaderStage::Fragment);
-    CHECK(has_dependency(report, "src:/shaders/triangle.slang"));
-    CHECK(has_dependency(report, "src:/shaders/common/color.slang"));
+    CHECK(vertex.reflection.push_constant_bytes >= 44);
+    REQUIRE(field(vertex.reflection, "frame") != nullptr);
+    CHECK(field(vertex.reflection, "frame")->offset == 0);
+    CHECK(field(vertex.reflection, "frame")->size == 8); // a pointer
+    REQUIRE(field(vertex.reflection, "instance") != nullptr);
+    CHECK(field(vertex.reflection, "instance")->offset == 32);
+    CHECK(basic_lit->stages[1].code[0] == kSpirvMagic);
+    CHECK(basic_lit->stages[1].reflection.stage == ShaderStage::Fragment);
+    CHECK(has_dependency(report, "src:/shaders/scene/basic_lit.slang"));
+    CHECK(has_dependency(report, "src:/shaders/common/bindless.slang"));
 
     const ShaderEntry compute_entry[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
     auto compute = compiler.compile({.module = "tests.fill_buffer", .entries = compute_entry});

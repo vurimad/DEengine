@@ -694,6 +694,19 @@ core::Result<void> AssetRegistry::add_listener(AssetListener listener, void* con
     return {};
 }
 
+void AssetRegistry::remove_listener(AssetListener listener, void* context) {
+    RegistryState& state = *state_;
+    for (uint32_t l = 0; l < state.listener_count; ++l) {
+        if (state.listeners[l].function == listener && state.listeners[l].context == context) {
+            for (uint32_t next = l + 1; next < state.listener_count; ++next) {
+                state.listeners[next - 1] = state.listeners[next];
+            }
+            --state.listener_count;
+            return;
+        }
+    }
+}
+
 AssetRegistryStats AssetRegistry::stats() const {
     const RegistryState& state = *state_;
     return {
