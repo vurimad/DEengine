@@ -21,16 +21,21 @@ core::Allocator& render_heap() {
     return core::heap_allocator(core::MemoryTag::Render);
 }
 
-// Matches SceneFrame in shaders/scene/basic_lit.slang.
+// Matches SceneFrame in shaders/scene/scene_common.slang.
 struct SceneFrame {
     float view_proj[16] = {};
+    float inv_view_proj[16] = {};
+    float camera_position[4] = {};
     float sun_direction[4] = {};
     float sun_color[4] = {};
-    float ambient_color[4] = {};
+    float sky_color[4] = {};
+    float ground_color[4] = {};
+    float shadow_color[4] = {};
 };
+static_assert(sizeof(SceneFrame) <= 256);
 
-// Matches BasicLitPush in shaders/scene/basic_lit.slang.
-struct BasicLitPush {
+// Matches GBufferPush in shaders/scene/gbuffer.slang.
+struct GBufferPush {
     uint64_t frame = 0;
     uint64_t instances = 0;
     uint64_t vertices = 0;
@@ -40,8 +45,38 @@ struct BasicLitPush {
     uint32_t sampler = 0;
 };
 
+// Matches DeferredLightPush in shaders/scene/deferred_light.slang.
+struct DeferredLightPush {
+    uint64_t frame = 0;
+    uint32_t gb0 = 0;
+    uint32_t gb1 = 0;
+    uint32_t gb2 = 0;
+    uint32_t depth = 0;
+};
+
+// Matches TonemapPush in shaders/scene/tonemap.slang.
+struct TonemapPush {
+    uint32_t hdr = 0;
+    uint32_t gb0 = 0;
+    uint32_t gb1 = 0;
+    uint32_t gb2 = 0;
+    float exposure = 1.0f;
+    uint32_t view = 0;
+};
+
 constexpr uint64_t kInstancesOffset = 256; // after the SceneFrame
 constexpr uint64_t kInstanceBytes = 48;    // three float4 rows
+
+// The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
+constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
+constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16Float;
+constexpr rhi::Format kDepthFormat = rhi::Format::D32Float;
+
+void copy3(const float (&from)[3], float (&to)[4]) {
+    to[0] = from[0];
+    to[1] = from[1];
+    to[2] = from[2];
+}
 
 } // namespace
 
@@ -49,41 +84,61 @@ struct SceneRendererState {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
-    shader::ProgramHandle cull_back;
-    shader::ProgramHandle cull_none; // double-sided materials
-    rhi::Format programs_format = rhi::Format::Unknown;
+    shader::ProgramHandle gbuffer_cull_back;
+    shader::ProgramHandle gbuffer_cull_none; // double-sided materials
+    shader::ProgramHandle deferred_light;
+    shader::ProgramHandle tonemap;
+    rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
     SceneRendererStats stats;
 
     ~SceneRendererState() {
-        shaders->destroy(cull_back);
-        shaders->destroy(cull_none);
+        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap}) {
+            shaders->destroy(program);
+        }
         for (const rhi::BufferHandle buffer : frame_buffers) {
             device->destroy(buffer);
         }
     }
 
-    void make_programs(rhi::Format format) {
-        if (format == programs_format) {
+    shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state) const {
+        const core::Result<shader::ProgramHandle> program =
+            shaders->create_graphics({.module = module, .state = state});
+        return program ? *program : shader::ProgramHandle{};
+    }
+
+    void make_programs(rhi::Format target_format) {
+        if (target_format == programs_format) {
             return;
         }
-        shaders->destroy(cull_back);
-        shaders->destroy(cull_none);
-        rhi::GraphicsPipelineDesc state{.color_count = 1,
-                                        .depth_format = rhi::Format::D32Float,
-                                        .depth_test = true,
-                                        .depth_write = true,
-                                        .depth_compare = rhi::CompareOp::Greater,
-                                        .debug_name = "basic lit"};
-        state.color_formats[0] = format;
-        const auto back = shaders->create_graphics({.module = "scene.basic_lit", .state = state});
-        state.cull = rhi::CullMode::None;
-        state.debug_name = "basic lit (double-sided)";
-        const auto none = shaders->create_graphics({.module = "scene.basic_lit", .state = state});
-        cull_back = back ? *back : shader::ProgramHandle{};
-        cull_none = none ? *none : shader::ProgramHandle{};
-        programs_format = format;
+        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap}) {
+            shaders->destroy(program);
+        }
+        rhi::GraphicsPipelineDesc gbuffer{.color_count = 4,
+                                          .depth_format = kDepthFormat,
+                                          .depth_test = true,
+                                          .depth_write = true,
+                                          .depth_compare = rhi::CompareOp::Greater,
+                                          .debug_name = "gbuffer"};
+        for (uint32_t i = 0; i < 3; ++i) {
+            gbuffer.color_formats[i] = kGBufferFormats[i];
+        }
+        gbuffer.color_formats[3] = kHdrFormat;
+        gbuffer_cull_back = make("scene.gbuffer", gbuffer);
+        gbuffer.cull = rhi::CullMode::None;
+        gbuffer.debug_name = "gbuffer (double-sided)";
+        gbuffer_cull_none = make("scene.gbuffer", gbuffer);
+
+        rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
+        light.color_formats[0] = kHdrFormat;
+        light.blend[0] = rhi::BlendMode::Additive;
+        deferred_light = make("scene.deferred_light", light);
+
+        rhi::GraphicsPipelineDesc post{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "tonemap"};
+        post.color_formats[0] = target_format;
+        tonemap = make("scene.tonemap", post);
+        programs_format = target_format;
     }
 
     // This frame slot's buffer, big enough for count instances: written by the CPU now, read by
@@ -103,7 +158,63 @@ struct SceneRendererState {
         }
         return frame_buffers[slot];
     }
+
+    // Writes the frame's constants and instance transforms; false without a buffer.
+    bool write_frame(rhi::BufferHandle buffer, const world::RenderFrame& frame, const SceneLighting& lighting,
+                     float aspect) {
+        const std::span<std::byte> mapped = device->mapped(buffer);
+        if (mapped.empty()) {
+            return false;
+        }
+        SceneFrame scene;
+        camera_view_proj(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m, aspect,
+                         scene.view_proj);
+        if (!invert_4x4(scene.view_proj, scene.inv_view_proj)) {
+            return false;
+        }
+        scene.camera_position[0] = frame.camera.transform[3];
+        scene.camera_position[1] = frame.camera.transform[7];
+        scene.camera_position[2] = frame.camera.transform[11];
+        const float* d = lighting.sun_direction;
+        const float length = std::max(std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), 1e-6f);
+        for (int i = 0; i < 3; ++i) {
+            scene.sun_direction[i] = d[i] / length;
+        }
+        copy3(lighting.sun_color, scene.sun_color);
+        copy3(lighting.sky_color, scene.sky_color);
+        copy3(lighting.ground_color, scene.ground_color);
+        copy3(lighting.shadow_color, scene.shadow_color);
+        std::memcpy(mapped.data(), &scene, sizeof(scene));
+        for (size_t i = 0; i < frame.instances.size(); ++i) {
+            std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
+                        kInstanceBytes);
+        }
+        device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
+        return true;
+    }
 };
+
+const char* scene_view_name(SceneView view) {
+    switch (view) {
+    case SceneView::Lit:
+        return "lit";
+    case SceneView::BaseColor:
+        return "base color";
+    case SceneView::Normal:
+        return "normal";
+    case SceneView::Roughness:
+        return "roughness";
+    case SceneView::Metalness:
+        return "metalness";
+    case SceneView::Occlusion:
+        return "occlusion";
+    case SceneView::Translucency:
+        return "translucency";
+    case SceneView::Count:
+        break;
+    }
+    return "unknown";
+}
 
 void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect, float (&out)[16]) {
     // The camera's rotation (columns of its 3x4) and position; the view is its inverse: the
@@ -132,6 +243,51 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
         out[8 + c] = c == 3 ? near_m : 0.0f;
         out[12 + c] = -view[2][c];
     }
+}
+
+bool invert_4x4(const float (&m)[16], float (&out)[16]) {
+    // Gauss-Jordan with partial pivoting, in doubles.
+    double a[4][8] = {};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            a[r][c] = m[r * 4 + c];
+        }
+        a[r][4 + r] = 1.0;
+    }
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; ++r) {
+            if (std::abs(a[r][col]) > std::abs(a[pivot][col])) {
+                pivot = r;
+            }
+        }
+        if (std::abs(a[pivot][col]) < 1e-12) {
+            return false;
+        }
+        if (pivot != col) {
+            for (int c = 0; c < 8; ++c) {
+                std::swap(a[col][c], a[pivot][c]);
+            }
+        }
+        const double scale = 1.0 / a[col][col];
+        for (double& value : a[col]) {
+            value *= scale;
+        }
+        for (int r = 0; r < 4; ++r) {
+            if (r != col && a[r][col] != 0.0) {
+                const double factor = a[r][col];
+                for (int c = 0; c < 8; ++c) {
+                    a[r][c] -= factor * a[col][c];
+                }
+            }
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = static_cast<float>(a[r][4 + c]);
+        }
+    }
+    return true;
 }
 
 core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc) {
@@ -163,75 +319,84 @@ SceneRenderer& SceneRenderer::operator=(SceneRenderer&& other) noexcept {
     return *this;
 }
 
-void SceneRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Format target_format,
-                             const world::RenderFrame& frame, const SceneLighting& lighting, rhi::Color clear) {
-    DE_PROFILE_ZONE("scene pass setup");
+void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format,
+                               const world::RenderFrame& frame, const SceneLighting& lighting, SceneView view) {
+    DE_PROFILE_ZONE("scene passes setup");
     SceneRendererState& state = *state_;
     state.make_programs(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
+    const rhi::PipelineHandle gbuffer_back = state.shaders->pipeline(state.gbuffer_cull_back);
+    const rhi::PipelineHandle gbuffer_none = state.shaders->pipeline(state.gbuffer_cull_none);
+    const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
+    const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
+    const bool ready = frame.camera.valid && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
+                       tonemap.is_valid();
+    if (!ready) {
+        // Nothing to look through, or shaders missing: the target is cleared.
+        graph.add_pass(
+            "scene (cleared)", [&](PassBuilder& pass) { pass.use(target, rhi::ResourceState::RenderTarget); },
+            [target](PassContext& context) {
+                const rhi::ColorAttachment color{.texture = context.texture(target)};
+                context.list.begin_rendering({.colors = std::span(&color, 1)});
+                context.list.end_rendering();
+            });
+        return;
+    }
 
-    struct Pass {
+    struct Targets {
+        GraphTexture gb[3];
+        GraphTexture hdr;
+        GraphTexture depth;
+    };
+    struct GBufferPass {
         SceneRendererState* state = nullptr;
         const world::RenderFrame* frame = nullptr;
-        GraphTexture target;
-        GraphTexture depth;
-        rhi::Color clear;
         SceneLighting lighting;
+        Targets targets;
         rhi::PipelineHandle cull_back;
         rhi::PipelineHandle cull_none;
         rhi::BufferHandle frame_buffer;
     };
-    graph.add_pass<Pass>(
-        "scene",
-        [&](PassBuilder& pass, Pass& data) {
-            data.state = &state;
-            data.frame = &frame;
-            data.target = target;
-            data.clear = clear;
-            data.lighting = lighting;
-            data.depth = pass.create_texture({.desc = {.format = rhi::Format::D32Float}, .reference_scale = 1.0f});
-            pass.use(target, rhi::ResourceState::RenderTarget);
-            pass.use(data.depth, rhi::ResourceState::DepthWrite);
-            data.cull_back = state.shaders->pipeline(state.cull_back);
-            data.cull_none = state.shaders->pipeline(state.cull_none);
-            data.frame_buffer = frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
+    const auto& gbuffer = graph.add_pass<GBufferPass>(
+        "gbuffer",
+        [&](PassBuilder& pass, GBufferPass& data) {
+            data = {.state = &state,
+                    .frame = &frame,
+                    .lighting = lighting,
+                    .targets = {},
+                    .cull_back = gbuffer_back,
+                    .cull_none = gbuffer_none,
+                    .frame_buffer = state.frame_buffer(frame.instances.size())};
+            for (uint32_t i = 0; i < 3; ++i) {
+                data.targets.gb[i] =
+                    pass.create_texture({.desc = {.format = kGBufferFormats[i]}, .reference_scale = 1.0f});
+                pass.use(data.targets.gb[i], rhi::ResourceState::RenderTarget);
+            }
+            data.targets.hdr = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+            data.targets.depth = pass.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
+            pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
+            pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
         },
-        [](const Pass& data, PassContext& context) {
-            DE_PROFILE_ZONE("scene pass");
-            const rhi::ColorAttachment color{.texture = context.texture(data.target), .clear = data.clear};
-            const rhi::DepthAttachment depth{.texture = context.texture(data.depth)};
-            context.list.begin_rendering({.colors = std::span(&color, 1), .depth = &depth});
+        [](const GBufferPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("gbuffer pass");
             SceneRendererState& renderer = *data.state;
-            if (data.frame_buffer.is_valid() && data.cull_back.is_valid() && data.cull_none.is_valid()) {
-                const rhi::TextureDesc& size = context.desc(data.target);
-                const world::RenderFrame& extracted = *data.frame;
-                const std::span<std::byte> mapped = context.device.mapped(data.frame_buffer);
-                SceneFrame scene;
-                camera_view_proj(extracted.camera.transform, extracted.camera.vertical_fov_rad, extracted.camera.near_m,
-                                 static_cast<float>(size.width) / static_cast<float>(std::max(size.height, 1U)),
-                                 scene.view_proj);
-                const SceneLighting& light = data.lighting;
-                const float sun_length = std::sqrt(light.sun_direction[0] * light.sun_direction[0] +
-                                                   light.sun_direction[1] * light.sun_direction[1] +
-                                                   light.sun_direction[2] * light.sun_direction[2]);
-                for (int i = 0; i < 3; ++i) {
-                    scene.sun_direction[i] = light.sun_direction[i] / std::max(sun_length, 1e-6f);
-                    scene.sun_color[i] = light.sun_color[i];
-                    scene.ambient_color[i] = light.ambient_color[i];
-                }
-                std::memcpy(mapped.data(), &scene, sizeof(scene));
-                for (size_t i = 0; i < extracted.instances.size(); ++i) {
-                    std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, extracted.instances[i].transform,
-                                kInstanceBytes);
-                }
-                context.device.flush_mapped(data.frame_buffer, 0,
-                                            kInstancesOffset + extracted.instances.size() * kInstanceBytes);
-
+            const world::RenderFrame& extracted = *data.frame;
+            rhi::ColorAttachment colors[4];
+            for (uint32_t i = 0; i < 3; ++i) {
+                colors[i] = {.texture = context.texture(data.targets.gb[i])};
+            }
+            colors[3] = {.texture = context.texture(data.targets.hdr)};
+            const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
+            context.list.begin_rendering({.colors = colors, .depth = &depth});
+            const rhi::TextureDesc& size = context.desc(data.targets.hdr);
+            const float aspect = static_cast<float>(size.width) / static_cast<float>(std::max(size.height, 1U));
+            if (data.frame_buffer.is_valid() &&
+                renderer.write_frame(data.frame_buffer, extracted, data.lighting, aspect)) {
                 const uint64_t address = context.device.buffer_address(data.frame_buffer);
-                BasicLitPush push{.frame = address,
-                                  .instances = address + kInstancesOffset,
-                                  .materials = renderer.gpu_assets->material_table_address(),
-                                  .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
+                GBufferPush push{.frame = address,
+                                 .instances = address + kInstancesOffset,
+                                 .materials = renderer.gpu_assets->material_table_address(),
+                                 .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
                 rhi::PipelineHandle bound;
                 for (size_t i = 0; i < extracted.instances.size(); ++i) {
                     const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
@@ -256,6 +421,63 @@ void SceneRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                     }
                 }
             }
+            context.list.end_rendering();
+        });
+    const Targets targets = gbuffer.targets;
+    const rhi::BufferHandle frame_buffer = gbuffer.frame_buffer;
+
+    graph.add_pass(
+        "deferred light",
+        [&](PassBuilder& pass) {
+            for (const GraphTexture gb : targets.gb) {
+                pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
+        },
+        [targets, frame_buffer, light](PassContext& context) {
+            DE_PROFILE_ZONE("deferred light pass");
+            const rhi::ColorAttachment color{.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load};
+            context.list.begin_rendering({.colors = std::span(&color, 1)});
+            if (frame_buffer.is_valid()) {
+                context.list.bind_pipeline(light);
+                context.list.push_constants(DeferredLightPush{
+                    .frame = context.device.buffer_address(frame_buffer),
+                    .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
+                    .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
+                    .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
+                    .depth = context.device.texture_index(context.texture(targets.depth)),
+                });
+                context.list.draw(3);
+            }
+            context.list.end_rendering();
+        });
+
+    const float exposure = std::exp2(lighting.exposure_ev);
+    const auto view_index = static_cast<uint32_t>(view);
+    graph.add_pass(
+        "tonemap",
+        [&](PassBuilder& pass) {
+            pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            for (const GraphTexture gb : targets.gb) {
+                pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            pass.use(target, rhi::ResourceState::RenderTarget);
+        },
+        [targets, target, tonemap, exposure, view_index](PassContext& context) {
+            DE_PROFILE_ZONE("tonemap pass");
+            const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
+            context.list.begin_rendering({.colors = std::span(&color, 1)});
+            context.list.bind_pipeline(tonemap);
+            context.list.push_constants(TonemapPush{
+                .hdr = context.device.texture_index(context.texture(targets.hdr)),
+                .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
+                .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
+                .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
+                .exposure = exposure,
+                .view = view_index,
+            });
+            context.list.draw(3);
             context.list.end_rendering();
         });
 }

@@ -493,7 +493,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 1. GPU culling (instances, lights) and Hi-Z build
 2. Shadows: cascaded sun shadows with cached far cascades; local shadow atlas for torches and spells
-3. G-buffer: albedo, normal (octahedral), roughness/metal/AO, emissive, motion vectors, material ID, lighting group ID, translucency (see the look study below)
+3. G-buffer: base color + lighting group ID (RGBA8 sRGB), octahedral normal (RG16), roughness/metalness/occlusion/translucency (RGBA8), emissive straight into the HDR target, reverse-Z depth; motion vectors join with TAA (engine/render/scene/README.md)
 4. Terrain and grass write into the same G-buffer
 5. Deferred decals (blood, scorch, footprints) modify the G-buffer
 6. Async compute: SSAO/GTAO, light clustering, particle simulation
@@ -1170,3 +1170,4 @@ Decisions so far:
 | 2026-11-03 | Cells are assets and entities: members carry a non-fragmenting `(InCell, cell)` that deletes them with the cell; entities hold non-owning asset handles | One owner per thing, no mirrored lists between world, assets and renderer; streaming mechanism built in M0b, policy in M1 |
 | 2026-11-03 | `.cell` is JSON with world-space positions for roots; props are static by default (children as their parent); members respawn when hot reload swaps in a re-cooked cell | Readable and diffable by people and agents; most placed things never move; edit, cook and see it in the running game |
 | 2026-11-03 | Elden Ring may be studied in full from an owned copy, shader code included (captures and dumps, offline only); own implementations, findings in our words, nothing extracted committed | Its techniques are the reference for the look; studying the real thing beats guessing, and clean implementations keep the engine ours |
+| 2026-11-03 | G-buffer v1: three targets (base color + lighting group, RG16 octahedral normal, roughness/metalness/occlusion/translucency) and emissive into HDR, 20 bytes a pixel | Room for the look's art levers (groups, translucency) at the bandwidth of a lean layout; emissive needs no target of its own |

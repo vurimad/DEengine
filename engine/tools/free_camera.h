@@ -43,6 +43,7 @@ public:
     float speed_mps = 6.0f;          // walking pace; fast is 6 times this
     float mouse_rad_per_px = 0.003f; // look sensitivity
     float stick_rad_per_s = 2.5f;
+    static constexpr float kAxisDeadzone = 0.3f; // stick values below it are ignored (drift)
 
 private:
     DVec3 position_;

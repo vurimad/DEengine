@@ -133,6 +133,21 @@ TEST_CASE("the view-projection looks down the camera's -Z with reverse-Z depth")
     CHECK(clip(0, top, 0, 1) / clip(0, top, 0, 3) == doctest::Approx(1.0f));
     // The aspect ratio squeezes x.
     CHECK(clip(top * 2.0f, 0, 0, 0) / clip(top * 2.0f, 0, 0, 3) == doctest::Approx(1.0f));
+
+    // Its inverse takes clip space back: rows x inverse is the identity.
+    float inverse[16] = {};
+    REQUIRE(de::render::invert_4x4(rows, inverse));
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float sum = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                sum += rows[r * 4 + k] * inverse[k * 4 + c];
+            }
+            CHECK(sum == doctest::Approx(r == c ? 1.0f : 0.0f).epsilon(1e-4));
+        }
+    }
+    const float singular[16] = {1, 2, 3, 4, 2, 4, 6, 8, 0, 0, 1, 0, 0, 0, 0, 1};
+    CHECK_FALSE(de::render::invert_4x4(singular, inverse));
 }
 
 TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera looks, and leave when unloaded") {
@@ -194,30 +209,45 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         REQUIRE(target.ok());
         auto graph = de::render::RenderGraph::create(*device);
         REQUIRE(graph.ok());
-        device->begin_frame();
-        uploader->record(); // as the engine does each frame: the material's table entry lands first
-        graph->begin(kSize, kSize);
-        const de::render::GraphTexture color = graph->import_texture(
-            {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-        // The sun straight down the camera's view, no ambient: the square is exactly its color.
-        const de::render::SceneLighting light{
-            .sun_direction = {0, 0, 1}, .sun_color = {1, 1, 1}, .ambient_color = {0, 0, 0}};
-        renderer->add_pass(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, {.r = 0, .g = 0, .b = 1});
-        graph->execute();
-        device->end_frame();
+        const auto render = [&](de::render::SceneView view) {
+            device->begin_frame();
+            uploader->record(); // as the engine does each frame: the material's table entry lands first
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, view);
+            graph->execute();
+            device->end_frame();
+            return de::test::read_texture(*device, *target);
+        };
+        // The G-buffer, as its debug views show it: the square's base color, and its normal (+Z).
+        const de::core::Array<std::byte> pixels = render(de::render::SceneView::BaseColor);
         CHECK(renderer->stats().drawn == 1);
         CHECK(renderer->stats().draws == 1);
-        const de::core::Array<std::byte> pixels = de::test::read_texture(*device, *target);
+        const de::core::Array<std::byte> normals = render(de::render::SceneView::Normal);
+        const uint8_t* normal = texel(normals, kSize / 2, kSize / 2);
+        CHECK(normal[0] == doctest::Approx(128).epsilon(0.01));
+        CHECK(normal[1] == doctest::Approx(128).epsilon(0.01));
+        CHECK(normal[2] == 255);
+        // Lit: the sun straight at it (and behind the camera: a white specular highlight on top),
+        // so it's bright and clearly red; the sky around it isn't.
+        const de::core::Array<std::byte> lit = render(de::render::SceneView::Lit);
+        const uint8_t* lit_center = texel(lit, kSize / 2, kSize / 2);
+        CHECK(lit_center[0] > 200);
+        CHECK(lit_center[0] > 2 * lit_center[1]);
+        CHECK(lit_center[0] > 2 * lit_center[2]);
+        const uint8_t* lit_sky = texel(lit, 1, 1);
+        CHECK(lit_sky[2] > lit_sky[0]); // bluish
         const uint8_t* center = texel(pixels, kSize / 2, kSize / 2);
         CHECK(center[0] == 255);
         CHECK(center[1] == 0);
         CHECK(center[2] == 0);
         const uint8_t* corner = texel(pixels, 1, 1);
-        CHECK(corner[0] == 0);
-        CHECK(corner[2] == 255);
+        CHECK(corner[0] == 0); // nothing drawn: a cleared G-buffer
         // The square's edge: 1 m at 3 m with a 1 rad field of view is about 0.61 of the half height.
         const uint8_t* outside = texel(pixels, kSize / 2, kSize / 2 - 24);
-        CHECK(outside[2] == 255);
+        CHECK(outside[0] == 0);
         const uint8_t* inside = texel(pixels, kSize / 2, kSize / 2 - 16);
         CHECK(inside[0] == 255);
 

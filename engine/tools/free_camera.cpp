@@ -7,6 +7,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 namespace de::tools {
 
@@ -65,20 +66,26 @@ void FreeCamera::update(const platform::Input& input, const FreeCameraActions& a
                         flecs::entity camera) {
     DE_PROFILE_ZONE("free camera");
     // Look: the stick as a rate, mouse motion in pixels while its button is held.
+    // Sticks that don't rest at zero (drift above the input deadzone) mustn't fly the camera off:
+    // small values are dropped here (keys give 1).
+    const auto axis = [&](platform::ActionId action) {
+        const float value = input.state(action).value;
+        return std::abs(value) < kAxisDeadzone ? 0.0f : value;
+    };
     const bool mouse = input.state(actions.look_hold).down;
     const float stick = stick_rad_per_s * frame_s;
-    const float yaw = input.state(actions.look_x).value * stick +
-                      (mouse ? input.state(actions.mouse_x).value * mouse_rad_per_px : 0.0f);
-    const float pitch = input.state(actions.look_y).value * stick +
-                        (mouse ? input.state(actions.mouse_y).value * mouse_rad_per_px : 0.0f);
+    const float yaw =
+        axis(actions.look_x) * stick + (mouse ? input.state(actions.mouse_x).value * mouse_rad_per_px : 0.0f);
+    const float pitch =
+        axis(actions.look_y) * stick + (mouse ? input.state(actions.mouse_y).value * mouse_rad_per_px : 0.0f);
     yaw_rad_ -= yaw;
     pitch_rad_ = std::clamp(pitch_rad_ - pitch, -1.55f, 1.55f);
 
     const Quat rotation = this->rotation();
     const Vec3 right = rotation * Vec3(1.0f, 0.0f, 0.0f);
     const Vec3 forward = rotation * Vec3(0.0f, 0.0f, -1.0f);
-    const Vec3 move = right * input.state(actions.move_right).value +
-                      forward * input.state(actions.move_forward).value + kWorldUp * input.state(actions.move_up).value;
+    const Vec3 move =
+        right * axis(actions.move_right) + forward * axis(actions.move_forward) + kWorldUp * axis(actions.move_up);
     const float speed = speed_mps * (input.state(actions.fast).down ? 6.0f : 1.0f);
     position_ += DVec3(move) * static_cast<double>(speed * frame_s);
     world::place(camera, world::Transform{.position = position_, .rotation = rotation});

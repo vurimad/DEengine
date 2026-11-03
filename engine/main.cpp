@@ -67,8 +67,9 @@ bool has_flag(int argc, char** argv, const char* flag) {
 } // namespace
 
 // The engine's loop until the game's own lands: opens the window, loads a cell and draws it (renderer
-// step 1: GPU copies of the loaded assets, a placeholder lit pass) through a free camera (WASD/QE and
-// the right mouse button, or a gamepad), with hot-reloaded shaders and assets; pumps events,
+// step 2: deferred, with a sun, a hemisphere ambient and a filmic tonemap) through a free camera (WASD/QE and
+// the right mouse button, or a gamepad; F2 steps through G-buffer views), with hot-reloaded shaders
+// and assets; pumps events,
 // samples input and logs actions.
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --cell ID        the cooked cell to load (asset ID, 16 hex digits; default: the test cell)
@@ -276,6 +277,13 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
     de::tools::FreeCamera free_camera({64.0, 2.0, 74.0}, 0.0f, -0.12f);
+    // The scene's light, and what the window shows: F2 steps through the G-buffer's channels.
+    const de::render::SceneLighting scene_lighting;
+    de::render::SceneView scene_view = de::render::SceneView::Lit;
+    const ActionId next_view = input.add_action("debug.next_view"_sid, ActionKind::Button);
+    if (!input.bind(next_view, "key:F2").ok()) {
+        DE_LOG_ERROR("input", "can't bind F2");
+    }
     const flecs::entity camera = world->ecs().entity("free_camera").set(de::world::Camera{.vertical_fov_rad = 1.0f});
     world->ecs().set(de::world::ActiveCamera{.entity = camera.id()});
 
@@ -337,6 +345,11 @@ int main(int argc, char** argv) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
         free_camera.update(input, *camera_actions, static_cast<float>(frame_s), camera);
+        if (input.state(next_view).pressed) {
+            scene_view = static_cast<de::render::SceneView>((static_cast<uint32_t>(scene_view) + 1) %
+                                                            static_cast<uint32_t>(de::render::SceneView::Count));
+            DE_LOG_INFO("render", "view: %s", de::render::scene_view_name(scene_view));
+        }
         assets->update();     // commits finished reads, unloads what nobody holds, reloads re-cooked files
         gpu_assets->update(); // meshes whose uploads are in become drawable
 
@@ -365,9 +378,10 @@ int main(int argc, char** argv) {
                                                                          .state = de::rhi::ResourceState::Present,
                                                                          .final_state = de::rhi::ResourceState::Present,
                                                                          .discard = true});
-            static constexpr de::rhi::Color kDusk{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
+            static constexpr de::rhi::Color kDusk{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f}; // no shaders
             if (scene_renderer) {
-                scene_renderer->add_pass(*graph, back, device->swapchain_format(), world->render_frame(), {}, kDusk);
+                scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
+                                           scene_lighting, scene_view);
             } else {
                 graph->add_pass(
                     "clear",
