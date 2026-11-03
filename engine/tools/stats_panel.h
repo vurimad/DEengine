@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 namespace de::tools {
 
@@ -17,6 +18,8 @@ struct FrameStats {
     rhi::GpuMemoryStats memory{};
     render::RenderGraphStats graph{};
     rhi::UploaderStats uploads{};
+    std::span<const render::PassGpuTime> gpu_passes{}; // RenderGraph::gpu_times(): copied by record()
+    float gpu_frame_ms = 0.0f;
 };
 
 // The frame stats panel (M0a): frame time and its history, heap allocations per frame, GPU memory
@@ -24,6 +27,13 @@ struct FrameStats {
 // NewFrame() and Render().
 class StatsPanel {
 public:
+    StatsPanel() = default;
+    // last_ points into this panel's own copy of the GPU times.
+    StatsPanel(const StatsPanel&) = delete;
+    StatsPanel& operator=(const StatsPanel&) = delete;
+    StatsPanel(StatsPanel&&) = delete;
+    StatsPanel& operator=(StatsPanel&&) = delete;
+
     void record(const FrameStats& stats);
     // A window the user can close: open is set to false then.
     void draw(bool* open) const;
@@ -35,7 +45,8 @@ private:
     size_t next_ = 0;
     size_t count_ = 0;
     uint64_t frames_with_allocations_ = 0;
-    FrameStats last_;
+    FrameStats last_; // its gpu_passes point at gpu_passes_
+    render::PassGpuTime gpu_passes_[render::kMaxTimedPasses] = {};
 };
 
 } // namespace de::tools

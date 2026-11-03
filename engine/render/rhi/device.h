@@ -201,9 +201,10 @@ public:
     // Frames begun so far: the current frame between begin_frame() and end_frame().
     uint64_t frame_index() const;
 
-    // The GPU timestamps a frame wrote (CommandList::write_timestamp), in nanoseconds on the GPU's
-    // clock, by index: those of the frame whose slot the last begin_frame() reused (kFramesInFlight
-    // frames before the current one), once the GPU had finished it. frame is 0 and ns empty
+    // The GPU timestamps a frame wrote (CommandList::write_timestamp), by index, in nanoseconds
+    // after the frame's first one (index 0 is 0; a counter that wraps is handled): those of the
+    // frame whose slot the last begin_frame() reused (kFramesInFlight frames before the current
+    // one), once the GPU had finished it. frame is 0 and ns empty
     // before any, or when it wrote none. Valid until the next begin_frame().
     struct FrameTimestamps {
         uint64_t frame = 0;

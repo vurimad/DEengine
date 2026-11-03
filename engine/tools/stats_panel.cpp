@@ -5,6 +5,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <iterator>
 
 namespace de::tools {
 
@@ -23,6 +24,10 @@ void StatsPanel::record(const FrameStats& stats) {
     count_ = std::min(count_ + 1, kHistory);
     frames_with_allocations_ += stats.heap_allocations > 0 ? 1 : 0;
     last_ = stats;
+    // The times are the graph's until its next begin(): kept as a copy (one per frame).
+    const size_t gpu_count = std::min(stats.gpu_passes.size(), std::size(gpu_passes_));
+    std::copy_n(stats.gpu_passes.data(), gpu_count, gpu_passes_);
+    last_.gpu_passes = std::span<const render::PassGpuTime>(gpu_passes_, gpu_count);
 }
 
 void StatsPanel::draw(bool* open) const {
@@ -72,14 +77,12 @@ void StatsPanel::draw(bool* open) const {
     }
 
     if (ImGui::CollapsingHeader("GPU time", ImGuiTreeNodeFlags_DefaultOpen)) {
-        const render::RenderGraphStats& timed = last_.graph;
-        if (timed.gpu_pass_count == 0) {
+        if (last_.gpu_passes.empty()) {
             ImGui::TextUnformatted("no GPU timestamps");
         } else {
-            ImGui::Text("%.2f ms, first pass to last", static_cast<double>(timed.gpu_frame_ms));
-            for (uint32_t i = 0; i < timed.gpu_pass_count; ++i) {
-                ImGui::Text("%6.3f ms  %s", static_cast<double>(timed.gpu_passes[i].ms),
-                            timed.gpu_passes[i].name.c_str());
+            ImGui::Text("%.2f ms, first pass to last", static_cast<double>(last_.gpu_frame_ms));
+            for (const render::PassGpuTime& pass : last_.gpu_passes) {
+                ImGui::Text("%6.3f ms  %s", static_cast<double>(pass.ms), pass.name.c_str());
             }
         }
     }

@@ -146,6 +146,8 @@ void fill_capabilities(DeviceImpl& impl, bool ray_query) {
     caps.timestamps = limits.timestampComputeAndGraphics == VK_TRUE && limits.timestampPeriod > 0.0f &&
                       families[family(QueueType::Graphics)].timestampValidBits > 0;
     caps.timestamp_period_ns = limits.timestampPeriod;
+    const uint32_t valid_bits = families[family(QueueType::Graphics)].timestampValidBits;
+    impl.timestamp_mask = valid_bits >= 64 ? UINT64_MAX : (uint64_t{1} << valid_bits) - 1;
 
     caps.max_texture_size_2d = limits.maxImageDimension2D;
     caps.max_texture_size_3d = limits.maxImageDimension3D;
@@ -1417,12 +1419,17 @@ void DeviceImpl::collect_timestamps(FrameSlot& slot) {
         device, slot.timestamps, 0, slot.timestamps_written, completed_timestamps.size() * sizeof(uint64_t),
         completed_timestamps.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result == VK_SUCCESS) {
+        // Ticks since the frame's first timestamp, modulo the counter's valid bits (a counter
+        // narrower than 64 bits wraps), then nanoseconds.
         const auto ns_per_tick = static_cast<double>(capabilities.timestamp_period_ns);
+        const uint64_t first = completed_timestamps[0];
         for (uint64_t& ticks : completed_timestamps) {
-            ticks = static_cast<uint64_t>(static_cast<double>(ticks) * ns_per_tick);
+            ticks = static_cast<uint64_t>(static_cast<double>((ticks - first) & timestamp_mask) * ns_per_tick);
         }
         completed_timestamps_frame = slot.timestamps_frame;
     } else {
+        DE_LOG_WARN("render", "GPU timestamps of frame %llu couldn't be read: %s",
+                    static_cast<unsigned long long>(slot.timestamps_frame), vk_result_name(result));
         completed_timestamps.clear();
     }
     vkResetQueryPool(device, slot.timestamps, 0, slot.timestamps_written);

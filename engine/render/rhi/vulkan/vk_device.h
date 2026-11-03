@@ -280,6 +280,7 @@ struct DeviceImpl {
     bool in_frame = false;
     FrameSlot frames[kFramesInFlight];
     std::atomic<uint32_t> timestamps_used{0}; // by the current frame, every list
+    uint64_t timestamp_mask = UINT64_MAX;     // the graphics queue's valid timestamp bits
     // Those of the frame begin_frame() last found finished, in nanoseconds (completed_timestamps()).
     core::Array<uint64_t> completed_timestamps{core::heap_allocator(core::MemoryTag::Render)};
     uint64_t completed_timestamps_frame = 0;

@@ -401,7 +401,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                             .device = device->stats(),
                             .memory = device->memory_stats(),
                             .graph = graph->stats(),
-                            .uploads = uploader->stats()});
+                            .uploads = uploader->stats(),
+                            .gpu_passes = graph->gpu_times(),
+                            .gpu_frame_ms = graph->gpu_frame_ms()});
 #endif
         DE_PROFILE_FRAME();
         ++frame;

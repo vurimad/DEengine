@@ -8,6 +8,7 @@
 #include "core/hash_map.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "core/string_id.h"
 #include "render/rhi/device.h"
 
 #include <algorithm>
@@ -63,7 +64,8 @@ struct TimedPass {
 };
 
 // Tracy keeps plot names by pointer, and may read them until the process exits: the names of
-// timed passes' plots ("gpu ms: gbuffer"), interned for good. Past the table's size, no plot.
+// timed passes' plots ("gpu ms: gbuffer"), interned for good, shared by every graph (hence the
+// lock; each graph caches what it got, so frames don't take it). Past the table's size, no plot.
 const char* gpu_plot_name(std::string_view pass) {
     using PlotName = core::FixedString<40>;
     static PlotName names[64];
@@ -76,6 +78,12 @@ const char* gpu_plot_name(std::string_view pass) {
         }
     }
     if (count == 64) {
+        static bool logged = false;
+        if (!logged) {
+            DE_LOG_WARN("render", "more than 64 timed pass names: '%.*s' and later ones aren't plotted",
+                        static_cast<int>(pass.size()), pass.data());
+            logged = true;
+        }
         return nullptr;
     }
     PlotName& name = names[count++];
@@ -271,7 +279,8 @@ struct RenderGraphState {
     PassGpuTime gpu_passes[kMaxTimedPasses] = {};
     uint32_t gpu_pass_count = 0;
     float gpu_frame_ms = 0.0f;
-    core::HashMap<uint64_t, const char*> plot_names{render_heap()};
+    core::HashMap<core::StringId, const char*> plot_names{render_heap()};
+    uint64_t resolved_frame = 0; // the device frame whose begin() last read the times
     uint32_t reference_width = 0;
     uint32_t reference_height = 0;
     uint32_t open_pass = kNone; // in add_pass, between begin_pass and end_pass
@@ -591,11 +600,11 @@ struct RenderGraphState {
             }
         }
         const rhi::ScopedDebugLabel label(list, pass.name);
-        const uint32_t begin = list.write_timestamp(); // the pass's barriers count toward it
+        const uint32_t begin = desc.gpu_timing ? list.write_timestamp() : rhi::kNoTimestamp; // barriers count
         batch.flush(list);
         PassContext context(list, *device, *this, pass_index);
         pass.execute(pass.closure, context);
-        const uint32_t end = list.write_timestamp();
+        const uint32_t end = begin != rhi::kNoTimestamp ? list.write_timestamp() : rhi::kNoTimestamp;
         if (begin != rhi::kNoTimestamp && end != rhi::kNoTimestamp) {
             timed[timing_slot].push({.name = core::FixedString<31>(pass.name), .begin = begin, .end = end});
         }
@@ -624,7 +633,7 @@ struct RenderGraphState {
             if (gpu_pass_count < kMaxTimedPasses) {
                 gpu_passes[gpu_pass_count++] = {.name = pass.name, .ms = ms};
             }
-            const uint64_t key = core::hash_bytes(pass.name.c_str(), pass.name.size());
+            const core::StringId key(pass.name.c_str(), pass.name.size());
             const char* const* plot = plot_names.find(key);
             if (plot == nullptr) {
                 plot = &plot_names.set(key, gpu_plot_name(pass.name.view()));
@@ -634,7 +643,7 @@ struct RenderGraphState {
             }
         }
         gpu_frame_ms = last > first ? static_cast<float>(static_cast<double>(last - first) * 1e-6) : 0.0f;
-        DE_PROFILE_PLOT("gpu ms: frame", static_cast<double>(gpu_frame_ms));
+        DE_PROFILE_PLOT("gpu frame ms", static_cast<double>(gpu_frame_ms));
     }
 
     // Keeps the passes whose writes something needs: an imported resource, or a later kept pass's
@@ -900,10 +909,15 @@ void RenderGraph::begin(uint32_t reference_width, uint32_t reference_height) {
     DE_ASSERT_MSG(state.device->in_frame(), "the render graph runs between device.begin_frame() and end_frame()");
     DE_ASSERT_MSG(!state.in_frame, "render graph begin() twice without execute()");
     ++state.frame;
-    state.resolve_gpu_times();
-    state.timing_slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
-    state.timed[state.timing_slot].clear();
-    state.timed_frame[state.timing_slot] = state.device->frame_index();
+    // GPU times: read once per device frame; this frame's records start (a second begin() in the same
+    // device frame adds to them).
+    if (const uint64_t device_frame = state.device->frame_index(); device_frame != state.resolved_frame) {
+        state.resolved_frame = device_frame;
+        state.resolve_gpu_times();
+        state.timing_slot = static_cast<uint32_t>(device_frame % rhi::kFramesInFlight);
+        state.timed[state.timing_slot].clear();
+        state.timed_frame[state.timing_slot] = device_frame;
+    }
     state.arena.reset();
     state.passes.clear();
     state.uses.clear();
@@ -1028,6 +1042,14 @@ rhi::ResourceState RenderGraph::final_texture_state(GraphTexture texture) const 
     return resource.first_state == kNone ? ResourceState::Undefined : state.states[resource.first_state].state;
 }
 
+std::span<const PassGpuTime> RenderGraph::gpu_times() const {
+    return {state_->gpu_passes, state_->gpu_pass_count};
+}
+
+float RenderGraph::gpu_frame_ms() const {
+    return state_->gpu_frame_ms;
+}
+
 RenderGraphStats RenderGraph::stats() const {
     const RenderGraphState& state = *state_;
     RenderGraphStats stats{
@@ -1037,11 +1059,7 @@ RenderGraphStats RenderGraph::stats() const {
         .pooled_buffers = static_cast<uint32_t>(state.buffer_pool.size()),
         .pool_creations = state.pool_creations,
         .skipped_passes = state.skipped_passes,
-        .gpu_pass_count = state.gpu_pass_count,
-        .gpu_passes = {},
-        .gpu_frame_ms = state.gpu_frame_ms,
     };
-    std::copy_n(state.gpu_passes, state.gpu_pass_count, stats.gpu_passes);
     for (const Pass& pass : state.passes) {
         stats.culled_passes += pass.live ? 0 : 1;
     }

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <span>
 #include <type_traits>
 #include <utility>
 
@@ -115,6 +116,9 @@ struct RenderGraphDesc {
     bool log_transitions = false;
     // Transient resources unused for this many frames go back to the device.
     uint32_t keep_unused_frames = 8;
+    // Time each pass on the GPU (gpu_times()); when the device has timestamps. Off in ship builds,
+    // where nothing reads them.
+    bool gpu_timing = DE_BUILD_DEV != 0;
 };
 
 // The passes a frame's GPU times cover (later ones aren't timed).
@@ -134,13 +138,6 @@ struct RenderGraphStats {
     uint32_t pooled_buffers = 0;
     uint32_t pool_creations = 0; // transient resources created since the graph was, in total
     uint32_t skipped_passes = 0; // in the last frame: a transient they use couldn't be made (logged)
-    // GPU time of each pass that ran, in order, in the latest frame the GPU has finished (the
-    // device's kFramesInFlight frames back), from GPU timestamps (rhi::Capabilities::timestamps;
-    // none without them, or in immediate mode). gpu_frame_ms runs from the first pass's start to
-    // the last one's end.
-    uint32_t gpu_pass_count = 0;
-    PassGpuTime gpu_passes[kMaxTimedPasses] = {};
-    float gpu_frame_ms = 0.0f;
 };
 
 // The frame graph (docs/design.md, Rendering: render graph v1). Each frame:
@@ -209,6 +206,12 @@ public:
     rhi::ResourceState final_texture_state(GraphTexture texture) const;
 
     RenderGraphStats stats() const;
+    // GPU time of each pass that ran, in order, in the latest frame the GPU has finished (the
+    // device's kFramesInFlight frames back), from timestamps (RenderGraphDesc::gpu_timing and
+    // rhi::Capabilities::timestamps; empty without them). Valid until the next begin().
+    std::span<const PassGpuTime> gpu_times() const;
+    // That frame's GPU time, from the first pass's start to the last one's end.
+    float gpu_frame_ms() const;
     // Logs the last frame's graph: passes (culled ones too), their uses, the resources.
     void dump() const;
 

@@ -422,6 +422,7 @@ TEST_CASE("GPU timestamps come back once their frame is done, in order, up to th
             const Device::FrameTimestamps done = device->completed_timestamps();
             CHECK(done.frame == 1);
             REQUIRE(done.ns.size() == kMaxTimestampsPerFrame);
+            CHECK(done.ns[0] == 0); // relative to the frame's first timestamp
             CHECK(done.ns[1] >= done.ns[0]);
             CHECK(done.ns[1] - done.ns[0] < 1'000'000'000ULL); // under a second for a 1 MiB fill
         } else {

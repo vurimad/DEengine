@@ -243,8 +243,13 @@ TEST_CASE("the ImGui renderer gives its textures back, and a new one makes them 
 TEST_CASE("the stats panel draws whatever the frame's numbers are") {
     const ImGuiScope imgui;
     de::tools::StatsPanel panel;
+    const de::render::PassGpuTime passes[] = {{.name = de::core::FixedString<31>("gbuffer"), .ms = 0.2f},
+                                              {.name = de::core::FixedString<31>("tonemap"), .ms = 0.05f}};
     for (int frame = 0; frame < 300; ++frame) {
-        panel.record({.frame_ms = 8.0f + static_cast<float>(frame % 7), .heap_allocations = frame % 50 == 0 ? 3U : 0U});
+        panel.record({.frame_ms = 8.0f + static_cast<float>(frame % 7),
+                      .heap_allocations = frame % 50 == 0 ? 3U : 0U,
+                      .gpu_passes = frame % 2 == 0 ? std::span(passes) : std::span<const de::render::PassGpuTime>(),
+                      .gpu_frame_ms = 0.25f});
     }
     ImGui::GetIO().Fonts->Build();
     bool open = true;
