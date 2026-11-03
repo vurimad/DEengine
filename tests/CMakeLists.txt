@@ -8,6 +8,7 @@ add_executable(de_tests
     main.cpp
     asset/asset_fuzz_test.cpp
     asset/asset_test.cpp
+    asset/registry_test.cpp
     cooker/cooker_test.cpp
     core/allocator_test.cpp
     core/arena_test.cpp

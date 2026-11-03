@@ -338,6 +338,8 @@ Avoided by design: a thread per request, systems reading files on their own, per
 
 **Hot reload.** A file watcher on `src:/` triggers the cooker; when cooked output changes in `game:/`, the asset registry reloads it in place and notifies dependents.
 
+**Asset registry v1** (`engine/asset/registry.h`; rules in `engine/asset/README.md`). `load(ref)` holds an asset by ID and type and returns a handle at once; the read lands straight in the asset's memory, is checked on a job, and is committed with the other finished reads once per frame on the main thread, which then loads what its header depends on. States are Loading, Ready (file in, dependencies settled) and Failed (logged; users draw a placeholder). Assets are reference counted and unloaded when nobody holds them. Hot reload polls a few held files per frame (an OS watcher comes later) and swaps changed ones in place, telling listeners. Cooked headers list dependencies with their type, since the type names the file.
+
 **Errors and debugging.** Calls return `Result`. A missing asset shows a loud placeholder (magenta checker mesh, error log with the path) in dev, and a logged fallback in ship. An IO debug view shows throughput, queue depth per priority, latency, and the slowest requests.
 
 **AI and tools.** The editor exposes `fs.list`, `fs.read` and `fs.write` commands on `src:/`, so agents edit source files through the same VFS and its validation as humans.

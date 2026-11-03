@@ -56,7 +56,7 @@ DE_ENUM_FLAGS(ShaderFlags)
 // names shaders by module ("imgui", "common.color").
 struct ShaderAsset {
     static constexpr AssetType kType = AssetType::Shader;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2; // 2: typed dependencies
 
     AssetHeader header;
     char module[kShaderNameSize] = {};

@@ -31,7 +31,7 @@ public:
     // Writes the asset struct and the common header (type, version, ID, platform, dependencies, size,
     // content hash) and returns the file. T is a *Asset struct whose header is its first member.
     template <typename T>
-    core::Array<std::byte> finish(T asset, asset::AssetId id, std::span<const asset::AssetId> dependencies) {
+    core::Array<std::byte> finish(T asset, asset::AssetId id, std::span<const asset::AssetRef> dependencies) {
         static_assert(std::is_trivially_copyable_v<T> && offsetof(T, header) == 0);
         DE_ASSERT(sizeof(T) <= bytes_.size());
         asset.header = asset::AssetHeader{};

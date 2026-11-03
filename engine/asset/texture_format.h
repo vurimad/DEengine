@@ -50,7 +50,7 @@ inline constexpr uint32_t kMaxTextureSize = 1U << (kMaxTextureMips - 1); // texe
 // compressed by the cooker, which also filters the mips).
 struct TextureAsset {
     static constexpr AssetType kType = AssetType::Texture;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2; // 2: typed dependencies
 
     AssetHeader header;
     TextureFormat format = TextureFormat::Unknown;

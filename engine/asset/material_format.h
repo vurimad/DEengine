@@ -38,7 +38,7 @@ struct MaterialTexture {
 // template's business; the cooker writes the ones the source sets, and templates have defaults.
 struct MaterialAsset {
     static constexpr AssetType kType = AssetType::Material;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2; // 2: typed dependencies
 
     AssetHeader header;
     core::StringId shader_template; // "pbr_opaque"

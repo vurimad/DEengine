@@ -1,3 +1,4 @@
+#include "asset/registry.h"
 #include "core/array.h"
 #include "core/job_system.h"
 #include "core/log.h"
@@ -89,14 +90,14 @@ int main(int argc, char** argv) {
     // it (ship builds), shaders load from the cooker's .deshader files in game:/.
     const char* src_dir = flag_value(argc, argv, "--src-dir");
     const char* src_root = DE_BUILD_DEV != 0 ? (src_dir != nullptr ? src_dir : DE_SOURCE_DIR) : nullptr;
-    auto vfs =
-        de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked", .src_root = src_root});
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_dir != nullptr ? game_dir : "cooked", .src_root = src_root, .jobs = &jobs});
     if (!vfs && src_root != nullptr) {
         // A dev build away from its source tree (copied to another machine, the repo moved): run
         // without src:/, and so without shaders, rather than not at all.
         DE_LOG_WARN("engine", "source tree %s not found (pass --src-dir): running without src:/", src_root);
         src_root = nullptr;
-        vfs = de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked"});
+        vfs = de::platform::Vfs::create({.game_root = game_dir != nullptr ? game_dir : "cooked", .jobs = &jobs});
     }
     if (!vfs) {
         return EXIT_FAILURE;
@@ -273,6 +274,14 @@ int main(int argc, char** argv) {
         device->destroy(*quad_texture);
         return EXIT_FAILURE;
     }
+    // Cooked assets by ID (nothing loads them yet; the renderer will): reads, reference counts and,
+    // in dev builds, hot reload of files the cooker rewrites.
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs});
+    if (!assets) {
+        DE_LOG_ERROR("asset", "%s", assets.error().message);
+        device->destroy(*quad_texture);
+        return EXIT_FAILURE;
+    }
 
     // Debug UI: Dear ImGui, with the frame stats panel (F1 shows and hides it). Made after the
     // device, uploader and graph, so it goes before them.
@@ -331,6 +340,7 @@ int main(int argc, char** argv) {
         if (shaders) {
             shaders->update(); // hot reload: picks up edits to shaders/*.slang
         }
+        assets->update(); // commits finished reads, unloads what nobody holds, reloads re-cooked files
 
         world->advance(frame_s); // fixed ticks, then RenderExtract
 
@@ -473,6 +483,9 @@ int main(int argc, char** argv) {
     device->log_memory_report(5);
     device->destroy(*quad_texture);
     device->wait_idle();
+    const de::asset::AssetRegistryStats asset_stats = assets->stats();
+    DE_LOG_INFO("asset", "%u assets held (%u failed), %llu bytes, %u reloads", asset_stats.assets, asset_stats.failed,
+                static_cast<unsigned long long>(asset_stats.bytes), asset_stats.reloads);
     const de::rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),
