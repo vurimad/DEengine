@@ -97,10 +97,14 @@ jobs:
 
       # Same LLVM major as Visual Studio's bundled clang tools, so local and CI formatting agree.
       - name: Install LLVM 22 tools
+        # apt.llvm.org drops connections now and then: retry before failing the job.
         run: |
-          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
+          for attempt in 1 2 3 4 5; do
+            wget -qO llvm.sh --tries=3 --retry-connrefused https://apt.llvm.org/llvm.sh && chmod +x llvm.sh &&
+              sudo ./llvm.sh 22 && break
+            echo "LLVM install attempt $attempt failed; retrying"
+            sleep $((attempt * 10))
+          done
           sudo apt-get install -y clang-format-22 clang-tidy-22 $LINUX_PACKAGES
 
       - name: clang-format
