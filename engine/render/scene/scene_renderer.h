@@ -98,12 +98,14 @@ void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, floa
 
 struct SceneRendererState;
 
-// Draws a world::RenderFrame, deferred (renderer step 2, docs/design.md, Rendering):
+// Draws a world::RenderFrame, deferred (renderer steps 2 and 3, docs/design.md, Rendering):
+//   sun shadows     every instance into each cascade's tile of the shadow atlas, depth only
 //   gbuffer         every instance whose mesh is on the GPU, a draw per mesh part: the G-buffer
 //                   (base color + lighting group, octahedral normal, roughness/metalness/occlusion/
 //                   translucency), emissive into the HDR target, reverse-Z depth
-//   deferred light  a full-screen pass adding the sun and the ambient onto the HDR target, and the
-//                   sky where nothing was drawn
+//   shadow mask     a full-screen pass resolving the cascades: how much sun each pixel sees
+//   deferred light  a full-screen pass adding the sun (through the mask) and the ambient onto the
+//                   HDR target, and the sky where nothing was drawn
 //   tonemap         exposure and a filmic curve into the target (or a G-buffer channel: SceneView)
 // It looks through the frame's camera (down its -Z). Per-frame data (view, light, instance
 // transforms) goes through a mapped buffer per frame in flight, grown as needed: no allocation
