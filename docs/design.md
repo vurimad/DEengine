@@ -871,7 +871,7 @@ The world is one seamless space streamed around the player in a grid of cells, w
 
 **Camera.** A third-person orbit camera with collision (sphere cast back from the pivot), smoothed follow, and a lock-on mode that frames player and target. Camera shake is data-driven per hit type. Camera pull-in near walls must never hide an enemy's startup frames.
 
-**Input.** SDL3 gamepad first, keyboard and mouse second. Inputs are mapped to actions (attack\_light, roll, use\_item), sampled once per tick, and pushed into the input buffer. Target input-to-action latency: 3 ticks or less (about 50 ms) plus render latency.
+**Input.** SDL3 gamepad first, keyboard and mouse second. Inputs are mapped to actions (attack\_light, roll, use\_item), sampled once per tick, and pushed into the input buffer. Code adds actions; their bindings are text, `config/input.bindings` (read from `src:/` in dev builds, from `game:/config/` in ship), plus the player's `user:/input.bindings`. Target input-to-action latency: 3 ticks or less (about 50 ms) plus render latency.
 
 **Audio.** miniaudio with 3D positional sources, distance attenuation and a few reverb zones per area. Sounds are triggered by animation events and hit resolution. Mix buses: music, SFX, ambience, UI. Boss music changes with phase.
 
@@ -1019,6 +1019,8 @@ One style everywhere, enforced by clang-format and clang-tidy in CI, so humans a
 
 ```
 engine/
+  main.cpp    # the entry point: arguments, the application, run_framework
+  app/        # the framework (engine systems, frame loop) and the applications it runs
   core/       # core library, allocators, jobs, logging, math
   asset/      # cooked formats (load in place), asset IDs
   platform/   # SDL3, file IO, threads, OS glue
@@ -1027,6 +1029,8 @@ engine/
   game/       # combat, AI, player, items, saves
   script/     # Lua bindings
   editor/     # editor mode, panels, commands
+  tools/      # debug UI, stats panel, free camera
+config/       # engine settings as text: input bindings (copied into game:/config/)
 tools/
   cooker/     # asset cooker, validators, packer
 shaders/      # Slang
@@ -1174,4 +1178,5 @@ Decisions so far:
 | 2026-11-03 | Elden Ring may be studied in full from an owned copy, shader code included (captures and dumps, offline only); own implementations, findings in our words, nothing extracted committed | Its techniques are the reference for the look; studying the real thing beats guessing, and clean implementations keep the engine ours |
 | 2026-11-03 | Match Elden Ring's feel, atmosphere and art controls, not its low-level renderer; our own G-buffer, lighting core, shadows and upscaling | Their look comes from art direction on dated tech; a modern, consistent core with their art levers on top looks as good and ages better |
 | 2026-11-03 | G-buffer v1: three targets (base color + lighting group, RG16 octahedral normal, roughness/metalness/occlusion/translucency) and emissive into HDR, 20 bytes a pixel | Room for the look's art levers (groups, translucency) at the bandwidth of a lean layout; emissive needs no target of its own |
+| 2026-11-03 | The entry point only parses arguments, declares the application and calls `run_framework`; the framework owns the engine and the frame loop, the application (`startup`, `update`) says what to load and does its frame's work; bindings and settings are text in `config/`, not code | Platform entry, engine and game stay apart; what a build loads and binds is data, so it changes without a rebuild |
 | 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |

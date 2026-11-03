@@ -13,8 +13,8 @@ namespace de::tools {
 using namespace core::literals;
 using platform::ActionKind;
 
-core::Result<FreeCameraActions> add_free_camera_actions(platform::Input& input) {
-    const FreeCameraActions actions{
+FreeCameraActions add_free_camera_actions(platform::Input& input) {
+    return {
         .move_right = input.add_action("free_camera.move_right"_sid, ActionKind::Axis),
         .move_forward = input.add_action("free_camera.move_forward"_sid, ActionKind::Axis),
         .move_up = input.add_action("free_camera.move_up"_sid, ActionKind::Axis),
@@ -25,36 +25,6 @@ core::Result<FreeCameraActions> add_free_camera_actions(platform::Input& input) 
         .look_hold = input.add_action("free_camera.look_hold"_sid, ActionKind::Button),
         .fast = input.add_action("free_camera.fast"_sid, ActionKind::Button),
     };
-    struct Binding {
-        platform::ActionId action;
-        const char* name;
-        float scale;
-    };
-    const Binding bindings[] = {
-        {.action = actions.move_right, .name = "key:D", .scale = 1.0f},
-        {.action = actions.move_right, .name = "key:A", .scale = -1.0f},
-        {.action = actions.move_right, .name = "gamepad:leftx", .scale = 1.0f},
-        {.action = actions.move_forward, .name = "key:W", .scale = 1.0f},
-        {.action = actions.move_forward, .name = "key:S", .scale = -1.0f},
-        {.action = actions.move_forward, .name = "gamepad:lefty", .scale = -1.0f}, // stick up is negative
-        {.action = actions.move_up, .name = "key:E", .scale = 1.0f},
-        {.action = actions.move_up, .name = "key:Q", .scale = -1.0f},
-        {.action = actions.move_up, .name = "gamepad:righttrigger", .scale = 1.0f},
-        {.action = actions.move_up, .name = "gamepad:lefttrigger", .scale = -1.0f},
-        {.action = actions.look_x, .name = "gamepad:rightx", .scale = 1.0f},
-        {.action = actions.look_y, .name = "gamepad:righty", .scale = 1.0f},
-        {.action = actions.mouse_x, .name = "mouse:x", .scale = 1.0f},
-        {.action = actions.mouse_y, .name = "mouse:y", .scale = 1.0f},
-        {.action = actions.look_hold, .name = "mouse:right", .scale = 1.0f},
-        {.action = actions.fast, .name = "key:Left Shift", .scale = 1.0f},
-        {.action = actions.fast, .name = "gamepad:leftstick", .scale = 1.0f},
-    };
-    for (const Binding& binding : bindings) {
-        if (const core::Result<void> bound = input.bind(binding.action, binding.name, binding.scale); !bound) {
-            return core::fail(bound.error());
-        }
-    }
-    return actions;
 }
 
 Quat FreeCamera::rotation() const {

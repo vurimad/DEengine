@@ -21,6 +21,7 @@
 #include "render/shader/shader_asset.h"
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 
 namespace de::cooker {
@@ -90,6 +91,7 @@ private:
             failed(path.view());
         }
         cook_shaders();
+        copy_config();
         if (!options_.content) {
             keep_content();
         }
@@ -279,6 +281,31 @@ private:
         const uint64_t hash = bytes ? core::hash_bytes(bytes->data(), bytes->size()) : 0;
         file_hashes_.set(path_key(path), hash);
         return hash;
+    }
+
+    // --- Config ------------------------------------------------------------------------------
+
+    // config/ (input bindings, engine settings: text the engine reads as it is) into game:/config/,
+    // where ship builds find it. Copied when its bytes differ.
+    void copy_config() {
+        core::Array<SourcePath> files(tools_heap());
+        list_tree(vfs_, "config", true, diagnostics_, files);
+        for (const SourcePath& file : files) {
+            const core::Result<core::Array<std::byte>> bytes = read_source(file.view());
+            if (!bytes) {
+                continue;
+            }
+            core::FixedString<kMaxSourcePath + 8> target("game:/");
+            static_cast<void>(target.append(file.view()));
+            const core::Result<core::Array<std::byte>> current = read_whole_file(vfs_, target.c_str());
+            if (current && current->size() == bytes->size() &&
+                std::memcmp(current->data(), bytes->data(), bytes->size()) == 0) {
+                continue;
+            }
+            if (const core::Result<void> written = vfs_.write_file(target.c_str(), bytes->span()); !written) {
+                diagnostics_.error(file.view(), "%s could not be written: %s", target.c_str(), written.error().message);
+            }
+        }
     }
 
     // --- Shaders -----------------------------------------------------------------------------

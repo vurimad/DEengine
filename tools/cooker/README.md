@@ -76,6 +76,7 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
 | `.cell` | a `.decell`: its entities, parents first, with the meshes of the models they name (relative paths) as its dependencies |
+| `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings: what ship builds read) |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
 
 ## Rules and invariants
@@ -96,4 +97,5 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 - FBX: separate roughness and metalness textures packed into one; skinning and animation (with `.deskel` and `.deanim`).
 - HDR sources (EXR through tinyexr, BC6H), alpha-coverage-preserving mips for foliage, a quality setting for the BC7 encoder.
 - Shader permutations: modules cook with no defines; a list of permutations per module comes with the materials that need them.
+- Removing files deleted from `config/` from `game:/config/`; checking config files (`--check`).
 - Running on file change (the editor), cooking in parallel across sources, `de asset move`, and the archive packer.

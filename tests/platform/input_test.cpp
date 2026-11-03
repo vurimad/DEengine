@@ -288,6 +288,45 @@ TEST_CASE("bad bindings are rejected") {
     de::core::set_log_level(saved);
 }
 
+TEST_CASE("bindings read from text") {
+    Input input;
+    const ActionId roll = input.add_action("roll"_sid, ActionKind::Button);
+    const ActionId move_x = input.add_action("move_x"_sid, ActionKind::Axis);
+    const ActionId sprint = input.add_action("sprint"_sid, ActionKind::Button);
+    uint32_t skipped = 99;
+    const char* const text = "# a comment, then a blank line\n"
+                             "\n"
+                             "roll      key:Space\r\n"
+                             "move_x    key:D\n"
+                             "  move_x  key:A   -1   # left\n"
+                             "sprint    \"key:Left Shift\"\n"
+                             "jump      key:J\n"; // no such action: skipped
+    REQUIRE(input.bind_text(text, &skipped).ok());
+    CHECK(skipped == 1);
+    input.push(event("key:Space", 1.0f));
+    input.push(event("key:A", 1.0f));
+    input.push(event("key:Left Shift", 1.0f));
+    input.sample();
+    CHECK(input.state(roll).pressed);
+    CHECK(input.state(move_x).value == -1.0f);
+    CHECK(input.state(sprint).down);
+}
+
+TEST_CASE("malformed bindings text is rejected") {
+    const de::core::LogLevel saved = de::core::log_level();
+    de::core::set_log_level(de::core::LogLevel::Fatal); // the rejections log errors by design
+    Input input;
+    input.add_action("roll"_sid, ActionKind::Button);
+    input.add_action("move_x"_sid, ActionKind::Axis);
+    CHECK_FALSE(input.bind_text("roll\n").ok());                       // no binding
+    CHECK_FALSE(input.bind_text("move_x key:A -1 extra\n").ok());      // too many tokens
+    CHECK_FALSE(input.bind_text("move_x key:A minus\n").ok());         // the scale isn't a number
+    CHECK_FALSE(input.bind_text("move_x key:A 1.5x\n").ok());          // nor is this
+    CHECK_FALSE(input.bind_text("roll key:NotAKey\n").ok());           // an unknown binding
+    CHECK_FALSE(input.bind_text("roll key:Space\nroll Space\n").ok()); // stops at line 2
+    de::core::set_log_level(saved);
+}
+
 TEST_CASE("release_all lets go of everything") {
     Input input;
     const ActionId roll = button(input, "roll"_sid, "key:Space");

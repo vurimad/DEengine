@@ -20,7 +20,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 
 - Engine and game code never include OS or SDL headers; only this folder does. The Vulkan RHI backend gets its instance extensions and window surface from `vulkan_instance_extensions()` and `create_vulkan_surface()`, with Vulkan handles passed as plain pointers and integers.
 - No platform `#ifdef`: OS-specific code lives in `*_win32.cpp` / `*_linux.cpp`, picked by CMake.
-- Game code reads actions, never device codes. Bindings are text (`"key:Space"`, `"gamepad:righttrigger"`, `"mouse:x"`) so they can live in data files; key names are SDL scancode names, gamepad names SDL gamepad button and axis names.
+- Game code reads actions, never device codes. Bindings are text (`"key:Space"`, `"gamepad:righttrigger"`, `"mouse:x"`), read from `config/input.bindings` by `Input::bind_text` (a line an action, a binding and an optional scale; lines for actions a build doesn't add are skipped); key names are SDL scancode names, gamepad names SDL gamepad button and axis names.
 - Input never loses a tap: presses and releases between two samples both show up in the next sample, with the first press's timestamp for the combat input buffer.
 - Losing focus or a gamepad releases everything held.
 - `push` and `sample` never allocate.

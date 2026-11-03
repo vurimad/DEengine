@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/math.h"
-#include "core/result.h"
 #include "platform/input.h"
 
 #include <flecs.h>
@@ -21,10 +20,10 @@ struct FreeCameraActions {
     platform::ActionId fast;
 };
 
-// Adds the free camera's actions and their default bindings: WASD and the left stick move, Q/E and
-// the triggers go down and up, the mouse (with the right button held) and the right stick look,
-// Shift and the left stick's click go fast.
-core::Result<FreeCameraActions> add_free_camera_actions(platform::Input& input);
+// Adds the free camera's actions ("free_camera.move_right"...). Their bindings are text, in
+// config/input.bindings: WASD and the left stick move, Q/E and the triggers go down and up, the
+// mouse (right button held) and the right stick look, Shift goes fast.
+FreeCameraActions add_free_camera_actions(platform::Input& input);
 
 // A fly camera for looking around a scene (a debug tool, not the game's camera). Each frame,
 // update() moves it by the actions over the real frame time and places its entity there at once

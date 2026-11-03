@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace de::platform {
@@ -286,6 +287,90 @@ void Input::sample() {
 const ActionState& Input::state(ActionId action) const {
     DE_ASSERT_MSG(action.is_valid() && action.index < actions_.size(), "state() of an unknown action");
     return actions_[action.index].published;
+}
+
+} // namespace de::platform
+
+namespace de::platform {
+
+namespace {
+
+bool is_space(char c) {
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+// The next token of a line: quoted (spaces allowed) or up to the next space. Empty at the end.
+std::string_view next_token(std::string_view& line) {
+    while (!line.empty() && is_space(line.front())) {
+        line.remove_prefix(1);
+    }
+    if (line.empty() || line.front() == '#') {
+        line = {};
+        return {};
+    }
+    if (line.front() == '"') {
+        const size_t end = line.find('"', 1);
+        const std::string_view token = line.substr(1, end == std::string_view::npos ? line.size() - 1 : end - 1);
+        line.remove_prefix(end == std::string_view::npos ? line.size() : end + 1);
+        return token;
+    }
+    size_t end = 0;
+    while (end < line.size() && !is_space(line[end]) && line[end] != '#') {
+        ++end;
+    }
+    const std::string_view token = line.substr(0, end);
+    line.remove_prefix(end);
+    return token;
+}
+
+} // namespace
+
+core::Result<void> Input::bind_text(std::string_view text, uint32_t* skipped) {
+    uint32_t line_number = 0;
+    uint32_t unknown = 0;
+    while (!text.empty()) {
+        const size_t end = text.find('\n');
+        std::string_view line = text.substr(0, end);
+        text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1);
+        ++line_number;
+        const std::string_view action_name = next_token(line);
+        if (action_name.empty()) {
+            continue; // blank or a comment
+        }
+        const std::string_view binding = next_token(line);
+        const std::string_view scale_text = next_token(line);
+        char binding_text[64] = {};
+        char scale_buffer[32] = {};
+        if (binding.empty() || binding.size() >= sizeof(binding_text) || scale_text.size() >= sizeof(scale_buffer) ||
+            !next_token(line).empty()) {
+            DE_LOG_ERROR("input", "bindings line %u: expected an action, a binding and an optional scale", line_number);
+            return core::fail(core::ErrorCode::InvalidArgument, "malformed bindings line");
+        }
+        std::memcpy(binding_text, binding.data(), binding.size());
+        float scale = 1.0f;
+        if (!scale_text.empty()) {
+            std::memcpy(scale_buffer, scale_text.data(), scale_text.size());
+            char* parsed_end = nullptr;
+            scale = std::strtof(scale_buffer, &parsed_end);
+            if (parsed_end != scale_buffer + scale_text.size()) {
+                DE_LOG_ERROR("input", "bindings line %u: '%s' isn't a number", line_number, scale_buffer);
+                return core::fail(core::ErrorCode::InvalidArgument, "malformed bindings line");
+            }
+        }
+        const ActionId action = find_action(core::StringId(action_name.data(), action_name.size()));
+        if (!action.is_valid()) {
+            ++unknown;
+            continue;
+        }
+        if (const core::Result<void> bound = bind(action, binding_text, scale); !bound) {
+            DE_LOG_ERROR("input", "bindings line %u: %s (%s)", line_number, bound.error().message, binding_text);
+            return core::fail(bound.error());
+        }
+    }
+    if (skipped != nullptr) {
+        *skipped = unknown;
+    }
+    return {};
 }
 
 } // namespace de::platform

@@ -8,6 +8,7 @@
 #include "core/string_id.h"
 
 #include <cstdint>
+#include <string_view>
 
 namespace de::platform {
 
@@ -98,6 +99,15 @@ public:
     // with -1); on a button bound to an axis it picks the direction that counts as pressed.
     // Fails on an unknown binding name, or on mouse motion bound to a button.
     core::Result<void> bind(ActionId action, const char* binding, float scale = 1.0f);
+
+    // Binds from text, one binding a line: the action's name, the binding (in quotes when it has
+    // spaces), and an optional scale. '#' starts a comment.
+    //     move_y              key:S                -1
+    //     free_camera.fast    "key:Left Shift"
+    // Actions must have been added; a line naming an action that isn't (a dev tool's, in a ship
+    // build) is skipped and counted in skipped. Fails on the first malformed line or unknown binding,
+    // naming the line.
+    core::Result<void> bind_text(std::string_view text, uint32_t* skipped = nullptr);
 
     // Applies one device event.
     void push(const RawInput& input);
