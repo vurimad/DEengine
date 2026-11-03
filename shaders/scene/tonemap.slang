@@ -1,4 +1,4 @@
-// HDR to the display (renderer step 2): exposure, then a filmic curve (the ACES fit), written to
+// HDR to the display: exposure, then a filmic curve (the ACES fit), written to
 // an sRGB target (the hardware encodes). Debug views show a G-buffer channel instead.
 
 import common.bindless;

@@ -27,6 +27,9 @@ The foundation every other system builds on: the core library (containers, strin
 | `enum_flags.h` | `DE_ENUM_FLAGS(Enum)`, `has_any`, `has_all` | Own |
 | `assert.h` | `DE_ASSERT`, `DE_VERIFY`, fatal handler | Own: logs, then the fatal handler, then abort |
 | `compiler.h` | `DE_PRINTF_FORMAT` | Compiler differences only |
+| `math.h` | `Vec3`, `DVec3`, `Quat`, `Mat4`..., `kWorldUp` | GLM, set to the engine's conventions |
+| `text.h` | `trim`, `next_line`, `strip_comment`... for line-based text files (`config/`) | Own |
+| `version.h` | `Version`, `engine_version_string()` | Own |
 
 `core.natvis` gives each type a readable view in the Visual Studio debugger.
 
@@ -40,7 +43,7 @@ The foundation every other system builds on: the core library (containers, strin
 - Lookups return a pointer or null; nothing inserts behind your back (`find_or_insert` is explicit).
 - Debug and dev builds check bounds and invariants with `DE_ASSERT`; ship builds don't evaluate them. `DE_VERIFY` checks in every build, for failures that would corrupt memory.
 - Every heap byte belongs to a `MemoryTag`. Systems allocate from their tagged heap, an `Arena`, a `Pool` or the frame allocator.
-- The heaps, memory stats, logging and the fatal handler are process-wide by design: they are needed everywhere, before any `EngineContext` exists. Platform specifics plug in through hooks (`set_fatal_handler`, `add_log_sink`); core itself has no OS code.
+- The heaps, memory stats, logging and the fatal handler are process-wide by design: they are needed everywhere, before the engine (`app::Engine`) exists. Platform specifics plug in through hooks (`set_fatal_handler`, `add_log_sink`); core itself has no OS code.
 - Hot paths stay off the heap: wrap them in `NoHeapAllocationScope` in tests and in the frame loop.
 - Jobs are a function pointer plus a context: give each job its own range of data to write, and join with a `JobCounter`. A waiting thread runs jobs instead of blocking, so jobs may wait on their own children.
 - Long jobs (shader compiles, cooking) go through `submit_background`: idle workers run them after all regular work, and a waiting thread never picks one up, so they can't stall a frame.

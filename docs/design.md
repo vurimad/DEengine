@@ -101,7 +101,7 @@ Both desktop platforms build on every PR; a platform that stops building blocks 
 - Shaders are written once in Slang, which can target SPIR-V today and DXIL/HLSL later; no backend-specific shader code in passes.
 - Format, feature and limit queries go through RHI capability structs, so passes ask "is ray query available?", never "is this Vulkan?".
 
-**Platform layer.** Everything OS-specific lives in `engine/platform/`: window and input (SDL3 on desktop), file IO backends (IoRing on Windows, `io_uring` on Linux), threads, memory paging, timers, crash handling. Game and engine code never include OS headers. A console port would add a platform folder and an RHI backend; nothing else should change.
+**Platform layer.** Everything OS-specific lives in `engine/platform/`: window and input (SDL3 on desktop), file IO backends (positional reads on a small thread pool now; IoRing on Windows and `io_uring` on Linux later), threads, memory paging, timers, crash handling. Game and engine code never include OS headers. A console port would add a platform folder and an RHI backend; nothing else should change.
 
 **Rules that keep ports possible.**
 
@@ -112,13 +112,13 @@ Both desktop platforms build on every PR; a platform that stops building blocks 
 
 ## High-level architecture
 
-The engine is four layers, and each layer only calls the one below it. Gameplay runs on a fixed 60 Hz tick on the main thread; rendering runs on its own thread from a snapshot of that tick.
+The engine is four layers, and each layer only calls the one below it. Gameplay runs on a fixed 60 Hz tick on the main thread; rendering is planned to run on its own thread from a snapshot of that tick. There is no render thread yet: the main thread records and submits each frame itself after the ticks, from the same snapshot (`world::RenderFrame`; `app::run_framework`).
 
 &#91;embedded content: engine architecture · 4 layers\]
 
 Game rules never touch Vulkan or SDL directly, so the renderer or platform can change without rewriting combat.
 
-Main loop (game thread):
+Main loop (game thread; the hand-off to a render thread is the plan):
 
 ```cpp
 while (running) {
@@ -133,7 +133,7 @@ while (running) {
 }
 ```
 
-Threads: a game thread (input, flecs systems, combat), a render thread, an async-compute queue for culling and particles, and a job system (work-stealing, fiber-free) that open-world streaming needs from day one: decompression, cooking of streamed cells, animation sampling, navmesh tile loads and physics body creation all run as jobs. flecs systems may run multithreaded where they don't share writes. Audio runs on miniaudio's own thread.
+Threads: a game thread (input, flecs systems, combat), a render thread (planned; today the game thread records and submits the frame), an async-compute queue for culling and particles (planned), and a job system (work-stealing, fiber-free) that open-world streaming needs from day one: decompression, cooking of streamed cells, animation sampling, navmesh tile loads and physics body creation all run as jobs. flecs systems may run multithreaded where they don't share writes. Audio runs on miniaudio's own thread.
 
 ## Core systems
 
@@ -142,10 +142,10 @@ The core is flecs for the world, a job system and allocators for streaming, a co
 **flecs as the world model.** All runtime state lives in one flecs world:
 
 - Components are plain structs registered with flecs reflection, so every component is inspectable, serializable and editable without hand-written UI or save code.
-- Hierarchies (`ChildOf`) for transforms and attachments; relationships for gameplay links (`TargetOf`, `OwnedBy`, `InCell`).
+- Hierarchies (flecs' non-fragmenting `Parent`, see World data rules) for transforms and attachments; relationships for gameplay links (`TargetOf`, `OwnedBy`, `InCell`).
 - Prefabs (`IsA`) for enemy and item archetypes; a spawned enemy is an instance that overrides a few fields.
 - Systems run in explicit pipeline phases: Input → PreSim → Combat → Physics → Animation → PostSim → RenderExtract.
-- The flecs REST explorer runs in dev builds, so humans and AI can query the live world from outside.
+- Planned for dev builds: the flecs REST explorer, so humans and AI can query the live world from outside. It isn't on yet: its HTTP server runs on a thread of flecs' own, and the engine turns flecs' threads off (below).
 
 **World data rules.** flecs keeps entities with the same set of components together in one archetype table, one tightly packed column per component; a cached query holds the tables it matches, and a system runs as a flat loop over each table's columns. Everything below keeps the world on that path (checked against flecs 4.1.6):
 
@@ -155,7 +155,7 @@ The core is flecs for the world, a job system and allocators for streaming, a co
   - Bulky, rarely iterated data (debug info, editor metadata) is `Sparse`: stable pointers, no table moves.
 - **Queries, never `get()` in a loop.** Per-frame systems iterate cached queries; `get()` is for one entity, once. Hot components stay small, plain and split from cold data (doc rule 1).
 - **Shared, not copied.** Data the same for every instance of a prefab (stats, mesh and material IDs, collision shapes) is marked `(OnInstantiate, Inherit)`: stored once on the prefab, read as one value per table. flecs copies prefab components by default.
-- **Change detection by table.** Systems skip tables nothing wrote to (`changed()`); data that changes often and data that rarely does live in different components, since one write marks its whole table. Render extraction sends only changed transforms to the GPU instance buffer.
+- **Change detection by table.** Systems skip tables nothing wrote to (`changed()`); data that changes often and data that rarely does live in different components, since one write marks its whole table. Render extraction is to send only changed transforms to the GPU instance buffer once instances persist on the GPU (GPU-driven v1); until then every instance is written each frame.
 - **Events, not polling.** Observers for reactions, singletons for global state, IDs hashed at load, spatial queries through the grid.
 - **Our memory and threads.** flecs' allocations go through our allocators (its OS API hooks, tag World), so they count in the per-frame allocation counter; flecs' own threads stay off (its workers wait on each other at every merge, which a job system can't promise): systems over big tables split their rows with `JobSystem::parallel_for`, one writer per row. Structural changes stay deferred and merge at phase boundaries; Tracy shows each merge.
 - **Measured.** A headless world benchmark (about 10k entities in typical shapes: a transform hierarchy, movement, render extraction) runs in CI, and Tracy plots tables and entities per query, so fragmentation is a number, not a guess.
@@ -166,7 +166,7 @@ The core is flecs for the world, a job system and allocators for streaming, a co
 
 1. Source: glTF, PNG/EXR, JSON/Lua data, WAV/OGG, Slang shaders.
 2. Cooker: vertex-cache-optimized meshes + LOD chains (meshoptimizer), BC7/BC5 textures with mips, ozz animations, baked navmesh tiles, physics shapes.
-3. Cooked assets are content-addressed by hash; the same cooker runs offline, on file change, and from the command line.
+3. Cooked assets are named by asset ID and carry a content hash; the same cooker runs offline, on file change (with the editor, later), and from the command line.
 4. Runtime loads asynchronously via the job system with priorities; GPU uploads go through a staging ring on the transfer queue.
 
 **Ship build: clean, packed, no raw files.** The root holds only the executable, its DLLs and licenses; all game data lives in numbered archives DATA\_000X.arc inside the Archives folder. Source assets never leave the repository.
@@ -336,7 +336,7 @@ Avoided by design: a thread per request, systems reading files on their own, per
 
 **Writes.** Only `user:/` and `temp:/` are writable. Saves and settings use write-to-temp-then-rename so a crash never corrupts them.
 
-**Hot reload.** A file watcher on `src:/` triggers the cooker; when cooked output changes in `game:/`, the asset registry reloads it in place and notifies dependents.
+**Hot reload.** A file watcher on `src:/` is to trigger the cooker (for now it is run by hand); when cooked output changes in `game:/`, the asset registry reloads it in place and notifies dependents.
 
 **Asset registry v1** (`engine/asset/registry.h`; rules in `engine/asset/README.md`). `load(ref)` holds an asset by ID and type and returns a handle at once; the read lands straight in the asset's memory, is checked on a job, and is committed with the other finished reads once per frame on the main thread, which then loads what its header depends on. States are Loading, Ready (file in, dependencies settled) and Failed (logged; users draw a placeholder). Assets are reference counted and unloaded when nobody holds them. Hot reload polls a few held files per frame (an OS watcher comes later) and swaps changed ones in place, telling listeners. Cooked headers list dependencies with their type, since the type names the file.
 
@@ -495,16 +495,19 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 **Frame passes, in order:**
 
 1. GPU culling (instances, lights) and Hi-Z build
-2. Shadows: cascaded sun shadows (4 cascades in an atlas, stable fitting, a screen-space mask with contact-hardening filtering and a shadow tint; engine/render/scene/README.md), cached far cascades later; local shadow atlas for torches and spells
+2. Shadows: cascaded sun shadows (4 cascades in an atlas, stable fitting), cached far cascades later; local shadow atlas for torches and spells
 3. G-buffer: base color + lighting group ID (RGBA8 sRGB), octahedral normal (RG16), roughness/metalness/occlusion/translucency (RGBA8), emissive straight into the HDR target, reverse-Z depth; motion vectors join with TAA (engine/render/scene/README.md)
 4. Terrain and grass write into the same G-buffer
 5. Deferred decals (blood, scorch, footprints) modify the G-buffer
-6. Async compute: SSAO/GTAO, light clustering, particle simulation
-7. Deferred lighting: sun, clustered local lights, sky and IBL probes, subsurface for skin and foliage
-8. Atmosphere and sky (precomputed scattering), volumetric fog and god rays (froxels), clouds
-9. Forward pass for transparents, particles, water, hair cards
-10. Post: TAA, SSR, bloom, depth of field, motion blur, tonemapping, color grading LUT, film grain
-11. UI and editor overlays
+6. Sun shadow mask: the cascades resolved per pixel into a screen-space mask with contact-hardening filtering; it reads the G-buffer's depth and normals, so it runs after the G-buffer, not with the shadow maps
+7. Async compute: SSAO/GTAO, light clustering, particle simulation
+8. Deferred lighting: sun (through the mask, tinted toward a shadow color), clustered local lights, sky and IBL probes, subsurface for skin and foliage
+9. Atmosphere and sky (precomputed scattering), volumetric fog and god rays (froxels), clouds
+10. Forward pass for transparents, particles, water, hair cards
+11. Post: TAA, SSR, bloom, depth of field, motion blur, tonemapping, color grading LUT, film grain
+12. UI and editor overlays
+
+Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
 
 GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
@@ -536,10 +539,10 @@ GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
 *What it changes for us (renderer v1 and after):*
 
-- G-buffer v1 keeps the planned octahedral normals (more precision for the same bits), and adds a **translucency amount** and an **8-bit lighting group ID** next to the material ID, so the group lever exists from the start.
+- G-buffer v1 keeps the planned octahedral normals (more precision for the same bits), and adds a **translucency amount** and an **8-bit lighting group ID** (in base color's alpha; there is no material ID channel), so the group lever exists from the start. Both are written as 0 until materials carry them.
 - Lighting v1: metal-roughness GGX for the sun plus a placeholder ambient; materials flagged translucent get wrapped diffuse and backlight transmission (cheap, and central to foliage and cloth). Shadows get a **shadow color** parameter from the first shadow pass.
 - Lighting groups (a key and fill light per group, from a table indexed by the G-buffer ID): designed in v1 (the ID is written), used from M1 with the lighting presets.
-- Post v1: fixed exposure, then the tonemap curve as a 1D table (a filmic curve to start, others swappable), then a 3D LUT hook (identity at first). Auto exposure, bloom and blended LUTs follow. Grading always happens after tonemapping, on the LUT.
+- Post v1: fixed exposure, then the tonemap curve as a 1D table (a filmic curve to start, others swappable), then a 3D LUT hook (identity at first). Auto exposure, bloom and blended LUTs follow. Grading always happens after tonemapping, on the LUT. Built so far: fixed exposure and a filmic curve computed in the shader (the ACES fit); the table and the LUT hook are next.
 
 The simulation stays at a fixed 60 Hz tick; the renderer interpolates transforms between ticks, so the game renders at 120+ FPS while combat frame data stays deterministic. Input is polled every rendered frame and timestamped into the buffer to cut latency. Raising the tick to 120 Hz is possible later (frame data would be authored in seconds, not frames) but doubles simulation cost.
 
@@ -652,7 +655,7 @@ This is where the game's identity lives, so iteration speed matters most: every 
 
 - Shaders written in Slang, split into modules: common lighting, G-buffer packing, wind, dissolve, noise library, terrain sampling.
 - Permutations kept small and explicit (skinned, alpha-tested, wind, dissolve); compiled in parallel, cached by hash, reloaded live.
-- Reflection generates descriptor layouts and C++/Lua-visible parameter structs, so no hand-written binding code.
+- No descriptor layouts per shader: every pipeline shares one layout (push constants, bindless tables), and reflection checks each program against it. Reflection is also to generate C++/Lua-visible parameter structs, so no hand-written binding code.
 - A shader playground panel: pick a material, tweak parameters, see it on a test sphere, character or terrain patch.
 
 **Materials.** No node graph. Materials are text files choosing a shader "template" (standard PBR, foliage, skin, cloth, hair, emissive rune, glass, water) plus parameters and textures. Text materials are easy to diff, batch-edit and generate, for both humans and AI. Custom looks are new templates written in Slang.
@@ -844,7 +847,7 @@ The world is one seamless space streamed around the player in a grid of cells, w
 **Large-world precision.** World coordinates in double precision on the CPU, floats relative to a render origin near the camera on the GPU, so a 10+ km world has no jitter.
 
 - Positions are doubles everywhere on the CPU (`Transform.position`); rotation and scale stay float. The simulation never rebases: physics, AI, saves and distances all see one fixed world space. At 60k entities this costs about 2 MB.
-- The GPU sees floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Extraction is the only place doubles become floats; moving the origin re-uploads instances once, and nothing outside extraction knows it exists. Static instances otherwise upload once, so change-only uploads keep working. Within 1 km of the origin, float precision is about 0.06 mm.
+- The GPU sees floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Extraction is the only place doubles become floats, and nothing outside extraction knows the origin exists. Today every instance is written each frame; once instances persist on the GPU (GPU-driven v1), moving the origin re-uploads them once and static instances otherwise upload once, so the origin doesn't get in the way of change-only uploads. Within 1 km of the origin, float precision is about 0.06 mm.
 
 **World model: one owner per thing, data flowing one way.** No system keeps its own copy of what exists in the world; the flecs world is the only list.
 
@@ -1009,7 +1012,7 @@ One style everywhere, enforced by clang-format and clang-tidy in CI, so humans a
 - C++20 subset: no exceptions, no RTTI, no iostreams; `Result` for recoverable errors, `DE_ASSERT` for invariants.
 - Plain structs for data; classes only for things that guard invariants (containers, RHI objects, allocators).
 - No raw `new`/`delete` outside allocators; ownership through handles or a single owner, no `shared_ptr`.
-- No hidden globals or singletons: engine services are reached through an explicit `EngineContext` passed in, or through the flecs world.
+- No hidden globals or singletons: engine services are reached through an explicit `Engine` (`app/framework.h`) passed in, or through the flecs world.
 - `const` by default; `auto` only when the type is obvious from the line; `enum class` only.
 - Templates kept simple: concepts are fine, deep metaprogramming is not.
 - Headers: `#pragma once`, minimal includes, forward declarations, no `using namespace` in headers.
@@ -1033,7 +1036,7 @@ engine/
   script/     # Lua bindings
   editor/     # editor mode, panels, commands
   tools/      # debug UI, stats panel, free camera
-config/       # engine settings as text: input bindings (copied into game:/config/)
+config/       # engine settings as text: input bindings, engine.settings (copied into game:/config/)
 tools/
   cooker/     # asset cooker, validators, packer
 shaders/      # Slang
@@ -1082,14 +1085,14 @@ Decision: Git + Git LFS (GitHub or self-hosted Gitea). It fits a two-person team
 
 - `.gitattributes` from day one: `.png`, `.exr`, `.tga`, `.psd`, `.blend`, `.fbx`, `.glb`, `.wav`, `.ogg`, `.ktx2` go to LFS.
 - LFS file locking on unmergeable files (`.blend`, `.psd`), so two people never overwrite each other's work.
-- A pre-commit hook rejects any file over 1 MB that is not tracked by LFS.
+- Planned: a pre-commit hook that rejects any file over 1 MB not tracked by LFS. It isn't set up yet.
 
 **Never committed.** Cooked data, `Archives/`, build output, shader caches, editor user settings. The cooker rebuilds them; CI caches cooked data keyed by content hash.
 
 **Workflow.**
 
 - Short-lived branches, pull requests into `main`, squash merges.
-- CI on every PR: build (debug + release), unit tests, headless gameplay tests, benchmark scenes, ship-layout validator.
+- CI on every PR: debug and ship builds with the unit tests on Windows and Linux, `cooker --check`, clang-format and clang-tidy. Headless gameplay tests, benchmark scenes and the ship-layout validator join as they land.
 - `main` always builds and runs; tagged releases map to milestones (`m0`, `m1`...).
 - Commit messages: imperative, prefixed by system (`render: add Hi-Z build pass`).
 
@@ -1111,31 +1114,33 @@ M0 is split in two so something runs early. Tasks are ordered: each builds on th
 
 **M0a: window, core, first pixels.** Gate: Windows and Linux CI green; a triangle and a textured quad drawn through the RHI and render graph; shader hot reload; Tracy shows every system.
 
-- [ ] Repo setup: CMake presets, vcpkg manifest, `.gitattributes` for LFS, clang-format and clang-tidy, CI building Windows and Linux
-- [ ] Core library facade: `Array`, `InlineArray`, `HashMap`, `SlotMap`, `StringId`, `FunctionRef`, `Result` (std underneath)
-- [ ] Allocators: heap, arena, frame, pool, with tags and the per-frame allocation counter; `DE_ASSERT` and logging
-- [ ] Platform layer: SDL3 window, input actions, timers, threads
-- [ ] Job system (work-stealing) and Tracy zones
-- [ ] VFS: `game:/`, `user:/`, `temp:/` mounts, loose-file backend, async reads on a small thread pool
-- [ ] Vulkan RHI: device, VMA, swapchain, command lists, sync2, dynamic rendering, capability struct
-- [ ] Slang compilation, reflection and shader hot reload
-- [ ] Bindless setup: texture and buffer descriptors by index, buffer device address
-- [ ] Render graph v1: pass setup/execute, transient resources, automatic barriers, unused-pass culling
-- [ ] Dear ImGui as a graph pass, with a frame stats panel
+- [x] Repo setup: CMake presets, vcpkg manifest, `.gitattributes` for LFS, clang-format and clang-tidy, CI building Windows and Linux
+- [x] Core library facade: `Array`, `InlineArray`, `HashMap`, `SlotMap`, `StringId`, `FunctionRef`, `Result` (std underneath)
+- [x] Allocators: heap, arena, frame, pool, with tags and the per-frame allocation counter; `DE_ASSERT` and logging
+- [x] Platform layer: SDL3 window, input actions, timers, threads
+- [x] Job system (work-stealing) and Tracy zones
+- [x] VFS: `game:/`, `user:/`, `temp:/` mounts (and `src:/` in dev builds), loose-file backend, async reads on a small thread pool
+- [x] Vulkan RHI: device, VMA, swapchain, command lists, sync2, dynamic rendering, capability struct; GPU uploads through a staging ring (transfer queue when there is one)
+- [x] Slang compilation, reflection and shader hot reload
+- [x] Bindless setup: textures and samplers by index, buffers by device address
+- [x] Render graph v1: pass setup/execute, transient resources, automatic barriers, unused-pass culling
+- [x] Dear ImGui as a graph pass, with a frame stats panel
 
 **M0b: engine skeleton.** Gate: a cooked glTF scene with textures, rendered deferred through the graph at 120 FPS, editable in editor mode, Lua and asset hot reload working, one headless test passing in CI.
 
-- [ ] flecs world: pipeline phases, component reflection, fixed 60 Hz tick with render interpolation
-- [ ] Meta tree and cooker v1: GUIDs, folder rules, ufbx/cgltf/stb import, `.demesh`, `.detex`, `.demat`, `.deshader`, common header, load-in-place
-- [ ] Asset registry: load by ID through VFS and jobs, reference counting, hot reload of cooked assets
-- [ ] Deferred renderer v1: G-buffer, sun light, placeholder IBL, tonemapping, free camera
+- [x] flecs world: pipeline phases, component reflection, fixed 60 Hz tick with render interpolation; double-precision transforms, cells as assets and entities
+- [x] Meta tree and cooker v1: GUIDs, folder rules, ufbx/cgltf/stb import, `.demesh`, `.detex`, `.demat`, `.decell`, `.deworld`, `.deenv`, `.deshader`, common header, load-in-place
+- [x] Asset registry: load by ID through VFS and jobs, reference counting, hot reload of cooked assets
+- [x] Deferred renderer v1: G-buffer, sun light with cascaded shadows and a screen-space mask, hemisphere ambient as the placeholder for IBL, filmic tonemapping, G-buffer debug views, free camera
+- [x] App framework: `engine/main.cpp` calls `run_framework` with an application (the viewer opens a world); input bindings and engine settings as text in `config/`
 - [ ] GPU-driven v1: shared vertex/index buffers, compute instance culling, indirect draws
 - [ ] Render graph v2: transient memory aliasing, graph and lifetime debug view, a `discard` declaration on uses (so passes whose output is fully overwritten get culled), parallel pass recording (passes split into chunks recorded by jobs on command lists of their own, submitted in order)
 - [ ] Render graph v3, before M1 content: async compute passes (a queue per pass, queue ownership transfers and semaphores between queues), barrier grouping by dependency level, then pass reordering where profiling shows bubbles
 - [ ] LuaJIT + sol2: bindings for entities, components and commands, script hot reload
 - [ ] Command API v1: `entity.create`, `component.set`, undo/redo, local JSON-RPC socket
 - [ ] Editor mode v1: outliner, reflection-driven inspector, gizmos, save to text cell files
-- [ ] Headless mode, doctest suite and one benchmark scene in CI
+- [x] doctest suite in CI, GPU tests included (lavapipe on Linux), with a headless world benchmark (10k entities)
+- [ ] Headless mode (`--headless`) and one benchmark scene in CI
 
 ## Open questions & decisions log
 
@@ -1158,7 +1163,7 @@ Decisions so far:
 | 2026-10-31 | Lua as first-class scripting; heavy logic stays in C++ | Fast iteration without per-frame cost |
 | 2026-10-31 | Terrain clipmaps + GPU-driven indirect grass | Huge fields at low CPU cost |
 | 2026-10-31 | AI-friendly: text sources, command API, MCP server | AI and humans use the same doors |
-| 2026-10-31 | Elden Ring shaders used as reference only | Own implementations, clean IP |
+| 2026-10-31 | Elden Ring shaders used as reference only (superseded on 2026-11-03: studied in full, below) | Own implementations, clean IP |
 | 2026-10-31 | 120 FPS target for the full game; 60 Hz fixed simulation with interpolation | Smooth, responsive feel; deterministic frame data |
 | 2026-10-31 | Own core library API; std underneath first, own implementations swapped in when profiling demands | std allocates silently and scales poorly; we keep only what wins benchmarks |
 | 2026-11-01 | Slang for all shaders | Modules, generics, reflection, good Vulkan support |
@@ -1184,3 +1189,4 @@ Decisions so far:
 | 2026-11-03 | The entry point only parses arguments, declares the application and calls `run_framework`; the framework owns the engine and the frame loop, the application (`startup`, `update`) says what to load, does its frame's work and decides when to quit; bindings and settings are text in `config/`, not code | Platform entry, engine and game stay apart; what a build loads and binds is data, so it changes without a rebuild |
 | 2026-11-03 | A world is an asset (`.world`: cells, start, environment) and the light is one too (`.environment`), both hot reloaded; the engine opens the world named in `config/engine.settings` | Nothing about a scene is in code; editing the light or the world shows in the running game, and the same assets carry over to the streamer, time of day and weather |
 | 2026-11-03 | Sun shadows v1: 4 stable cascades in one atlas, resolved into a screen-space mask (dithered cascade seams, contact-hardening filter), sunlight in shadow tinted toward a shadow color | A mask keeps lighting simple and makes room for temporal filtering; tinted shadows are part of the look; the static cache waits until scenes have enough static casters to need it |
+| 2026-11-03 | Until GPU-driven v1 keeps instances on the GPU, render extraction writes every instance each frame; change-only uploads (and the render origin's one re-upload) arrive with it | The simplest correct path first; the per-frame cost is measured (GPU timers, Tracy) before it's optimized |

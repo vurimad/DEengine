@@ -64,9 +64,9 @@ struct ShaderLibraryStats {
 // a re-cooked file is picked up the same way an edited source is.
 //
 // Create programs at load time (the first compile blocks). Call update() once per frame on the
-// render thread. Pipelines are created and destroyed on that thread only; rebuilds run one at a
-// time as background jobs, which only idle workers pick up, so they never stall a frame.
-// Move-only; the device, VFS, job system and compiler must outlive it.
+// thread that renders (the main thread today). Pipelines are created and destroyed on that thread only; rebuilds run
+// one at a time as background jobs, which only idle workers pick up, so they never stall a frame. Move-only; the
+// device, VFS, job system and compiler must outlive it.
 class ShaderLibrary {
 public:
     static core::Result<ShaderLibrary> create(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,

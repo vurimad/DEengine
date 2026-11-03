@@ -1,4 +1,4 @@
-// Shadow casters (renderer step 3): every mesh instance into one cascade's tile of the shadow
+// Shadow casters: every mesh instance into one cascade's tile of the shadow
 // atlas, depth only (reverse Z: nearer the sun is greater). Masked materials alpha-test.
 
 import common.bindless;

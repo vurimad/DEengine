@@ -1,4 +1,4 @@
-// The sun's shadow mask (renderer step 3): one full-screen pass resolving how much of the sun each
+// The sun's shadow mask: one full-screen pass resolving how much of the sun each
 // pixel sees, from the cascaded shadow atlas, for the lighting pass to read.
 //   - The cascade by distance along the view; near a cascade's far edge, a dithered share of pixels
 //     uses the next one, so the seam doesn't show (temporal filtering will smooth the dither).
