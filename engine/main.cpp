@@ -264,8 +264,8 @@ int main(int argc, char** argv) {
     }
     std::optional<de::render::SceneRenderer> scene_renderer;
     if (shaders) {
-        auto created =
-            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        auto created = de::render::SceneRenderer::create(
+            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .shadows = {}});
         if (created) {
             scene_renderer.emplace(std::move(*created));
         }

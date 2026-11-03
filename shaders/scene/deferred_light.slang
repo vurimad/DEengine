@@ -14,6 +14,7 @@ struct DeferredLightPush
     uint gb1;
     uint gb2;
     uint depth;
+    uint shadow_mask; // r: sunlight seen
 };
 
 [[vk::push_constant]]
@@ -123,7 +124,10 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const float3 diffuse = albedo * (1.0 - fresnel) * diffuse_term / kPi;
     const float through = pow(saturate(dot(-v, l)), 12.0) * saturate(-n_dot_l_raw + 0.5);
     const float3 transmitted = albedo * s.translucency * through / kPi;
-    const float3 sun = frame.sun_color.rgb * (diffuse + specular + transmitted);
+    // Shadowed sunlight keeps the shadow color (a tint, not black: the look's painterly shadows).
+    const float seen = load_texture(push.shadow_mask, texel).r;
+    const float3 sun_light = frame.sun_color.rgb * lerp(frame.shadow_color.rgb, float3(1.0), seen);
+    const float3 sun = sun_light * (diffuse + specular + transmitted);
 
     // Ambient: the hemisphere for diffuse, and in the reflected direction for specular.
     const float3 r = reflect(-v, n);

@@ -35,8 +35,14 @@ struct SceneFrame {
     float sky_color[4] = {};
     float ground_color[4] = {};
     float shadow_color[4] = {};
+    float cascade_view_proj[64] = {};
+    float cascade_far[4] = {};
+    float cascade_texel_m[4] = {};
+    float cascade_depth_per_m[4] = {};
+    float camera_forward[4] = {};
+    float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
 };
-static_assert(sizeof(SceneFrame) <= 256);
+static_assert(sizeof(SceneFrame) <= 1024);
 
 // Matches GBufferPush in shaders/scene/gbuffer.slang.
 struct GBufferPush {
@@ -49,6 +55,27 @@ struct GBufferPush {
     uint32_t sampler = 0;
 };
 
+// Matches ShadowCasterPush in shaders/scene/shadow_caster.slang.
+struct ShadowCasterPush {
+    uint64_t frame = 0;
+    uint64_t instances = 0;
+    uint64_t vertices = 0;
+    uint64_t materials = 0;
+    uint32_t instance = 0;
+    uint32_t material = 0;
+    uint32_t sampler = 0;
+    uint32_t cascade = 0;
+};
+
+// Matches ShadowMaskPush in shaders/scene/shadow_mask.slang.
+struct ShadowMaskPush {
+    uint64_t frame = 0;
+    uint32_t depth = 0;
+    uint32_t gb1 = 0;
+    uint32_t atlas = 0;
+    uint32_t sampler = 0;
+};
+
 // Matches DeferredLightPush in shaders/scene/deferred_light.slang.
 struct DeferredLightPush {
     uint64_t frame = 0;
@@ -56,6 +83,7 @@ struct DeferredLightPush {
     uint32_t gb1 = 0;
     uint32_t gb2 = 0;
     uint32_t depth = 0;
+    uint32_t shadow_mask = 0;
 };
 
 // Matches TonemapPush in shaders/scene/tonemap.slang.
@@ -67,15 +95,17 @@ struct TonemapPush {
     float exposure = 1.0f;
     uint32_t view = 0;
     uint32_t srgb_target = 0;
+    uint32_t shadow_mask = 0;
 };
 
-constexpr uint64_t kInstancesOffset = 256; // after the SceneFrame
-constexpr uint64_t kInstanceBytes = 48;    // three float4 rows
+constexpr uint64_t kInstancesOffset = 1024; // after the SceneFrame
+constexpr uint64_t kInstanceBytes = 48;     // three float4 rows
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16Float;
 constexpr rhi::Format kDepthFormat = rhi::Format::D32Float;
+constexpr rhi::Format kShadowMaskFormat = rhi::Format::RG8Unorm;
 
 void copy3(const float (&from)[3], float (&to)[4]) {
     to[0] = from[0];
@@ -93,14 +123,18 @@ struct SceneRendererState {
     shader::ProgramHandle gbuffer_cull_none; // double-sided materials
     shader::ProgramHandle deferred_light;
     shader::ProgramHandle tonemap;
+    shader::ProgramHandle shadow_caster;
+    shader::ProgramHandle shadow_mask;
+    SceneShadows shadows;
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
     SceneRendererStats stats;
-    bool frame_written = false; // this frame's SceneFrame: set by the G-buffer pass, read by the light pass
+    bool frame_written = false; // this frame's SceneFrame: written when the passes are added
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap}) {
+        for (const shader::ProgramHandle program :
+             {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap, shadow_caster, shadow_mask}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -135,6 +169,18 @@ struct SceneRendererState {
         light.color_formats[0] = kHdrFormat;
         light.blend[0] = rhi::BlendMode::Additive;
         deferred_light = make("scene.deferred_light", light);
+
+        // Casters: depth only, no culling (thin geometry casts from both sides).
+        const rhi::GraphicsPipelineDesc caster{.depth_format = kDepthFormat,
+                                               .depth_test = true,
+                                               .depth_write = true,
+                                               .depth_compare = rhi::CompareOp::Greater,
+                                               .cull = rhi::CullMode::None,
+                                               .debug_name = "shadow caster"};
+        shadow_caster = make("scene.shadow_caster", caster);
+        rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
+        mask.color_formats[0] = kShadowMaskFormat;
+        shadow_mask = make("scene.shadow_mask", mask);
     }
 
     // The tonemap writes the caller's target: made again when its format changes.
@@ -192,6 +238,27 @@ struct SceneRendererState {
         copy3(lighting.sky_color, scene.sky_color);
         copy3(lighting.ground_color, scene.ground_color);
         copy3(lighting.shadow_color, scene.shadow_color);
+        const float forward[3] = {-frame.camera.transform[2], -frame.camera.transform[6], -frame.camera.transform[10]};
+        const float forward_length =
+            std::max(std::sqrt(forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]), 1e-6f);
+        for (int i = 0; i < 3; ++i) {
+            scene.camera_forward[i] = forward[i] / forward_length;
+        }
+        const float sun[3] = {scene.sun_direction[0], scene.sun_direction[1], scene.sun_direction[2]};
+        ShadowCascade cascades[4];
+        fit_shadow_cascades(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m, aspect, sun,
+                            shadows, cascades);
+        for (int c = 0; c < 4; ++c) {
+            std::memcpy(&scene.cascade_view_proj[static_cast<size_t>(c) * 16], cascades[c].view_proj,
+                        sizeof(cascades[c].view_proj));
+            scene.cascade_far[c] = cascades[c].far_m;
+            scene.cascade_texel_m[c] = cascades[c].texel_m;
+            scene.cascade_depth_per_m[c] = cascades[c].depth_per_m;
+        }
+        scene.shadow_params[0] = shadows.blend_band;
+        scene.shadow_params[1] = 1.0f / static_cast<float>(shadows.resolution * 2);
+        scene.shadow_params[2] = shadows.penumbra_per_m;
+        scene.shadow_params[3] = shadows.max_penumbra_texels;
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         for (size_t i = 0; i < frame.instances.size(); ++i) {
             std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
@@ -218,6 +285,10 @@ const char* scene_view_name(SceneView view) {
         return "occlusion";
     case SceneView::Translucency:
         return "translucency";
+    case SceneView::ShadowMask:
+        return "shadow mask";
+    case SceneView::Cascades:
+        return "shadow cascades";
     case SceneView::Count:
         break;
     }
@@ -253,6 +324,69 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
     }
 }
 
+void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
+                         const float (&sun_direction)[3], const SceneShadows& shadows, ShadowCascade (&out)[4]) {
+    const glm::dvec3 position(camera[3], camera[7], camera[11]);
+    const glm::dvec3 forward = -glm::normalize(glm::dvec3(camera[2], camera[6], camera[10]));
+    const double tan_y = std::tan(static_cast<double>(vertical_fov_rad) * 0.5);
+    const double tan_x = tan_y * aspect;
+    // The light's axes: back toward the sun, and any right and up across it.
+    const glm::dvec3 back = glm::normalize(glm::dvec3(sun_direction[0], sun_direction[1], sun_direction[2]));
+    const glm::dvec3 reference = std::abs(back.y) > 0.99 ? glm::dvec3(1, 0, 0) : glm::dvec3(0, 1, 0);
+    const glm::dvec3 right = glm::normalize(glm::cross(reference, back));
+    const glm::dvec3 up = glm::cross(back, right);
+    const double near = std::max(static_cast<double>(near_m), 0.05);
+    const double far = std::max(static_cast<double>(shadows.distance_m), near * 2.0);
+    const double lambda = std::clamp(static_cast<double>(shadows.split_lambda), 0.0, 1.0);
+    double slice_near = near;
+    for (int c = 0; c < 4; ++c) {
+        // The practical split scheme: a blend of logarithmic and even splits.
+        const double t = static_cast<double>(c + 1) / 4.0;
+        const double slice_far = lambda * near * std::pow(far / near, t) + (1.0 - lambda) * (near + (far - near) * t);
+        // The slice's bounding sphere: on the view axis (the corners are symmetric about it), with a
+        // radius that depends only on the slice, not on where the camera looks.
+        const double diagonal2 = tan_x * tan_x + tan_y * tan_y;
+        // Center at distance z on the axis, equidistant from a near and a far corner (clamped inside).
+        double z = (slice_far * slice_far * (1.0 + diagonal2) - slice_near * slice_near * (1.0 + diagonal2)) /
+                   (2.0 * (slice_far - slice_near));
+        z = std::clamp(z, slice_near, slice_far);
+        const double radius_near = std::sqrt(slice_near * slice_near * diagonal2 + (z - slice_near) * (z - slice_near));
+        const double radius_far = std::sqrt(slice_far * slice_far * diagonal2 + (slice_far - z) * (slice_far - z));
+        double radius = std::max(radius_near, radius_far);
+        radius = std::ceil(radius * 16.0) / 16.0; // steps of 1/16 m: stable
+        const double texel = 2.0 * radius / static_cast<double>(shadows.resolution);
+        // The center snapped to the shadow texel grid, in the light's axes: no swimming.
+        glm::dvec3 center = position + forward * z;
+        const double cx = std::floor(glm::dot(center, right) / texel) * texel;
+        const double cy = std::floor(glm::dot(center, up) / texel) * texel;
+        const double cz = glm::dot(center, back);
+        center = right * cx + up * cy + back * cz;
+        // Clip space: x, y over the sphere; depth 1 nearest the sun (reverse Z), across the sphere
+        // and the reach toward the sun that catches casters outside the view.
+        const double depth_range = 2.0 * radius + static_cast<double>(shadows.caster_reach_m);
+        const double rows[3][3] = {{right.x / radius, right.y / radius, right.z / radius},
+                                   {up.x / radius, up.y / radius, up.z / radius},
+                                   {back.x / depth_range, back.y / depth_range, back.z / depth_range}};
+        const double offsets[3] = {-glm::dot(right, center) / radius, -glm::dot(up, center) / radius,
+                                   (radius - glm::dot(back, center)) / depth_range};
+        ShadowCascade& cascade = out[c];
+        for (int r = 0; r < 3; ++r) {
+            for (int k = 0; k < 3; ++k) {
+                cascade.view_proj[r * 4 + k] = static_cast<float>(rows[r][k]);
+            }
+            cascade.view_proj[r * 4 + 3] = static_cast<float>(offsets[r]);
+        }
+        cascade.view_proj[12] = 0.0f;
+        cascade.view_proj[13] = 0.0f;
+        cascade.view_proj[14] = 0.0f;
+        cascade.view_proj[15] = 1.0f;
+        cascade.far_m = static_cast<float>(slice_far);
+        cascade.texel_m = static_cast<float>(texel);
+        cascade.depth_per_m = static_cast<float>(1.0 / depth_range);
+        slice_near = slice_far;
+    }
+}
+
 bool invert_4x4(const float (&m)[16], float (&out)[16]) {
     // glm is column-major: element [column][row].
     glm::dmat4 matrix;
@@ -282,6 +416,8 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->device = desc.device;
     state->shaders = desc.shaders;
     state->gpu_assets = desc.gpu_assets;
+    state->shadows = desc.shadows;
+    state->shadows.resolution = std::max(state->shadows.resolution, 64U);
     state->make_scene_programs();
     return SceneRenderer(state);
 }
@@ -314,8 +450,16 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle gbuffer_none = state.shaders->pipeline(state.gbuffer_cull_none);
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
     const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
-    const bool ready = frame.camera.valid && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
-                       tonemap.is_valid();
+    const rhi::PipelineHandle caster = state.shaders->pipeline(state.shadow_caster);
+    const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
+    // This frame's constants, now: every pass below draws only if they're in.
+    const rhi::BufferHandle frame_buffer =
+        frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
+    const float aspect =
+        static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
+    state.frame_written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
+    const bool ready = state.frame_written && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
+                       tonemap.is_valid() && caster.is_valid() && mask.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -327,6 +471,67 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             });
         return;
     }
+    const uint64_t frame_address = state.device->buffer_address(frame_buffer);
+    const uint32_t cascade_size = state.shadows.resolution;
+
+    // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
+    struct ShadowPass {
+        SceneRendererState* state = nullptr;
+        const world::RenderFrame* frame = nullptr;
+        GraphTexture atlas;
+        rhi::PipelineHandle caster;
+        uint64_t frame_address = 0;
+        uint32_t cascade_size = 0;
+    };
+    const auto& shadow = graph.add_pass<ShadowPass>(
+        "sun shadows",
+        [&](PassBuilder& pass, ShadowPass& data) {
+            data = {.state = &state,
+                    .frame = &frame,
+                    .atlas = {},
+                    .caster = caster,
+                    .frame_address = frame_address,
+                    .cascade_size = cascade_size};
+            data.atlas = pass.create_texture(
+                {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
+            pass.use(data.atlas, rhi::ResourceState::DepthWrite);
+        },
+        [](const ShadowPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("shadow pass");
+            SceneRendererState& renderer = *data.state;
+            const world::RenderFrame& extracted = *data.frame;
+            ShadowCasterPush push{.frame = data.frame_address,
+                                  .instances = data.frame_address + kInstancesOffset,
+                                  .materials = renderer.gpu_assets->material_table_address(),
+                                  .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
+            for (uint32_t cascade = 0; cascade < 4; ++cascade) {
+                const rhi::DepthAttachment depth{.texture = context.texture(data.atlas)};
+                const rhi::Rect tile{.x = static_cast<int32_t>((cascade & 1U) * data.cascade_size),
+                                     .y = static_cast<int32_t>((cascade >> 1U) * data.cascade_size),
+                                     .width = data.cascade_size,
+                                     .height = data.cascade_size};
+                context.list.begin_rendering({.depth = &depth, .area = tile});
+                context.list.bind_pipeline(data.caster);
+                push.cascade = cascade;
+                for (size_t i = 0; i < extracted.instances.size(); ++i) {
+                    const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
+                    if (mesh == nullptr) {
+                        continue;
+                    }
+                    push.instance = static_cast<uint32_t>(i);
+                    push.vertices = mesh->vertex_address;
+                    context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
+                    for (const GpuMeshPart& part : mesh->parts) {
+                        push.material = part.material;
+                        context.list.push_constants(push);
+                        context.list.draw_indexed(part.index_count, 1, part.first_index);
+                        ++renderer.stats.shadow_draws;
+                    }
+                }
+                context.list.end_rendering();
+            }
+        });
+    const GraphTexture atlas = shadow.atlas;
 
     struct Targets {
         GraphTexture gb[3];
@@ -336,22 +541,20 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     struct GBufferPass {
         SceneRendererState* state = nullptr;
         const world::RenderFrame* frame = nullptr;
-        SceneLighting lighting;
         Targets targets;
         rhi::PipelineHandle cull_back;
         rhi::PipelineHandle cull_none;
-        rhi::BufferHandle frame_buffer;
+        uint64_t frame_address = 0;
     };
     const auto& gbuffer = graph.add_pass<GBufferPass>(
         "gbuffer",
         [&](PassBuilder& pass, GBufferPass& data) {
             data = {.state = &state,
                     .frame = &frame,
-                    .lighting = lighting,
                     .targets = {},
                     .cull_back = gbuffer_back,
                     .cull_none = gbuffer_none,
-                    .frame_buffer = state.frame_buffer(frame.instances.size())};
+                    .frame_address = frame_address};
             for (uint32_t i = 0; i < 3; ++i) {
                 data.targets.gb[i] =
                     pass.create_texture({.desc = {.format = kGBufferFormats[i]}, .reference_scale = 1.0f});
@@ -373,44 +576,66 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             colors[3] = {.texture = context.texture(data.targets.hdr)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
-            const rhi::TextureDesc& size = context.desc(data.targets.hdr);
-            const float aspect = static_cast<float>(size.width) / static_cast<float>(std::max(size.height, 1U));
-            renderer.frame_written = data.frame_buffer.is_valid() &&
-                                     renderer.write_frame(data.frame_buffer, extracted, data.lighting, aspect);
-            if (renderer.frame_written) {
-                const uint64_t address = context.device.buffer_address(data.frame_buffer);
-                GBufferPush push{.frame = address,
-                                 .instances = address + kInstancesOffset,
-                                 .materials = renderer.gpu_assets->material_table_address(),
-                                 .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
-                rhi::PipelineHandle bound;
-                for (size_t i = 0; i < extracted.instances.size(); ++i) {
-                    const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
-                    if (mesh == nullptr) {
-                        continue;
+            GBufferPush push{.frame = data.frame_address,
+                             .instances = data.frame_address + kInstancesOffset,
+                             .materials = renderer.gpu_assets->material_table_address(),
+                             .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
+            rhi::PipelineHandle bound;
+            for (size_t i = 0; i < extracted.instances.size(); ++i) {
+                const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
+                if (mesh == nullptr) {
+                    continue;
+                }
+                ++renderer.stats.drawn;
+                push.instance = static_cast<uint32_t>(i);
+                push.vertices = mesh->vertex_address;
+                context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
+                for (const GpuMeshPart& part : mesh->parts) {
+                    const rhi::PipelineHandle pipeline =
+                        renderer.gpu_assets->double_sided(part.material) ? data.cull_none : data.cull_back;
+                    if (!(pipeline == bound)) {
+                        context.list.bind_pipeline(pipeline);
+                        bound = pipeline;
                     }
-                    ++renderer.stats.drawn;
-                    push.instance = static_cast<uint32_t>(i);
-                    push.vertices = mesh->vertex_address;
-                    context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
-                    for (const GpuMeshPart& part : mesh->parts) {
-                        const rhi::PipelineHandle pipeline =
-                            renderer.gpu_assets->double_sided(part.material) ? data.cull_none : data.cull_back;
-                        if (!(pipeline == bound)) {
-                            context.list.bind_pipeline(pipeline);
-                            bound = pipeline;
-                        }
-                        push.material = part.material;
-                        context.list.push_constants(push);
-                        context.list.draw_indexed(part.index_count, 1, part.first_index);
-                        ++renderer.stats.draws;
-                    }
+                    push.material = part.material;
+                    context.list.push_constants(push);
+                    context.list.draw_indexed(part.index_count, 1, part.first_index);
+                    ++renderer.stats.draws;
                 }
             }
             context.list.end_rendering();
         });
     const Targets targets = gbuffer.targets;
-    const rhi::BufferHandle frame_buffer = gbuffer.frame_buffer;
+
+    // The shadow mask: how much sun each pixel sees.
+    struct MaskPass {
+        GraphTexture mask;
+    };
+    const auto& mask_pass = graph.add_pass<MaskPass>(
+        "shadow mask",
+        [&](PassBuilder& pass, MaskPass& data) {
+            data.mask = pass.create_texture({.desc = {.format = kShadowMaskFormat}, .reference_scale = 1.0f});
+            pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(targets.gb[1], rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(data.mask, rhi::ResourceState::RenderTarget);
+        },
+        [targets, atlas, mask, frame_address](const MaskPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("shadow mask pass");
+            const rhi::ColorAttachment color{.texture = context.texture(data.mask), .load = rhi::LoadOp::DontCare};
+            context.list.begin_rendering({.colors = std::span(&color, 1)});
+            context.list.bind_pipeline(mask);
+            context.list.push_constants(ShadowMaskPush{
+                .frame = frame_address,
+                .depth = context.device.texture_index(context.texture(targets.depth)),
+                .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
+                .atlas = context.device.texture_index(context.texture(atlas)),
+                .sampler = rhi::sampler_index(rhi::DefaultSampler::PointClamp),
+            });
+            context.list.draw(3);
+            context.list.end_rendering();
+        });
+    const GraphTexture shadow_mask = mask_pass.mask;
 
     graph.add_pass(
         "deferred light",
@@ -419,23 +644,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             }
             pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
         },
-        [&state, targets, frame_buffer, light](PassContext& context) {
+        [targets, shadow_mask, frame_address, light](PassContext& context) {
             DE_PROFILE_ZONE("deferred light pass");
             const rhi::ColorAttachment color{.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
-            if (state.frame_written) { // the G-buffer pass ran just before, in this execute()
-                context.list.bind_pipeline(light);
-                context.list.push_constants(DeferredLightPush{
-                    .frame = context.device.buffer_address(frame_buffer),
-                    .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
-                    .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
-                    .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
-                    .depth = context.device.texture_index(context.texture(targets.depth)),
-                });
-                context.list.draw(3);
-            }
+            context.list.bind_pipeline(light);
+            context.list.push_constants(DeferredLightPush{
+                .frame = frame_address,
+                .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
+                .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
+                .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
+                .depth = context.device.texture_index(context.texture(targets.depth)),
+                .shadow_mask = context.device.texture_index(context.texture(shadow_mask)),
+            });
+            context.list.draw(3);
             context.list.end_rendering();
         });
 
@@ -449,9 +674,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             for (const GraphTexture gb : targets.gb) {
                 pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             }
+            pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
-        [targets, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
+        [targets, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
             DE_PROFILE_ZONE("tonemap pass");
             const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
@@ -464,6 +690,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .exposure = exposure,
                 .view = view_index,
                 .srgb_target = srgb_target,
+                .shadow_mask = context.device.texture_index(context.texture(shadow_mask)),
             });
             context.list.draw(3);
             context.list.end_rendering();

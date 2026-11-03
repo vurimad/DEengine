@@ -804,6 +804,14 @@ RenderGraph& RenderGraph::operator=(RenderGraph&& other) noexcept {
     return *this;
 }
 
+uint32_t RenderGraph::reference_width() const {
+    return state_->reference_width;
+}
+
+uint32_t RenderGraph::reference_height() const {
+    return state_->reference_height;
+}
+
 void RenderGraph::begin(uint32_t reference_width, uint32_t reference_height) {
     DE_PROFILE_ZONE("render graph begin");
     RenderGraphState& state = *state_;

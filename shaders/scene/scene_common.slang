@@ -11,8 +11,30 @@ public struct SceneFrame
     public float4 sun_color;        // rgb: illuminance, in exposure-relative units
     public float4 sky_color;        // rgb: ambient from above
     public float4 ground_color;     // rgb: ambient from below
-    public float4 shadow_color;     // rgb: what shadowed sunlight keeps (no shadows yet: unused)
+    public float4 shadow_color;     // rgb: what shadowed sunlight keeps
+    // Sun shadows: kCascadeCount cascades, each a tile of the shadow atlas.
+    public float4 cascade_view_proj[16]; // 4 rows per cascade: render-origin space to the cascade's clip space
+    public float4 cascade_far;           // per cascade: its far edge, as distance along the view
+    public float4 cascade_texel_m;       // per cascade: a shadow texel's size in meters
+    public float4 cascade_depth_per_m;   // per cascade: depth units per meter toward the sun
+    public float4 camera_forward;        // xyz: the view direction
+    public float4 shadow_params;         // x: blend band (fraction of a cascade), y: atlas texel (uv), z: penumbra scale, w: max penumbra (texels)
 };
+
+public static const uint kCascadeCount = 4;
+
+// A cascade's tile in the 2x2 shadow atlas: uv offset (each tile is half the atlas).
+public float2 cascade_tile(uint cascade)
+{
+    return float2(float(cascade & 1u), float(cascade >> 1u)) * 0.5;
+}
+
+public float4 cascade_clip(SceneFrame frame, uint cascade, float3 position)
+{
+    const float4 p = float4(position, 1.0);
+    return float4(dot(frame.cascade_view_proj[cascade * 4 + 0], p), dot(frame.cascade_view_proj[cascade * 4 + 1], p),
+                  dot(frame.cascade_view_proj[cascade * 4 + 2], p), dot(frame.cascade_view_proj[cascade * 4 + 3], p));
+}
 
 // Matches asset::MeshVertex.
 public struct MeshVertex
