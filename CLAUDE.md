@@ -45,6 +45,7 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 
 ## Clean IP
 
-- Other games (e.g. Elden Ring) are studied only through frame captures, public talks and observation. Never commit extracted game data, shaders or scripts; write findings in our own words.
+- Other games (e.g. Elden Ring) may be studied in full from a copy we own: frame captures, their shader code (as captures show it, or dumped with modding tools), public talks, community analysis and observation. Captures and dumps are taken offline only, never by tampering with anti-cheat online (docs/design.md, Using Elden Ring as reference).
+- Studying is for understanding techniques: we write our own implementations shaped to our pipeline, never copy or transcribe their shader code, and write findings in our own words. Nothing extracted from a game (data, shaders, scripts, captures) is ever committed.
 - Reference engines: Godot (MIT) may be read and quoted with attribution; Unreal source is for understanding ideas only, never copied.
 - Never read, copy or derive from leaked or stolen proprietary source code.
