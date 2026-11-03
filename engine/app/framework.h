@@ -40,7 +40,7 @@ namespace de::app {
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked)
 //   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
-//   --deadzone X     stick deadzone, 0..0.9 (default 0.15)
+//   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
 //   --show-sticks    dev builds: deadzone off, raw stick values logged twice a second (drift)
 struct FrameworkArgs {
     int argc = 0;
