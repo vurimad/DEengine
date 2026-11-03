@@ -137,15 +137,18 @@ TEST_CASE("a raised deadzone hides a drifting stick") {
     const ActionId move_x = input.add_action("move_x"_sid, ActionKind::Axis);
     REQUIRE(input.bind(move_x, "gamepad:leftx").ok());
 
-    input.push(event("gamepad:leftx", 0.2f)); // a worn stick resting at 0.2
-    input.sample();
-    CHECK(input.state(move_x).down); // the default deadzone (0.15) lets it through
-
-    input.set_stick_deadzone(0.25f);
-    input.push(event("gamepad:leftx", 0.2f));
+    input.push(event("gamepad:leftx", 0.2f)); // a worn stick resting at 0.2: the default (0.3) hides it
     input.sample();
     CHECK_FALSE(input.state(move_x).down);
-    CHECK(input.stick_deadzone() == 0.25f);
+    input.push(event("gamepad:leftx", 0.35f)); // a worse one, at 0.35, gets through
+    input.sample();
+    CHECK(input.state(move_x).down);
+
+    input.set_stick_deadzone(0.45f);
+    input.push(event("gamepad:leftx", 0.35f));
+    input.sample();
+    CHECK_FALSE(input.state(move_x).down);
+    CHECK(input.stick_deadzone() == 0.45f);
 
     input.push(event("gamepad:leftx", 1.0f)); // full deflection still reaches 1
     input.sample();

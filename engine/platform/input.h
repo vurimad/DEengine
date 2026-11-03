@@ -76,9 +76,10 @@ struct BindTextOptions {
 
 class Input {
 public:
-    // Stick values below the deadzone read as zero. Worn sticks drift: raise it per player
-    // (an options-menu setting) rather than changing the default.
-    static constexpr float kDefaultStickDeadzone = 0.15f;
+    // Stick values below the deadzone read as zero. 0.3 by default: worn sticks drift (the dev pad
+    // rests past 0.15), and a camera that turns by itself is worse than a little dead travel. A
+    // player can still set their own (deengine --deadzone, an options-menu setting later).
+    static constexpr float kDefaultStickDeadzone = 0.3f;
     static constexpr float kMaxStickDeadzone = 0.9f;
     static constexpr float kTriggerThreshold = 0.5f; // an axis bound to a button goes down past this...
     static constexpr float kTriggerRelease = 0.4f;   // ...and up below this, so resting near 0.5 can't flicker
