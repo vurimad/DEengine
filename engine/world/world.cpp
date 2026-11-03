@@ -150,7 +150,9 @@ flecs::entity World::phase(Phase phase) const {
 
 void World::tick() {
     DE_PROFILE_ZONE("world tick");
-    // frame_begin gives systems the step (it.delta_time()) and moves flecs' time and timers on.
+    // frame_begin gives systems the step (it.delta_time()). flecs' own timers (interval, rate,
+    // tick sources) don't run: their systems live in phases our pipelines don't have. Time systems
+    // by the fixed tick instead.
     const flecs::world& ecs = state_->ecs;
     ecs.frame_begin(static_cast<ecs_ftime_t>(state_->tick_dt_s));
     ecs.run_pipeline(state_->simulation, static_cast<ecs_ftime_t>(state_->tick_dt_s));

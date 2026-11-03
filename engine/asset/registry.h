@@ -124,6 +124,8 @@ public:
     uint32_t revision(AssetHandle handle) const;
 
     // The assets it depends on, held for it, in its header's order; empty until its file is loaded.
+    // A dependency that would close a cycle (a corrupt file) is left out, so don't index this by a
+    // header position: find() the header's entry.
     std::span<const AssetHandle> dependencies(AssetHandle handle) const;
 
     // Once per frame, on the registry's thread: commits finished reads in one batch, unloads

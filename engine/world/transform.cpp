@@ -91,13 +91,20 @@ void detach(flecs::entity entity) {
 }
 
 void attach(flecs::entity entity, flecs::entity parent) {
-    const auto* world = entity.try_get<WorldTransform>();
-    const auto* parent_world = parent.try_get<WorldTransform>();
+    // Copied first: the removes and sets below move the entity to another table, and a pointer into
+    // its old row would then read whichever entity took that row's place.
+    const auto* world_ptr = entity.try_get<WorldTransform>();
+    const auto* parent_ptr = parent.try_get<WorldTransform>();
+    const bool placed = world_ptr != nullptr && parent_ptr != nullptr;
+    const WorldTransform world_value = world_ptr != nullptr ? *world_ptr : WorldTransform{};
+    const WorldTransform parent_value = parent_ptr != nullptr ? *parent_ptr : WorldTransform{};
     entity.remove(flecs::ChildOf, flecs::Wildcard);
     entity.set(flecs::Parent{parent});
-    if (world == nullptr || parent_world == nullptr) {
+    if (!placed) {
         return;
     }
+    const WorldTransform* world = &world_value;
+    const WorldTransform* parent_world = &parent_value;
     // The local transform that composes back to where the entity is now.
     const Quat inverse = glm::inverse(parent_world->rotation);
     entity.set(Transform{
@@ -168,7 +175,11 @@ void add_transform_systems(flecs::world& ecs, flecs::entity first_phase, flecs::
             DE_PROFILE_ZONE("world transforms");
             while (it.next()) {
                 const bool has_parent = it.is_set(2);
-                if (!has_parent && !it.changed()) {
+                // Entities with a flecs::Parent come one row at a time, and change detection is per
+                // table: after the table's first row, it.changed() says nothing changed. They're
+                // attachments (few): always computed.
+                const bool per_row = it.table().has<flecs::Parent>();
+                if (!has_parent && !per_row && !it.changed()) {
                     it.skip();
                     continue;
                 }

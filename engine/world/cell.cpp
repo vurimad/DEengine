@@ -56,7 +56,7 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
                    CellSpawnScratch& scratch) {
     ecs.delete_with(ecs.pair<InCell>(cell));
     const asset::AssetHandle handle = cell.get<Cell>().asset;
-    cell.set(CellContents{.revision = assets.revision(handle)});
+    cell.set(CellContents{.asset = handle, .revision = assets.revision(handle)});
     const auto* asset = assets.get<asset::CellAsset>(handle);
     if (asset == nullptr) {
         return; // failed, or unloaded: empty
@@ -120,7 +120,7 @@ void spawn_cells(flecs::iter& it, const asset::AssetRegistry& assets, CellSpawnS
         const auto cells = it.field<const Cell>(0);
         const auto contents = it.field<const CellContents>(1);
         for (const size_t i : it) {
-            if (assets.revision(cells[i].asset) != contents[i].revision) {
+            if (!(cells[i].asset == contents[i].asset) || assets.revision(cells[i].asset) != contents[i].revision) {
                 scratch.pending.push(it.entity(i).id());
             }
         }

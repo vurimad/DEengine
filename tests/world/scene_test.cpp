@@ -485,7 +485,7 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
     // Members behind the asset's revision are spawned again (a reload swapped in a new file).
     const de::world::CellContents spawned = cell.get<de::world::CellContents>();
     CHECK(spawned.revision == assets->revision(cell.get<de::world::Cell>().asset));
-    cell.set(de::world::CellContents{.revision = spawned.revision + 1});
+    cell.set(de::world::CellContents{.asset = spawned.asset, .revision = spawned.revision + 1});
     world->tick();
     CHECK_FALSE(child.is_alive());
     CHECK(members_of(ecs, cell) == 5);
@@ -578,6 +578,79 @@ TEST_CASE("a cell that can't load stays empty, and the world goes on") {
     world->tick();
     CHECK(assets->state(cell.get<de::world::Cell>().asset) == de::asset::AssetState::Failed);
     CHECK(members_of(ecs, cell) == 0);
+    cell.destruct();
+    assets->update();
+    CHECK(assets->stats().assets == 0);
+}
+
+TEST_CASE("every row under a parent without a transform gets its world transform") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity group = ecs.entity(); // no Transform
+    const flecs::entity a = ecs.entity(flecs::Parent{group});
+    const flecs::entity b = ecs.entity(flecs::Parent{group});
+    de::world::place(a, Transform{.position = {1.0, 0.0, 0.0}});
+    de::world::place(b, Transform{.position = {2.0, 0.0, 0.0}});
+    world->tick();
+    // Only the second row moves: it must still be computed.
+    b.set(Transform{.position = {7.0, 0.0, 0.0}});
+    world->tick();
+    CHECK(near(b.get<WorldTransform>().position.x, 7.0));
+    a.set(Transform{.position = {5.0, 0.0, 0.0}});
+    b.set(Transform{.position = {9.0, 0.0, 0.0}});
+    world->tick();
+    CHECK(near(a.get<WorldTransform>().position.x, 5.0));
+    CHECK(near(b.get<WorldTransform>().position.x, 9.0));
+}
+
+TEST_CASE("attaching keeps the entity where it is, whatever row it was in") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rider = ecs.entity();
+    de::world::place(rider, Transform{.position = {100.0, 0.0, 0.0}});
+    // Three entities in one table: the sword is in the middle, so moving it to another table swaps
+    // the last row into its place.
+    const flecs::entity before = ecs.entity();
+    const flecs::entity sword = ecs.entity();
+    const flecs::entity after = ecs.entity();
+    de::world::place(before, Transform{.position = {1.0, 0.0, 0.0}});
+    de::world::place(sword, Transform{.position = {103.0, 0.0, 0.0}});
+    de::world::place(after, Transform{.position = {-50.0, 0.0, 0.0}});
+    de::world::attach(sword, rider);
+    world->tick();
+    CHECK(near(sword.get<Transform>().position.x, 3.0)); // its offset from the rider
+    CHECK(near(sword.get<WorldTransform>().position.x, 103.0));
+}
+
+TEST_CASE("a cell given another loaded asset spawns that asset's members") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId first = de::asset::AssetId::from_value(0xb0);
+    const de::asset::AssetId second = de::asset::AssetId::from_value(0xb1);
+    const de::asset::AssetId rock = de::asset::AssetId::from_value(0xb2);
+    const de::asset::AssetId lamp = de::asset::AssetId::from_value(0xb3);
+    put_mesh(vfs, rock);
+    put_mesh(vfs, lamp);
+    put_cell(vfs, first, rock, lamp, 3);
+    put_cell(vfs, second, rock, lamp, 6);
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(world->ecs(), first);
+    const de::asset::AssetHandle other = assets->load<de::asset::CellAsset>(second);
+    assets->wait_all();
+    world->tick();
+    REQUIRE(members_of(ecs, cell) == 3);
+    // Both assets are at revision 1: the asset itself must tell them apart.
+    REQUIRE(assets->revision(other) == assets->revision(cell.get<de::world::Cell>().asset));
+    cell.set(de::world::Cell(other, {}));
+    world->tick();
+    CHECK(members_of(ecs, cell) == 6);
     cell.destruct();
     assets->update();
     CHECK(assets->stats().assets == 0);

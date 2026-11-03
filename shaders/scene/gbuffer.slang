@@ -70,14 +70,14 @@ GBufferOutput fragment_main(VertexOutput input, bool front_face: SV_IsFrontFace)
     float2 xy = sample_texture(material.normal_texture, push.sampler, input.uv).xy * 2.0 - 1.0;
     xy *= material.normal_scale;
     const float3 tangent_normal = float3(xy, sqrt(saturate(1.0 - dot(xy, xy))));
-    float3 n = normalize(input.normal);
-    if ((material.flags & kMaterialDoubleSided) != 0 && !front_face)
-    {
-        n = -n;
-    }
-    const float3 t = normalize(input.tangent.xyz - n * dot(n, input.tangent.xyz));
-    const float3 b = cross(n, t) * input.tangent.w;
-    n = normalize(t * tangent_normal.x + b * tangent_normal.y + n * tangent_normal.z);
+    // The tangent frame from the front face's normal; a back face is the mirror image: the same
+    // tangent and bitangent, the normal flipped (flipping it first would flip the bitangent too).
+    const float3 geometric = normalize(input.normal);
+    const float3 t = normalize(input.tangent.xyz - geometric * dot(geometric, input.tangent.xyz));
+    const float3 b = cross(geometric, t) * input.tangent.w;
+    const bool back = (material.flags & kMaterialDoubleSided) != 0 && !front_face;
+    const float3 n = normalize(t * tangent_normal.x + b * tangent_normal.y +
+                               (back ? -geometric : geometric) * tangent_normal.z);
 
     // glTF's packing: occlusion in r, roughness in g, metalness in b.
     const float3 orm = sample_texture(material.metallic_roughness_texture, push.sampler, input.uv).rgb;
