@@ -660,7 +660,11 @@ Anything a node graph can do, Slang code can do: graph nodes are just functions.
 - Effects are text files composed of emitters, decals, lights, sounds and camera shake, triggered by animation events or Lua.
 - Budget: a fixed particle pool (e.g. 1M) with priority, so a boss fight never starves the player's own effects.
 
-**Using Elden Ring as reference.** Study the look through RenderDoc frame captures, FromSoftware's public talks, and community analysis; shader dumps from modding tools are fine for understanding techniques. We write our own implementations rather than copying their shader code, which keeps the engine clean legally and lets us shape every effect to our pipeline.
+**Using Elden Ring as reference.** Everything a copy we own exposes may be studied: RenderDoc frame captures (passes, render-target formats, G-buffer contents, timings), its shader code (as captures show it, or dumped with modding tools), FromSoftware's public talks, community analysis and observation. Captures and dumps are taken offline only, never by tampering with anti-cheat online.
+
+- Study is for understanding techniques. We write our own implementations, shaped to our pipeline, and never copy or transcribe their shader code: that keeps the engine clean legally and every effect ours.
+- Findings go into this document in our own words, as techniques and the decisions they lead to.
+- Nothing extracted from the game (data, shaders, scripts, captures) is ever committed.
 
 ## Combat & character systems
 
@@ -1140,3 +1144,4 @@ Decisions so far:
 | 2026-11-02 | Cooked files named by asset ID in game:/, not by source path | Runtime loads by ID; one source makes several assets; the archive packer works by ID anyway |
 | 2026-11-03 | Double-precision world positions on the CPU; floats relative to a render origin on the GPU | No rebasing of simulation state; about 2 MB at 60k entities; change-only uploads keep working |
 | 2026-11-03 | Cells are assets and entities: members carry a non-fragmenting `(InCell, cell)` that deletes them with the cell; entities hold non-owning asset handles | One owner per thing, no mirrored lists between world, assets and renderer; streaming mechanism built in M0b, policy in M1 |
+| 2026-11-03 | Elden Ring may be studied in full from an owned copy, shader code included (captures and dumps, offline only); own implementations, findings in our words, nothing extracted committed | Its techniques are the reference for the look; studying the real thing beats guessing, and clean implementations keep the engine ours |
