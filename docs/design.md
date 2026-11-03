@@ -405,6 +405,7 @@ The editor browses source assets but always loads their cooked versions, so prev
 - A glTF or FBX cooks to one mesh (its default scene flattened, a part per material), a material per material, and a texture per embedded image. Scenes as prefabs and cells come with the prefab and cell formats.
 - Texture defaults follow from use: a texture a material samples as a normal map compresses to BC5, color to sRGB BC7, other maps to linear BC7. Folder rules and metas override them (JSON merge patches, root to leaf).
 - Our text material source is `.material` (JSON): a template, named parameters and textures by relative path.
+- Cells are `.cell` (JSON): the cell's grid coordinates and its entities (name, mesh by relative path to a model source, position, rotation, scale, parent by name, static). The `.decell` lists the meshes as dependencies, puts parents before children, and is cooked again when a model it names gets a new ID, not when a model is cooked again.
 - The cooker keeps its state in `game:/cook_state.json`: per source, the hash of every input (bytes, settings, files it reads, versions) and what it made. Unchanged sources are skipped, outputs of deleted sources removed, and metas of files moved outside the tools re-linked by the last content hash.
 - `cooker --check` validates the source and meta trees and writes nothing, for CI.
 
@@ -822,7 +823,8 @@ The world is one seamless space streamed around the player in a grid of cells, w
 ```
 
 - **A cell is an asset.** Its cooked `.decell` lists every asset its entities use as dependencies, so the registry makes it Ready only when they're resident: the activation rule above, with nothing added.
-- **A cell is an entity.** When the cell asset is Ready, its entities are created in one batch on the main thread, each with an `(InCell, cell)` pair. `InCell` is `DontFragment` (cells don't create tables) with `(OnDeleteTarget, Delete)`: unloading a cell is deleting its entity, which deletes its members; an observer on the cell's component releases its asset, which releases what it held. No lists, no manual cleanup.
+- **A cell is an entity.** When the cell asset is Ready, its entities are created in one batch on the main thread at the start of a tick, each placed (no slide in), with an `(InCell, cell)` pair. `InCell` is `DontFragment` (cells don't create tables) with `(OnDeleteTarget, Delete)`: unloading a cell is deleting its entity, which deletes its members; the cell component's hooks release its asset, which releases what it held. No lists, no manual cleanup.
+- **A cell's members match its loaded file.** The cell entity remembers which file it spawned from; when hot reload swaps in a re-cooked one, its members are spawned again from it. Editing a `.cell` and cooking it updates the running game.
 - **Lifetime and transforms are separate.** Placed entities are roots with world-space transforms; the non-fragmenting `Parent` hierarchy is for things actually attached (a sword in a hand, a prefab's parts), and world transforms are computed down it once per tick.
 - **Entities hold non-owning asset handles.** A `MeshInstance` names its mesh by handle without a reference: the cell holds the references, and a member never outlives its cell, so a handle can't dangle.
 - **The renderer owns no entity list.** RenderExtract queries the world each frame and writes what is visible into instance data. When instances become persistent (GPU-driven), the slot lives in a component on the entity, given and freed by observers, so it lives and dies with the entity.
@@ -1140,3 +1142,4 @@ Decisions so far:
 | 2026-11-02 | Cooked files named by asset ID in game:/, not by source path | Runtime loads by ID; one source makes several assets; the archive packer works by ID anyway |
 | 2026-11-03 | Double-precision world positions on the CPU; floats relative to a render origin on the GPU | No rebasing of simulation state; about 2 MB at 60k entities; change-only uploads keep working |
 | 2026-11-03 | Cells are assets and entities: members carry a non-fragmenting `(InCell, cell)` that deletes them with the cell; entities hold non-owning asset handles | One owner per thing, no mirrored lists between world, assets and renderer; streaming mechanism built in M0b, policy in M1 |
+| 2026-11-03 | `.cell` is JSON with world-space positions for roots; props are static by default; members respawn when hot reload swaps in a re-cooked cell | Readable and diffable by people and agents; most placed things never move; edit, cook and see it in the running game |

@@ -11,6 +11,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | `mesh_format.h` | `.demesh`: 32-byte vertices, 32-bit indices, LODs, parts, material slots, bounds |
 | `texture_format.h` | `.detex`: a 2D texture with its mip chain, BCn or RGBA8 |
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
+| `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, name, flags); its meshes are its dependencies |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |
 | `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload |
 

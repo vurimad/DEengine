@@ -51,6 +51,7 @@ struct WorldState {
     // Before ecs, so they outlive the world's systems, which write into them.
     RenderFrame render_frame;
     RenderExtractScratch extract_scratch;
+    CellSpawnScratch cell_scratch;
     flecs::world ecs;
     flecs::entity phases[static_cast<size_t>(Phase::Count)];
     flecs::entity simulation; // the pipelines
@@ -101,6 +102,9 @@ core::Result<World> World::create(const WorldDesc& desc) {
     state->frame = make_pipeline<FramePhase>(ecs, "de::FramePipeline");
 
     add_transform_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], transforms);
+    if (desc.assets != nullptr) {
+        add_cell_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], *desc.assets, state->cell_scratch);
+    }
     add_render_extract(
         ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],
         {.frame = &state->render_frame, .scratch = &state->extract_scratch, .alpha = &state->alpha, .jobs = desc.jobs});

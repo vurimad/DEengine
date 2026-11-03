@@ -8,7 +8,7 @@ The game world (docs/design.md, Core systems; Open world & streaming: world mode
 | --- | --- |
 | `world.h` | `World`: the flecs world on the engine's memory, log and jobs; the phases; the fixed 60 Hz tick with interpolation; `render_frame()` |
 | `transform.h` | `Transform` (local, double position), `WorldTransform` and `PreviousWorldTransform` (computed), `StaticTransform`, `compose`, `interpolate`, `place`, `attach`, `detach` |
-| `cell.h` | `Cell`, `InCell`, `create_cell`, `add_to_cell`: cells own their entities and the assets they use |
+| `cell.h` | `Cell`, `InCell`, `load_cell` (spawns a cooked cell's members once it's loaded), `create_cell`, `add_to_cell`: cells own their entities and the assets they use |
 | `render_extract.h` | `MeshInstance`, `Camera`, `ActiveCamera`, and `RenderFrame`: instances and camera as floats relative to a render origin |
 | `flecs_os.h` | flecs on the engine's allocator and log, with its own threads off |
 
@@ -21,12 +21,13 @@ The game world (docs/design.md, Core systems; Open world & streaming: world mode
 - **Static entities** carry `StaticTransform`: tables of their own, so a moving neighbour with the same components doesn't make them look changed (change detection is per table), and they cost nothing per tick.
 - **Hierarchy is for attachment, not ownership:** placed entities are roots, attachments use `flecs::Parent`. Deleting a parent deletes its children.
 - **Cells:** a cell is an entity with a `Cell` (its coordinates and its hold on its cell asset). Members carry `(InCell, cell)`: exclusive (one cell each), `DontFragment` (cells make no tables), deleted with their cell. Unloading a cell is deleting its entity. A `Cell` is exactly one hold, kept by its hooks: removing it (or deleting the entity) deletes the members and releases the hold, which releases what the cell's asset depends on; replacing it releases the old hold. It can't be copied. The registry must outlive the world (`WorldDesc::assets`).
+- **Spawning:** `load_cell()` loads a `.decell` and makes its entity; once the cell and its meshes are Ready, `de::SpawnCells` (first in Input, immediate) makes its members in one batch: transforms composed down the cell's hierarchy and set with their previous ones, `MeshInstance` from the cell's dependencies, `flecs::Parent`, `StaticTransform` for static ones. `CellContents` remembers the file they came from: when hot reload swaps in a re-cooked cell, the members are made again. A failed cell stays empty.
 - **Entities hold no assets:** `MeshInstance` names a mesh by handle without holding it; its cell does, and outlives it, so the handle can't dangle.
 - **Extraction** runs once per frame in RenderExtract: the active camera first (it may move the origin), then every entity with `MeshInstance`, interpolated: every table is cut into 512-row chunks, run as one parallel job over all of them, whatever the tables' sizes. Unmoved entities skip the slerp. The instance and chunk arrays keep their capacity: no allocation per frame once the world has settled.
 
 ## Not yet
 
-- Spawning cells from cooked `.decell` files, the `.cell` text format and test content (next).
+- Spreading a big cell's spawning over frames (a budget per frame); names on entities (they're in the `.decell`, for the editor).
 - The streamer that picks cells around the camera, with budgets and hysteresis (M1).
 - Entities moving between cells as they cross borders, prefab instancing into cells, lights.
 - Persistent GPU instance slots (with GPU-driven rendering), owned by entities through observers.

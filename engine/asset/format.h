@@ -21,6 +21,7 @@ enum class AssetType : uint16_t {
     Texture = 2,  // .detex
     Material = 3, // .demat
     Shader = 4,   // .deshader
+    Cell = 5,     // .decell
 };
 
 // ".demesh"; "" for Unknown.

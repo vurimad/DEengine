@@ -1,3 +1,4 @@
+#include "asset/cell_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
@@ -1180,4 +1181,99 @@ TEST_CASE("normals pack to two snorm16 and back") {
             CHECK(decoded[axis] == doctest::Approx(input[axis] / length).epsilon(0.001));
         }
     }
+}
+
+TEST_CASE("cells place models by path, parents first, and cook again when a model's ID changes") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    quad(vertices, indices);
+    write_src(sandbox, "content/props/crate.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "content/props/lamp.gltf", gltf(vertices, indices, 1.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "content/props/crate.png", png(8, 8, color_texels(8, 1)));
+    // The child comes before its parent in the source: the cooked file puts the parent first.
+    write_src(sandbox, "content/world/cell_1_2.cell", R"({
+  "coord": [1, 2],
+  "entities": [
+    {"name": "lamp", "parent": "post", "mesh": "../props/lamp.gltf", "position": [0, 2, 0], "static": false},
+    {"name": "post", "mesh": "../props/crate.gltf", "position": [130, 0, 260], "rotation_deg": [0, 90, 0], "scale": 2},
+    {"mesh": "../props/crate.gltf", "position": [200, 0.5, 300.25], "rotation": [0, 0, 0, 2], "scale": [1, 2, 3]},
+  ],
+})");
+    write_src(sandbox, "content/world/broken.cell", R"({
+  "coord": [0, 0.5],
+  "entities": [
+    {"name": "a", "parent": "b"}, {"name": "b", "parent": "a"},
+    {"name": "c", "parent": "nobody", "mesh": "../props/crate.png"},
+    {"name": "c", "scale": [1, 0, 1], "colour": 1},
+    {"name": "far", "position": [-5, 0, 0]},
+    {"parent": "ghost"},
+  ],
+})");
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    const char* broken = "content/world/broken.cell";
+    CHECK(has_message(report, broken, "coord should be [x, z]"));
+    CHECK(has_message(report, broken, "its parents loop back to it"));
+    CHECK(has_message(report, broken, "parent 'nobody' isn't another entity"));
+    CHECK(has_message(report, broken, "entity 5: parent 'ghost' isn't another entity")); // unnamed: by index
+    CHECK(has_message(report, broken, "should name a model source"));
+    CHECK(has_message(report, broken, "another entity has its name"));
+    CHECK(has_message(report, broken, "scale has a zero"));
+    CHECK(has_message(report, broken, "unknown cell entity setting 'colour'"));
+    CHECK(report.stats.failed == 1);
+    CHECK_FALSE(has_message(report, "content/world/cell_1_2.cell", ""));
+
+    const AssetId crate = asset_id(guid_of(vfs, "src:/meta/props/crate.gltf.json"));
+    const AssetId lamp = asset_id(guid_of(vfs, "src:/meta/props/lamp.gltf.json"));
+    const AssetId cell_id = asset_id(guid_of(vfs, "src:/meta/world/cell_1_2.cell.json"));
+    {
+        Cooked file(vfs, cell_id, AssetType::Cell);
+        const auto& cell = file.load<CellAsset>();
+        CHECK(cell.coord_x == 1);
+        CHECK(cell.coord_z == 2);
+        const auto dependencies = cell.header.dependencies.get(file.data());
+        REQUIRE(dependencies.size() == 2); // the crate once, though placed twice
+        CHECK(dependencies[0] == AssetRef{.id = lamp, .type = AssetType::Mesh});
+        CHECK(dependencies[1] == AssetRef{.id = crate, .type = AssetType::Mesh});
+        const auto entities = cell.entities.get(file.data());
+        REQUIRE(entities.size() == 3);
+        CHECK((cell.name(file.data(), entities[0]) == "post"));
+        CHECK((cell.name(file.data(), entities[1]) == ""));
+        CHECK((cell.name(file.data(), entities[2]) == "lamp"));
+        CHECK(entities[0].parent == CellEntity::kNone);
+        CHECK(entities[2].parent == 0);
+        CHECK(entities[2].mesh == 0);
+        CHECK(entities[0].mesh == 1);
+        CHECK(entities[1].mesh == 1);
+        CHECK(entities[0].position[0] == 130.0);
+        CHECK(entities[1].position[2] == 300.25);
+        // 90 degrees of yaw; scales uniform and per axis; a quaternion is normalized.
+        CHECK(entities[0].rotation[1] == doctest::Approx(std::sqrt(0.5)));
+        CHECK(entities[0].rotation[3] == doctest::Approx(std::sqrt(0.5)));
+        CHECK(entities[0].scale[2] == 2.0f);
+        CHECK(entities[1].scale[2] == 3.0f);
+        CHECK(entities[1].rotation[3] == 1.0f);
+        CHECK((entities[0].flags & CellEntityFlags::Static) == CellEntityFlags::Static);
+        CHECK((entities[2].flags & CellEntityFlags::Static) == CellEntityFlags::None);
+    }
+    // A root outside its cell is only a warning.
+    write_src(sandbox, broken, R"({"coord": [0, 0], "entities": [{"name": "far", "position": [-5, 0, 0]}]})");
+    const CookReport fixed = run_cook(vfs);
+    CHECK(has_message(fixed, broken, "far: lies outside the cell [0, 0]"));
+    CHECK(fixed.stats.failed == 0);
+
+    // A model cooked again (new bytes, same ID) leaves the cell alone; a model with a new ID cooks it
+    // again, pointing at the new ID.
+    write_src(sandbox, "content/props/lamp.gltf", gltf(vertices, indices, 3.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    const CookReport touched = run_cook(vfs);
+    CHECK(touched.stats.cooked == 1);
+    remove_src(sandbox, "meta/props/lamp.gltf.json");
+    const CookReport reminted = run_cook(vfs);
+    const AssetId new_lamp = asset_id(guid_of(vfs, "src:/meta/props/lamp.gltf.json"));
+    REQUIRE(new_lamp != lamp);
+    CHECK(reminted.stats.cooked == 2); // the lamp and the cell
+    Cooked file(vfs, cell_id, AssetType::Cell);
+    const auto& cell = file.load<CellAsset>();
+    CHECK(cell.header.dependencies.get(file.data())[0].id == new_lamp);
 }

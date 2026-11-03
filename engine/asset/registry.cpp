@@ -1,5 +1,6 @@
 #include "asset/registry.h"
 
+#include "asset/cell_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
@@ -61,6 +62,8 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<MaterialAsset>(file));
     case AssetType::Shader:
         return checked(load_in_place<ShaderAsset>(file));
+    case AssetType::Cell:
+        return checked(load_in_place<CellAsset>(file));
     case AssetType::Unknown:
         break;
     }

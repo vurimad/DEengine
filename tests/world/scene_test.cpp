@@ -1,5 +1,6 @@
 #include "asset/mesh_format.h"
 #include "asset/registry.h"
+#include "cooker/cell_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "core/job_system.h"
 #include "core/memory_stats.h"
@@ -402,4 +403,140 @@ TEST_CASE("extraction covers many small tables at once, each entity exactly once
     }
     CHECK(misplaced == 0);
     CHECK(std::count(seen.begin(), seen.end(), 1) == static_cast<std::ptrdiff_t>(next));
+}
+
+namespace {
+
+// A cooked cell in game:/: a parent with a mesh, a moving child with another mesh, then count - 2
+// static entities with no parent.
+void put_cell(const de::platform::Vfs& vfs, de::asset::AssetId id, de::asset::AssetId mesh_a, de::asset::AssetId mesh_b,
+              uint32_t count) {
+    using de::asset::CellEntity;
+    de::cooker::CellBuild build;
+    build.coord_x = 3;
+    build.coord_z = -1;
+    build.meshes.push({.id = mesh_a, .type = de::asset::AssetType::Mesh});
+    build.meshes.push({.id = mesh_b, .type = de::asset::AssetType::Mesh});
+    const Quat yaw = yaw_deg(90.0f);
+    build.entities.push({.position = {400.0, 0.0, -100.0},
+                         .rotation = {yaw.x, yaw.y, yaw.z, yaw.w},
+                         .scale = {2.0f, 2.0f, 2.0f},
+                         .mesh = 0,
+                         .flags = de::asset::CellEntityFlags::Static});
+    build.entities.push({.position = {1.0, 0.0, 0.0}, .parent = 0, .mesh = 1});
+    for (uint32_t i = 2; i < count; ++i) {
+        build.entities.push({.position = {390.0 + i, 0.0, -110.0}, .flags = de::asset::CellEntityFlags::Static});
+    }
+    const auto cooked = de::cooker::cook_cell(build, id);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(id, de::asset::AssetType::Cell).c_str(), cooked.span()).ok());
+}
+
+int members_of(const flecs::world& ecs, flecs::entity cell) {
+    int count = 0;
+    ecs.query_builder().with<InCell>(cell).build().each([&](flecs::entity) { ++count; });
+    return count;
+}
+
+} // namespace
+
+TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and again when re-cooked") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId cell_id = de::asset::AssetId::from_value(0x90);
+    const de::asset::AssetId rock = de::asset::AssetId::from_value(0x91);
+    const de::asset::AssetId lamp = de::asset::AssetId::from_value(0x92);
+    put_mesh(vfs, rock);
+    put_mesh(vfs, lamp);
+    put_cell(vfs, cell_id, rock, lamp, 5);
+    auto assets = de::asset::AssetRegistry::create(
+        {.vfs = &vfs, .jobs = &jobs, .hot_reload = true, .reload_checks_per_update = 64});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(ecs, cell_id);
+    world->tick(); // still loading: nothing yet
+    CHECK(members_of(ecs, cell) == 0);
+    assets->wait_all();
+    world->tick();
+    REQUIRE(members_of(ecs, cell) == 5);
+    CHECK(cell.get<de::world::Cell>().coord == de::world::CellCoord{.x = 3, .z = -1});
+
+    // The child: composed with its parent at once (no slide in), its mesh the cell's dependency.
+    flecs::entity child;
+    ecs.query_builder<const MeshInstance>().with<InCell>(cell).build().each([&](flecs::entity e, const MeshInstance&) {
+        if (e.parent().is_valid()) {
+            child = e;
+        }
+    });
+    REQUIRE(child.is_valid());
+    CHECK_FALSE(child.has<de::world::StaticTransform>());
+    CHECK(child.parent().has<de::world::StaticTransform>());
+    CHECK(child.get<MeshInstance>().mesh == assets->find({.id = lamp, .type = de::asset::AssetType::Mesh}));
+    CHECK(child.parent().get<MeshInstance>().mesh == assets->find({.id = rock, .type = de::asset::AssetType::Mesh}));
+    CHECK(near(child.get<de::world::PreviousWorldTransform>().value.position.x, 400.0));
+    CHECK(near(child.get<de::world::PreviousWorldTransform>().value.position.z, -102.0));
+    CHECK(near(child.get<WorldTransform>().position.z, -102.0));
+    world->tick();
+    CHECK(near(child.get<WorldTransform>().position.z, -102.0)); // the system agrees
+
+    // A new file where the old one lay (two reloads between ticks): told apart by its content hash.
+    const de::world::CellContents spawned = cell.get<de::world::CellContents>();
+    cell.set(de::world::CellContents{.spawned_from = spawned.spawned_from, .content_hash = spawned.content_hash + 1});
+    world->tick();
+    CHECK_FALSE(child.is_alive());
+    CHECK(members_of(ecs, cell) == 5);
+    CHECK(cell.get<de::world::CellContents>().content_hash == spawned.content_hash);
+    world->tick();
+    CHECK(members_of(ecs, cell) == 5); // settled: not spawned again
+    ecs.query_builder<const MeshInstance>().with<InCell>(cell).build().each([&](flecs::entity e, const MeshInstance&) {
+        if (e.parent().is_valid()) {
+            child = e;
+        }
+    });
+    REQUIRE(child.is_alive());
+
+    // Re-cooked with fewer entities: hot reload swaps the file in, the members follow.
+    put_cell(vfs, cell_id, rock, lamp, 3);
+    for (int i = 0; i < 4 && assets->stats().reloads == 0; ++i) {
+        assets->update();
+        assets->wait_all();
+    }
+    REQUIRE(assets->stats().reloads == 1);
+    world->tick();
+    CHECK(members_of(ecs, cell) == 3);
+    CHECK_FALSE(child.is_alive());
+
+    // Unloading is deleting the entity: members, the cell asset and its meshes all go.
+    cell.destruct();
+    assets->update();
+    CHECK(assets->stats().assets == 0);
+    int left = 0;
+    ecs.query_builder<const Transform>().build().each([&](const Transform&) { ++left; });
+    CHECK(left == 0);
+}
+
+TEST_CASE("a cell that can't load stays empty, and the world goes on") {
+    {
+        auto alone = World::create(); // no registry: nothing to load through
+        REQUIRE(alone.ok());
+        CHECK_FALSE(de::world::load_cell(alone->ecs(), de::asset::AssetId::from_value(0x98)).is_valid());
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(ecs, de::asset::AssetId::from_value(0x99));
+    assets->wait_all();
+    world->tick();
+    CHECK(assets->state(cell.get<de::world::Cell>().asset) == de::asset::AssetState::Failed);
+    CHECK(members_of(ecs, cell) == 0);
+    cell.destruct();
+    assets->update();
+    CHECK(assets->stats().assets == 0);
 }
