@@ -6,7 +6,7 @@ The frame graph (docs/design.md, Rendering: render graph v1): each frame's passe
 
 | File | What it gives |
 | --- | --- |
-| `render_graph.h` | `RenderGraph` (begin, import, add_pass, execute, stats, dump), `PassBuilder` (create and use resources), `PassContext` (the pass's command list and its resources), `GraphTexture`, `GraphBuffer` |
+| `render_graph.h` | `RenderGraph` (begin, import, add_pass, execute, stats, gpu_times, dump), `PassBuilder` (create and use resources), `PassContext` (the pass's command list and its resources), `GraphTexture`, `GraphBuffer` |
 
 ## Rules and invariants
 
@@ -16,6 +16,7 @@ The frame graph (docs/design.md, Rendering: render graph v1): each frame's passe
 - **Transients** are pooled by description across frames and returned to the device after `keep_unused_frames` unused frames. A transient the device can't make skips the passes that use it (counted, logged) instead of crashing.
 - **Imports:** importing the same texture or buffer twice in a frame gives one handle; imported resources come in from their stated state and leave in their final one.
 - **Pass data and closures** live in the graph's frame arena and are never destroyed: they hold graph handles, pointers and values, never containers or references to the stack.
+- **GPU time per pass** (`RenderGraphDesc::gpu_timing`, on in dev builds): each pass, its barriers included, between two GPU timestamps; `gpu_times()` gives the latest frame the GPU finished (the device's `kFramesInFlight` frames back) and stays as it was over frames the graph didn't time. Each pass is a Tracy plot (`gpu ms: <pass>`, and `gpu frame ms`), so `tools/profile.ps1` prints them.
 - **Immediate mode** (dev builds, for bisecting graph bugs) runs each pass as it is added: no culling, transients made with every usage their format allows.
 - Single-threaded, move-only; the device must outlive it.
 
