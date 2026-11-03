@@ -426,6 +426,13 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
             DE_VK_CHECK(vkCreateCommandPool(device, &transfer_pool_info, nullptr, &slot.transfer_pool));
         }
         DE_VK_CHECK(vkCreateSemaphore(device, &binary_info, nullptr, &slot.acquire_semaphore));
+        if (capabilities.timestamps) {
+            const VkQueryPoolCreateInfo query_info{.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                                                   .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                                                   .queryCount = kMaxTimestampsPerFrame};
+            DE_VK_CHECK(vkCreateQueryPool(device, &query_info, nullptr, &slot.timestamps));
+            vkResetQueryPool(device, slot.timestamps, 0, kMaxTimestampsPerFrame); // host reset (Vulkan 1.2)
+        }
     }
 
     // --- Bindless tables and the one pipeline layout ---
@@ -505,6 +512,7 @@ void DeviceImpl::shutdown() {
             vkDestroyCommandPool(device, slot.command_pool, nullptr);
             vkDestroyCommandPool(device, slot.transfer_pool, nullptr);
             vkDestroySemaphore(device, slot.acquire_semaphore, nullptr);
+            vkDestroyQueryPool(device, slot.timestamps, nullptr);
             slot = {};
         }
         vkDestroySemaphore(device, frame_timeline, nullptr);
@@ -1195,6 +1203,7 @@ void Device::begin_frame() {
         DE_VK_CHECK(vkWaitSemaphores(impl.device, &wait, UINT64_MAX));
     }
     impl.free_pending(slot);
+    impl.collect_timestamps(slot);
     vmaSetCurrentFrameIndex(impl.allocator, static_cast<uint32_t>(impl.frame_index));
     impl.check_memory_budget();
     DE_VK_CHECK(vkResetCommandPool(impl.device, slot.command_pool, 0));
@@ -1214,6 +1223,8 @@ void Device::end_frame() {
     DeviceImpl& impl = *impl_;
     DE_ASSERT_MSG(impl.in_frame, "end_frame without begin_frame");
     FrameSlot& slot = impl.current_slot();
+    slot.timestamps_written = std::min(impl.timestamps_used.load(std::memory_order_relaxed), kMaxTimestampsPerFrame);
+    slot.timestamps_frame = impl.frame_index;
 
     // Per queue, in the order they were begun: FrameStart graphics lists ahead of the others, and
     // transfer lists that wait for the previous frame in a submission of their own.
@@ -1386,6 +1397,36 @@ void Device::wait_idle() {
 
 uint64_t Device::frame_index() const {
     return impl_->frame_index;
+}
+
+Device::FrameTimestamps Device::completed_timestamps() const {
+    const DeviceImpl& impl = *impl_;
+    return {.frame = impl.completed_timestamps_frame, .ns = impl.completed_timestamps.span()};
+}
+
+void DeviceImpl::collect_timestamps(FrameSlot& slot) {
+    timestamps_used.store(0, std::memory_order_relaxed);
+    completed_timestamps.clear();
+    completed_timestamps_frame = 0;
+    if (slot.timestamps_written == 0) {
+        return;
+    }
+    // The slot's frame is done (begin_frame waited for it): every timestamp it wrote is available.
+    completed_timestamps.resize_uninit(slot.timestamps_written);
+    const VkResult result = vkGetQueryPoolResults(
+        device, slot.timestamps, 0, slot.timestamps_written, completed_timestamps.size() * sizeof(uint64_t),
+        completed_timestamps.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (result == VK_SUCCESS) {
+        const auto ns_per_tick = static_cast<double>(capabilities.timestamp_period_ns);
+        for (uint64_t& ticks : completed_timestamps) {
+            ticks = static_cast<uint64_t>(static_cast<double>(ticks) * ns_per_tick);
+        }
+        completed_timestamps_frame = slot.timestamps_frame;
+    } else {
+        completed_timestamps.clear();
+    }
+    vkResetQueryPool(device, slot.timestamps, 0, slot.timestamps_written);
+    slot.timestamps_written = 0;
 }
 
 uint64_t Device::completed_frame() const {

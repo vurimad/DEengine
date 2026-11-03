@@ -22,6 +22,11 @@ namespace de::rhi {
 // Frames the CPU may record ahead of the GPU. Resources destroyed in a frame are freed once
 // the GPU has finished it, at most this many frames later.
 inline constexpr uint32_t kFramesInFlight = 2;
+
+// GPU timestamps a frame can write (CommandList::write_timestamp), every list together.
+inline constexpr uint32_t kMaxTimestampsPerFrame = 256;
+// What write_timestamp() returns when it wrote nothing.
+inline constexpr uint32_t kNoTimestamp = UINT32_MAX;
 inline constexpr uint32_t kMaxColorAttachments = 8;
 // Every pipeline shares one layout: push constants of this size, visible to all stages (the
 // guaranteed minimum on every GPU), and the bindless tables. Resources are reached by index.

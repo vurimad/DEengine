@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/fixed_string.h"
 #include "core/result.h"
 #include "render/rhi/command_list.h"
 #include "render/rhi/rhi.h"
@@ -116,6 +117,15 @@ struct RenderGraphDesc {
     uint32_t keep_unused_frames = 8;
 };
 
+// The passes a frame's GPU times cover (later ones aren't timed).
+inline constexpr uint32_t kMaxTimedPasses = 32;
+
+// How long a pass took on the GPU: from a timestamp before its barriers to one after its commands.
+struct PassGpuTime {
+    core::FixedString<31> name; // the pass's, cut to fit
+    float ms = 0.0f;
+};
+
 struct RenderGraphStats {
     uint32_t passes = 0;        // added in the last frame
     uint32_t culled_passes = 0; // of those, culled
@@ -124,6 +134,13 @@ struct RenderGraphStats {
     uint32_t pooled_buffers = 0;
     uint32_t pool_creations = 0; // transient resources created since the graph was, in total
     uint32_t skipped_passes = 0; // in the last frame: a transient they use couldn't be made (logged)
+    // GPU time of each pass that ran, in order, in the latest frame the GPU has finished (the
+    // device's kFramesInFlight frames back), from GPU timestamps (rhi::Capabilities::timestamps;
+    // none without them, or in immediate mode). gpu_frame_ms runs from the first pass's start to
+    // the last one's end.
+    uint32_t gpu_pass_count = 0;
+    PassGpuTime gpu_passes[kMaxTimedPasses] = {};
+    float gpu_frame_ms = 0.0f;
 };
 
 // The frame graph (docs/design.md, Rendering: render graph v1). Each frame:

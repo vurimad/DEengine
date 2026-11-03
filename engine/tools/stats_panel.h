@@ -20,8 +20,8 @@ struct FrameStats {
 };
 
 // The frame stats panel (M0a): frame time and its history, heap allocations per frame, GPU memory
-// by category, the render graph, uploads and the device. Draws with Dear ImGui, between NewFrame()
-// and Render().
+// by category, GPU time per render graph pass, the render graph, uploads and the device. Draws with Dear ImGui, between
+// NewFrame() and Render().
 class StatsPanel {
 public:
     void record(const FrameStats& stats);

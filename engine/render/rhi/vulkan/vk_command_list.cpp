@@ -433,6 +433,21 @@ void CommandList::set_cull_mode(CullMode cull) {
     vkCmdSetCullMode(impl_->cmd, to_vk(cull));
 }
 
+uint32_t CommandList::write_timestamp() {
+    DE_ASSERT(impl_ != nullptr);
+    DeviceImpl& device = *impl_->device;
+    VkQueryPool pool = device.current_slot().timestamps;
+    if (pool == VK_NULL_HANDLE || impl_->queue != QueueType::Graphics) {
+        return kNoTimestamp;
+    }
+    const uint32_t index = device.timestamps_used.fetch_add(1, std::memory_order_relaxed);
+    if (index >= kMaxTimestampsPerFrame) {
+        return kNoTimestamp;
+    }
+    vkCmdWriteTimestamp2(impl_->cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, pool, index);
+    return index;
+}
+
 void CommandList::push_constants(std::span<const std::byte> data, uint32_t offset) {
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");

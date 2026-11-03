@@ -385,3 +385,51 @@ TEST_CASE("frames keep pace with the GPU") {
     CHECK(device->stats().pending_destroys == 0);
     check_clean(*device);
 }
+
+TEST_CASE("GPU timestamps come back once their frame is done, in order, up to the frame's limit") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    if (!device->capabilities().timestamps) {
+        device->begin_frame();
+        CHECK(device->begin_command_list().write_timestamp() == kNoTimestamp);
+        device->end_frame();
+        return;
+    }
+    const auto buffer = device->create_buffer({.size = 1 << 20, .usage = BufferUsage::CopyDst});
+    REQUIRE(buffer.ok());
+    // Frame 1: a timestamp, a fill, another; then far more than the frame may write.
+    device->begin_frame();
+    CommandList list = device->begin_command_list();
+    CHECK(list.write_timestamp() == 0);
+    list.fill_buffer(*buffer, 0, 1 << 20, 7);
+    CHECK(list.write_timestamp() == 1);
+    uint32_t written = 2;
+    for (uint32_t i = 0; i < kMaxTimestampsPerFrame; ++i) {
+        written += list.write_timestamp() != kNoTimestamp ? 1 : 0;
+    }
+    CHECK(written == kMaxTimestampsPerFrame);
+    if (device->capabilities().transfer_queue) {
+        CHECK(device->begin_command_list(QueueType::Transfer).write_timestamp() == kNoTimestamp);
+    }
+    device->end_frame();
+    CHECK(device->completed_timestamps().frame == 0); // not done yet
+    // The frames until its slot comes around again: then its timestamps are read.
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame) {
+        device->begin_frame();
+        if (frame + 1 == kFramesInFlight) {
+            const Device::FrameTimestamps done = device->completed_timestamps();
+            CHECK(done.frame == 1);
+            REQUIRE(done.ns.size() == kMaxTimestampsPerFrame);
+            CHECK(done.ns[1] >= done.ns[0]);
+            CHECK(done.ns[1] - done.ns[0] < 1'000'000'000ULL); // under a second for a 1 MiB fill
+        } else {
+            CHECK(device->completed_timestamps().frame == 0); // a frame that wrote none
+        }
+        device->end_frame();
+    }
+    device->destroy(*buffer);
+    device->wait_idle();
+    check_clean(*device);
+}

@@ -670,3 +670,54 @@ TEST_CASE("immediate mode makes transients with every usage a later pass may nee
     device->wait_idle();
     check_clean(*device);
 }
+
+TEST_CASE("passes are timed on the GPU, and their times arrive once the frame is done") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const auto run_frame = [&] {
+        device->begin_frame();
+        graph->begin(64, 64);
+        const GraphTexture first = add_clear(*graph, "first clear").texture;
+        graph->add_pass(
+            "second clear", [&](PassBuilder& pass) { pass.use(first, ResourceState::RenderTarget).never_cull(); },
+            [first](PassContext& context) { clear_texture(context, first); });
+        graph->execute();
+        device->end_frame();
+    };
+    run_frame();
+    CHECK(graph->stats().gpu_pass_count == 0); // nothing has finished yet
+    if (!device->capabilities().timestamps) {
+        return;
+    }
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame) {
+        run_frame();
+    }
+    const de::render::RenderGraphStats stats = graph->stats();
+    REQUIRE(stats.gpu_pass_count == 2);
+    CHECK((stats.gpu_passes[0].name.view() == "first clear"));
+    CHECK((stats.gpu_passes[1].name.view() == "second clear"));
+    CHECK(stats.gpu_passes[0].ms >= 0.0f);
+    CHECK(stats.gpu_passes[0].ms < 100.0f);
+    CHECK(stats.gpu_frame_ms >= stats.gpu_passes[1].ms);
+    // Frames later, still the two passes of one frame (each frame's records replace the slot's).
+    for (uint32_t frame = 0; frame < 2 * kFramesInFlight; ++frame) {
+        run_frame();
+    }
+    CHECK(graph->stats().gpu_pass_count == 2);
+    // Frames without the graph, writing timestamps of their own: when the graph comes back, the
+    // finished frame isn't one it timed, so the last times stand (they aren't read from those).
+    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame) {
+        device->begin_frame();
+        CHECK(device->begin_command_list().write_timestamp() == 0);
+        device->end_frame();
+    }
+    run_frame();
+    CHECK(graph->stats().gpu_pass_count == 2);
+    CHECK((graph->stats().gpu_passes[1].name.view() == "second clear"));
+    device->wait_idle();
+    check_clean(*device);
+}
