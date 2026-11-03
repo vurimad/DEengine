@@ -493,7 +493,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 1. GPU culling (instances, lights) and Hi-Z build
 2. Shadows: cascaded sun shadows with cached far cascades; local shadow atlas for torches and spells
-3. G-buffer: albedo, normal (octahedral), roughness/metal/AO, emissive, motion vectors, material ID
+3. G-buffer: albedo, normal (octahedral), roughness/metal/AO, emissive, motion vectors, material ID, lighting group ID, translucency (see the look study below)
 4. Terrain and grass write into the same G-buffer
 5. Deferred decals (blood, scorch, footprints) modify the G-buffer
 6. Async compute: SSAO/GTAO, light clustering, particle simulation
@@ -514,6 +514,27 @@ GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 | Atmosphere + volumetrics | 0.8 ms |
 | Transparents + VFX | 0.8 ms |
 | Post + TAA/upscaler | 1.0 ms |
+
+**Look study: Elden Ring (part 1, 2026-11-03).** From its shaders, studied from an owned copy (names, buffer layouts and the disassembled sun-light, tonemapping and grading passes), in our own words. Not yet checked against a frame capture: what runs each frame, and the render-target formats, still need one.
+
+*What their renderer does:*
+
+- **Deferred, tile-based lighting.** Lights accumulate per tile, with variants by light type and count; a composite pass combines them. Forward variants of every material exist for transparents, and every material has G-buffer, velocity, depth and shadow variants.
+- **G-buffer:** five color targets plus depth. As the sun pass reads it: a world normal stored as plain xyz remapped to 0..1; metalness; a translucency amount; base color; and an 8-bit **lighting group ID** in alpha. Position comes from depth and the inverse view-projection.
+- **Shading is metal-roughness** (F0 from 0.04 to the base color by metalness), with two additions that matter for the look:
+  - **wrapped diffuse** for translucent materials (light wraps past the terminator, for foliage, cloth and skin);
+  - **backlight transmission**: a tight lobe toward the sun, seen through the surface, weighted by how much it faces away. This gives the glowing rims of leaves, hair and cloth against the sun: the golden backlight.
+- **Lighting groups.** The ID indexes a table of parameters per group, including **two directional lights** (a key and a fill, each with a direction and color). Areas and material classes can be lit differently by the same sun: an art-direction lever behind the painterly look.
+- **Tinted shadows.** The sun's shadow, from a screen-space mask over cascades (4 cascades, plus a second shadow map packed into an atlas for a region near the camera, and a cloud shadow variant), is blended toward a shadow color rather than black.
+- **Atmosphere is a large system:** froxel volumetric fog with injected density and local lights, shadowed by the sun, plus separate fog volumes. Indirect light comes from box-projected environment-map regions blended across areas, and a GI volume system with several techniques (which ones ship at runtime is for a capture to tell).
+- **Post chain:** auto exposure from adapted luminance (center-weighted), bright pass and bloom, a tonemap curve baked into a table from selectable curves (filmic, Reinhard, a sensitometric film curve), a color matrix and chromatic aberration, then **3D LUT grading with LUTs blended together** (by area and time of day, presumably), TAA or FXAA, motion blur and a lens-simulation depth of field.
+
+*What it changes for us (renderer v1 and after):*
+
+- G-buffer v1 keeps the planned octahedral normals (more precision for the same bits), and adds a **translucency amount** and an **8-bit lighting group ID** next to the material ID, so the group lever exists from the start.
+- Lighting v1: metal-roughness GGX for the sun plus a placeholder ambient; materials flagged translucent get wrapped diffuse and backlight transmission (cheap, and central to foliage and cloth). Shadows get a **shadow color** parameter from the first shadow pass.
+- Lighting groups (a key and fill light per group, from a table indexed by the G-buffer ID): designed in v1 (the ID is written), used from M1 with the lighting presets.
+- Post v1: fixed exposure, then the tonemap curve as a 1D table (a filmic curve to start, others swappable), then a 3D LUT hook (identity at first). Auto exposure, bloom and blended LUTs follow. Grading always happens after tonemapping, on the LUT.
 
 The simulation stays at a fixed 60 Hz tick; the renderer interpolates transforms between ticks, so the game renders at 120+ FPS while combat frame data stays deterministic. Input is polled every rendered frame and timestamped into the buffer to cut latency. Raising the tick to 120 Hz is possible later (frame data would be authored in seconds, not frames) but doubles simulation cost.
 
