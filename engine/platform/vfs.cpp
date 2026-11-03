@@ -561,6 +561,23 @@ core::Result<size_t> Vfs::read_file(const char* path, std::span<std::byte> dest)
     return file->read_at(0, dest.first(static_cast<size_t>(*size)));
 }
 
+core::Result<core::Array<std::byte>> Vfs::read_whole_file(const char* path, core::Allocator& allocator) const {
+    const core::Result<uint64_t> size = file_size(path);
+    if (!size) {
+        return fail(size.error());
+    }
+    core::Array<std::byte> bytes(allocator);
+    bytes.resize_uninit(static_cast<size_t>(*size));
+    const core::Result<size_t> read = read_file(path, bytes.span());
+    if (!read) {
+        return fail(read.error());
+    }
+    if (*read != bytes.size()) {
+        return fail(ErrorCode::IoError, "the file changed size while it was read");
+    }
+    return bytes;
+}
+
 core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> data) const {
     DE_PROFILE_ZONE("vfs_write_file");
     const core::Result<ParsedPath> parsed = parse_path(path);

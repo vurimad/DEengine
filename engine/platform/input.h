@@ -8,6 +8,7 @@
 #include "core/string_id.h"
 
 #include <cstdint>
+#include <string_view>
 
 namespace de::platform {
 
@@ -68,6 +69,11 @@ struct RawInput {
 // stick noise, or the duplicate pad Steam Input exposes, can't overwrite the pad in use.
 //
 // Pushing and sampling never allocate. Not thread-safe: use it from the game thread.
+struct BindTextOptions {
+    bool replace = false;      // an action's first line in the text drops the bindings it had (a player's file)
+    bool warn_unknown = false; // log lines naming actions that aren't added (typos), not just count them
+};
+
 class Input {
 public:
     // Stick values below the deadzone read as zero. Worn sticks drift: raise it per player
@@ -98,6 +104,18 @@ public:
     // with -1); on a button bound to an axis it picks the direction that counts as pressed.
     // Fails on an unknown binding name, or on mouse motion bound to a button.
     core::Result<void> bind(ActionId action, const char* binding, float scale = 1.0f);
+
+    // Removes an action's bindings, letting go of what they hold.
+    void unbind_all(ActionId action);
+
+    // Binds from text, one binding a line: the action's name, the binding (in quotes when it has
+    // spaces), and an optional scale. '#' starts a comment; a UTF-8 byte order mark is ignored.
+    //     move_y              key:S                -1
+    //     free_camera.fast    "key:Left Shift"
+    // Actions must have been added; a line naming an action that isn't (a dev tool's, in a ship
+    // build) is skipped. Returns how many were. Every line is checked before any is bound: a
+    // malformed line or an unknown binding fails, naming the line, and changes nothing.
+    core::Result<uint32_t> bind_text(std::string_view text, const BindTextOptions& options = {});
 
     // Applies one device event.
     void push(const RawInput& input);

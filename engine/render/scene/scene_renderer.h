@@ -27,6 +27,9 @@ struct SceneLighting {
 };
 
 // What the window shows: the lit image, or one G-buffer channel.
+// What a frame shows with no scene (and the window without shaders): a dusk blue.
+inline constexpr rhi::Color kEmptySceneColor{.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f};
+
 enum class SceneView : uint32_t {
     Lit,
     BaseColor,
@@ -115,7 +118,7 @@ public:
     // empty.
     void add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format, const world::RenderFrame& frame,
                     const SceneLighting& lighting, SceneView view = SceneView::Lit,
-                    rhi::Color empty = {.r = 0.10f, .g = 0.11f, .b = 0.15f, .a = 1.0f});
+                    rhi::Color empty = kEmptySceneColor);
 
     SceneRendererStats stats() const;
 

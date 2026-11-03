@@ -1,0 +1,40 @@
+# Input bindings (docs/design.md, Input): action, binding, optional scale. Actions are added by code;
+# a line naming an action this build doesn't have (a dev tool's, in ship) is skipped. A player's
+# user:/input.bindings, in the same form, is read after this file: its lines replace these for the
+# actions they name.
+#
+# Bindings: key:<SDL key name> (in quotes when it has a space), mouse:left|right|middle|x|y,
+# gamepad:<SDL button or axis>. On an axis, the scale weights the input (-1 for the opposite way).
+
+# Game
+quit                        key:Escape
+quit                        gamepad:back
+
+# Free camera (the viewer)
+free_camera.move_right      key:D
+free_camera.move_right      key:A                   -1
+free_camera.move_right      gamepad:leftx
+free_camera.move_forward    key:W
+free_camera.move_forward    key:S                   -1
+free_camera.move_forward    gamepad:lefty           -1     # stick up is negative
+free_camera.move_up         key:E
+free_camera.move_up         key:Q                   -1
+free_camera.move_up         gamepad:righttrigger
+free_camera.move_up         gamepad:lefttrigger     -1
+free_camera.look_x          gamepad:rightx
+free_camera.look_y          gamepad:righty
+free_camera.mouse_x         mouse:x
+free_camera.mouse_y         mouse:y
+free_camera.look_hold       mouse:right
+free_camera.fast            "key:Left Shift"
+free_camera.fast            gamepad:leftstick
+
+# Debug views (dev builds)
+debug.toggle_stats          key:F1
+debug.next_view             key:F2
+
+# Raw stick readout, deengine --show-sticks (dev builds)
+debug.stick_left_x          gamepad:leftx
+debug.stick_left_y          gamepad:lefty
+debug.stick_right_x         gamepad:rightx
+debug.stick_right_y         gamepad:righty

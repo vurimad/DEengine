@@ -72,20 +72,7 @@ core::Array<Diagnostic> Diagnostics::all() const {
 }
 
 core::Result<core::Array<std::byte>> read_whole_file(const platform::Vfs& vfs, const char* path) {
-    const core::Result<uint64_t> size = vfs.file_size(path);
-    if (!size) {
-        return core::fail(size.error());
-    }
-    core::Array<std::byte> bytes(tools_heap());
-    bytes.resize_uninit(static_cast<size_t>(*size));
-    const core::Result<size_t> read = vfs.read_file(path, bytes.span());
-    if (!read) {
-        return core::fail(read.error());
-    }
-    if (*read != bytes.size()) {
-        return core::fail(core::ErrorCode::IoError, "the file changed size while it was read");
-    }
-    return bytes;
+    return vfs.read_whole_file(path, tools_heap());
 }
 
 std::string_view extension_of(std::string_view path) {
