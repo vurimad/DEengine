@@ -4,8 +4,6 @@
 
 #include <glm/gtc/quaternion.hpp>
 
-#include <cstring>
-
 namespace de::world {
 
 namespace {
@@ -53,19 +51,60 @@ void to_matrix_3x4(const WorldTransform& transform, const DVec3& origin, float (
     }
 }
 
-void place(flecs::entity entity, const Transform& transform) {
-    entity.set(transform);
+namespace {
+
+// The world transform of an entity whose local one is `local`: composed with its parent's, if its
+// parent has one (otherwise it's a root: a scope or a grouping entity isn't a transform parent).
+WorldTransform world_of(flecs::entity entity, const Transform& local) {
     const flecs::entity parent = entity.parent();
-    WorldTransform world = as_world(transform);
-    if (parent.is_valid()) {
-        const auto* parent_world = parent.try_get<WorldTransform>();
-        if (parent_world == nullptr) {
-            return; // computed at the end of the next tick
-        }
-        world = compose(*parent_world, transform);
-    }
+    const auto* parent_world = parent.is_valid() ? parent.try_get<WorldTransform>() : nullptr;
+    return parent_world != nullptr ? compose(*parent_world, local) : as_world(local);
+}
+
+// Sets an entity's world and previous world transforms, then those of everything attached to it.
+void snap(flecs::entity entity, const WorldTransform& world) {
     entity.set(world);
     entity.set(PreviousWorldTransform{.value = world});
+    entity.children([&world](flecs::entity child) {
+        const auto* local = child.try_get<Transform>();
+        if (local != nullptr) {
+            snap(child, compose(world, *local));
+        }
+    });
+}
+
+} // namespace
+
+void place(flecs::entity entity, const Transform& transform) {
+    entity.set(transform);
+    snap(entity, world_of(entity, transform));
+}
+
+void detach(flecs::entity entity) {
+    const auto* world = entity.try_get<WorldTransform>();
+    const Transform in_world =
+        world != nullptr ? Transform{.position = world->position, .rotation = world->rotation, .scale = world->scale}
+                         : Transform{};
+    entity.remove<flecs::Parent>();
+    entity.remove(flecs::ChildOf, flecs::Wildcard);
+    entity.set(in_world);
+}
+
+void attach(flecs::entity entity, flecs::entity parent) {
+    const auto* world = entity.try_get<WorldTransform>();
+    const auto* parent_world = parent.try_get<WorldTransform>();
+    entity.remove(flecs::ChildOf, flecs::Wildcard);
+    entity.set(flecs::Parent{parent});
+    if (world == nullptr || parent_world == nullptr) {
+        return;
+    }
+    // The local transform that composes back to where the entity is now.
+    const Quat inverse = glm::inverse(parent_world->rotation);
+    entity.set(Transform{
+        .position = DVec3(inverse * Vec3(world->position - parent_world->position) / parent_world->scale),
+        .rotation = glm::normalize(inverse * world->rotation),
+        .scale = world->scale / parent_world->scale,
+    });
 }
 
 void register_transform(flecs::world& ecs) {
@@ -78,6 +117,7 @@ void register_transform(flecs::world& ecs) {
         .member<Quat>("rotation")
         .member<Vec3>("scale");
     ecs.component<PreviousWorldTransform>("de::PreviousWorldTransform").member<WorldTransform>("value");
+    ecs.component<StaticTransform>("de::StaticTransform");
     // Every entity with a Transform has the two computed ones.
     ecs.component<Transform>("de::Transform")
         .member<DVec3>("position")
@@ -87,7 +127,7 @@ void register_transform(flecs::world& ecs) {
         .add(flecs::With, ecs.component<PreviousWorldTransform>());
 }
 
-void add_transform_systems(flecs::world& ecs, flecs::entity first_phase, flecs::entity last_sim_phase) {
+void add_transform_systems(flecs::world& ecs, flecs::entity first_phase, flecs::entity transform_phase) {
     // First of every tick: PreviousWorldTransform catches up with WorldTransform, for the tables
     // whose WorldTransform changed since (static ones cost nothing).
     ecs.system<const WorldTransform, PreviousWorldTransform>("de::KeepPreviousWorldTransform")
@@ -110,44 +150,39 @@ void add_transform_systems(flecs::world& ecs, flecs::entity first_phase, flecs::
             }
         });
 
-    // Last of every tick: world transforms. Entities without a parent (almost all: everything
-    // placed in cells) copy Transform, only in tables where it changed. Children compose their
-    // parent's, parents first (cascade), every tick: they are few (attachments, prefab parts).
-    ecs.system<const Transform, WorldTransform>("de::RootWorldTransforms")
-        .kind(last_sim_phase)
-        .without<flecs::Parent>()
-        .term_at(1)
-        .out()
-        .detect_changes()
-        .run([](flecs::iter& it) {
-            DE_PROFILE_ZONE("root world transforms");
-            while (it.next()) {
-                if (!it.changed()) {
-                    it.skip();
-                    continue;
-                }
-                const auto local = it.field<const Transform>(0);
-                const auto world = it.field<WorldTransform>(1);
-                for (const size_t i : it) {
-                    world[i] = as_world(local[i]);
-                }
-            }
-        });
-    ecs.system<const Transform, WorldTransform, const WorldTransform>("de::ChildWorldTransforms")
-        .kind(last_sim_phase)
+    // Last of every tick (a phase of its own, after every PostSim system): world transforms, down
+    // every hierarchy, parents first (cascade). An entity whose parent has a WorldTransform composes
+    // with it, every tick (children are few: attachments, prefab parts); any other is a root, and
+    // copies its Transform only in tables where it changed. A scope or grouping parent without a
+    // transform makes a root, whichever hierarchy (Parent or ChildOf) it's in.
+    ecs.system<const Transform, WorldTransform, const WorldTransform>("de::WorldTransforms")
+        .kind(transform_phase)
         .term_at(1)
         .out()
         .term_at(2)
         .parent()
         .cascade()
+        .optional()
+        .detect_changes()
         .run([](flecs::iter& it) {
-            DE_PROFILE_ZONE("child world transforms");
+            DE_PROFILE_ZONE("world transforms");
             while (it.next()) {
+                const bool has_parent = it.is_set(2);
+                if (!has_parent && !it.changed()) {
+                    it.skip();
+                    continue;
+                }
                 const auto local = it.field<const Transform>(0);
                 const auto world = it.field<WorldTransform>(1);
-                const auto parent = it.field<const WorldTransform>(2); // one value: shared by the rows
-                for (const size_t i : it) {
-                    world[i] = compose(parent[0], local[i]);
+                if (has_parent) {
+                    const WorldTransform parent = it.field<const WorldTransform>(2)[0]; // shared by the rows
+                    for (const size_t i : it) {
+                        world[i] = compose(parent, local[i]);
+                    }
+                } else {
+                    for (const size_t i : it) {
+                        world[i] = as_world(local[i]);
+                    }
                 }
             }
         });

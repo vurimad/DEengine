@@ -11,7 +11,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <vector>
 
 using de::DVec3;
 using de::Quat;
@@ -219,4 +222,184 @@ TEST_CASE("an entity is in one cell at a time") {
     a.destruct();
     CHECK(wanderer.is_alive());
     CHECK(de::world::cell_at({200.0, 0.0, -1.0}) == de::world::CellCoord{.x = 1, .z = -1});
+}
+
+TEST_CASE("teleporting a parent takes what it carries along at once, without a streak") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rider = ecs.entity();
+    de::world::place(rider, Transform{.position = {0.0, 0.0, 0.0}});
+    const flecs::entity sword = ecs.entity(flecs::Parent{rider});
+    de::world::place(sword, Transform{.position = {1.0, 0.0, 0.0}});
+    world->tick();
+    de::world::place(rider, Transform{.position = {500.0, 0.0, 0.0}});
+    // At once, before any tick: the sword's world and previous transforms are at the new spot.
+    CHECK(near(sword.get<WorldTransform>().position.x, 501.0));
+    CHECK(near(sword.get<de::world::PreviousWorldTransform>().value.position.x, 501.0));
+    world->tick();
+    CHECK(near(sword.get<de::world::PreviousWorldTransform>().value.position.x, 501.0)); // nothing to interpolate
+}
+
+TEST_CASE("world transforms follow every PostSim system, whenever it was made") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity follower = ecs.entity();
+    de::world::place(follower, Transform{});
+    // A game system made after the world: it still runs before the world transforms of its tick.
+    ecs.system<Transform>("snap to ground").kind(world->phase(de::world::Phase::PostSim)).each([](Transform& t) {
+        t.position.y = 7.0;
+    });
+    world->tick();
+    CHECK(near(follower.get<WorldTransform>().position.y, 7.0));
+}
+
+TEST_CASE("an entity whose parent has no transform is a root, in either hierarchy") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity scope = ecs.entity("level"); // a name scope, no Transform
+    const flecs::entity door = ecs.entity("door").child_of(scope);
+    de::world::place(door, Transform{.position = {3.0, 0.0, 0.0}});
+    const flecs::entity group = ecs.entity(); // a grouping entity, no Transform
+    const flecs::entity lamp = ecs.entity(flecs::Parent{group});
+    de::world::place(lamp, Transform{.position = {4.0, 0.0, 0.0}});
+    // Placed: right at once, previous included (no slide in from the origin).
+    CHECK(near(door.get<de::world::PreviousWorldTransform>().value.position.x, 3.0));
+    CHECK(near(lamp.get<de::world::PreviousWorldTransform>().value.position.x, 4.0));
+    door.set(Transform{.position = {5.0, 0.0, 0.0}});
+    lamp.set(Transform{.position = {6.0, 0.0, 0.0}});
+    world->tick();
+    CHECK(near(door.get<WorldTransform>().position.x, 5.0));
+    CHECK(near(lamp.get<WorldTransform>().position.x, 6.0));
+    // A ChildOf child of an entity with a transform composes, like a Parent child.
+    const flecs::entity cart = ecs.entity();
+    de::world::place(cart, Transform{.position = {10.0, 0.0, 0.0}});
+    const flecs::entity wheel = ecs.entity().child_of(cart);
+    de::world::place(wheel, Transform{.position = {0.5, 0.0, 0.0}});
+    cart.set(Transform{.position = {20.0, 0.0, 0.0}});
+    world->tick();
+    CHECK(near(wheel.get<WorldTransform>().position.x, 20.5));
+}
+
+TEST_CASE("attaching and detaching keep an entity where it is") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rider = ecs.entity();
+    de::world::place(
+        rider, Transform{.position = {10'000.0, 0.0, 0.0}, .rotation = yaw_deg(90.0f), .scale = {2.0f, 2.0f, 2.0f}});
+    const flecs::entity sword = ecs.entity();
+    de::world::place(sword, Transform{.position = {10'000.0, 1.0, -4.0}});
+    de::world::attach(sword, rider);
+    world->tick();
+    CHECK(near(sword.get<WorldTransform>().position.x, 10'000.0));
+    CHECK(near(sword.get<WorldTransform>().position.y, 1.0));
+    CHECK(near(sword.get<WorldTransform>().position.z, -4.0));
+    // Dropped: stays where it fell, not at its offset read as a world position.
+    rider.set(Transform{.position = {10'100.0, 0.0, 0.0}, .rotation = yaw_deg(90.0f), .scale = {2.0f, 2.0f, 2.0f}});
+    world->tick();
+    const DVec3 carried = sword.get<WorldTransform>().position;
+    CHECK(near(carried.x, 10'100.0));
+    de::world::detach(sword);
+    world->tick();
+    CHECK_FALSE(sword.parent().is_valid());
+    CHECK_FALSE(sword.has<flecs::Parent>());
+    CHECK(near(sword.get<WorldTransform>().position.x, carried.x));
+    CHECK(near(sword.get<WorldTransform>().position.z, carried.z));
+}
+
+TEST_CASE("static entities keep tables of their own, untouched by moving neighbours") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    ecs.system<Transform>("wind")
+        .kind(world->phase(de::world::Phase::PreSim))
+        .without<de::world::StaticTransform>()
+        .each([](Transform& t) { t.position.x += 1.0; });
+    const flecs::entity banner = ecs.entity().set(MeshInstance{});
+    de::world::place(banner, Transform{});
+    const flecs::entity rock = ecs.entity().set(MeshInstance{}).add<de::world::StaticTransform>();
+    de::world::place(rock, Transform{.position = {5.0, 0.0, 0.0}});
+    world->tick();
+    // A marker in the rock's world transform: its table's Transform is never written, so the world
+    // transforms system skips it and the marker stays.
+    rock.set(WorldTransform{.position = {-1.0, 0.0, 0.0}});
+    world->tick();
+    world->tick();
+    CHECK(near(rock.get<WorldTransform>().position.x, -1.0));
+    CHECK(near(banner.get<WorldTransform>().position.x, 3.0));
+}
+
+TEST_CASE("a cell's hold follows its Cell component: replaced, removed") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId first = de::asset::AssetId::from_value(0x81);
+    const de::asset::AssetId second = de::asset::AssetId::from_value(0x82);
+    put_mesh(vfs, first);
+    put_mesh(vfs, second);
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::create_cell(ecs, {.x = 0, .z = 0}, assets->load<de::asset::MeshAsset>(first));
+    const flecs::entity rock = ecs.entity();
+    de::world::add_to_cell(rock, cell);
+    assets->wait_all();
+    // Replaced: the old hold goes, the new one stays.
+    cell.set(de::world::Cell(assets->load<de::asset::MeshAsset>(second), {.x = 0, .z = 0}));
+    assets->wait_all();
+    assets->update();
+    CHECK_FALSE(assets->find({.id = first, .type = de::asset::AssetType::Mesh}).is_valid());
+    CHECK(assets->find({.id = second, .type = de::asset::AssetType::Mesh}).is_valid());
+    CHECK(rock.is_alive());
+    // Removed from a live entity: the hold goes, and the members with it (their handles may name
+    // what only the cell held).
+    cell.remove<de::world::Cell>();
+    CHECK(cell.is_alive());
+    CHECK_FALSE(rock.is_alive());
+    assets->update();
+    CHECK(assets->stats().assets == 0);
+}
+
+TEST_CASE("extraction covers many small tables at once, each entity exactly once") {
+    de::core::JobSystem jobs({.worker_count = 3});
+    auto world = World::create({.jobs = &jobs});
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    // 30 tables of 100 rows (a tag per kind), and one of 2000: chunks from all of them, in parallel.
+    constexpr int kKinds = 30;
+    std::vector<flecs::entity> kinds;
+    kinds.reserve(kKinds);
+    for (int k = 0; k < kKinds; ++k) {
+        kinds.push_back(ecs.entity());
+    }
+    uint32_t next = 0;
+    for (int k = 0; k < kKinds; ++k) {
+        for (int i = 0; i < 100; ++i) {
+            const flecs::entity e =
+                ecs.entity().add(kinds[k]).set(MeshInstance{.mesh = {.index = next, .generation = 1}});
+            de::world::place(e, Transform{.position = {static_cast<double>(next), 0.0, 0.0}});
+            ++next;
+        }
+    }
+    for (int i = 0; i < 2000; ++i) {
+        const flecs::entity e = ecs.entity().set(MeshInstance{.mesh = {.index = next, .generation = 1}});
+        de::world::place(e, Transform{.position = {static_cast<double>(next), 0.0, 0.0}});
+        ++next;
+    }
+    world->advance(1.0 / 60.0);
+    const auto& instances = world->render_frame().instances;
+    REQUIRE(instances.size() == next);
+    std::vector<int> seen(next, 0);
+    int misplaced = 0;
+    for (const de::world::RenderInstance& instance : instances) {
+        ++seen[instance.mesh.index];
+        misplaced += instance.transform[3] == static_cast<float>(instance.mesh.index) ? 0 : 1;
+    }
+    CHECK(misplaced == 0);
+    CHECK(std::count(seen.begin(), seen.end(), 1) == static_cast<std::ptrdiff_t>(next));
 }

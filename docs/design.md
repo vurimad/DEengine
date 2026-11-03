@@ -810,7 +810,7 @@ The world is one seamless space streamed around the player in a grid of cells, w
 4. Unload reverses the order and frees the cell arena in one shot.
 5. Budgets per category with hysteresis prevent load/unload thrashing at cell borders.
 
-**Large-world precision.** World coordinates in double precision on the CPU, camera-relative floats on the GPU, so a 10+ km world has no jitter.
+**Large-world precision.** World coordinates in double precision on the CPU, floats relative to a render origin near the camera on the GPU, so a 10+ km world has no jitter.
 
 - Positions are doubles everywhere on the CPU (`Transform.position`); rotation and scale stay float. The simulation never rebases: physics, AI, saves and distances all see one fixed world space. At 60k entities this costs about 2 MB.
 - The GPU sees floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Extraction is the only place doubles become floats; moving the origin re-uploads instances once, and nothing outside extraction knows it exists. Static instances otherwise upload once, so change-only uploads keep working. Within 1 km of the origin, float precision is about 0.06 mm.

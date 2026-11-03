@@ -48,8 +48,9 @@ flecs::entity make_pipeline(flecs::world& ecs, const char* name) {
 } // namespace
 
 struct WorldState {
-    // Before ecs, so it outlives the world's systems, which write into it.
+    // Before ecs, so they outlive the world's systems, which write into them.
     RenderFrame render_frame;
+    RenderExtractScratch extract_scratch;
     flecs::world ecs;
     flecs::entity phases[static_cast<size_t>(Phase::Count)];
     flecs::entity simulation; // the pipelines
@@ -91,14 +92,18 @@ core::Result<World> World::create(const WorldDesc& desc) {
         state->phases[i] = phase;
         previous = phase;
     }
+    // World transforms in a phase of their own after PostSim, so they follow every game system
+    // that moves something, whenever it was made.
+    const flecs::entity transforms = ecs.entity("de::WorldTransformsPhase").add<SimulationPhase>().depends_on(previous);
     state->phases[static_cast<size_t>(Phase::RenderExtract)] =
         ecs.entity(kPhaseNames[static_cast<size_t>(Phase::RenderExtract)]).add<FramePhase>();
     state->simulation = make_pipeline<SimulationPhase>(ecs, "de::SimulationPipeline");
     state->frame = make_pipeline<FramePhase>(ecs, "de::FramePipeline");
 
-    add_transform_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)],
-                          state->phases[static_cast<size_t>(Phase::PostSim)]);
-    add_render_extract(ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)], state->render_frame, desc.jobs);
+    add_transform_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], transforms);
+    add_render_extract(
+        ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],
+        {.frame = &state->render_frame, .scratch = &state->extract_scratch, .alpha = &state->alpha, .jobs = desc.jobs});
     return World(state);
 }
 
@@ -166,7 +171,6 @@ FrameStep World::advance(double real_dt_s) {
     {
         DE_PROFILE_ZONE("world frame");
         const auto frame_dt = static_cast<ecs_ftime_t>(std::max(real_dt_s, 1e-6)); // 0 would mean "measure it"
-        state.render_frame.alpha = state.alpha;
         state.ecs.frame_begin(frame_dt);
         state.ecs.run_pipeline(state.frame, frame_dt);
         state.ecs.frame_end();

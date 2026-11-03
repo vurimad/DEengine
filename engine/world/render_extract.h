@@ -51,7 +51,6 @@ struct RenderView {
 // at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
 // list of entities; it reads this, rebuilt every frame.
 struct RenderFrame {
-    float alpha = 0.0f;        // between the last tick and the next
     DVec3 origin{0.0};         // the render origin: what instance positions are relative to
     uint64_t origin_moves = 0; // counts origin moves: GPU copies made relative to it go stale
     RenderView camera;
@@ -64,10 +63,29 @@ inline constexpr double kRenderOriginStep = 1024.0;
 
 void register_render_components(flecs::world& ecs);
 
-// Adds the RenderExtract system that fills frame (which must outlive the world): interpolated
-// world transforms of everything with a MeshInstance, and the active camera, relative to the
-// render origin. Rows are split across jobs (null: one thread). After the first frames, it doesn't
-// allocate (the instance array keeps its capacity).
-void add_render_extract(flecs::world& ecs, flecs::entity phase, RenderFrame& frame, core::JobSystem* jobs);
+// Extraction's working memory, kept between frames so it doesn't allocate once settled.
+struct RenderExtractScratch {
+    struct Chunk {
+        const WorldTransform* current = nullptr;
+        const PreviousWorldTransform* previous = nullptr;
+        const MeshInstance* meshes = nullptr;
+        uint32_t count = 0;
+        uint32_t first = 0; // where its rows go in RenderFrame::instances
+    };
+    core::Array<Chunk> chunks{core::heap_allocator(core::MemoryTag::Render)};
+};
+
+struct RenderExtractDesc {
+    RenderFrame* frame = nullptr;            // filled; must outlive the world
+    RenderExtractScratch* scratch = nullptr; // must outlive the world
+    const float* alpha = nullptr;            // this frame's interpolation point, set before RenderExtract
+    core::JobSystem* jobs = nullptr;         // null: one thread
+};
+
+// Adds the RenderExtract systems that fill desc.frame: the active camera, then interpolated world
+// transforms of everything with a MeshInstance, relative to the render origin. Every table's rows
+// are cut into chunks and run as one parallel job over all of them. After the first frames it
+// doesn't allocate (the arrays keep their capacity).
+void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
 } // namespace de::world

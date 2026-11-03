@@ -1,9 +1,11 @@
 #include "world/render_extract.h"
 
+#include "core/job_system.h"
 #include "core/profile.h"
-#include "world/world.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace de::world {
 
@@ -11,7 +13,7 @@ namespace {
 
 // The active camera, interpolated, moving the render origin first when the camera has gone a
 // step away from it.
-void extract_camera(const flecs::world& ecs, RenderFrame& frame) {
+void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
     frame.camera.valid = false;
     const auto* active = ecs.try_get<ActiveCamera>();
     if (active == nullptr || active->entity == 0 || !ecs.is_alive(active->entity)) {
@@ -24,7 +26,7 @@ void extract_camera(const flecs::world& ecs, RenderFrame& frame) {
     if (current == nullptr || previous == nullptr || camera == nullptr) {
         return;
     }
-    const WorldTransform seen = interpolate(previous->value, *current, frame.alpha);
+    const WorldTransform seen = interpolate(previous->value, *current, alpha);
     const DVec3 offset = seen.position - frame.origin;
     if (std::abs(offset.x) > kRenderOriginStep || std::abs(offset.y) > kRenderOriginStep ||
         std::abs(offset.z) > kRenderOriginStep) {
@@ -45,38 +47,75 @@ void register_render_components(flecs::world& ecs) {
     ecs.component<ActiveCamera>("de::ActiveCamera").member<flecs::entity_t>("entity");
 }
 
-void add_render_extract(flecs::world& ecs, flecs::entity phase, RenderFrame& frame, core::JobSystem* jobs) {
-    RenderFrame* target = &frame;
+namespace {
+
+constexpr uint32_t kChunkRows = 512;
+
+struct ExtractJob {
+    const RenderExtractScratch* scratch = nullptr;
+    RenderInstance* instances = nullptr;
+    float alpha = 0.0f;
+    DVec3 origin{0.0};
+};
+
+void extract_chunks(size_t begin, size_t end, void* context) {
+    const ExtractJob& job = *static_cast<const ExtractJob*>(context);
+    for (size_t c = begin; c < end; ++c) {
+        const RenderExtractScratch::Chunk& chunk = job.scratch->chunks[c];
+        for (uint32_t i = 0; i < chunk.count; ++i) {
+            RenderInstance& instance = job.instances[chunk.first + i];
+            to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), job.origin,
+                          instance.transform);
+            instance.mesh = chunk.meshes[i].mesh;
+            instance.reserved[0] = 0;
+            instance.reserved[1] = 0;
+        }
+    }
+}
+
+} // namespace
+
+void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc) {
     // No terms, so it runs every frame, meshes or not: the camera (which may move the origin the
     // instances are made relative to), and a fresh instance list.
-    ecs.system("de::ExtractRenderView").kind(phase).run([target](flecs::iter& it) {
+    ecs.system("de::ExtractRenderView").kind(phase).run([desc](flecs::iter& it) {
         DE_PROFILE_ZONE("render extract view");
-        extract_camera(it.world(), *target);
-        target->instances.clear(); // keeps its capacity: no allocation once the world has settled
+        extract_camera(it.world(), *desc.alpha, *desc.frame);
+        desc.frame->instances.clear(); // keeps its capacity: no allocation once the world has settled
     });
+    // Every table cut into chunks first (the column pointers stay valid: nothing structural happens
+    // during the phase), then one parallel job over all chunks, whatever the tables' sizes.
     ecs.system<const WorldTransform, const PreviousWorldTransform, const MeshInstance>("de::ExtractRenderInstances")
         .kind(phase)
-        .run([target, jobs](flecs::iter& it) {
+        .run([desc](flecs::iter& it) {
             DE_PROFILE_ZONE("render extract");
-            RenderFrame& out = *target;
+            RenderFrame& out = *desc.frame;
+            RenderExtractScratch& scratch = *desc.scratch;
+            scratch.chunks.clear();
+            uint32_t rows = 0;
             while (it.next()) {
-                const size_t base = out.instances.size();
-                out.instances.resize_uninit(base + it.count());
                 const auto current = it.field<const WorldTransform>(0);
                 const auto previous = it.field<const PreviousWorldTransform>(1);
                 const auto meshes = it.field<const MeshInstance>(2);
-                RenderInstance* instances = out.instances.data() + base;
-                const float alpha = out.alpha;
-                const DVec3 origin = out.origin;
-                for_each_row_parallel(jobs, it.count(), 1024, [&](size_t i) {
-                    RenderInstance& instance = instances[i];
-                    to_matrix_3x4(interpolate(previous[i].value, current[i], alpha), origin, instance.transform);
-                    instance.mesh = meshes[i].mesh;
-                    instance.reserved[0] = 0;
-                    instance.reserved[1] = 0;
-                });
+                const auto count = static_cast<uint32_t>(it.count());
+                for (uint32_t first = 0; first < count; first += kChunkRows) {
+                    scratch.chunks.push({.current = &current[first],
+                                         .previous = &previous[first],
+                                         .meshes = &meshes[first],
+                                         .count = std::min(kChunkRows, count - first),
+                                         .first = rows + first});
+                }
+                rows += count;
             }
-            DE_PROFILE_PLOT("render instances", static_cast<int64_t>(out.instances.size()));
+            out.instances.resize_uninit(rows);
+            ExtractJob job{
+                .scratch = &scratch, .instances = out.instances.data(), .alpha = *desc.alpha, .origin = out.origin};
+            if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
+                desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
+            } else {
+                extract_chunks(0, scratch.chunks.size(), &job);
+            }
+            DE_PROFILE_PLOT("render instances", static_cast<int64_t>(rows));
         });
 }
 

@@ -18,11 +18,26 @@ struct CellCoord {
     constexpr bool operator==(const CellCoord&) const = default;
 };
 
-// On a cell's entity: the cell asset it was spawned from, held by it. Removing this (deleting the
-// cell entity) releases the hold, and with it everything the cell's asset depends on.
+// On a cell's entity: the cell asset it was spawned from, held by it: exactly one hold per Cell.
+// Removing it (or deleting the cell entity) releases the hold, and deletes the cell's members with
+// it, since they may name assets only the cell held; replacing it releases the old hold. Not
+// copyable (a copy would be a second release of one hold): a cell entity can't be cloned.
 struct Cell {
     asset::AssetHandle asset;
     CellCoord coord;
+
+    Cell() = default;
+    Cell(asset::AssetHandle held, CellCoord at) : asset(held), coord(at) {}
+    Cell(const Cell&) = delete;
+    Cell& operator=(const Cell&) = delete;
+    Cell(Cell&& other) noexcept : asset(other.asset), coord(other.coord) { other.asset = {}; }
+    Cell& operator=(Cell&& other) noexcept {
+        asset = other.asset;
+        coord = other.coord;
+        other.asset = {};
+        return *this;
+    }
+    ~Cell() = default;
 };
 
 // (InCell, cell): which cell an entity belongs to. Doesn't fragment tables (cells would otherwise
