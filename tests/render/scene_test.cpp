@@ -19,8 +19,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 using de::asset::AssetId;
@@ -834,21 +836,28 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const uint32_t x = kSize / 2;
         const uint32_t y = kSize - 2;
         const de::render::SceneFog closed{.density_per_m = 0.1f,
+                                          .extinction_tint = {0.8f, 1.0f, 1.3f},
                                           .sun_forward = {0.05f, 0.1f, 0.05f},
-                                          .sun_back = {0.05f, 0.1f, 0.05f},
+                                          .sun_back = {0.08f, 0.12f, 0.02f},
                                           .sun_height_attenuation = 0.0f,
                                           .ambient = {0.05f, 0.05f, 0.1f},
                                           .end_m = 1000.0f};
+        // Two images agree: every channel within 5% (or a few levels, near black).
+        const auto same = [](const de::core::Array<std::byte>& a, const de::core::Array<std::byte>& b, uint32_t at_x,
+                             uint32_t at_y) {
+            for (const uint32_t channel : {0U, 1U, 2U}) {
+                const int from_a = texel(a, at_x, at_y)[channel];
+                const int from_b = texel(b, at_x, at_y)[channel];
+                CHECK(std::abs(from_a - from_b) <= std::max(4, from_b / 20));
+            }
+        };
         de::render::SceneFog gridded = closed;
         gridded.volume_distance_m = 60.0f;
 
         // Nothing casts a shadow: the grid and the closed form give the same fog.
         const de::core::Array<std::byte> closed_clear = render(closed);
         const de::core::Array<std::byte> gridded_clear = render(gridded);
-        for (const uint32_t channel : {0U, 1U, 2U}) {
-            CHECK(static_cast<int>(texel(gridded_clear, x, y)[channel]) ==
-                  doctest::Approx(static_cast<int>(texel(closed_clear, x, y)[channel])).epsilon(0.05));
-        }
+        same(gridded_clear, closed_clear, x, y);
         CHECK(texel(gridded_clear, x, y)[1] > 40); // and there is fog to see
         // A height fog too, whose density changes along the ray: still the same.
         de::render::SceneFog high = closed;
@@ -860,8 +869,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         high_gridded.volume_distance_m = 60.0f;
         const de::core::Array<std::byte> high_closed = render(high);
         const de::core::Array<std::byte> high_grid = render(high_gridded);
-        CHECK(static_cast<int>(texel(high_grid, x, y)[1]) ==
-              doctest::Approx(static_cast<int>(texel(high_closed, x, y)[1])).epsilon(0.05));
+        same(high_grid, high_closed, x, y);
 
         // Fog that starts 15 m out, and sun haze that starts 30 m out: the same again (thin fog, so
         // that what's past those distances counts).
@@ -873,15 +881,13 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         started_gridded.volume_distance_m = 60.0f;
         const de::core::Array<std::byte> started_closed_image = render(started);
         const de::core::Array<std::byte> started_grid_image = render(started_gridded);
-        CHECK(static_cast<int>(texel(started_grid_image, x, y)[1]) ==
-              doctest::Approx(static_cast<int>(texel(started_closed_image, x, y)[1])).epsilon(0.05));
+        same(started_grid_image, started_closed_image, x, y);
         started.sun_start_m = 30.0f;
         started_gridded.sun_start_m = 30.0f;
         const de::core::Array<std::byte> late_closed_image = render(started);
         const de::core::Array<std::byte> late_grid_image = render(started_gridded);
         CHECK(texel(late_closed_image, x, y)[1] < texel(started_closed_image, x, y)[1]); // it matters here
-        CHECK(static_cast<int>(texel(late_grid_image, x, y)[1]) ==
-              doctest::Approx(static_cast<int>(texel(late_closed_image, x, y)[1])).epsilon(0.05));
+        same(late_grid_image, late_closed_image, x, y);
 
         // Thin fog ending past the grid, so the grid and what's beyond it both count; and at the corner
         // of the view, where a ray is longer than its view depth. Then ending inside the grid.
@@ -890,8 +896,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             fog.volume_distance_m = 60.0f;
             const de::core::Array<std::byte> grid_image = render(fog);
             CHECK(texel(closed_image, at_x, at_y)[1] > 40);
-            CHECK(static_cast<int>(texel(grid_image, at_x, at_y)[1]) ==
-                  doctest::Approx(static_cast<int>(texel(closed_image, at_x, at_y)[1])).epsilon(0.05));
+            same(grid_image, closed_image, at_x, at_y);
         };
         de::render::SceneFog thin = closed;
         thin.density_per_m = 0.004f;
@@ -903,11 +908,32 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         thin.end_m = 40.0f;
         agree(thin, x, y);
         agree(thin, 1, kSize - 2);
+        agree(thin, x, 1); // looking up at the sky: no fog dims it past where the fog ends
         // A surface inside the grid, close by: the fog up to it, read from between two slices.
         frame.instances.push({.transform = {5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}, .mesh = mesh});
         thin.density_per_m = 0.2f;
         thin.end_m = 1000.0f;
         agree(thin, kSize / 2, kSize / 2);
+        frame.instances.clear();
+        // A red surface in the grid behind dense fog, with red barely dimmed by it: a channel with a
+        // small extinction scale goes on falling with depth (optical depth 27.5, red's e^-2.75 and
+        // white's e^-27.5, far below what a stored transmittance could hold).
+        frame.instances.push({.transform = {300, 0, 0, 0, 0, 300, 0, 0, 0, 0, 300, -55}, .mesh = mesh});
+        de::render::SceneFog deep = closed;
+        deep.density_per_m = 0.5f;
+        deep.extinction_tint[0] = 0.1f;
+        deep.sun_forward[0] = deep.sun_back[0] = deep.ambient[0] = 0.0f;
+        agree(deep, kSize / 2, kSize / 2);
+        // A grid asked to reach past the shadows (the limit, 2 km) stops where they do: past them it
+        // would add nothing to the closed form but coarser slices. Nearer, it reaches as asked.
+        deep.volume_distance_m = 2000.0f;
+        static_cast<void>(render(deep));
+        CHECK(renderer->stats().froxel_reach_m == de::render::SceneShadows{}.distance_m);
+        deep.volume_distance_m = 60.0f;
+        static_cast<void>(render(deep));
+        CHECK(renderer->stats().froxel_reach_m == 60.0f);
+        static_cast<void>(render(closed));
+        CHECK(renderer->stats().froxel_reach_m == 0.0f);
         frame.instances.clear();
 
         // A roof 5 m up, 200 m wide (the square turned to lie flat), shadows the fog under it. The

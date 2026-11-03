@@ -342,7 +342,7 @@ struct SceneRendererState {
 
     // Writes the frame's constants and instance transforms; false without a buffer.
     bool write_frame(rhi::BufferHandle buffer, const world::RenderFrame& frame, const SceneLighting& lighting,
-                     float aspect) {
+                     float froxel_reach, float aspect) {
         const std::span<std::byte> mapped = device->mapped(buffer);
         if (mapped.empty()) {
             return false;
@@ -401,7 +401,7 @@ struct SceneRendererState {
         copy3(fog.ambient, scene.fog_ambient);
         scene.fog_ambient[3] = fog.start_m;
         scene.fog_range[0] = fog.end_m;
-        scene.fog_range[1] = fog.volume_distance_m;
+        scene.fog_range[1] = froxel_reach;
         scene.fog_range[2] = kFroxelSliceOffsetM;
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
@@ -641,15 +641,24 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
     const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
     const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
+    // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
+    // scene. The grid likewise (the closed form goes on alone). What it adds over the closed form is
+    // the sun's shadows, so it reaches no farther than they do.
+    const bool foggy = view == SceneView::Lit && fog.is_valid() &&
+                       (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
+    const bool froxels_on =
+        foggy && lighting.fog.volume_distance_m > 0.0f && fog_inject.is_valid() && fog_integrate.is_valid();
+    const float froxel_reach = froxels_on ? std::min(lighting.fog.volume_distance_m, state.shadows.distance_m) : 0.0f;
+    state.stats.froxel_reach_m = froxel_reach;
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
     const float aspect =
         static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
-    const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
+    const bool written =
+        frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, froxel_reach, aspect);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
-                       fog.is_valid() && fog_inject.is_valid() && fog_integrate.is_valid();
+                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -830,12 +839,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.end_rendering();
         });
 
-    const bool foggy =
-        view == SceneView::Lit && (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
-
     // The froxel grid, near the camera: each froxel's fog and light, then each column walked front to
     // back (so the composite reads the fog from the camera to any depth with one sample).
-    const bool froxels_on = foggy && lighting.fog.volume_distance_m > 0.0f;
     GraphTexture integrated;
     if (froxels_on) {
         const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);

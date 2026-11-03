@@ -12,7 +12,7 @@ struct FogPush
     SceneFrame* frame;
     uint hdr;        // lit, unfogged
     uint depth;
-    uint integrated; // the froxel grid, integrated: (in-scatter, transmittance); unused without one
+    uint integrated; // the froxel grid, integrated: (in-scatter, optical depth); unused without one
     uint sampler;    // linear clamp
 };
 
@@ -62,10 +62,8 @@ float4 fragment_main(VertexOutput input) : SV_Target
         const float slices = frame.fog.range.w;
         const float slice = froxel_t(frame.fog, view_depth) * slices;
         const float3 uvw = float3(input.ndc.x * 0.5 + 0.5, 0.5 - input.ndc.y * 0.5, (slice - 0.5) / slices);
-        float4 grid = texture_3d(push.integrated).SampleLevel(sampler_state(push.sampler), uvw, 0.0);
-        const float first = saturate(slice);
-        grid = float4(grid.rgb * first, lerp(1.0, grid.a, first));
-        near_transmittance = pow(max(grid.a, 1e-6), max(frame.fog.extinction.rgb, float3(0.01)));
+        const float4 grid = texture_3d(push.integrated).SampleLevel(sampler_state(push.sampler), uvw, 0.0) * saturate(slice);
+        near_transmittance = exp(-grid.a * max(frame.fog.extinction.rgb, float3(0.01)));
         near_scatter = grid.rgb;
         from_distance = reach / view_per_ray;
     }

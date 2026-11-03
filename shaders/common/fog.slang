@@ -60,7 +60,7 @@ float column_above(float h, float falloff)
 }
 
 // Optical depth (before the per-channel scale) along the ray from distance t0 to t1.
-float optical_depth(FogMedium medium, float camera_height, float direction_y, float t0, float t1)
+public float optical_depth(FogMedium medium, float camera_height, float direction_y, float t0, float t1)
 {
     const float falloff = max(medium.density.z, 1e-6);
     const float u0 = falloff * (camera_height + direction_y * t0 - medium.density.w);
@@ -92,6 +92,10 @@ public float3 fog_ambient_light(FogMedium medium, float height)
     const float column = medium.density.y * column_above(height, max(medium.density.z, 1e-6));
     return medium.ambient.rgb * exp(-extinction * column * medium.extinction.w);
 }
+
+// The grid stores extinction (1/m) times this: thin fog stays a normal half float (a subnormal may
+// flush to zero on some GPUs), and extinction up to twice the limit of 1 per meter still fits.
+public static const float kFroxelDensityScale = 4096.0;
 
 // The froxel grid's slices: view depth from 0 to its reach, spaced exponentially with an offset (no
 // slices vanishingly thin at the camera). t runs 0 to 1 across the grid.

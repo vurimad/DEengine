@@ -151,6 +151,53 @@ public float3 position_from_depth(SceneFrame* frame, float2 ndc, float depth)
     return point.xyz / point.w;
 }
 
+// The first cascade reaching a distance along the view; kCascadeCount past the last.
+public uint cascade_at(SceneFrame* frame, float distance)
+{
+    for (uint c = 0; c < kCascadeCount; ++c)
+    {
+        if (distance < frame.cascade_far[c])
+        {
+            return c;
+        }
+    }
+    return kCascadeCount;
+}
+
+// How far a distance is into a cascade's blend band, at its far edge: 0 before it, 1 at the edge.
+public float cascade_band(SceneFrame* frame, uint cascade, float distance)
+{
+    const float start = cascade == 0 ? 0.0 : frame.cascade_far[cascade - 1];
+    const float band_start = lerp(start, frame.cascade_far[cascade], 1.0 - frame.shadow_params.x);
+    return saturate((distance - band_start) / max(frame.cascade_far[cascade] - band_start, 1e-4));
+}
+
+// A cascade's uv in the atlas, kept inside its tile (a texel of border) so filters don't bleed.
+public float2 atlas_uv(SceneFrame* frame, uint cascade, float2 tile_uv)
+{
+    const float border = frame.shadow_params.y * 2.0;
+    return cascade_tile(cascade) + clamp(tile_uv, border, 1.0 - border) * 0.5;
+}
+
+// A froxel column's ray through the middle of its tile (grid_size columns across and down).
+public struct FroxelRay
+{
+    public float3 direction;    // unit
+    public float view_per_ray; // view depth per meter along the ray
+};
+
+public FroxelRay froxel_ray(SceneFrame* frame, uint2 column, uint2 grid_size)
+{
+    const float2 ndc = float2((float(column.x) + 0.5) / float(grid_size.x) * 2.0 - 1.0,
+                              1.0 - (float(column.y) + 0.5) / float(grid_size.y) * 2.0);
+    FroxelRay ray;
+    // From a point 100 m or so out, not the near plane: the difference from the camera stays precise
+    // far from the render origin.
+    ray.direction = normalize(position_from_depth(frame, ndc, 1e-3) - frame.camera_position.xyz);
+    ray.view_per_ray = max(dot(ray.direction, frame.camera_forward.xyz), 1e-3);
+    return ray;
+}
+
 public GBufferSample unpack_gbuffer(float4 gb0, float2 gb1, float4 gb2)
 {
     GBufferSample s;
