@@ -676,7 +676,7 @@ TEST_CASE("passes are timed on the GPU, and their times arrive once the frame is
     if (!device) {
         return;
     }
-    auto graph = RenderGraph::create(*device);
+    auto graph = RenderGraph::create(*device, {.gpu_timing = true}); // ship builds default to off
     REQUIRE(graph.ok());
     const auto run_frame = [&] {
         device->begin_frame();
