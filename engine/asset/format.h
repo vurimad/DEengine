@@ -128,3 +128,10 @@ core::Result<const T*> load_in_place(std::span<const std::byte> file) {
 }
 
 } // namespace de::asset
+
+template <>
+struct de::core::Hash<de::asset::AssetRef> {
+    constexpr uint64_t operator()(const de::asset::AssetRef& ref) const {
+        return mix64(ref.id.value() ^ (static_cast<uint64_t>(ref.type) << 56U));
+    }
+};

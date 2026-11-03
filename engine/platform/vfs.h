@@ -164,6 +164,9 @@ public:
 
     IoStats stats() const;
 
+    // Where read completions run (VfsDesc::jobs); null if reads can't have completions.
+    core::JobSystem* jobs() const;
+
     // The OS folder behind a mount point; empty if it isn't mounted (src:/ without a src_root).
     const char* mount_root(Mount mount) const;
 

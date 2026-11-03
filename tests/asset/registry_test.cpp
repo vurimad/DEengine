@@ -2,6 +2,7 @@
 #include "asset/mesh_format.h"
 #include "asset/registry.h"
 #include "asset/texture_format.h"
+#include "cooker/blob_writer.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/texture_cooker.h"
@@ -293,6 +294,8 @@ TEST_CASE("a re-cooked file is loaded again in place, and a missing one is picke
     CHECK_FALSE(dependency_of(registry, material, kMissing).is_valid());
     CHECK(fixture.recorder.count(AssetEvent::Unloaded, kMissing) == 1);
     CHECK(registry.state(dependency_of(registry, material, kDetail)) == AssetState::Ready);
+    // The new version waited for its new texture: swapped in (Reloaded) only after it was Ready.
+    CHECK(fixture.recorder.first(AssetEvent::Ready, kDetail) < fixture.recorder.first(AssetEvent::Reloaded, kMaterial));
 
     // A broken re-cook keeps the version that works.
     const de::core::Array<std::byte> broken = [] {
@@ -341,4 +344,104 @@ TEST_CASE("a registry can go while reads are in flight") {
         static_cast<void>(registry.load<TextureAsset>(kAlbedo));
     } // destroyed with loads in flight and holds outstanding
     CHECK(de::core::memory_stats(de::core::MemoryTag::Streaming).live_allocations == live); // all freed
+}
+
+TEST_CASE("an ID is held per type: a wrong-type request doesn't spoil the right one") {
+    Fixture fixture;
+    put_scene(fixture.vfs);
+    AssetRegistry registry = fixture.make({.hot_reload = false});
+    const AssetHandle wrong = registry.load<MeshAsset>(kAlbedo); // it's a texture
+    const AssetHandle right = registry.load<TextureAsset>(kAlbedo);
+    registry.wait_all();
+    CHECK(wrong != right);
+    CHECK(registry.state(wrong) == AssetState::Failed);
+    CHECK(registry.state(right) == AssetState::Ready);
+    CHECK(registry.get<TextureAsset>(right) != nullptr);
+    // find() only sees what's held: let go means gone, even before the next update().
+    CHECK(registry.find({.id = kAlbedo, .type = AssetType::Texture}) == right);
+    registry.release(right);
+    CHECK_FALSE(registry.find({.id = kAlbedo, .type = AssetType::Texture}).is_valid());
+    registry.release(wrong);
+    registry.update();
+    CHECK(registry.stats().assets == 0);
+}
+
+TEST_CASE("a file holding another asset than its name says is refused") {
+    Fixture fixture;
+    put_scene(fixture.vfs);
+    // The albedo's file copied to another ID's path (a stale or misplaced file).
+    const auto size = fixture.vfs.file_size(cooked_path(kAlbedo, AssetType::Texture).c_str());
+    REQUIRE(size.ok());
+    de::core::Array<std::byte> bytes;
+    bytes.resize(static_cast<size_t>(*size));
+    REQUIRE(fixture.vfs.read_file(cooked_path(kAlbedo, AssetType::Texture).c_str(), bytes.span()).ok());
+    put(fixture.vfs, kDetail, AssetType::Texture, bytes);
+    AssetRegistry registry = fixture.make({.hot_reload = false});
+    const AssetHandle detail = registry.load<TextureAsset>(kDetail);
+    registry.wait_all();
+    CHECK(registry.state(detail) == AssetState::Failed);
+    registry.release(detail);
+}
+
+TEST_CASE("a dependency cycle in a corrupt file is broken, and its assets still unload") {
+    Fixture fixture;
+    // Two materials that list each other.
+    const auto put_cyclic = [&](AssetId id, AssetId other) {
+        de::cooker::BlobWriter writer(sizeof(MaterialAsset));
+        const AssetRef dependency{.id = other, .type = AssetType::Material};
+        put(fixture.vfs, id, AssetType::Material, writer.finish(MaterialAsset{}, id, std::span(&dependency, 1)));
+    };
+    put_cyclic(kMaterial, kDetail);
+    put_cyclic(kDetail, kMaterial);
+    AssetRegistry registry = fixture.make({.hot_reload = false});
+    const AssetHandle material = registry.load<MaterialAsset>(kMaterial);
+    registry.wait_all();
+    CHECK(registry.state(material) == AssetState::Ready);
+    CHECK(registry.stats().assets == 2);
+    registry.release(material);
+    registry.update();
+    CHECK(registry.stats().assets == 0);
+}
+
+TEST_CASE("listeners may load and release, and hear what that causes in the same update") {
+    Fixture fixture;
+    put_scene(fixture.vfs);
+    AssetRegistry registry = fixture.make({.hot_reload = false});
+    // On the first event, ask for many bad assets: each is a Failed event right away, pushed
+    // while events are being told.
+    struct Asker {
+        AssetRegistry* registry = nullptr;
+        std::vector<AssetHandle> asked{};
+        static void on(void* context, const AssetNotice& /*notice*/) {
+            auto& self = *static_cast<Asker*>(context);
+            if (!self.asked.empty()) {
+                return;
+            }
+            for (uint64_t i = 1; i <= 64; ++i) {
+                self.asked.push_back(self.registry->load({.id = AssetId::from_value(i), .type = AssetType::Unknown}));
+            }
+        }
+    } asker{.registry = &registry};
+    REQUIRE(registry.add_listener(&Asker::on, &asker).ok());
+    const AssetHandle albedo = registry.load<TextureAsset>(kAlbedo);
+    registry.wait_all();
+    REQUIRE(asker.asked.size() == 64);
+    size_t failed = 0;
+    for (const AssetNotice& notice : fixture.recorder.notices) {
+        failed += notice.event == AssetEvent::Failed && notice.asset.type == AssetType::Unknown ? 1 : 0;
+    }
+    CHECK(failed == 64);
+    for (const AssetHandle handle : asker.asked) {
+        registry.release(handle);
+    }
+    registry.release(albedo);
+    registry.update();
+    CHECK(registry.stats().assets == 0);
+}
+
+TEST_CASE("a registry needs a VFS that runs completions on jobs") {
+    const Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 1});
+    Vfs vfs = sandbox.make_vfs(); // no jobs
+    CHECK_FALSE(AssetRegistry::create({.vfs = &vfs, .jobs = &jobs}).ok());
 }
