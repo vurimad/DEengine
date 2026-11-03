@@ -337,6 +337,13 @@ TEST_CASE("shadow cascades split the view, grow outward, and don't change size a
         CHECK(a[c].depth_per_m == doctest::Approx(b[c].depth_per_m));
     }
     CHECK(a[3].far_m == doctest::Approx(shadows.distance_m));
+    // No sun (a zero direction): finite cascades all the same (straight down).
+    const float none[3] = {0.0f, 0.0f, 0.0f};
+    de::render::ShadowCascade night[de::render::kShadowCascadeCount];
+    de::render::fit_shadow_cascades(looking_ahead, 1.0f, 0.1f, 16.0f / 9.0f, none, shadows, night);
+    for (const float value : night[0].view_proj) {
+        CHECK(std::isfinite(value));
+    }
     // A point at the camera, a few meters ahead: inside cascade 0, depth in (0, 1), nearer the sun
     // (higher) is deeper (reverse Z).
     const auto project = [&](const de::render::ShadowCascade& cascade, float x, float y, float z, int row) {

@@ -40,16 +40,20 @@ enum class SceneView : uint32_t {
     Count,
 };
 
+// The number of sun shadow cascades: tiles of a 2 x 2 atlas (shaders/scene/scene_common.slang's
+// kCascadeCount mirrors it).
+inline constexpr uint32_t kShadowCascadeCount = 4;
+
 // The sun's shadows (renderer step 3): cascaded shadow maps in one atlas, resolved per pixel into
 // a screen-space mask.
 struct SceneShadows {
-    uint32_t resolution = 2048;       // per cascade; the atlas is 2 x 2 of them
+    uint32_t resolution = 2048;       // per cascade (64 to 8192); the atlas is 2 x 2 of them
     float distance_m = 140.0f;        // along the view; shadows fade out over the last cascade's band
     float split_lambda = 0.75f;       // 0: even cascade splits, 1: logarithmic
     float blend_band = 0.12f;         // of each cascade, dithered into the next
     float caster_reach_m = 200.0f;    // how far toward the sun casters are caught
     float penumbra_per_m = 0.06f;     // penumbra width per meter between occluder and receiver
-    float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels
+    float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels (at least 1)
 };
 
 const char* scene_view_name(SceneView view);
@@ -76,11 +80,13 @@ struct ShadowCascade {
     float view_proj[16] = {}; // rows: render-origin space to the cascade's clip space
 };
 
-// Fits the cascades to a camera (3x4 rows, looking down -Z) and the sun (toward it, normalized):
+// Fits the cascades to a camera (3x4 rows, looking down -Z) and the sun (toward it; straight up if
+// it's zero):
 // splits between near_m and the shadow distance, a bounding sphere per slice (its size doesn't
 // change as the camera turns), centered on a texel grid (it doesn't swim as the camera moves).
 void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
-                         const float (&sun_direction)[3], const SceneShadows& shadows, ShadowCascade (&out)[4]);
+                         const float (&sun_direction)[3], const SceneShadows& shadows,
+                         ShadowCascade (&out)[kShadowCascadeCount]);
 
 struct SceneRendererState;
 

@@ -7,7 +7,8 @@
 //   - Contact-hardening filter: a blocker search finds how far the occluder is, which sets the
 //     filter's width (sharp at the contact, softer away from it), then 16 Poisson taps rotated per
 //     pixel by interleaved gradient noise.
-// Output: r = sunlight seen (0..1), g = the cascade used, for the debug view.
+// Output: r = sunlight seen (0..1); g = the cascade used, for the debug view: 0 nothing (sky),
+// (cascade + 1) / 5 for a cascade, 1 beyond the shadow distance.
 
 import common.bindless;
 import scene.scene_common;
@@ -70,8 +71,7 @@ float2 fragment_main(VertexOutput input) : SV_Target
     {
         return float2(1.0, 0.0); // the sky
     }
-    const float4 point = mul_rows(frame.inv_view_proj, float4(input.ndc, depth, 1.0));
-    float3 position = point.xyz / point.w;
+    float3 position = position_from_depth(frame, input.ndc, depth);
     const float distance = dot(position - frame.camera_position.xyz, frame.camera_forward.xyz);
 
     // The cascade: the first that reaches this far; the dithered band hands some pixels on.
@@ -100,7 +100,7 @@ float2 fragment_main(VertexOutput input) : SV_Target
         ++cascade;
     }
 
-    const float3 normal = octahedral_decode(load_texture(push.gb1, texel).xy * 2.0 - 1.0);
+    const float3 normal = gbuffer_normal(load_texture(push.gb1, texel).xy);
     const float texel_m = frame.cascade_texel_m[cascade];
     position += normal * texel_m * 1.5 + frame.sun_direction.xyz * texel_m * 0.5;
     const float4 clip = cascade_clip(frame, cascade, position);
@@ -108,37 +108,40 @@ float2 fragment_main(VertexOutput input) : SV_Target
     const float receiver = clip.z;
     const float atlas_texel = frame.shadow_params.y;
 
-    // Blocker search: the mean depth of what's nearer the sun, around the receiver.
+    // Blocker search: the mean depth of what's nearer the sun, around the receiver: the receiver's
+    // own texel, and 16 taps across the widest penumbra.
     const float angle = noise * 6.2831853;
     const float2x2 rotation = float2x2(cos(angle), -sin(angle), sin(angle), cos(angle));
     const float search = frame.shadow_params.w * atlas_texel;
     float blockers = 0.0;
     float blocker_depth = 0.0;
-    for (uint i = 0; i < 8; ++i)
+    for (uint i = 0; i < 17; ++i)
     {
-        const float2 uv = atlas_uv(frame, cascade, tile_uv + mul(rotation, kPoisson[i * 2]) * search * 2.0);
-        const float stored = sample_texture_level(push.atlas, push.sampler, uv, 0.0).r;
+        const float2 offset = i == 16 ? float2(0.0) : mul(rotation, kPoisson[i]) * search * 2.0;
+        const float stored = sample_texture_level(push.atlas, push.sampler, atlas_uv(frame, cascade, tile_uv + offset), 0.0).r;
         if (stored > receiver)
         {
             blocker_depth += stored;
             blockers += 1.0;
         }
     }
-    if (blockers == 0.0)
-    {
-        return float2(1.0, (float(cascade) + 0.5) / 4.0);
-    }
-    blocker_depth /= blockers;
+    // No blocker found: the narrowest filter still runs, so a thin occluder between the search taps
+    // isn't lost.
+    const float gap_m = blockers > 0.0 ? (blocker_depth / blockers - receiver) / frame.cascade_depth_per_m[cascade] : 0.0;
     // How far the occluder is above the receiver, in meters, sets the penumbra (in atlas texels).
-    const float gap_m = (blocker_depth - receiver) / frame.cascade_depth_per_m[cascade];
-    const float penumbra = clamp(gap_m * frame.shadow_params.z / texel_m, 1.0, frame.shadow_params.w);
+    const float penumbra = clamp(gap_m * frame.shadow_params.z / texel_m, 1.0, max(frame.shadow_params.w, 1.0));
+    // A wider filter reaches farther across the receiver's own surface: a slope-scaled bias, from
+    // how steeply the sun meets it, keeps the far taps off it.
+    const float n_dot_l = max(dot(normal, frame.sun_direction.xyz), 0.1);
+    const float slope = min(sqrt(1.0 - n_dot_l * n_dot_l) / n_dot_l, 8.0);
+    const float compare = receiver + frame.cascade_depth_per_m[cascade] * texel_m * penumbra * slope * 0.5;
 
     float lit = 0.0;
     for (uint i = 0; i < 16; ++i)
     {
         const float2 uv = atlas_uv(frame, cascade, tile_uv + mul(rotation, kPoisson[i]) * penumbra * atlas_texel * 2.0);
-        lit += sample_shadow(push.atlas, uv, receiver);
+        lit += sample_shadow(push.atlas, uv, compare);
     }
     lit /= 16.0;
-    return float2(lerp(lit, 1.0, fade_out), (float(cascade) + 0.5) / 4.0);
+    return float2(lerp(lit, 1.0, fade_out), (float(cascade) + 1.0) / 5.0);
 }

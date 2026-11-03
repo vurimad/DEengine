@@ -133,12 +133,25 @@ public struct GBufferSample
     public float translucency;
 };
 
+// GB1's normal: octahedral, remapped to 0..1.
+public float3 gbuffer_normal(float2 gb1)
+{
+    return octahedral_decode(gb1 * 2.0 - 1.0);
+}
+
+// A pixel's position in render-origin space, from its depth (reverse Z; 0 is the far plane).
+public float3 position_from_depth(SceneFrame frame, float2 ndc, float depth)
+{
+    const float4 point = mul_rows(frame.inv_view_proj, float4(ndc, max(depth, 1e-7), 1.0));
+    return point.xyz / point.w;
+}
+
 public GBufferSample unpack_gbuffer(float4 gb0, float2 gb1, float4 gb2)
 {
     GBufferSample s;
     s.base_color = gb0.rgb;
     s.lighting_group = uint(gb0.a * 255.0 + 0.5);
-    s.normal = octahedral_decode(gb1 * 2.0 - 1.0);
+    s.normal = gbuffer_normal(gb1);
     s.roughness = gb2.r;
     s.metalness = gb2.g;
     s.occlusion = gb2.b;

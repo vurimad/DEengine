@@ -39,6 +39,13 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
     return output;
 }
 
+// Opaque casters: depth only. Nothing to do, and no discard: early depth testing stays on.
+[shader("fragment")]
+void fragment_opaque(VertexOutput input)
+{
+}
+
+// Masked casters: the alpha test.
 [shader("fragment")]
 void fragment_main(VertexOutput input)
 {

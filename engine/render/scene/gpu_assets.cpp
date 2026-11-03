@@ -533,6 +533,11 @@ bool GpuAssets::double_sided(uint32_t material) const {
     return material < state.table.size() && core::has_any(state.table[material].flags, GpuMaterialFlags::DoubleSided);
 }
 
+bool GpuAssets::masked(uint32_t material) const {
+    const GpuAssetsState& state = *state_;
+    return material < state.table.size() && core::has_any(state.table[material].flags, GpuMaterialFlags::Masked);
+}
+
 uint64_t GpuAssets::material_table_address() const {
     return state_->material_table_address;
 }

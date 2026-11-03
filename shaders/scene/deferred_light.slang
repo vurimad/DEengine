@@ -89,9 +89,7 @@ float4 fragment_main(VertexOutput input) : SV_Target
     const int2 texel = int2(input.position.xy);
     const float depth = load_texture(push.depth, texel).r;
     // The point on the far plane (or the surface) back in render-origin space.
-    const float4 clip = float4(input.ndc.x, input.ndc.y, max(depth, 1e-7), 1.0);
-    const float4 point = mul_rows(frame.inv_view_proj, clip);
-    const float3 position = point.xyz / point.w;
+    const float3 position = position_from_depth(frame, input.ndc, depth);
     const float3 to_camera = frame.camera_position.xyz - position;
     const float3 v = normalize(to_camera);
     if (depth <= 0.0)
@@ -127,7 +125,9 @@ float4 fragment_main(VertexOutput input) : SV_Target
     // Shadowed sunlight keeps the shadow color (a tint, not black: the look's painterly shadows).
     const float seen = load_texture(push.shadow_mask, texel).r;
     const float3 sun_light = frame.sun_color.rgb * lerp(frame.shadow_color.rgb, float3(1.0), seen);
-    const float3 sun = sun_light * (diffuse + specular + transmitted);
+    // Light seen through a translucent surface isn't shadowed: the surface is its own occluder in
+    // the shadow map (sun behind it), which would always put it in shadow.
+    const float3 sun = sun_light * (diffuse + specular) + frame.sun_color.rgb * transmitted;
 
     // Ambient: the hemisphere for diffuse, and in the reflected direction for specular.
     const float3 r = reflect(-v, n);

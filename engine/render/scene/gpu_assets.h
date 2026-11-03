@@ -110,6 +110,8 @@ public:
     // Whether a material table entry draws without back-face culling (as last written: a reloaded
     // material changes it).
     bool double_sided(uint32_t material) const;
+    // Whether it alpha-tests (its shadow casters need the material; opaque ones don't).
+    bool masked(uint32_t material) const;
 
     GpuAssetsStats stats() const;
 

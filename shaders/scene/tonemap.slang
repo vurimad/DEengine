@@ -58,9 +58,19 @@ float4 fragment_main(VertexOutput input) : SV_Target
         {
             return show_data(mask.rrr);
         }
-        // Cascades: red, green, blue, yellow, darkened where shadowed.
-        const float3 colors[4] = { float3(1, 0.3, 0.3), float3(0.3, 1, 0.3), float3(0.3, 0.4, 1), float3(1, 1, 0.3) };
-        const uint cascade = min(uint(mask.g * 4.0), 3u);
+        // Cascades: red, green, blue, yellow, darkened where shadowed; grey with no shadow lookup
+        // (the sky), white beyond the shadow distance.
+        if (mask.g < 0.1)
+        {
+            return float4(0.25, 0.25, 0.25, 1.0);
+        }
+        if (mask.g > 0.9)
+        {
+            return float4(1.0, 1.0, 1.0, 1.0);
+        }
+        const float3 colors[kCascadeCount] = { float3(1, 0.3, 0.3), float3(0.3, 1, 0.3), float3(0.3, 0.4, 1),
+                                               float3(1, 1, 0.3) };
+        const uint cascade = min(uint(mask.g * 5.0 + 0.5) - 1u, kCascadeCount - 1u);
         return float4(colors[cascade] * (0.35 + 0.65 * mask.r), 1.0);
     }
     if (push.view != 0)

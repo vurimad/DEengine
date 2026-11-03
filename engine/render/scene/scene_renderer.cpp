@@ -35,10 +35,10 @@ struct SceneFrame {
     float sky_color[4] = {};
     float ground_color[4] = {};
     float shadow_color[4] = {};
-    float cascade_view_proj[64] = {};
-    float cascade_far[4] = {};
-    float cascade_texel_m[4] = {};
-    float cascade_depth_per_m[4] = {};
+    float cascade_view_proj[kShadowCascadeCount * 16] = {};
+    float cascade_far[kShadowCascadeCount] = {};
+    float cascade_texel_m[kShadowCascadeCount] = {};
+    float cascade_depth_per_m[kShadowCascadeCount] = {};
     float camera_forward[4] = {};
     float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
 };
@@ -123,18 +123,20 @@ struct SceneRendererState {
     shader::ProgramHandle gbuffer_cull_none; // double-sided materials
     shader::ProgramHandle deferred_light;
     shader::ProgramHandle tonemap;
-    shader::ProgramHandle shadow_caster;
+    shader::ProgramHandle shadow_caster;        // masked: alpha-tested
+    shader::ProgramHandle shadow_caster_opaque; // depth only
+    core::Array<const GpuMesh*> shadow_meshes{
+        core::heap_allocator(core::MemoryTag::Render)}; // per instance, this frame
     shader::ProgramHandle shadow_mask;
     SceneShadows shadows;
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
     SceneRendererStats stats;
-    bool frame_written = false; // this frame's SceneFrame: written when the passes are added
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program :
-             {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap, shadow_caster, shadow_mask}) {
+        for (const shader::ProgramHandle program : {gbuffer_cull_back, gbuffer_cull_none, deferred_light, tonemap,
+                                                    shadow_caster, shadow_caster_opaque, shadow_mask}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -178,6 +180,9 @@ struct SceneRendererState {
                                                .cull = rhi::CullMode::None,
                                                .debug_name = "shadow caster"};
         shadow_caster = make("scene.shadow_caster", caster);
+        const core::Result<shader::ProgramHandle> opaque = shaders->create_graphics(
+            {.module = "scene.shadow_caster", .fragment_entry = "fragment_opaque", .state = caster});
+        shadow_caster_opaque = opaque ? *opaque : shader::ProgramHandle{};
         rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
         mask.color_formats[0] = kShadowMaskFormat;
         shadow_mask = make("scene.shadow_mask", mask);
@@ -245,10 +250,10 @@ struct SceneRendererState {
             scene.camera_forward[i] = forward[i] / forward_length;
         }
         const float sun[3] = {scene.sun_direction[0], scene.sun_direction[1], scene.sun_direction[2]};
-        ShadowCascade cascades[4];
+        ShadowCascade cascades[kShadowCascadeCount];
         fit_shadow_cascades(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m, aspect, sun,
                             shadows, cascades);
-        for (int c = 0; c < 4; ++c) {
+        for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             std::memcpy(&scene.cascade_view_proj[static_cast<size_t>(c) * 16], cascades[c].view_proj,
                         sizeof(cascades[c].view_proj));
             scene.cascade_far[c] = cascades[c].far_m;
@@ -325,13 +330,15 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
 }
 
 void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
-                         const float (&sun_direction)[3], const SceneShadows& shadows, ShadowCascade (&out)[4]) {
+                         const float (&sun_direction)[3], const SceneShadows& shadows,
+                         ShadowCascade (&out)[kShadowCascadeCount]) {
     const glm::dvec3 position(camera[3], camera[7], camera[11]);
     const glm::dvec3 forward = -glm::normalize(glm::dvec3(camera[2], camera[6], camera[10]));
     const double tan_y = std::tan(static_cast<double>(vertical_fov_rad) * 0.5);
     const double tan_x = tan_y * aspect;
     // The light's axes: back toward the sun, and any right and up across it.
-    const glm::dvec3 back = glm::normalize(glm::dvec3(sun_direction[0], sun_direction[1], sun_direction[2]));
+    const glm::dvec3 sun(sun_direction[0], sun_direction[1], sun_direction[2]);
+    const glm::dvec3 back = glm::dot(sun, sun) > 1e-12 ? glm::normalize(sun) : glm::dvec3(0, 1, 0);
     const glm::dvec3 reference = std::abs(back.y) > 0.99 ? glm::dvec3(1, 0, 0) : glm::dvec3(0, 1, 0);
     const glm::dvec3 right = glm::normalize(glm::cross(reference, back));
     const glm::dvec3 up = glm::cross(back, right);
@@ -339,9 +346,9 @@ void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, floa
     const double far = std::max(static_cast<double>(shadows.distance_m), near * 2.0);
     const double lambda = std::clamp(static_cast<double>(shadows.split_lambda), 0.0, 1.0);
     double slice_near = near;
-    for (int c = 0; c < 4; ++c) {
+    for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
         // The practical split scheme: a blend of logarithmic and even splits.
-        const double t = static_cast<double>(c + 1) / 4.0;
+        const double t = static_cast<double>(c + 1) / static_cast<double>(kShadowCascadeCount);
         const double slice_far = lambda * near * std::pow(far / near, t) + (1.0 - lambda) * (near + (far - near) * t);
         // The slice's bounding sphere: on the view axis (the corners are symmetric about it), with a
         // radius that depends only on the slice, not on where the camera looks.
@@ -417,7 +424,8 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->shaders = desc.shaders;
     state->gpu_assets = desc.gpu_assets;
     state->shadows = desc.shadows;
-    state->shadows.resolution = std::max(state->shadows.resolution, 64U);
+    state->shadows.resolution = std::clamp(state->shadows.resolution, 64U, 8192U); // the atlas is twice that
+    state->shadows.max_penumbra_texels = std::max(state->shadows.max_penumbra_texels, 1.0f);
     state->make_scene_programs();
     return SceneRenderer(state);
 }
@@ -451,15 +459,16 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
     const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
     const rhi::PipelineHandle caster = state.shaders->pipeline(state.shadow_caster);
+    const rhi::PipelineHandle caster_opaque = state.shaders->pipeline(state.shadow_caster_opaque);
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
     const float aspect =
         static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
-    state.frame_written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
-    const bool ready = state.frame_written && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster.is_valid() && mask.is_valid();
+    const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, aspect);
+    const bool ready = written && gbuffer_back.is_valid() && gbuffer_none.is_valid() && light.is_valid() &&
+                       tonemap.is_valid() && caster.is_valid() && caster_opaque.is_valid() && mask.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -480,6 +489,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         const world::RenderFrame* frame = nullptr;
         GraphTexture atlas;
         rhi::PipelineHandle caster;
+        rhi::PipelineHandle caster_opaque;
         uint64_t frame_address = 0;
         uint32_t cascade_size = 0;
     };
@@ -490,6 +500,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .frame = &frame,
                     .atlas = {},
                     .caster = caster,
+                    .caster_opaque = caster_opaque,
                     .frame_address = frame_address,
                     .cascade_size = cascade_size};
             data.atlas = pass.create_texture(
@@ -504,17 +515,22 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                   .instances = data.frame_address + kInstancesOffset,
                                   .materials = renderer.gpu_assets->material_table_address(),
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
-            for (uint32_t cascade = 0; cascade < 4; ++cascade) {
+            // The meshes once, for every cascade.
+            renderer.shadow_meshes.clear();
+            for (const world::RenderInstance& instance : extracted.instances) {
+                renderer.shadow_meshes.push(renderer.gpu_assets->mesh(instance.mesh));
+            }
+            for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
                 const rhi::DepthAttachment depth{.texture = context.texture(data.atlas)};
                 const rhi::Rect tile{.x = static_cast<int32_t>((cascade & 1U) * data.cascade_size),
                                      .y = static_cast<int32_t>((cascade >> 1U) * data.cascade_size),
                                      .width = data.cascade_size,
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
-                context.list.bind_pipeline(data.caster);
                 push.cascade = cascade;
-                for (size_t i = 0; i < extracted.instances.size(); ++i) {
-                    const GpuMesh* mesh = renderer.gpu_assets->mesh(extracted.instances[i].mesh);
+                rhi::PipelineHandle bound;
+                for (size_t i = 0; i < renderer.shadow_meshes.size(); ++i) {
+                    const GpuMesh* mesh = renderer.shadow_meshes[i];
                     if (mesh == nullptr) {
                         continue;
                     }
@@ -522,6 +538,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     push.vertices = mesh->vertex_address;
                     context.list.bind_index_buffer(mesh->indices, 0, rhi::IndexType::Uint32);
                     for (const GpuMeshPart& part : mesh->parts) {
+                        const rhi::PipelineHandle pipeline =
+                            renderer.gpu_assets->masked(part.material) ? data.caster : data.caster_opaque;
+                        if (!(pipeline == bound)) {
+                            context.list.bind_pipeline(pipeline);
+                            bound = pipeline;
+                        }
                         push.material = part.material;
                         context.list.push_constants(push);
                         context.list.draw_indexed(part.index_count, 1, part.first_index);
