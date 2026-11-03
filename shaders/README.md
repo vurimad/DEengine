@@ -11,9 +11,10 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test) |
 | `scene/shadow_mask.slang` | The sun's shadow mask: the cascades resolved per pixel, with a contact-hardening filter |
 | `scene/deferred_light.slang` | Deferred lighting: the sun (GGX, Lambert, wrap and backlight for translucency) through the shadow mask, hemisphere ambient, the sky |
+| `scene/fog.slang` | Fog over the lit image and the sky (`common.fog`) |
 | `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel, the shadow mask or the cascades (debug views) |
 | `imgui.slang` | Dear ImGui's draw lists (the debug UI) |
-| `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color` |
+| `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color`, `common.fog` (the fog medium and its integral along a ray) |
 | `tests/` | Shaders the unit tests run: a solid triangle, buffers through pointers, textures by bindless index, storage writes, a shader that binds a slot of its own (refused) |
 
 A module's name is its path with dots: `common.color` is `common/color.slang`. Declarations other modules import are `public`.

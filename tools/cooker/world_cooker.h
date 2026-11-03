@@ -49,9 +49,15 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //       "shadow_color": [0.05, 0.06, 0.09],                 // what shadowed sunlight keeps
 //       "exposure_ev": 0,
 //       "shadows": {"resolution": 2048, "distance_m": 140, "split_lambda": 0.75, "blend_band": 0.12,
-//                   "caster_reach_m": 200, "penumbra_per_m": 0.06, "max_penumbra_texels": 6}
+//                   "caster_reach_m": 200, "penumbra_per_m": 0.06, "max_penumbra_texels": 6},
+//       "fog": {"density_per_m": 0.00008, "height_density_per_m": 0.004, "height_falloff_per_m": 0.08,  // per meter
+//               "base_height_m": 0, "extinction_tint": [0.8, 1, 1.3],
+//               "sun_forward": {"color": [1, 0.85, 0.7], "intensity": 0.5},  // times the sun's
+//               "sun_back": {"color": [0.5, 0.6, 0.8], "intensity": 0.08},
+//               "sun_height_attenuation": 1, "ambient": {"color": [0.3, 0.4, 0.62]},
+//               "ambient_height_attenuation": 1, "start_m": 0, "sun_start_m": 5, "end_m": 20000}
 //     }
-// The shadow settings are render::SceneShadows'.
+// The shadow settings are render::SceneShadows', the fog's render::SceneFog's (asset::FogLimits).
 core::Result<asset::EnvironmentAsset> import_environment(const Source& source, std::span<const std::byte> bytes,
                                                          Diagnostics& diagnostics);
 

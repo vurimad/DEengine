@@ -32,6 +32,26 @@ struct SceneShadows {
     float max_penumbra_texels = 6.0f; // the softest a shadow gets, in shadow texels (at least 1)
 };
 
+// Fog (shaders/common/fog.slang has the model): a constant extinction plus a height fog around a
+// base height, coloured per channel, lit by the sun (a colour looking toward it, another looking
+// away) and an ambient colour, from start_m to end_m along each view ray (the sky is at end_m).
+// The defaults are no fog.
+struct SceneFog {
+    float density_per_m = 0.0f;        // extinction everywhere
+    float height_density_per_m = 0.0f; // the height fog's extinction at its base
+    float height_falloff_per_m = 0.05f;
+    double base_height_m = 0.0; // world space
+    float extinction_tint[3] = {1.0f, 1.0f, 1.0f};
+    float sun_forward[3] = {}; // in-scatter looking toward the sun, times its colour
+    float sun_back[3] = {};    // looking away from it
+    float sun_height_attenuation = 1.0f;
+    float ambient[3] = {}; // isotropic in-scatter
+    float ambient_height_attenuation = 1.0f;
+    float start_m = 0.0f;
+    float sun_start_m = 0.0f; // where sun haze starts: none on the camera's nose
+    float end_m = 20000.0f;
+};
+
 // The scene's light, linear: what an environment asset gives (scene_lighting()).
 // Values are relative to exposure: a sun of 4 with an exposure of 1 is a bright day. The defaults
 // are a late afternoon, for tests and tools without an environment.
@@ -43,6 +63,7 @@ struct SceneLighting {
     float shadow_color[3] = {0.05f, 0.06f, 0.09f};    // what shadowed sunlight keeps: a cool tint, not black
     float exposure_ev = 0.0f;
     SceneShadows shadows{}; // the sun's
+    SceneFog fog{};
 };
 
 // An environment asset (.deenv) as the renderer's lighting.
