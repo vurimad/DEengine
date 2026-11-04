@@ -41,14 +41,15 @@ public:
 
     void record(const FrameStats& stats);
     // A window the user can close: open is set to false then.
-    void draw(bool* open) const;
+    void draw(bool* open);
 
 private:
     float frame_ms_[kFrameHistory] = {};
     size_t next_ = 0;
     size_t count_ = 0;
     uint64_t frames_with_allocations_ = 0;
-    size_t late_ = 0; // of the history, counted now and then: it's read as a slow number
+    size_t late_ = 0; // of the history, counted now and then while drawn: it's read as a slow number
+    uint32_t draws_until_late_ = 0;
     FrameStats last_; // its gpu_passes point at gpu_passes_
     render::PassGpuTime gpu_passes_[render::kMaxTimedPasses] = {};
 };
