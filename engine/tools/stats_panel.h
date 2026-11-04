@@ -10,7 +10,8 @@
 
 namespace de::tools {
 
-// How many of these frames took over 1.5 times their average: uneven pacing, even at a good frame rate.
+// How many of these frames took over 1.5 times their lower quartile: an uneven loop, even at a good frame
+// rate. The lower quartile, so neither one hitch nor a rhythm of short and long frames can hide it.
 size_t late_frames(std::span<const float> frame_ms);
 
 // One frame's numbers, gathered by whoever runs the frame.

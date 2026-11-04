@@ -68,36 +68,75 @@ TEST_CASE("settings are read by name, past comments and blanks") {
     CHECK(de::app::setting(text, "engine").empty()); // only in a comment
 }
 
-TEST_CASE("the frame clock evens out a rhythm, and hands out the time measured") {
-    // A loop that alternates 1 and 7 ms, as two frames back to back do: a steady 4 ms, once it's full.
-    de::app::FrameClock clock;
-    for (int i = 0; i < 12; ++i) {
-        static_cast<void>(clock.step(i % 2 == 0 ? 0.001 : 0.007));
-    }
-    for (int i = 0; i < 24; ++i) {
-        CHECK(clock.step(i % 2 == 0 ? 0.001 : 0.007) == doctest::Approx(0.004));
-    }
+TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds, and hands out the time measured") {
+    constexpr double kHz = 240.0;
+    constexpr double kInterval = 1.0 / kHz;
+    constexpr int kSettled = 64; // the frames it measures the rate over: the last of them goes in intervals
+    const auto approx = [](double value) { return doctest::Approx(value).epsilon(1e-9); };
 
-    // From the first frame: not diluted by a window that hasn't filled.
-    de::app::FrameClock fresh;
-    CHECK(fresh.step(0.004) == doctest::Approx(0.004));
-    CHECK(fresh.step(0.006) == doctest::Approx(0.005));
-
-    // A hitch is spread, not lost: over the frames that see it, the time adds up to what was measured.
-    de::app::FrameClock hitched;
-    for (int i = 0; i < 12; ++i) {
-        static_cast<void>(hitched.step(0.004));
+    // The loop's clock alternates, 1 and 7.33 ms, averaging the refresh rate: every step is an interval.
+    de::app::FrameClock rhythm;
+    for (int i = 0; i < kSettled - 1; ++i) {
+        const double measured = i % 2 == 0 ? 0.001 : kInterval * 2.0 - 0.001;
+        CHECK(rhythm.step(measured, kHz) == measured); // until it knows the rate holds: as measured
     }
+    static_cast<void>(rhythm.step(kInterval * 2.0 - 0.001, kHz));
     double handed_out = 0.0;
-    double measured = 0.0;
-    double largest = 0.0;
-    for (int i = 0; i < 12; ++i) {
-        const double step = i == 0 ? 0.100 : 0.004;
-        const double out = hitched.step(step);
-        measured += step;
-        handed_out += out;
-        largest = out > largest ? out : largest;
+    double measured_total = 0.0;
+    for (int i = 0; i < 2400; ++i) {
+        const double measured = i % 2 == 0 ? 0.001 : kInterval * 2.0 - 0.001;
+        const double step = rhythm.step(measured, kHz);
+        CHECK(step == approx(kInterval));
+        handed_out += step;
+        measured_total += measured;
     }
-    CHECK(handed_out == doctest::Approx(measured));
-    CHECK(largest < 0.015); // not the whole 100 ms at once
+    CHECK(handed_out == doctest::Approx(measured_total).epsilon(1e-4)); // nothing runs slow or fast
+
+    // A hitch is one jump of whole intervals, with what it measured, not spread over later frames.
+    const double jump = rhythm.step(kInterval * 10.0, kHz);
+    CHECK(jump >= kInterval * 9.0);
+    CHECK(jump <= kInterval * 11.0);
+    CHECK(rhythm.step(0.001, kHz) == approx(kInterval));
+
+    // A suspend is a long jump, within an interval of what it measured.
+    CHECK(rhythm.step(5.0, kHz) == doctest::Approx(5.0).epsilon(kInterval));
+
+    // A display a little slower than it says: an extra interval now and then, so the time adds up.
+    de::app::FrameClock slightly_off;
+    for (int i = 0; i < kSettled; ++i) {
+        static_cast<void>(slightly_off.step(kInterval * 1.03, kHz));
+    }
+    double off_handed_out = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        off_handed_out += slightly_off.step(kInterval * 1.03, kHz);
+    }
+    CHECK(off_handed_out == doctest::Approx(kInterval * 1030.0).epsilon(0.005));
+
+    // Without vsync, as measured, even at the rate.
+    de::app::FrameClock no_vsync;
+    for (int i = 0; i < kSettled * 2; ++i) {
+        CHECK(no_vsync.step(0.003 + (i % 2) * 0.002, 0.0) == 0.003 + (i % 2) * 0.002);
+    }
+
+    // Not holding the rate (too much to draw, or a variable-rate display): as measured.
+    de::app::FrameClock slower;
+    for (int i = 0; i < kSettled * 3; ++i) {
+        const double measured = 0.0065 + (i % 2) * 0.001;
+        CHECK(slower.step(measured, kHz) == measured);
+    }
+
+    // It stops, and starts again, as the rate does. Hitches alone don't stop it.
+    de::app::FrameClock changing;
+    for (int i = 0; i < kSettled; ++i) {
+        static_cast<void>(changing.step(kInterval, kHz));
+    }
+    CHECK(changing.step(kInterval, kHz) == approx(kInterval));
+    for (int i = 0; i < kSettled; ++i) {
+        static_cast<void>(changing.step(i == 10 ? 0.2 : kInterval, kHz));
+    }
+    CHECK(changing.step(0.001, kHz) == approx(kInterval)); // an interval, not what it measured
+    for (int i = 0; i < kSettled * 2; ++i) {
+        static_cast<void>(changing.step(kInterval * 1.3, kHz));
+    }
+    CHECK(changing.step(kInterval * 1.3, kHz) == doctest::Approx(kInterval * 1.3));
 }

@@ -226,50 +226,6 @@ TEST_CASE("a target reused every frame is discarded from its real previous state
     check_clean(*device);
 }
 
-TEST_CASE("begin_frame waits for the previous frame") {
-    auto device = make_device();
-    if (!device) {
-        return;
-    }
-    constexpr uint32_t kSize = 256;
-    const auto target = device->create_texture({.width = kSize,
-                                                .height = kSize,
-                                                .format = Format::RGBA8Unorm,
-                                                .usage = TextureUsage::RenderTarget | TextureUsage::CopySrc});
-    const auto readback = device->create_buffer(
-        {.size = uint64_t{kSize} * kSize * 4, .usage = BufferUsage::CopyDst, .memory = MemoryLocation::Readback});
-    REQUIRE((target.ok() && readback.ok()));
-    // Each frame's copy is there once the next frame begins, with nothing else waited for.
-    for (uint32_t frame = 0; frame < 32; ++frame) {
-        device->begin_frame();
-        CommandList list = device->begin_command_list();
-        list.barrier(TextureBarrier{.texture = *target,
-                                    .before = frame == 0 ? ResourceState::Undefined : ResourceState::CopySrc,
-                                    .after = ResourceState::RenderTarget,
-                                    .discard = true});
-        const float shade = static_cast<float>(frame % 4 + 1) / 4.0f;
-        const ColorAttachment color{.texture = *target, .clear = {.r = shade, .g = 0, .b = 0, .a = 1}};
-        list.begin_rendering({.colors = std::span(&color, 1)});
-        list.end_rendering();
-        list.barrier(*target, ResourceState::RenderTarget, ResourceState::CopySrc);
-        list.copy_texture_to_buffer(*target, *readback);
-        list.barrier(*readback, ResourceState::CopyDst, ResourceState::HostRead);
-        device->end_frame();
-
-        device->begin_frame();
-        device->invalidate_mapped(*readback);
-        const auto texel = static_cast<uint8_t>(device->mapped(*readback)[0]);
-        CAPTURE(frame);
-        CHECK(std::abs(static_cast<int>(texel) - static_cast<int>((frame % 4 + 1) * 255 / 4)) <= 1);
-        device->end_frame();
-    }
-    device->wait_idle();
-    device->destroy(*target);
-    device->destroy(*readback);
-    device->wait_idle();
-    check_clean(*device);
-}
-
 TEST_CASE("a depth buffer can be tested read-only and read by shaders at once") {
     auto device = make_device();
     if (!device) {

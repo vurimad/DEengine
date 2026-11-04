@@ -71,6 +71,11 @@ void Window::set_title(const char* title) {
     SDL_SetWindowTitle(window_, title);
 }
 
+double Window::refresh_hz() const {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
+    return mode != nullptr ? static_cast<double>(mode->refresh_rate) : 0.0;
+}
+
 void Window::refresh_pixel_size() {
     int width = 0;
     int height = 0;

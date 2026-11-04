@@ -171,8 +171,8 @@ public:
 
     // --- Frames ---
 
-    // Waits until the GPU has finished the previous frame (for even pacing), then recycles the command
-    // lists of the frame kFramesInFlight frames ago and frees the resources destroyed during it.
+    // Waits until the GPU has finished the frame kFramesInFlight frames ago, then recycles its
+    // command lists and frees the resources destroyed during it.
     void begin_frame();
 
     // The swapchain texture to draw into this frame, in Undefined state; hand it over in Present

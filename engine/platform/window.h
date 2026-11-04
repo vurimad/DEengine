@@ -41,6 +41,8 @@ public:
 
     // The drawable size in pixels: what the swapchain must match.
     uint32_t pixel_width() const { return pixel_width_; }
+    // The refresh rate of the display the window is on; 0 if it isn't known.
+    double refresh_hz() const;
     uint32_t pixel_height() const { return pixel_height_; }
 
     // True during the frame in which the drawable size changed: recreate the swapchain.

@@ -1,35 +1,56 @@
 #pragma once
 
 #include <algorithm>
-#include <cstddef>
+#include <cmath>
+#include <cstdint>
 
 namespace de::app {
 
-// The time a frame advances the camera and the world by: the mean of the last frames' measured times.
-// What a frame measures is when the loop came around, not when the frame is seen, and it's noisy: a
-// display shows frames evenly while the loop's clock doesn't tick evenly. Used raw, every bit of that
-// noise moves the camera unevenly. A mean is unbiased: the time it hands out adds up to the time
-// measured, so nothing runs slow or fast, and a real hitch is caught up over a few frames.
+// The time a frame advances the camera and the world by. With vsync, frames reach the screen a whole
+// number of refresh intervals apart, however unevenly the loop's clock ticks; used raw, that clock's
+// noise moves the camera unevenly. So while the frame rate holds the refresh rate, the measured time
+// adds up and goes out in whole intervals, the remainder carried over: nothing runs slow or fast, and a
+// hitch stays one jump. (The idea is Godot's MainTimerSync::DeltaSmoother, MIT.)
 class FrameClock {
 public:
-    double step(double measured_s) {
-        window_[next_] = measured_s;
-        next_ = (next_ + 1) % kWindow;
-        count_ = std::min(count_ + 1, kWindow);
-        double sum = 0.0;
-        for (const double value : window_) {
-            sum += value;
+    // refresh_hz: 0 without vsync, or if it isn't known; the measured time then goes out as it is.
+    double step(double measured_s, double refresh_hz) {
+        if (refresh_hz <= 0.0) {
+            leftover_s_ = 0.0;
+            return measured_s;
         }
-        return sum / static_cast<double>(count_);
+        const double interval_s = 1.0 / refresh_hz;
+
+        // Is it holding the refresh rate? Not with vsync overridden, a variable-rate display or too much
+        // to draw: then the screen isn't on these intervals. A hitch alone says nothing about it.
+        if (measured_s < interval_s * 4.0) {
+            rate_total_s_ += measured_s;
+            if (++rate_frames_ == kRateFrames) {
+                const double ratio = interval_s * kRateFrames / rate_total_s_;
+                holds_rate_ = ratio > 1.0 - kRateTolerance && ratio < 1.0 + kRateTolerance;
+                rate_total_s_ = 0.0;
+                rate_frames_ = 0;
+            }
+        }
+        if (!holds_rate_) {
+            leftover_s_ = 0.0;
+            return measured_s;
+        }
+
+        leftover_s_ += measured_s;
+        const double intervals = std::max(std::floor(leftover_s_ / interval_s), 1.0); // a frame takes at least one
+        leftover_s_ = std::max(leftover_s_ - intervals * interval_s, -interval_s * 4.0);
+        return intervals * interval_s;
     }
 
 private:
-    // Divisible by 2, 3 and 4: a rhythm that repeats every few frames cancels exactly.
-    static constexpr size_t kWindow = 12;
+    static constexpr uint32_t kRateFrames = 64; // frames the rate is measured over
+    static constexpr double kRateTolerance = 0.05;
 
-    double window_[kWindow] = {};
-    size_t next_ = 0;
-    size_t count_ = 0;
+    double leftover_s_ = 0.0;
+    double rate_total_s_ = 0.0;
+    uint32_t rate_frames_ = 0;
+    bool holds_rate_ = false;
 };
 
 } // namespace de::app

@@ -1193,19 +1193,14 @@ void Device::begin_frame() {
     impl.in_frame = true;
     impl.acquired = false;
 
-    // Waits for the previous frame, not just the one this slot last held: with two frames allowed to
-    // queue, the loop can settle into running two frames back to back and then waiting for two, which
-    // moves everything unevenly on the screen. Update runs before this wait, so it still overlaps the GPU;
-    // only recording waits. The slot's own frame is older, so it's finished too.
     FrameSlot& slot = impl.current_slot();
-    const uint64_t previous_frame = impl.frames[(impl.frame_index + 1) % kFramesInFlight].timeline_value;
-    if (previous_frame != 0) {
+    if (slot.timeline_value != 0) {
         DE_PROFILE_ZONE("wait for GPU");
         const VkSemaphoreWaitInfo wait{
             .sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO,
             .semaphoreCount = 1,
             .pSemaphores = &impl.frame_timeline,
-            .pValues = &previous_frame,
+            .pValues = &slot.timeline_value,
         };
         DE_VK_CHECK(vkWaitSemaphores(impl.device, &wait, UINT64_MAX));
     }
