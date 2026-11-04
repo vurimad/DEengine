@@ -96,6 +96,10 @@ public float3 fog_ambient_light(FogMedium medium, float height)
 // The grid stores extinction (1/m) times this: thin fog stays a normal half float (a subnormal may
 // flush to zero on some GPUs), and extinction up to twice the limit of 1 per meter still fits.
 public static const float kFroxelDensityScale = 4096.0;
+// A froxel stores (light * e / kFroxelLightScale, e), e being extinction * kFroxelDensityScale: light
+// weighted by fog, so filtering across a froxel with none doesn't dim it, with room in a half float for
+// bright light in dense fog.
+public static const float kFroxelLightScale = 64.0;
 
 // The froxel grid's slices: view depth from 0 to its reach, spaced exponentially with an offset (no
 // slices vanishingly thin at the camera). t runs 0 to 1 across the grid.

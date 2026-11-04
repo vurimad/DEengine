@@ -11,7 +11,7 @@ import scene.scene_common;
 struct FogIntegratePush
 {
     SceneFrame* frame;
-    uint froxels;    // RGBA16F 3D, sampled: (light per unit of extinction, extinction * kFroxelDensityScale)
+    uint froxels;    // RGBA16F 3D, sampled: light weighted by extinction, as common.fog says, and that extinction
     uint integrated; // RGBA16F 3D, storage: (in-scatter, optical depth)
     uint width;
     uint height;
@@ -30,7 +30,7 @@ void compute_main(uint3 column: SV_DispatchThreadID)
     }
     SceneFrame* frame = push.frame;
     const uint slices = uint(frame.fog.range.w);
-    const FroxelRay ray = froxel_ray(frame, column.xy, uint2(push.width, push.height));
+    const FroxelRay ray = froxel_ray(frame, float2(column.xy) + 0.5, uint2(push.width, push.height));
     const float3 extinction = max(frame.fog.extinction.rgb, float3(0.01));
 
     Texture3D froxels = texture_3d(push.froxels);
@@ -44,7 +44,8 @@ void compute_main(uint3 column: SV_DispatchThreadID)
         const float span = (far_depth - near_depth) / ray.view_per_ray;
         const float4 froxel = froxels.Load(int4(column.xy, slice, 0));
         const float depth = froxel.a / kFroxelDensityScale * span;
-        in_scatter += froxel.rgb * (1.0 - exp(-depth * extinction)) / extinction * exp(-optical * extinction);
+        const float3 light = froxel.a > 0.0 ? froxel.rgb * kFroxelLightScale / froxel.a : float3(0.0);
+        in_scatter += light * (1.0 - exp(-depth * extinction)) / extinction * exp(-optical * extinction);
         optical += depth;
         integrated[uint3(column.xy, slice)] = float4(min(in_scatter, kHalfMax), min(optical, kHalfMax));
         near_depth = far_depth;

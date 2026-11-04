@@ -592,7 +592,7 @@ The sky is a core system, not a skybox: it drives the lighting, fog, mood and co
 - Far range (built, `shaders/common/fog.slang`): the closed-form integral of that medium along each view ray, in a full-screen pass after lighting (about 0.06 ms at 1600 x 900). Settings in the environment asset, hot reloaded.
 - Near range, a froxel grid with the same medium, in phases:
   - A (built): a view-aligned grid (a column per 8 pixels, 64 slices spaced exponentially out to `volume_distance_m`). `fog inject` stores each froxel's extinction and light, with the sun's shadows from the cascaded atlas (light shafts); `fog integrate` walks each column front to back with the slice's closed-form integral; the composite reads it at each pixel's depth, then the far range goes on from the grid's edge. About 0.2 ms at 1600 x 900.
-  - B: temporal reprojection with per-frame jitter and a filter along depth, for smooth shafts.
+  - B (built): the light of each froxel blends into last frame's at the same place in the world, its samples moving around inside the froxel each frame, for smooth shafts. A filter along depth was planned too; in two trial scenes it made no measurable difference, so it isn't built. Extinction is exact, so it takes no history: fog never lags a change of density. No history after a cut, a frame not drawn, or a new reach or size.
   - C: fog volumes artists place (mist banks, fog walls), injected into the grid.
   - D: local lights in the fog (torch glow), once the engine has local lights.
 
