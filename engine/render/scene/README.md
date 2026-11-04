@@ -22,7 +22,7 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 
 24 bytes a pixel plus depth. Motion comes from each instance's pose now and a frame ago (`world::RenderInstance`, six rows per instance in the frame's buffer) through this frame's camera and last frame's (`world::RenderView`: what was drawn, at this frame's render origin); after a camera cut, and on the first frame, the camera adds none. A surface that was behind last frame's camera has a motion off the screen, so its history is rejected. Bounded to 2 either way. Temporal anti-aliasing reads it. `shaders/scene/scene_common.slang` packs and unpacks it.
 
-With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 samples), and motion is measured without it. Depth, motion and the resolved image of a frame are kept for the next: two sets of textures the renderer owns, swapped each frame, imported into the graph, made again when the size changes.
+With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 samples), and motion is measured without it. Depth, the resolved image and its object motion (TAA's own output: the motion target less the camera's part, from the nearest surface) are kept for the next frame: two sets of textures the renderer owns, swapped each frame, imported into the graph, made again when the size changes.
 
 ## The frame
 
@@ -41,9 +41,9 @@ With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 sample
 
 - **Motion from the nearest surface** in the 3 x 3 around the pixel, so an object's edges travel with it. The sky has no motion written: it takes the camera's.
 - **Colour clip:** history is clipped toward the neighbours' mean, in YCoCg, to the box of the colours around the pixel now. A colour that left can't stay. Most ghosts end here, but not next to an edge, where the old colour is still among the neighbours.
-- **Motion coherence:** history is scaled down by how far the motion at its old place differs from the motion here (in pixels squared): it was about something else. Not for the sky, which has no motion to compare.
-- **Depth:** where only the camera moved the point, its depth is compared with the near and far depths around its old place (last frame's, 3 x 3, the sky as very far, 1% slack). Outside them, a surface there has moved off or come in front, and history goes.
-- **No history at all:** off the screen, on the first frame, after a camera cut, after a frame not drawn with TAA (`RenderFrame::number` has a gap), or at a new size. A pixel without history takes a soft blur of this frame rather than raw aliasing.
+- **Object motion coherence:** history fades by how far the object motion at its old place, as kept last frame, differs from the object motion here (`1 / (1 + pixels squared)`): it was about something else. Without the camera's part, so a camera changing speed costs nothing, and from the nearest surface on both sides, so a silhouette's ring matches itself.
+- **Depth:** where only the camera moved the point, its depth is compared with the near and far depths around its old place (last frame's, 3 x 3, the sky as farther than anything, 1% slack). Outside them, a surface there has moved off or come in front, and history goes.
+- **No history at all:** off the screen or behind last frame's camera, on the first frame, after a camera cut, after a frame not drawn with TAA (`RenderFrame::number` has a gap), or at a new size. A pixel softens as it loses history, to a soft blur of this frame without any, rather than raw aliasing.
 
 No TAA is free of ghosts for what doesn't write depth or motion (particles, transparents): those will need a reactive mask when they arrive.
 

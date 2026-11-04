@@ -24,7 +24,7 @@ public struct SceneFrame
     public FogMedium fog;
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
-    public float4 taa_params;              // x: near (m), y: last frame's near (m), z: TAA's sample, 0 without TAA
+    public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA
 };
 
 public static const uint kCascadeCount = 4;
@@ -155,6 +155,18 @@ public float3 position_from_depth(SceneFrame* frame, float2 ndc, float depth)
 {
     const float4 point = mul_rows(frame.inv_view_proj, float4(ndc, max(depth, 1e-7), 1.0));
     return point.xyz / point.w;
+}
+
+// A point's uv now minus its uv last frame, from its clip positions. Clip y is up, uv's v is down.
+// Behind last frame's camera there is no previous position: a motion off the screen, so its history is
+// rejected. Bounded either way: a half float holds it, and nothing moves farther than off the screen.
+public float2 motion_between(float4 clip, float4 previous_clip)
+{
+    if (previous_clip.w <= 1e-4)
+    {
+        return float2(2.0);
+    }
+    return clamp((clip.xy / clip.w - previous_clip.xy / previous_clip.w) * float2(0.5, -0.5), -2.0, 2.0);
 }
 
 // The first cascade reaching a distance along the view; kCascadeCount past the last.

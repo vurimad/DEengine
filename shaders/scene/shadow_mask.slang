@@ -75,7 +75,7 @@ float2 fragment_main(VertexOutput input) : SV_Target
         return float2(1.0, 1.0); // beyond the shadow distance: lit
     }
     // With TAA, the noise changes every frame (IGN's own step per frame), and TAA averages it away.
-    const float noise_step = 5.588238 * frame.taa_params.z;
+    const float noise_step = 5.588238 * frame.taa_params.y;
     const float noise = gradient_noise(input.position.xy + noise_step);
     const float into_band = cascade_band(frame, cascade, distance);
     // The last cascade fades to lit over its band, so the shadow distance has no hard line (only

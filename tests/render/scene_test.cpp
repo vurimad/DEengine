@@ -1236,15 +1236,40 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         // The camera pans, 2 pixels a frame, past the still square: same for what it uncovers.
         frame.instances[0] = square;
         settle();
-        float camera_x = 0.0f;
+        float panned_x = 0.0f;
         for (int i = 0; i < 6; ++i) {
-            camera_x += pixel_m * 2.0f;
-            frame.camera.transform[3] = camera_x;
+            panned_x += pixel_m * 2.0f;
+            frame.camera.transform[3] = panned_x;
             const de::core::Array<std::byte> panned = draw(true);
             CAPTURE(i);
-            CHECK(std::abs(red(panned, column(1.0f + pixel_m * 2.0f, camera_x)) - sky_red) < 12);
-            CHECK(std::abs(red(panned, column(0.0f, camera_x)) - square_red) < 12);
+            CHECK(std::abs(red(panned, column(1.0f + pixel_m * 2.0f, panned_x)) - sky_red) < 12);
+            CHECK(std::abs(red(panned, column(0.0f, panned_x)) - square_red) < 12);
         }
+
+        // Its silhouette through the pan: halfway through a pixel, an edge stays between the two
+        // colours whatever the jitter, at once when the camera starts (its speed is nothing to history)
+        // and on: the ring of sky around it reads history as well as the square does.
+        frame.camera.transform[3] = 0.0f;
+        frame.camera.previous_valid = false;
+        frame.instances[0].transform[3] = 0.0f;
+        frame.instances[0].previous_transform[3] = 0.0f;
+        const float half_pixel_x =
+            (static_cast<float>(edge) + 0.5f - static_cast<float>(kSize) * 0.5f) * pixel_m - 1.0f;
+        frame.instances[0].transform[3] = half_pixel_x;
+        frame.instances[0].previous_transform[3] = half_pixel_x;
+        settle();
+        int edge_lowest = 255;
+        int edge_highest = 0;
+        for (int i = 1; i <= 8; ++i) {
+            frame.camera.transform[3] = pixel_m * 2.0f * static_cast<float>(i);
+            const de::core::Array<std::byte> panning = draw(true);
+            const int value = red(panning, edge - static_cast<uint32_t>(i) * 2);
+            edge_lowest = std::min(edge_lowest, value);
+            edge_highest = std::max(edge_highest, value);
+        }
+        CHECK(edge_lowest > sky_red + 15);
+        CHECK(edge_highest < square_red - 15);
+        CHECK(edge_highest - edge_lowest < 25);
 
         // Now a dark wall with a red strip on it, about the same depth: next to the strip's edge the old
         // colour is still among the neighbours, and depth says nothing, so neither clip nor the depth
@@ -1286,6 +1311,7 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         frame.camera.previous_valid = false;
         const de::core::Array<std::byte> cut = draw(true);
         CHECK(level(cut, kEdge - 2) < kept);
+        CHECK(level(cut, kEdge - 2) > wall_red + 15); // a soft blur: not raw aliasing
 
         // TAA off while the camera moves, then on: the same, across the gap.
         look_from(0.0f);
@@ -1354,6 +1380,7 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             const de::core::Array<std::byte> left = draw(true);
             if (trailing == kEdge + 2) {
                 CHECK(level(left, kEdge) < kept);
+                CHECK(level(left, kEdge) > wall_red + 50); // softened with the history gone: not raw aliasing
             }
         }
         frame.instances.pop();
@@ -1372,6 +1399,30 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             behind = draw(true);
         }
         CHECK(level(behind, 23) < kept);
+
+        // Two things moving opposite ways at the same speed: the speed alone says nothing. A dark thing
+        // moves left, out from under a red one moving right; a still red strip behind it keeps the old
+        // colour among the neighbours.
+        const float dark_z = 0.002f;
+        const float red_z = 0.004f;
+        constexpr int kLeading = 30; // the dark thing's left edge, at the end
+        frame.instances.clear();
+        frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+        frame.instances.push(thing(mesh, boundary(kLeading + 12) - 1.0f, 0.0f));
+        frame.instances.push(thing(wall_mesh, boundary(kLeading + 12, 0.0f, 3.0f - dark_z) + 1.0f, dark_z));
+        frame.instances.push(thing(mesh, boundary(kLeading - 7, 0.0f, 3.0f - red_z) + 1.0f, red_z));
+        settle();
+        de::core::Array<std::byte> crossed;
+        for (int step = 3; step >= 0; --step) {
+            de::world::RenderInstance& dark = frame.instances[2];
+            de::world::RenderInstance& bright = frame.instances[3];
+            dark.previous_transform[3] = dark.transform[3];
+            dark.transform[3] = boundary(kLeading + step * 3, 0.0f, 3.0f - dark_z) + 1.0f;
+            bright.previous_transform[3] = bright.transform[3];
+            bright.transform[3] = boundary(kLeading + 5 - step * 3, 0.0f, 3.0f - red_z) + 1.0f;
+            crossed = draw(true);
+        }
+        CHECK(level(crossed, kLeading) < kept);
 
         // The sky, the camera pitching 2 pixels a frame. Nothing writes the sky's motion: the horizon
         // moves by the camera's alone, with no trail, and history holds through the turn, so a horizon
@@ -1401,10 +1452,62 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             highest = std::max(highest, static_cast<int>(texel(pitched, kSize / 2, row)[0]));
         }
         CHECK(highest - lowest < 25);
+        // A fast turn, away from the middle of the screen: the sky is the sky, however it turned.
+        lowest = 255;
+        highest = 0;
+        frame.camera.previous_valid = false;
+        static_cast<void>(pitch_to(32.5f));
+        settle();
+        for (uint32_t row = 40; row <= 56; row += 8) {
+            const de::core::Array<std::byte> pitched = pitch_to(static_cast<float>(row) + 0.5f);
+            lowest = std::min(lowest, static_cast<int>(texel(pitched, 4, row)[0]));
+            highest = std::max(highest, static_cast<int>(texel(pitched, 4, row)[0]));
+        }
+        CHECK(highest - lowest < 25);
         frame.camera.transform[5] = 1.0f;
         frame.camera.transform[6] = 0.0f;
         frame.camera.transform[9] = 0.0f;
         frame.camera.transform[10] = 1.0f;
+        frame.camera.previous_valid = false;
+
+        // The camera snaps around with no cut, a quarter turn and more: points that were behind it, or
+        // exactly beside it, have no history, and nothing of the square stays or breaks.
+        frame.instances.clear();
+        frame.instances.push(square);
+        settle();
+        for (const float turn : {1.5707963f, -0.7853982f}) {
+            frame.camera.transform[0] = std::cos(turn);
+            frame.camera.transform[2] = std::sin(turn);
+            frame.camera.transform[8] = -std::sin(turn);
+            frame.camera.transform[10] = std::cos(turn);
+            const de::core::Array<std::byte> snapped = draw(true);
+            for (const uint32_t x : {4U, kSize / 2, kSize - 4}) {
+                CAPTURE(x);
+                CHECK(std::abs(static_cast<int>(texel(snapped, x, kRow)[0]) - sky_red) < 12);
+            }
+        }
+        frame.camera.transform[5] = 1.0f;
+        frame.camera.transform[6] = 0.0f;
+        frame.camera.transform[9] = 0.0f;
+        frame.camera.transform[10] = 1.0f;
+        frame.camera.previous_valid = false;
+
+        // Past a quarter turn every point on the screen was behind last frame's camera, and dividing by
+        // its w would mirror it back on the screen: the sky above the horizon would read the ground.
+        frame.instances.clear();
+        const auto yaw_to = [&](float turn) {
+            frame.camera.transform[0] = std::cos(turn);
+            frame.camera.transform[2] = std::sin(turn);
+            frame.camera.transform[8] = -std::sin(turn);
+            frame.camera.transform[10] = std::cos(turn);
+        };
+        yaw_to(1.4f);
+        frame.camera.previous_valid = false;
+        settle();
+        yaw_to(-1.4f);
+        const de::core::Array<std::byte> turned_back = draw(true);
+        CHECK(static_cast<int>(texel(turned_back, kSize / 2, kSize / 2 - 1)[0]) > 80);
+        yaw_to(0.0f);
         frame.camera.previous_valid = false;
 
         // Another size: new history, nothing breaks.

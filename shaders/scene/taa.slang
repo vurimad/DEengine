@@ -2,9 +2,10 @@
 // into its own history, reprojected by motion. What keeps history from ghosting, in layers:
 //   - Motion comes from the nearest surface around the pixel, so an object's edges travel with it.
 //   - History is clipped to the colours around the pixel now: a colour that left can't stay.
-//   - History is dropped where the motion at its old place disagrees with the motion here (it was
-//     about something else), where the depth there says another surface was in front (something
-//     moved off it), and off the screen. A dropped pixel takes a soft blur of this frame.
+//   - History fades where the object motion at its old place (the camera's part taken out, kept from
+//     last frame) differs from the object motion here: it was about something else. It goes where the
+//     depth there says another surface was in front, and off the screen. A pixel loses its sharpness
+//     as it loses its history: without any, it's a soft blur of this frame.
 // All of it in a tonemapped space, so a bright pixel neither dominates its neighbours nor flickers.
 
 import common.bindless;
@@ -18,7 +19,7 @@ struct TaaPush
     uint depth;
     uint previous_depth;
     uint motion;
-    uint previous_motion;
+    uint previous_object_motion;
     uint sampler;      // linear clamp
     uint has_history;  // 0: the first frame, after a cut or a gap: no history at all
     float exposure;    // what the tonemap will multiply by: the tonemapped space matches what's seen
@@ -31,11 +32,19 @@ ConstantBuffer<TaaPush> push;
 static const float kFeedback = 0.92;
 // Depth may differ by this share before it counts against the history.
 static const float kDepthSlack = 0.01;
+// The sky's depth along the view: farther than anything, and the same however the camera turns.
+static const float kSkyZ = 1e30;
 
 struct VertexOutput
 {
     float4 position : SV_Position;
     float2 ndc : TEXCOORD;
+};
+
+struct ResolveOutput
+{
+    float4 color : SV_Target0;
+    float2 object_motion : SV_Target1; // uv now minus uv last frame, without the camera's part
 };
 
 [shader("vertex")]
@@ -115,7 +124,7 @@ float2 uv_of(float4 clip)
 }
 
 [shader("fragment")]
-float4 fragment_main(VertexOutput input) : SV_Target
+ResolveOutput fragment_main(VertexOutput input)
 {
     SceneFrame* frame = push.frame;
     const int2 texel = int2(input.position.xy);
@@ -127,7 +136,7 @@ float4 fragment_main(VertexOutput input) : SV_Target
     float3 box_max = float3(-1e30);
     float3 sum = float3(0.0);
     float3 blurred = float3(0.0);
-    float nearest = -1.0;
+    float nearest = 0.0; // the sky, unless a surface is around
     int2 nearest_texel = texel;
     float3 here = float3(0.0);
     const int2 last = int2(size) - 1;
@@ -155,12 +164,14 @@ float4 fragment_main(VertexOutput input) : SV_Target
         }
     }
 
-    // Where this point was: by its surface's motion; the sky moves with the camera alone.
-    const float center_depth = load_texture(push.depth, texel).r;
-    const float3 position = position_from_depth(frame, input.ndc, center_depth);
-    const float2 camera_motion = uv_of(mul_rows(frame.unjittered_view_proj, float4(position, 1.0))) -
-                                 uv_of(mul_rows(frame.previous_view_proj, float4(position, 1.0)));
+    // Where this point was: by the nearest surface's motion. The sky has none written, and moves with
+    // the camera alone. What's left without the camera's part is the object's own.
+    const float2 nearest_ndc = input.ndc + float2(nearest_texel - texel) * float2(2.0, -2.0) / size;
+    const float4 nearest_position = float4(position_from_depth(frame, nearest_ndc, nearest), 1.0);
+    const float2 camera_motion =
+        motion_between(mul_rows(frame.unjittered_view_proj, nearest_position), mul_rows(frame.previous_view_proj, nearest_position));
     const float2 motion = nearest > 0.0 ? load_texture(push.motion, nearest_texel).rg : camera_motion;
+    const float2 object_motion = motion - camera_motion;
     const float2 previous_uv = uv - motion;
 
     float weight = kFeedback;
@@ -170,34 +181,28 @@ float4 fragment_main(VertexOutput input) : SV_Target
     }
     else
     {
-        // The motion at its old place: if it differs, the history there was about something else. Not
-        // for the sky, whose motion isn't written: it has nothing to compare, and it isn't covering.
+        // The object motion at its old place: if it differs, the history there was about something else.
         const int2 previous_texel = clamp(int2(previous_uv * size), int2(0), last);
-        if (nearest > 0.0)
-        {
-            const float2 motion_px = motion * size;
-            const float2 previous_px = load_texture(push.previous_motion, previous_texel).rg * size;
-            const float a = dot(motion_px, motion_px);
-            const float b = dot(previous_px, previous_px);
-            weight *= (min(a, b) + 1.0) / (max(a, b) + 1.0);
-        }
+        const float2 difference_px = (object_motion - load_texture(push.previous_object_motion, previous_texel).rg) * size;
+        weight /= 1.0 + dot(difference_px, difference_px);
 
         // The depth at its old place, where only the camera moved it (a moving surface's own motion
         // along the view isn't known, and its colour is clipped anyway): a surface that was in front
         // there has moved off, and what's here wasn't seen. Over the texels around it, so neither a
-        // slope at a grazing angle nor an edge the jitter moves counts against itself. The sky counts
-        // like any other depth: very far.
-        if (length((motion - camera_motion) * size) < 0.5)
+        // slope at a grazing angle nor an edge the jitter moves counts against itself.
+        if (length(object_motion * size) < 0.5)
         {
-            const float expected = mul_rows(frame.previous_view_proj, float4(position, 1.0)).w;
-            float near_z = 1e30;
+            const float center_depth = load_texture(push.depth, texel).r;
+            const float4 position = float4(position_from_depth(frame, input.ndc, center_depth), 1.0);
+            const float expected = center_depth > 0.0 ? max(mul_rows(frame.previous_view_proj, position).w, 1e-4) : kSkyZ;
+            float near_z = kSkyZ;
             float far_z = 0.0;
             for (int y = -1; y <= 1; ++y)
             {
                 for (int x = -1; x <= 1; ++x)
                 {
                     const float depth = load_texture(push.previous_depth, clamp(previous_texel + int2(x, y), int2(0), last)).r;
-                    const float z = frame.taa_params.y / max(depth, 1e-7);
+                    const float z = depth > 0.0 ? frame.taa_params.x / depth : kSkyZ;
                     near_z = min(near_z, z);
                     far_z = max(far_z, z);
                 }
@@ -207,17 +212,17 @@ float4 fragment_main(VertexOutput input) : SV_Target
         }
     }
 
-    float3 resolved;
-    if (weight <= 0.001)
-    {
-        resolved = lerp(here, blurred, 0.5); // no history: soft, not raw aliasing
-    }
-    else
+    // This frame softens as history goes: raw aliasing would show where nothing covers it.
+    const float3 soft = lerp(here, blurred, 0.5 * (1.0 - weight / kFeedback));
+    float3 kept = soft;
+    if (weight > 0.0)
     {
         const float3 history = to_ycocg(tonemapped(sample_history(previous_uv, size)));
-        const float3 clipped = from_ycocg(clip_to_box(history, box_min, box_max, sum / 9.0));
-        resolved = lerp(here, clipped, weight);
+        kept = from_ycocg(clip_to_box(history, box_min, box_max, sum / 9.0));
     }
-    const float3 color = untonemapped(saturate(resolved));
-    return float4(any(isnan(color)) ? float3(0.0) : min(color, kHalfMax), 1.0);
+    const float3 color = untonemapped(saturate(lerp(soft, kept, weight)));
+    ResolveOutput output;
+    output.color = float4(any(isnan(color)) ? float3(0.0) : min(color, kHalfMax), 1.0);
+    output.object_motion = object_motion;
+    return output;
 }

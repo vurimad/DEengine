@@ -92,12 +92,7 @@ GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial mat
     output.gb1 = octahedral_encode(n) * 0.5 + 0.5;
     output.gb2 = float4(saturate(orm.g * material.roughness), saturate(orm.b * material.metallic), occlusion, 0.0);
     output.emissive = float4(emissive, 1.0);
-    // Clip y is up, uv's v is down. Behind last frame's camera there is no previous position: a motion
-    // off the screen, so its history is rejected. Bounded either way: a half float holds it, and
-    // nothing moves farther than off the screen.
-    const float2 ndc = input.clip.xy / input.clip.w;
-    const float2 previous_ndc = input.previous_clip.xy / max(input.previous_clip.w, 1e-4);
-    output.motion = input.previous_clip.w > 1e-4 ? clamp((ndc - previous_ndc) * float2(0.5, -0.5), -2.0, 2.0) : float2(2.0);
+    output.motion = motion_between(input.clip, input.previous_clip);
     return output;
 }
 
