@@ -125,7 +125,8 @@ bool safe(std::span<const std::byte> file, const MaterialAsset& material) {
 // What spawning relies on: parents already made, meshes among the dependencies, names in the file,
 // finite transforms.
 bool safe(std::span<const std::byte> file, const CellAsset& cell) {
-    if (!inside(file, cell.entities) || !inside(file, cell.names) || !inside(file, cell.header.dependencies)) {
+    if (!inside(file, cell.fog_volumes) || !inside(file, cell.entities) || !inside(file, cell.names) ||
+        !inside(file, cell.header.dependencies)) {
         return false;
     }
     const auto entities = cell.entities.get(file.data());
@@ -136,6 +137,7 @@ bool safe(std::span<const std::byte> file, const CellAsset& cell) {
              (entity.mesh >= cell.header.dependencies.count ||
               cell.header.dependencies.get(file.data())[entity.mesh].type != AssetType::Mesh)) ||
             uint64_t{entity.name_offset} + entity.name_length > cell.names.count ||
+            (entity.fog_volume != CellEntity::kNone && entity.fog_volume >= cell.fog_volumes.count) ||
             !std::isfinite(entity.position[0]) || !std::isfinite(entity.scale[1]) ||
             !std::isfinite(entity.rotation[3])) {
             return false;
@@ -295,7 +297,8 @@ std::vector<std::byte> sample_cell() {
     }
     build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
-    build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5});
+    build.fog_volumes.push({.density_per_m = 0.2f});
+    build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
 }
 

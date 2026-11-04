@@ -11,7 +11,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test) |
 | `scene/shadow_mask.slang` | The sun's shadow mask: the cascades resolved per pixel, with a contact-hardening filter |
 | `scene/deferred_light.slang` | Deferred lighting: the sun (GGX, Lambert, wrap and backlight for translucency) through the shadow mask, hemisphere ambient, the sky |
-| `scene/fog_inject.slang`, `scene/fog_integrate.slang` | The froxel grid (compute): each froxel's extinction and light, with the sun's shadows and last frame's light at the same place; then each column integrated front to back |
+| `scene/fog_inject.slang`, `scene/fog_integrate.slang` | The froxel grid (compute): each froxel's extinction and light, with fog volumes, the sun's shadows and last frame's light at the same place; then each column integrated front to back |
 | `scene/fog.slang` | Fog over the lit image and the sky: the grid as far as it reaches, closed form past it (`common.fog`) |
 | `scene/taa.slang` | Temporal anti-aliasing: history reprojected by motion, clipped to the neighbourhood, dropped where object motion or depth says it was about something else; writes the object motion the next frame compares |
 | `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel, the shadow mask or the cascades (debug views) |

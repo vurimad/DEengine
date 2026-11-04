@@ -157,6 +157,48 @@ TEST_CASE("render extraction: interpolated instances and the active camera, noth
     CHECK(near(frame.instances[0].transform[3], 6.0, 1e-2)); // halfway from 1 to 11
 }
 
+TEST_CASE("render extraction: fog volumes, relative to the render origin, and the shape of what's placed") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    world->advance(1.0 / 60.0);
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.fog_volumes.empty());
+
+    const Quat yaw = yaw_deg(90.0f);
+    const flecs::entity mist = ecs.entity().set(
+        de::world::FogVolume{.density_per_m = 0.3f, .edge_m = 2.0f, .tint = {1.0f, 0.5f, 0.25f}, .ellipsoid = true});
+    de::world::place(mist, Transform{.position = {10.0, 2.0, -5.0}, .rotation = yaw, .scale = {4.0f, 2.0f, 1.0f}});
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.fog_volumes.size() == 1);
+    const de::world::RenderFogVolume& volume = frame.fog_volumes[0];
+    CHECK(volume.density_per_m == 0.3f);
+    CHECK(volume.edge_m == 2.0f);
+    CHECK(volume.tint[1] == 0.5f);
+    CHECK(volume.ellipsoid);
+    CHECK(volume.half_extents[0] == 4.0f);
+    CHECK(volume.half_extents[1] == 2.0f);
+    CHECK(volume.half_extents[2] == 1.0f);
+    CHECK(near(volume.center[0], 10.0, 1e-5));
+    // Its own axes: its center is its origin, and its local x is where the rotation takes x.
+    const Vec3 axis_x = yaw * Vec3(1.0f, 0.0f, 0.0f);
+    const auto local_x = [&](const Vec3 point) {
+        return volume.to_local[0] * point.x + volume.to_local[1] * point.y + volume.to_local[2] * point.z +
+               volume.to_local[3];
+    };
+    const Vec3 center(10.0f, 2.0f, -5.0f);
+    CHECK(near(local_x(center), 0.0, 1e-5));
+    CHECK(near(local_x(center + axis_x * 3.0f), 3.0, 1e-5));
+
+    // Moving: where it's seen, like anything else; gone when it's gone.
+    mist.set(Transform{.position = {20.0, 2.0, -5.0}, .rotation = yaw, .scale = {4.0f, 2.0f, 1.0f}});
+    world->advance(1.5 / 60.0);
+    CHECK(near(frame.fog_volumes[0].center[0], 15.0, 1e-2));
+    mist.destruct();
+    world->advance(1.0 / 60.0);
+    CHECK(frame.fog_volumes.empty());
+}
+
 TEST_CASE("a cell owns its entities and its assets: deleting it unloads both, in any number of cells") {
     const de::test::Sandbox sandbox;
     de::core::JobSystem jobs({.worker_count = 2});
@@ -428,6 +470,11 @@ void put_cell(const de::platform::Vfs& vfs, de::asset::AssetId id, de::asset::As
     for (uint32_t i = 2; i < count; ++i) {
         build.entities.push({.position = {390.0 + i, 0.0, -110.0}, .flags = de::asset::CellEntityFlags::Static});
     }
+    build.fog_volumes.push({.density_per_m = 0.4f,
+                            .edge_m = 3.0f,
+                            .tint = {0.5f, 0.6f, 0.7f},
+                            .shape = de::asset::CellFogShape::Ellipsoid});
+    build.entities[2].fog_volume = 0;
     const auto cooked = de::cooker::cook_cell(build, id);
     REQUIRE(vfs.write_file(de::asset::cooked_path(id, de::asset::AssetType::Cell).c_str(), cooked.span()).ok());
 }
@@ -463,6 +510,18 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
     world->tick();
     REQUIRE(members_of(ecs, cell) == 5);
     CHECK(cell.get<de::world::Cell>().coord == de::world::CellCoord{.x = 3, .z = -1});
+
+    // One of them is a fog volume, as the cell says.
+    int fog_volumes = 0;
+    ecs.query_builder<const de::world::FogVolume>().with<InCell>(cell).build().each(
+        [&](flecs::entity, const de::world::FogVolume& fog) {
+            ++fog_volumes;
+            CHECK(fog.density_per_m == 0.4f);
+            CHECK(fog.edge_m == 3.0f);
+            CHECK(fog.tint[2] == 0.7f);
+            CHECK(fog.ellipsoid);
+        });
+    CHECK(fog_volumes == 1);
 
     // The child: composed with its parent at once (no slide in), its mesh the cell's dependency.
     flecs::entity child;

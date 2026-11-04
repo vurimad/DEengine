@@ -1314,6 +1314,156 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             device->destroy(*shaft_target);
         }
 
+        // Fog volumes: a box of mist in clear air, 10 m ahead, 3 m to a side. It takes the world's fog colours.
+        de::render::SceneFog clear_air = gridded;
+        clear_air.density_per_m = 0.0f;
+        restart();
+        const auto volume_at = [](float x, float y, float z, float half_size, float density, float edge) {
+            de::world::RenderFogVolume volume{.to_local = {1, 0, 0, -x, 0, 1, 0, -y, 0, 0, 1, -z},
+                                              .center = {x, y, z},
+                                              .half_extents = {half_size, half_size, half_size},
+                                              .density_per_m = density,
+                                              .edge_m = edge};
+            return volume;
+        };
+        // Where a point at this x and y, 10 m out, is on the screen.
+        const auto screen = [](float at) {
+            return static_cast<uint32_t>(static_cast<float>(kSize) * 0.5f * (1.0f + at / (10.0f * std::tan(0.5f))));
+        };
+        const auto at_pixel = [&](const de::core::Array<std::byte>& image, uint32_t at_x, uint32_t at_y,
+                                  uint32_t channel) { return static_cast<int>(texel(image, at_x, at_y)[channel]); };
+        const uint32_t heart = kSize / 2 - 1;
+        const uint32_t outside = screen(4.5f);
+        const de::core::Array<std::byte> no_volume = render(clear_air);
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        const de::core::Array<std::byte> box = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 1);
+        CHECK(std::abs(at_pixel(box, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
+        CHECK(std::abs(at_pixel(box, outside, heart, 1) - at_pixel(no_volume, outside, heart, 1)) <= 3);
+
+        // Without a grid to hold them, none: and no pass for them.
+        de::render::SceneFog no_grid = clear_air;
+        no_grid.volume_distance_m = 0.0f;
+        const de::core::Array<std::byte> gridless = render(no_grid);
+        CHECK(renderer->stats().fog_volumes == 0);
+        CHECK(std::abs(at_pixel(gridless, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) <= 3);
+
+        // A soft edge thins it toward its surface; its heart is as dense.
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 2.5f));
+        const de::core::Array<std::byte> soft = render(clear_air);
+        const uint32_t near_surface = screen(2.3f);
+        CHECK(std::abs(at_pixel(soft, near_surface, heart, 1) - at_pixel(no_volume, near_surface, heart, 1)) <
+              std::abs(at_pixel(box, near_surface, heart, 1) - at_pixel(no_volume, near_surface, heart, 1)) - 2);
+
+        // An ellipsoid has no corners. A box, looked at toward one, has fog there.
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        frame.fog_volumes[0].ellipsoid = true;
+        const de::core::Array<std::byte> ball = render(clear_air);
+        const uint32_t corner_x = screen(2.4f);
+        const uint32_t corner_y = screen(-2.4f);
+        CHECK(std::abs(at_pixel(ball, corner_x, corner_y, 1) - at_pixel(no_volume, corner_x, corner_y, 1)) <
+              std::abs(at_pixel(box, corner_x, corner_y, 1) - at_pixel(no_volume, corner_x, corner_y, 1)) - 2);
+        CHECK(std::abs(at_pixel(ball, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
+
+        // Turned: a slab 10 m wide and thin, across the view, then along it, seen through its width.
+        frame.fog_volumes.clear();
+        de::world::RenderFogVolume slab = volume_at(0.0f, 0.0f, -10.0f, 1.0f, 0.5f, 0.2f);
+        slab.half_extents[0] = 6.0f;
+        slab.half_extents[1] = 6.0f;
+        slab.half_extents[2] = 1.0f;
+        frame.fog_volumes.push(slab);
+        const de::core::Array<std::byte> across = render(clear_air);
+        const float turned[12] = {0, 0, 1, 10, 0, 1, 0, 0, -1, 0, 0, 0}; // its x along the view
+        std::memcpy(frame.fog_volumes[0].to_local, turned, sizeof(turned));
+        const de::core::Array<std::byte> along = render(clear_air);
+        const uint32_t aside = screen(4.0f);
+        CHECK(std::abs(at_pixel(across, aside, heart, 1) - at_pixel(no_volume, aside, heart, 1)) > 8);
+        CHECK(std::abs(at_pixel(along, aside, heart, 1) - at_pixel(no_volume, aside, heart, 1)) <= 3);
+        CHECK(std::abs(at_pixel(along, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 8);
+
+        // Its tint is of the light it scatters.
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        frame.fog_volumes[0].tint[1] = 0.1f;
+        frame.fog_volumes[0].tint[2] = 0.1f;
+        const de::core::Array<std::byte> red_box = render(clear_air);
+        CHECK(at_pixel(red_box, heart, heart, 1) < at_pixel(box, heart, heart, 1) - 15);
+
+        // It's in the sun's shadow like any fog.
+        frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
+        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}, .mesh = mesh});
+        const de::core::Array<std::byte> roofed_box = render(clear_air);
+        frame.instances.clear();
+        CHECK(at_pixel(roofed_box, heart, heart, 1) < at_pixel(box, heart, heart, 1) - 15);
+
+        // Over frames it holds, like the rest of the grid, and goes when it goes.
+        settle(clear_air);
+        const de::core::Array<std::byte> settled_box = next_frame(clear_air);
+        CHECK(std::abs(at_pixel(settled_box, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        frame.fog_volumes.clear();
+        const de::core::Array<std::byte> gone_box = next_frame(clear_air);
+        CHECK(std::abs(at_pixel(gone_box, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) <= 3);
+        restart();
+
+        // Around the camera, too, and it's in every slice it reaches. To the side of the view: not sent,
+        // unless it reaches into it.
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, 0.0f, 6.0f, 0.5f, 0.5f));
+        const de::core::Array<std::byte> inside_it = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 1);
+        CHECK(std::abs(at_pixel(inside_it, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(40.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        frame.fog_volumes.push(volume_at(0.0f, 40.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        static_cast<void>(render(clear_air));
+        CHECK(renderer->stats().fog_volumes == 0);
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(7.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f)); // 4 m aside, and the view reaches 5.5
+        const de::core::Array<std::byte> reaching_in = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 1);
+        CHECK(std::abs(at_pixel(reaching_in, screen(4.7f), heart, 1) - at_pixel(no_volume, screen(4.7f), heart, 1)) >
+              8);
+        frame.fog_volumes.clear();
+
+        // Long along the view: it reaches across many slices, and it's in them all.
+        de::world::RenderFogVolume long_one = volume_at(0.0f, 0.0f, -30.0f, 3.0f, 0.1f, 0.5f);
+        long_one.half_extents[2] = 25.0f;
+        frame.fog_volumes.push(long_one);
+        const de::core::Array<std::byte> long_view = render(clear_air);
+        frame.fog_volumes[0].half_extents[2] = 5.0f;
+        const de::core::Array<std::byte> short_view = render(clear_air);
+        CHECK(std::abs(at_pixel(long_view, heart, heart, 1) - at_pixel(short_view, heart, heart, 1)) > 5);
+        frame.fog_volumes.clear();
+
+        // Past the first 32 of them, read from the mask's second half.
+        for (int i = 0; i < 40; ++i) {
+            frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 2.0f, 10.0f, -30.0f, 3.0f, 0.5f, 0.5f));
+        }
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        const de::core::Array<std::byte> late_in_mask = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 41);
+        CHECK(std::abs(at_pixel(late_in_mask, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        frame.fog_volumes.clear();
+
+        // Out of reach, or behind the camera: not sent. Too many: the nearest.
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -500.0f, 3.0f, 0.5f, 0.5f));
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, 50.0f, 3.0f, 0.5f, 0.5f));
+        static_cast<void>(render(clear_air));
+        CHECK(renderer->stats().fog_volumes == 0);
+        frame.fog_volumes.clear();
+        for (int i = 0; i < 70; ++i) {
+            frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 3.5f, 10.0f, -30.0f, 3.0f, 0.5f,
+                                             0.5f)); // in view, above the heart
+        }
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        const de::core::Array<std::byte> crowded = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 64);
+        CHECK(renderer->stats().fog_volumes_dropped == 7);
+        CHECK(std::abs(at_pixel(crowded, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        frame.fog_volumes.clear();
+        restart();
+
         assets->release(mesh);
         assets->update();
         device->wait_idle();

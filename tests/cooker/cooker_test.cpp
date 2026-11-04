@@ -1217,6 +1217,19 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "huge", "scale": 1e39},
     {"name": "cart", "static": false},
     {"name": "wheel", "parent": "cart", "static": true},
+    {"name": "mist_a", "fog_volume": 1},
+    {"name": "mist_b", "fog_volume": {"shape": "cube", "density": 0.2}},
+    {"name": "mist_c", "fog_volume": {"edge_m": 2}},
+    {"name": "mist_d", "fog_volume": {"density": 0.2, "edge_m": -1, "tint": [1, 1], "paint": 1}},
+  ],
+})");
+    write_src(sandbox, "content/world/cell_5_5.cell", R"({
+  "coord": [5, 5],
+  "entities": [
+    {"name": "mist", "position": [700, 0, 700], "scale": [8, 3, 8],
+     "fog_volume": {"shape": "ellipsoid", "density": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7]}},
+    {"name": "fog wall", "position": [710, 0, 700], "fog_volume": {"density": 0.1}},
+    {"name": "plain", "position": [720, 0, 700]},
   ],
 })");
     Vfs vfs = cooker_vfs(sandbox);
@@ -1234,12 +1247,37 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "another entity has its name"));
     CHECK(has_message(report, broken, "scale has a zero"));
     CHECK(has_message(report, broken, "unknown cell entity setting 'colour'"));
+    CHECK(has_message(report, broken, "mist_a: fog_volume should be an object"));
+    CHECK(has_message(report, broken, "mist_b: fog_volume shape should be box or ellipsoid"));
+    CHECK(has_message(report, broken, "mist_c: fog_volume needs a density above 0"));
+    CHECK(has_message(report, broken, "mist_d: fog_volume edge_m should be 0 or more"));
+    CHECK(has_message(report, broken, "mist_d: fog_volume tint should be 3 numbers"));
+    CHECK(has_message(report, broken, "unknown fog volume setting 'paint'"));
+    CHECK_FALSE(has_message(report, "content/world/cell_5_5.cell", ""));
     CHECK(report.stats.failed == 1);
     CHECK_FALSE(has_message(report, "content/world/cell_1_2.cell", ""));
 
     const AssetId crate = asset_id(guid_of(vfs, "src:/meta/props/crate.gltf.json"));
     const AssetId lamp = asset_id(guid_of(vfs, "src:/meta/props/lamp.gltf.json"));
     const AssetId cell_id = asset_id(guid_of(vfs, "src:/meta/world/cell_1_2.cell.json"));
+    {
+        Cooked mist_file(vfs, asset_id(guid_of(vfs, "src:/meta/world/cell_5_5.cell.json")), AssetType::Cell);
+        const auto& mist_cell = mist_file.load<CellAsset>();
+        const auto volumes = mist_cell.fog_volumes.get(mist_file.data());
+        REQUIRE(volumes.size() == 2);
+        const auto placed = mist_cell.entities.get(mist_file.data());
+        REQUIRE(placed.size() == 3);
+        CHECK(placed[0].fog_volume == 0);
+        CHECK(placed[1].fog_volume == 1);
+        CHECK(placed[2].fog_volume == CellEntity::kNone);
+        CHECK(volumes[0].shape == de::asset::CellFogShape::Ellipsoid);
+        CHECK(volumes[0].density_per_m == 0.2f);
+        CHECK(volumes[0].edge_m == 2.0f);
+        CHECK(volumes[0].tint[2] == 0.7f);
+        CHECK(volumes[1].shape == de::asset::CellFogShape::Box);
+        CHECK(volumes[1].edge_m == 1.0f); // by default
+        CHECK(volumes[1].tint[0] == 1.0f);
+    }
     {
         Cooked file(vfs, cell_id, AssetType::Cell);
         const auto& cell = file.load<CellAsset>();
@@ -1280,7 +1318,7 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     const CookReport shaders_only = run_cook(vfs, {.content = false});
     CHECK(shaders_only.stats.removed == 0);
     CHECK(vfs.exists(cooked_path(cell_id, AssetType::Cell).c_str()));
-    CHECK(run_cook(vfs).stats.up_to_date == 4); // and the state still knows it
+    CHECK(run_cook(vfs).stats.up_to_date == 5); // and the state still knows it
     // A root outside its cell is only a warning.
     write_src(sandbox, broken, R"({"coord": [0, 0], "entities": [{"name": "far", "position": [-5, 0, 0]}]})");
     const CookReport fixed = run_cook(vfs);

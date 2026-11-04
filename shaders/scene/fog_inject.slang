@@ -23,6 +23,7 @@ struct FogInjectPush
 {
     SceneFrame* frame;
     FogVolumeData* fog_volumes;
+    uint2* fog_slice_masks; // per slice, a bit per volume that reaches it
     uint volume; // RGBA16F 3D, storage: the froxels
     uint atlas;  // the sun's shadow atlas
     uint width;
@@ -139,12 +140,16 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         const float3 middle = camera + ray.direction * (middle_depth / ray.view_per_ray);
         const float reach = frame.fog.range.y;
         const float reach_fade = saturate((reach - middle_depth) / (reach * 0.1));
-        for (uint i = 0; i < push.fog_volume_count; ++i)
+        const uint2 mask = push.fog_slice_masks[froxel.z];
+        for (uint word = 0; word < 2; ++word)
         {
-            const FogVolumeData volume = push.fog_volumes[i];
-            const float density = volume.tint_density.w * fog_volume_share(volume, middle) * reach_fade;
-            volume_density += density;
-            volume_tinted += density * volume.tint_density.rgb;
+            for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
+            {
+                const FogVolumeData volume = push.fog_volumes[word * 32 + firstbitlow(bits)];
+                const float density = volume.tint_density.w * fog_volume_share(volume, middle) * reach_fade;
+                volume_density += density;
+                volume_tinted += density * volume.tint_density.rgb;
+            }
         }
     }
     const float all_density = mean_density + volume_density;

@@ -118,6 +118,7 @@ static_assert(sizeof(GpuFogVolume) == 96);
 struct FogInjectPush {
     uint64_t frame = 0;
     uint64_t fog_volumes = 0;
+    uint64_t fog_slice_masks = 0;
     uint32_t volume = 0;
     uint32_t atlas = 0;
     uint32_t width = 0;
@@ -192,7 +193,10 @@ struct TonemapPush {
 constexpr uint64_t kFogVolumesOffset = 1024; // after the SceneFrame
 // The nearest this many in reach go into the froxel grid each frame.
 constexpr uint32_t kMaxFogVolumes = 64;
-constexpr uint64_t kInstancesOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
+static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
+// Per slice of the grid, which volumes reach it: a froxel tests only those.
+constexpr uint64_t kFogSliceMasksOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
+constexpr uint64_t kInstancesOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
 constexpr uint64_t kInstanceBytes = 96; // six float4 rows: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
@@ -501,9 +505,10 @@ struct SceneRendererState {
     }
 
     // The fog volumes that reach the froxel grid, the nearest if there are too many, into the frame's
-    // buffer. In front of the camera or around it, and within the grid's reach; a rough test: what it lets
-    // through costs a little, and adds nothing.
-    void write_fog_volumes(std::span<std::byte> mapped, const world::RenderFrame& frame, float froxel_reach) {
+    // buffer: in the view, within the grid's reach, by their bounding spheres. What that lets through costs
+    // a little and adds nothing. Each gets a bit in the masks of the slices its sphere's depth covers.
+    void write_fog_volumes(std::span<std::byte> mapped, const world::RenderFrame& frame, float froxel_reach,
+                           float aspect) {
         fog_volumes_now = 0;
         if (froxel_reach <= 0.0f || frame.fog_volumes.empty()) {
             stats.fog_volumes = 0;
@@ -512,6 +517,12 @@ struct SceneRendererState {
         }
         const float* camera = frame.camera.transform;
         const float forward[3] = {-camera[2], -camera[6], -camera[10]};
+        const float right[3] = {camera[0], camera[4], camera[8]};
+        const float up[3] = {camera[1], camera[5], camera[9]};
+        const float tan_y = std::tan(frame.camera.vertical_fov_rad * 0.5f);
+        const float tan_x = tan_y * aspect;
+        const float cos_x = 1.0f / std::sqrt(1.0f + tan_x * tan_x);
+        const float cos_y = 1.0f / std::sqrt(1.0f + tan_y * tan_y);
         uint32_t kept[kMaxFogVolumes];
         float kept_distance[kMaxFogVolumes];
         uint32_t dropped = 0;
@@ -524,7 +535,10 @@ struct SceneRendererState {
                                            volume.half_extents[2] * volume.half_extents[2]);
             const float distance = std::sqrt(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
             const float ahead = to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2];
-            if (distance - radius > froxel_reach || ahead < -radius) {
+            const float aside = std::abs(to[0] * right[0] + to[1] * right[1] + to[2] * right[2]);
+            const float above = std::abs(to[0] * up[0] + to[1] * up[1] + to[2] * up[2]);
+            if (distance - radius > froxel_reach || ahead < -radius || (aside - ahead * tan_x) * cos_x > radius ||
+                (above - ahead * tan_y) * cos_y > radius) {
                 continue;
             }
             uint32_t at = fog_volumes_now;
@@ -543,8 +557,25 @@ struct SceneRendererState {
             kept[at] = i;
             kept_distance[at] = distance;
         }
+        uint64_t slice_masks[kFroxelSlices] = {};
+        const auto slice_of = [&](float depth) {
+            const float t = std::log(std::max(depth, 0.0f) / kFroxelSliceOffsetM + 1.0f) /
+                            std::log(froxel_reach / kFroxelSliceOffsetM + 1.0f);
+            return static_cast<uint32_t>(
+                std::clamp(t * static_cast<float>(kFroxelSlices), 0.0f, static_cast<float>(kFroxelSlices - 1)));
+        };
         for (uint32_t k = 0; k < fog_volumes_now; ++k) {
             const world::RenderFogVolume& volume = frame.fog_volumes[kept[k]];
+            const float to[3] = {volume.center[0] - camera[3], volume.center[1] - camera[7],
+                                 volume.center[2] - camera[11]};
+            const float ahead = to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2];
+            const float radius = std::sqrt(volume.half_extents[0] * volume.half_extents[0] +
+                                           volume.half_extents[1] * volume.half_extents[1] +
+                                           volume.half_extents[2] * volume.half_extents[2]);
+            const uint32_t last_slice = slice_of(ahead + radius);
+            for (uint32_t slice = slice_of(ahead - radius); slice <= last_slice; ++slice) {
+                slice_masks[slice] |= uint64_t{1} << k;
+            }
             GpuFogVolume gpu;
             std::memcpy(gpu.to_local, volume.to_local, sizeof(gpu.to_local));
             gpu.half_extents[0] = volume.half_extents[0];
@@ -558,6 +589,7 @@ struct SceneRendererState {
             gpu.shape[0] = volume.ellipsoid ? 1.0f : 0.0f;
             std::memcpy(mapped.data() + kFogVolumesOffset + k * sizeof(GpuFogVolume), &gpu, sizeof(gpu));
         }
+        std::memcpy(mapped.data() + kFogSliceMasksOffset, slice_masks, sizeof(slice_masks));
         stats.fog_volumes = fog_volumes_now;
         stats.fog_volumes_dropped = dropped;
     }
@@ -655,7 +687,7 @@ struct SceneRendererState {
             std::memcpy(rows, frame.instances[i].transform, kInstanceBytes / 2);
             std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
-        write_fog_volumes(mapped, frame, froxel_reach);
+        write_fog_volumes(mapped, frame, froxel_reach, aspect);
         device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
         return true;
     }
@@ -1215,6 +1247,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                         push.width = grid_width;
                         push.height = grid_height;
                         push.fog_volumes = fog_volumes_address;
+                        push.fog_slice_masks = fog_volumes_address + (kFogSliceMasksOffset - kFogVolumesOffset);
                         push.fog_volume_count = renderer->fog_volumes_now;
                         push.history =
                             froxels_have_history ? context.device.texture_index(context.texture(last_froxels)) : 0;
