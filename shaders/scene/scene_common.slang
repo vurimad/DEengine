@@ -197,17 +197,17 @@ public float2 atlas_uv(SceneFrame* frame, uint cascade, float2 tile_uv)
     return cascade_tile(cascade) + clamp(tile_uv, border, 1.0 - border) * 0.5;
 }
 
-// A froxel column's ray through the middle of its tile (grid_size columns across and down).
+// The ray through a point of the froxel grid's columns (grid_size across and down; a column's middle is
+// its index plus a half).
 public struct FroxelRay
 {
     public float3 direction;    // unit
     public float view_per_ray; // view depth per meter along the ray
 };
 
-public FroxelRay froxel_ray(SceneFrame* frame, uint2 column, uint2 grid_size)
+public FroxelRay froxel_ray(SceneFrame* frame, float2 at, uint2 grid_size)
 {
-    const float2 ndc = float2((float(column.x) + 0.5) / float(grid_size.x) * 2.0 - 1.0,
-                              1.0 - (float(column.y) + 0.5) / float(grid_size.y) * 2.0);
+    const float2 ndc = float2(at.x / float(grid_size.x) * 2.0 - 1.0, 1.0 - at.y / float(grid_size.y) * 2.0);
     FroxelRay ray;
     // From a point 100 m or so out, not the near plane: the difference from the camera stays precise
     // far from the render origin.

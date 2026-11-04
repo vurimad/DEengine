@@ -112,6 +112,12 @@ struct FogInjectPush {
     uint32_t atlas = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t history = 0;
+    uint32_t sampler = 0;
+    float jitter_x = 0.0f;
+    float jitter_y = 0.0f;
+    float jitter_z = 0.0f;
+    uint32_t jittered = 0;
 };
 
 // Matches FogIntegratePush in shaders/scene/fog_integrate.slang.
@@ -268,6 +274,14 @@ struct SceneRendererState {
     uint32_t temporal_current = 0;
     uint64_t temporal_frame = 0; // the RenderFrame whose TAA pass last ran: temporal[temporal_current] then
     uint32_t taa_sample = 0;
+    // The froxels of a frame, kept for the next's reprojection: two, a frame's target and the last's to read.
+    rhi::TextureHandle froxel_sets[2];
+    bool froxels_written[2] = {};
+    uint32_t froxels_width = 0;
+    uint32_t froxels_height = 0;
+    uint32_t froxels_current = 0;
+    uint64_t froxels_frame = 0;   // the RenderFrame the injection last ran for: froxel_sets[froxels_current] then
+    float froxels_reach_m = 0.0f; // where its slices reached
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
@@ -283,6 +297,43 @@ struct SceneRendererState {
             device->destroy(buffer);
         }
         destroy_temporal();
+        destroy_froxels();
+    }
+
+    void destroy_froxels() {
+        for (rhi::TextureHandle& texture : froxel_sets) {
+            if (texture.is_valid()) {
+                device->destroy(texture);
+            }
+            texture = {};
+        }
+        froxels_written[0] = froxels_written[1] = false;
+    }
+
+    // The kept froxels at this size (a new size starts with no history); false if they can't be made.
+    bool ensure_froxels(uint32_t width, uint32_t height) {
+        if (width == froxels_width && height == froxels_height) {
+            return froxel_sets[0].is_valid();
+        }
+        destroy_froxels();
+        froxels_width = width;
+        froxels_height = height;
+        for (rhi::TextureHandle& texture : froxel_sets) {
+            const core::Result<rhi::TextureHandle> made =
+                device->create_texture({.width = width,
+                                        .height = height,
+                                        .depth = kFroxelSlices,
+                                        .format = kFroxelFormat,
+                                        .usage = rhi::TextureUsage::Storage | rhi::TextureUsage::Sampled,
+                                        .dimension = rhi::TextureDimension::Texture3D,
+                                        .debug_name = "froxels"});
+            if (!made) {
+                destroy_froxels();
+                return false;
+            }
+            texture = *made;
+        }
+        return true;
     }
 
     void destroy_temporal() {
@@ -1022,26 +1073,67 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         struct GridPass {
             GraphTexture volume;
         };
+        // Kept across frames when they can be made; if not, the grid works alone, without history.
+        const bool froxels_kept = state.ensure_froxels(grid_width, grid_height);
+        const bool froxels_have_history =
+            froxels_kept && frame.camera.previous_valid && state.froxels_frame + 1 == frame.number &&
+            state.froxels_written[state.froxels_current] && state.froxels_reach_m == froxel_reach;
+        GraphTexture kept_froxels;
+        GraphTexture last_froxels;
+        if (froxels_kept) {
+            if (froxels_have_history) {
+                last_froxels = graph.import_texture({.texture = state.froxel_sets[state.froxels_current],
+                                                     .name = "last froxels",
+                                                     .state = rhi::ResourceState::ShaderRead,
+                                                     .final_state = rhi::ResourceState::ShaderRead});
+            }
+            state.froxels_current ^= 1U;
+            kept_froxels = graph.import_texture({.texture = state.froxel_sets[state.froxels_current],
+                                                 .name = "froxels",
+                                                 .state = state.froxels_written[state.froxels_current]
+                                                              ? rhi::ResourceState::ShaderRead
+                                                              : rhi::ResourceState::Undefined,
+                                                 .final_state = rhi::ResourceState::ShaderRead,
+                                                 .discard = true});
+            state.froxels_written[state.froxels_current] = true; // the graph leaves it so, even if it's skipped
+        }
+        // A different place in each froxel every frame; none on a frame that counts no frames (no history
+        // to average with).
+        const auto froxel_sample = static_cast<uint32_t>(frame.number % kTaaSamples) + 1;
+        const FogInjectPush injection{.frame = frame_address,
+                                      .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
+                                      .jitter_x = halton(froxel_sample, 2) - 0.5f,
+                                      .jitter_y = halton(froxel_sample, 3) - 0.5f,
+                                      .jitter_z = halton(froxel_sample, 5),
+                                      .jittered = froxels_kept && frame.number != 0 ? 1U : 0U};
         const GraphTexture froxels =
             graph
                 .add_pass<GridPass>(
                     "fog inject",
                     [&](PassBuilder& pass, GridPass& data) {
-                        data.volume = pass.create_texture({.desc = grid});
+                        data.volume = froxels_kept ? kept_froxels : pass.create_texture({.desc = grid});
                         pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
                         pass.use(data.volume, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                        if (froxels_have_history) {
+                            pass.use(last_froxels, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                        }
                     },
-                    [atlas, frame_address, fog_inject, grid_width, grid_height](const GridPass& data,
-                                                                                PassContext& context) {
+                    [atlas, last_froxels, froxels_have_history, injection, fog_inject, grid_width, grid_height,
+                     renderer = &state, frame_number = frame.number,
+                     froxel_reach](const GridPass& data, PassContext& context) {
                         DE_PROFILE_ZONE("fog inject pass");
+                        // Only now: a skipped pass leaves no history.
+                        renderer->froxels_frame = frame_number;
+                        renderer->froxels_reach_m = froxel_reach;
                         context.list.bind_pipeline(fog_inject);
-                        context.list.push_constants(FogInjectPush{
-                            .frame = frame_address,
-                            .volume = context.device.storage_texture_index(context.texture(data.volume)),
-                            .atlas = context.device.texture_index(context.texture(atlas)),
-                            .width = grid_width,
-                            .height = grid_height,
-                        });
+                        FogInjectPush push = injection;
+                        push.volume = context.device.storage_texture_index(context.texture(data.volume));
+                        push.atlas = context.device.texture_index(context.texture(atlas));
+                        push.width = grid_width;
+                        push.height = grid_height;
+                        push.history =
+                            froxels_have_history ? context.device.texture_index(context.texture(last_froxels)) : 0;
+                        context.list.push_constants(push);
                         context.list.dispatch((grid_width + 3) / 4, (grid_height + 3) / 4, (kFroxelSlices + 3) / 4);
                     })
                 .volume;

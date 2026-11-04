@@ -30,7 +30,7 @@ void compute_main(uint3 column: SV_DispatchThreadID)
     }
     SceneFrame* frame = push.frame;
     const uint slices = uint(frame.fog.range.w);
-    const FroxelRay ray = froxel_ray(frame, column.xy, uint2(push.width, push.height));
+    const FroxelRay ray = froxel_ray(frame, float2(column.xy) + 0.5, uint2(push.width, push.height));
     const float3 extinction = max(frame.fog.extinction.rgb, float3(0.01));
 
     Texture3D froxels = texture_3d(push.froxels);
