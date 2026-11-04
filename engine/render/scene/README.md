@@ -17,9 +17,10 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 | 1 | RG16 unorm | world normal, octahedral, remapped to 0..1 |
 | 2 | RGBA8 unorm | roughness, metalness, occlusion, translucency (0 until materials carry one) |
 | HDR | RGBA16 float | emissive, written by the G-buffer pass; the lighting is added onto it |
+| motion | RG16 float | uv now minus uv last frame, per pixel (0 where nothing was drawn: the sky moves with the camera alone) |
 | depth | D32 float | reverse Z |
 
-20 bytes a pixel plus depth. Motion vectors come with temporal anti-aliasing (written in the G-buffer pass, not a pass of their own). `shaders/scene/scene_common.slang` packs and unpacks it.
+24 bytes a pixel plus depth. Motion comes from each instance's pose now and a frame ago (`world::RenderInstance`, six rows per instance in the frame's buffer) through this frame's camera and last frame's (`world::RenderView`: what was drawn, at this frame's render origin); after a camera cut, and on the first frame, the camera adds none. A surface that was behind last frame's camera has a motion off the screen, so its history is rejected. Bounded to 2 either way. Temporal anti-aliasing reads it. `shaders/scene/scene_common.slang` packs and unpacks it.
 
 ## The frame
 

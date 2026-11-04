@@ -30,9 +30,9 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const float4 local = float4(vertex.position, 1.0);
-    const float3 world = float3(dot(push.instances[push.instance * 3 + 0], local),
-                                dot(push.instances[push.instance * 3 + 1], local),
-                                dot(push.instances[push.instance * 3 + 2], local));
+    const float3 world = float3(dot(push.instances[push.instance * kInstanceRows + 0], local),
+                                dot(push.instances[push.instance * kInstanceRows + 1], local),
+                                dot(push.instances[push.instance * kInstanceRows + 2], local));
     VertexOutput output;
     output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;

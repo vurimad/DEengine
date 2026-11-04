@@ -42,12 +42,13 @@ struct SceneFrame {
     float camera_forward[4] = {};
     float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
     // FogMedium in shaders/common/fog.slang.
-    float fog_density[4] = {};     // constant, height base, falloff, base height (render-origin space)
-    float fog_extinction[4] = {};  // tint, ambient height attenuation
-    float fog_sun_forward[4] = {}; // colour, sun height attenuation
-    float fog_sun_back[4] = {};    // colour, sun start
-    float fog_ambient[4] = {};     // colour, start
-    float fog_range[4] = {};       // end, froxel grid reach, slice offset, slices
+    float fog_density[4] = {};         // constant, height base, falloff, base height (render-origin space)
+    float fog_extinction[4] = {};      // tint, ambient height attenuation
+    float fog_sun_forward[4] = {};     // colour, sun height attenuation
+    float fog_sun_back[4] = {};        // colour, sun start
+    float fog_ambient[4] = {};         // colour, start
+    float fog_range[4] = {};           // end, froxel grid reach, slice offset, slices
+    float previous_view_proj[16] = {}; // last frame's camera, relative to this frame's render origin
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -137,14 +138,16 @@ struct TonemapPush {
     uint32_t view = 0;
     uint32_t srgb_target = 0;
     uint32_t shadow_mask = 0;
+    uint32_t motion = 0;
 };
 
 constexpr uint64_t kInstancesOffset = 1024; // after the SceneFrame
-constexpr uint64_t kInstanceBytes = 48;     // three float4 rows
+constexpr uint64_t kInstanceBytes = 96;     // six float4 rows: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16Float;
+constexpr rhi::Format kMotionFormat = rhi::Format::RG16Float;
 constexpr rhi::Format kDepthFormat = rhi::Format::D32Float;
 constexpr rhi::Format kShadowMaskFormat = rhi::Format::RG8Unorm;
 
@@ -246,7 +249,7 @@ struct SceneRendererState {
 
     // The G-buffer and light programs: their formats are the renderer's own, so made once.
     void make_scene_programs() {
-        rhi::GraphicsPipelineDesc gbuffer{.color_count = 4,
+        rhi::GraphicsPipelineDesc gbuffer{.color_count = 5,
                                           .depth_format = kDepthFormat,
                                           .depth_test = true,
                                           .depth_write = true,
@@ -256,6 +259,7 @@ struct SceneRendererState {
             gbuffer.color_formats[i] = kGBufferFormats[i];
         }
         gbuffer.color_formats[3] = kHdrFormat;
+        gbuffer.color_formats[4] = kMotionFormat;
         gbuffer_opaque = make("scene.gbuffer", gbuffer, "fragment_opaque");
         gbuffer.debug_name = "gbuffer (masked)";
         gbuffer_masked = make("scene.gbuffer", gbuffer, "fragment_masked");
@@ -353,6 +357,13 @@ struct SceneRendererState {
         if (!invert_4x4(scene.view_proj, scene.inv_view_proj)) {
             return false;
         }
+        // Last frame's view (at this frame's render origin); after a cut, or at first, this one's.
+        if (frame.camera.previous_valid) {
+            camera_view_proj(frame.camera.previous_transform, frame.camera.previous_vertical_fov_rad,
+                             frame.camera.previous_near_m, aspect, scene.previous_view_proj);
+        } else {
+            std::memcpy(scene.previous_view_proj, scene.view_proj, sizeof(scene.view_proj));
+        }
         scene.camera_position[0] = frame.camera.transform[3];
         scene.camera_position[1] = frame.camera.transform[7];
         scene.camera_position[2] = frame.camera.transform[11];
@@ -406,8 +417,10 @@ struct SceneRendererState {
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         for (size_t i = 0; i < frame.instances.size(); ++i) {
-            std::memcpy(mapped.data() + kInstancesOffset + i * kInstanceBytes, frame.instances[i].transform,
-                        kInstanceBytes);
+            static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
+            std::byte* const rows = mapped.data() + kInstancesOffset + i * kInstanceBytes;
+            std::memcpy(rows, frame.instances[i].transform, kInstanceBytes / 2);
+            std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
         device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
         return true;
@@ -463,6 +476,8 @@ const char* scene_view_name(SceneView view) {
         return "occlusion";
     case SceneView::Translucency:
         return "translucency";
+    case SceneView::Motion:
+        return "motion";
     case SceneView::ShadowMask:
         return "shadow mask";
     case SceneView::Cascades:
@@ -728,6 +743,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         GraphTexture gb[3];
         GraphTexture hdr;
         GraphTexture depth;
+        GraphTexture motion;
     };
     struct GBufferPass {
         SceneRendererState* state = nullptr;
@@ -751,17 +767,20 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             }
             data.targets.hdr = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
             data.targets.depth = pass.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
+            data.targets.motion = pass.create_texture({.desc = {.format = kMotionFormat}, .reference_scale = 1.0f});
             pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
+            pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
         },
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
             SceneRendererState& renderer = *data.state;
-            rhi::ColorAttachment colors[4];
+            rhi::ColorAttachment colors[5];
             for (uint32_t i = 0; i < 3; ++i) {
                 colors[i] = {.texture = context.texture(data.targets.gb[i])};
             }
             colors[3] = {.texture = context.texture(data.targets.hdr)};
+            colors[4] = {.texture = context.texture(data.targets.motion)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
             const GBufferPush push{.frame = data.frame_address,
@@ -952,6 +971,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             }
             pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(targets.motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
         [targets, fogged, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
@@ -968,6 +988,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .view = view_index,
                 .srgb_target = srgb_target,
                 .shadow_mask = context.device.texture_index(context.texture(shadow_mask)),
+                .motion = context.device.texture_index(context.texture(targets.motion)),
             });
             context.list.draw(3);
             context.list.end_rendering();

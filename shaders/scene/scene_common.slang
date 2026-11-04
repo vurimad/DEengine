@@ -22,9 +22,13 @@ public struct SceneFrame
     public float4 camera_forward;        // xyz: the view direction
     public float4 shadow_params;         // x: blend band (fraction of a cascade), y: atlas texel (uv), z: penumbra scale, w: max penumbra (texels)
     public FogMedium fog;
+    public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
 };
 
 public static const uint kCascadeCount = 4;
+
+// An instance in the frame's buffer: three rows of its transform, then three of last frame's.
+public static const uint kInstanceRows = 6;
 
 // A cascade's tile in the 2x2 shadow atlas: uv offset (each tile is half the atlas).
 public float2 cascade_tile(uint cascade)

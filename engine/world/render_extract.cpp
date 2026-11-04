@@ -6,15 +6,19 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 
 namespace de::world {
 
 namespace {
 
 // The active camera, interpolated, moving the render origin first when the camera has gone a
-// step away from it.
+// step away from it. What was drawn last frame becomes the previous view, moved to the new origin.
 void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
+    const RenderView last = frame.camera;
+    const DVec3 last_origin = frame.origin;
     frame.camera.valid = false;
+    frame.camera.previous_valid = false;
     const auto* active = ecs.try_get<ActiveCamera>();
     if (active == nullptr || active->entity == 0 || !ecs.is_alive(active->entity)) {
         return;
@@ -37,6 +41,21 @@ void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
     frame.camera.vertical_fov_rad = camera->vertical_fov_rad;
     frame.camera.near_m = camera->near_m;
     frame.camera.valid = true;
+    const bool cut = active->cut || active->entity != frame.camera_entity || !last.valid;
+    if (active->cut) {
+        ecs.get_mut<ActiveCamera>().cut = false;
+    }
+    frame.camera_entity = active->entity;
+    if (!cut) {
+        std::memcpy(frame.camera.previous_transform, last.transform, sizeof(last.transform));
+        for (int row = 0; row < 3; ++row) {
+            frame.camera.previous_transform[row * 4 + 3] = static_cast<float>(
+                static_cast<double>(last.transform[row * 4 + 3]) + last_origin[row] - frame.origin[row]);
+        }
+        frame.camera.previous_vertical_fov_rad = last.vertical_fov_rad;
+        frame.camera.previous_near_m = last.near_m;
+        frame.camera.previous_valid = true;
+    }
 }
 
 } // namespace
@@ -55,6 +74,7 @@ struct ExtractJob {
     const RenderExtractScratch* scratch = nullptr;
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
+    float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
     DVec3 origin{0.0};
 };
 
@@ -66,9 +86,14 @@ void extract_chunks(size_t begin, size_t end, void* context) {
             RenderInstance& instance = job.instances[chunk.first + i];
             to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), job.origin,
                           instance.transform);
+            if (same_transform(chunk.previous[i].value, chunk.current[i])) {
+                std::memcpy(instance.previous_transform, instance.transform,
+                            sizeof(instance.transform)); // most of a world
+            } else {
+                to_matrix_3x4(pose_at(chunk.previous[i].value, chunk.current[i], job.previous_alpha), job.origin,
+                              instance.previous_transform);
+            }
             instance.mesh = chunk.meshes[i].mesh;
-            instance.reserved[0] = 0;
-            instance.reserved[1] = 0;
         }
     }
 }
@@ -108,8 +133,11 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                 rows += count;
             }
             out.instances.resize_uninit(rows);
-            ExtractJob job{
-                .scratch = &scratch, .instances = out.instances.data(), .alpha = *desc.alpha, .origin = out.origin};
+            ExtractJob job{.scratch = &scratch,
+                           .instances = out.instances.data(),
+                           .alpha = *desc.alpha,
+                           .previous_alpha = *desc.alpha - *desc.alpha_step,
+                           .origin = out.origin};
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
             } else {

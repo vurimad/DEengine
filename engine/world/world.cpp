@@ -61,6 +61,7 @@ struct WorldState {
     double accumulator_s = 0.0;
     uint64_t ticks = 0;
     float alpha = 0.0f;
+    float alpha_step = 0.0f; // how much of a tick the last advance() took
     core::JobSystem* jobs = nullptr;
     int64_t merges = 0; // flecs' merge count at the last advance()
 };
@@ -108,9 +109,12 @@ core::Result<World> World::create(const WorldDesc& desc) {
         add_cell_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], spawn_cells, *desc.assets,
                          state->cell_scratch);
     }
-    add_render_extract(
-        ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],
-        {.frame = &state->render_frame, .scratch = &state->extract_scratch, .alpha = &state->alpha, .jobs = desc.jobs});
+    add_render_extract(ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],
+                       {.frame = &state->render_frame,
+                        .scratch = &state->extract_scratch,
+                        .alpha = &state->alpha,
+                        .alpha_step = &state->alpha_step,
+                        .jobs = desc.jobs});
     return World(state);
 }
 
@@ -176,6 +180,9 @@ FrameStep World::advance(double real_dt_s) {
         step.dropped_time = true;
     }
     state.alpha = static_cast<float>(state.accumulator_s / state.tick_dt_s);
+    // Bounded by what the ticks cover: a hitch's dropped time is motion nothing went through.
+    state.alpha_step = static_cast<float>(
+        std::min(std::max(real_dt_s, 0.0) / state.tick_dt_s, static_cast<double>(state.max_ticks_per_frame)));
     step.alpha = state.alpha;
     {
         DE_PROFILE_ZONE("world frame");

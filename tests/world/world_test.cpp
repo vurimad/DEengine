@@ -128,6 +128,107 @@ TEST_CASE("world transforms interpolate between ticks, and static tables aren't 
     CHECK(near(glm::degrees(glm::angle(half.rotation)), 45.0));
 }
 
+TEST_CASE("each instance knows where it was a frame ago, from the same two ticks") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    add_movement(*world);
+    constexpr double kTick = 1.0 / 60.0;
+    // Moving at a meter a tick; standing still; and place()d mid-flight.
+    const flecs::entity mover =
+        ecs.entity().set(Transform{}).set(Velocity{.meters_per_s = {60.0f, 0.0f, 0.0f}}).set(de::world::MeshInstance{});
+    const flecs::entity statue = ecs.entity().set(de::world::MeshInstance{});
+    de::world::place(statue, Transform{.position = {-100.0, 0.0, 0.0}});
+
+    const auto instance_x = [&](flecs::entity entity, bool previous) {
+        const de::world::RenderFrame& frame = world->render_frame();
+        const bool want_statue = entity == statue; // told apart by where they are: it's far behind
+        for (const de::world::RenderInstance& instance : frame.instances) {
+            const float x = previous ? instance.previous_transform[3] : instance.transform[3];
+            if (want_statue == (instance.transform[3] < -50.0f)) {
+                return x;
+            }
+        }
+        FAIL("no such instance");
+        return 0.0f;
+    };
+    world->advance(kTick * 1.25); // a tick, and a quarter of the next
+    const float first = instance_x(mover, false);
+    CHECK(first == doctest::Approx(0.25f));
+    // Half a tick later, no tick between: a frame ago is where it was drawn.
+    world->advance(kTick * 0.5);
+    CHECK(instance_x(mover, false) == doctest::Approx(0.75f));
+    CHECK(instance_x(mover, true) == doctest::Approx(first));
+    // Half a tick later again, over a tick: the same, through the tick boundary.
+    world->advance(kTick * 0.5);
+    CHECK(instance_x(mover, false) == doctest::Approx(1.25f));
+    CHECK(instance_x(mover, true) == doctest::Approx(0.75f));
+    // What doesn't move has no motion.
+    CHECK(instance_x(statue, false) == doctest::Approx(-100.0f));
+    CHECK(instance_x(statue, true) == doctest::Approx(-100.0f));
+    // place(): no motion, however far it jumped.
+    de::world::place(mover, Transform{.position = {3.0, 0.0, 0.0}});
+    world->advance(kTick * 0.1);
+    CHECK(instance_x(mover, false) == doctest::Approx(3.0f));
+    CHECK(instance_x(mover, true) == doctest::Approx(3.0f));
+    // A frame longer than a tick (30 fps here) goes back past the previous tick by the same motion:
+    // the whole frame's motion, not a tick's.
+    world->advance(kTick * 2.0);
+    world->advance(kTick * 2.0);
+    CHECK(instance_x(mover, false) - instance_x(mover, true) == doctest::Approx(2.0f));
+    // A hitch: no more than the ticks ran (four by default), not the second that passed.
+    world->advance(1.0);
+    CHECK(instance_x(mover, false) - instance_x(mover, true) == doctest::Approx(4.0f));
+    // A scale growing from zero doesn't go negative a frame before it began.
+    const WorldTransform before = de::world::pose_at(WorldTransform{.scale = {0.1f, 0.1f, 0.1f}},
+                                                     WorldTransform{.scale = {1.0f, 1.0f, 1.0f}}, -0.5f);
+    CHECK(before.scale.x == doctest::Approx(0.1f));
+}
+
+TEST_CASE("the view a frame ago is what was drawn, at this frame's origin, and a cut drops it") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity camera = ecs.entity().set(de::world::Camera{.vertical_fov_rad = 0.9f});
+    de::world::place(camera, Transform{.position = {1.0, 0.0, 0.0}});
+    ecs.set(de::world::ActiveCamera{.entity = camera.id()});
+    const de::world::RenderView& view = world->render_frame().camera;
+    constexpr double kFrame = 1.0 / 240.0;
+    // The first frame has nothing to look back at.
+    world->advance(kFrame);
+    REQUIRE(view.valid);
+    CHECK_FALSE(view.previous_valid);
+    // A free camera is place()d every frame, so its ticks don't say where it was: what was drawn does.
+    de::world::place(camera, Transform{.position = {2.0, 0.0, 0.0}});
+    world->advance(kFrame);
+    REQUIRE(view.previous_valid);
+    CHECK(view.transform[3] == doctest::Approx(2.0f));
+    CHECK(view.previous_transform[3] == doctest::Approx(1.0f));
+    CHECK(view.previous_vertical_fov_rad == doctest::Approx(0.9f));
+    // The render origin jumps with it: the same world position, relative to the new origin.
+    de::world::place(camera, Transform{.position = {2000.0, 0.0, 0.0}});
+    world->advance(kFrame);
+    CHECK(world->render_frame().origin.x == 2048.0);
+    CHECK(view.transform[3] == doctest::Approx(-48.0f));
+    CHECK(view.previous_transform[3] == doctest::Approx(2.0f - 2048.0f));
+    // A cut: no looking back, once.
+    de::world::place(camera, Transform{.position = {2001.0, 0.0, 0.0}});
+    ecs.get_mut<de::world::ActiveCamera>().cut = true;
+    world->advance(kFrame);
+    CHECK_FALSE(view.previous_valid);
+    CHECK_FALSE(ecs.get<de::world::ActiveCamera>().cut);
+    world->advance(kFrame);
+    CHECK(view.previous_valid);
+    // Another camera is a cut by itself.
+    const flecs::entity other = ecs.entity().set(de::world::Camera{});
+    de::world::place(other, Transform{.position = {2002.0, 0.0, 0.0}});
+    ecs.set(de::world::ActiveCamera{.entity = other.id()});
+    world->advance(kFrame);
+    CHECK_FALSE(view.previous_valid);
+    world->advance(kFrame);
+    CHECK(view.previous_valid);
+}
+
 TEST_CASE("components are reflected: inspectable and serializable") {
     auto world = World::create();
     REQUIRE(world.ok());

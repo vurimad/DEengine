@@ -496,7 +496,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 
 1. GPU culling (instances, lights) and Hi-Z build
 2. Shadows: cascaded sun shadows (4 cascades in an atlas, stable fitting), cached far cascades later; local shadow atlas for torches and spells
-3. G-buffer: base color + lighting group ID (RGBA8 sRGB), octahedral normal (RG16), roughness/metalness/occlusion/translucency (RGBA8), emissive straight into the HDR target, reverse-Z depth; motion vectors join with TAA (engine/render/scene/README.md)
+3. G-buffer: base color + lighting group ID (RGBA8 sRGB), octahedral normal (RG16), roughness/metalness/occlusion/translucency (RGBA8), emissive straight into the HDR target, motion vectors (RG16F), reverse-Z depth (engine/render/scene/README.md)
 4. Terrain and grass write into the same G-buffer
 5. Deferred decals (blood, scorch, footprints) modify the G-buffer
 6. Sun shadow mask: the cascades resolved per pixel into a screen-space mask with contact-hardening filtering; it reads the G-buffer's depth and normals, so it runs after the G-buffer, not with the shadow maps
@@ -1201,3 +1201,4 @@ Decisions so far:
 | 2026-11-03 | Until GPU-driven v1 keeps instances on the GPU, render extraction writes every instance each frame; change-only uploads (and the render origin's one re-upload) arrive with it | The simplest correct path first; the per-frame cost is measured (GPU timers, Tracy) before it's optimized |
 | 2026-11-03 | Fog v1 is an analytic height fog (Elden Ring's medium: constant plus bounded exponential height fog, coloured extinction, two-colour sun lobe, ambient) in a full-screen pass over the scene and the sky; froxels come next with the same model | Most of the atmosphere for a few hundredths of a millisecond; the froxel fog needs this model and this far range anyway |
 | 2026-11-03 | Froxel fog in phases: A the grid with sun shadows, B temporal, C fog volumes, D local lights; 8-pixel columns and 64 slices, on when an environment sets `volume_distance_m` | Each phase is usable alone; 0.2 ms measured for A leaves room in the budget; the closed form stays the far range and the no-grid path |
+| 2026-11-03 | Motion vectors: an instance's pose a frame ago comes from the same two ticks it's interpolated between, stepped back by the frame's share of a tick; no history per entity | Stateless and compact, exact for steady motion, none for what's static or place()d; a change of speed is a small one-frame error, which TAA's rejection covers. The camera keeps real history (what was drawn) in the render frame, since a free camera is place()d every frame; an explicit cut drops it |
