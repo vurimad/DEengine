@@ -194,7 +194,7 @@ private:
             return;
         }
         static constexpr const char* kKeys[] = {"shape", "density", "edge_m", "tint"};
-        KeyReader reader(diagnostics_, path_, object);
+        const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
         reader.check_keys(kKeys, "fog volume");
         asset::CellFogVolume volume;
         const std::string_view shape = reader.string("shape", "box");
