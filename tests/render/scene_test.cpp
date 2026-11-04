@@ -32,6 +32,8 @@ namespace {
 
 constexpr AssetId kQuad = AssetId::from_value(0x51);
 constexpr AssetId kRed = AssetId::from_value(0x52);
+constexpr AssetId kWall = AssetId::from_value(0x53);
+constexpr AssetId kDarkGreen = AssetId::from_value(0x54);
 constexpr uint32_t kSize = 64;
 
 // A 2 x 2 m square in the XY plane, facing +Z, drawn with one material.
@@ -60,13 +62,18 @@ void put_quad(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
     REQUIRE(vfs.write_file(de::asset::cooked_path(mesh_id, AssetType::Mesh).c_str(), mesh->span()).ok());
 }
 
-// The square with one red material.
+// The square with a red material, and again with a dark green one.
 void put_assets(const de::platform::Vfs& vfs) {
     put_quad(vfs, kQuad, kRed);
+    put_quad(vfs, kWall, kDarkGreen);
     de::cooker::MaterialBuild red;
     red.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, 1.0f);
     const auto cooked = de::cooker::cook_material(red, kRed);
     REQUIRE(vfs.write_file(de::asset::cooked_path(kRed, AssetType::Material).c_str(), cooked.span()).ok());
+    de::cooker::MaterialBuild green;
+    green.set_param(de::asset::material::kBaseColor, 0.0f, 0.2f, 0.0f, 1.0f);
+    const auto cooked_green = de::cooker::cook_material(green, kDarkGreen);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(kDarkGreen, AssetType::Material).c_str(), cooked_green.span()).ok());
 }
 
 // A mesh of `parts` squares side by side, each with a material of its own sampling a texture of its
@@ -1073,6 +1080,346 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
         frame.instances.clear();
         static_cast<void>(shown());
         assets->release(mesh);
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}
+
+TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    put_assets(*vfs);
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        REQUIRE(renderer.ok());
+        const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
+        const de::asset::AssetHandle wall_mesh = assets->load<de::asset::MeshAsset>(kWall);
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+        REQUIRE(gpu_assets->mesh(wall_mesh) != nullptr);
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+
+        // A red square 3 m away over the sky, the sun behind the camera.
+        de::world::RenderFrame frame;
+        frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+        const de::world::RenderInstance square{.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+                                               .previous_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+                                               .mesh = mesh};
+        const auto draw = [&](bool taa) {
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            ++frame.number; // as extraction does
+            const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit,
+                                 taa);
+            graph->execute();
+            device->end_frame();
+            // As extraction does: what was drawn is the next frame's previous view.
+            std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
+            frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
+            frame.camera.previous_near_m = frame.camera.near_m;
+            frame.camera.previous_valid = true;
+            return de::test::read_texture(*device, *target);
+        };
+        const auto settle = [&] {
+            for (int i = 0; i < 40; ++i) {
+                static_cast<void>(draw(true));
+            }
+        };
+        // The pixel column of a world x at the square's distance, on a row through the square, away
+        // from the horizon (which TAA smooths too).
+        constexpr uint32_t kRow = kSize / 2 - 8;
+        const auto column = [](float world_x, float camera_x = 0.0f) {
+            const float half = static_cast<float>(kSize) * 0.5f;
+            return static_cast<uint32_t>(half + (world_x - camera_x) / (3.0f * std::tan(0.5f)) * half);
+        };
+        const auto red = [&](const de::core::Array<std::byte>& pixels, uint32_t x) {
+            return static_cast<int>(texel(pixels, x, kRow)[0]);
+        };
+
+        // What's what, without TAA: the sky alone, the square alone. An edge is one or the other.
+        const de::core::Array<std::byte> sky_only = draw(false);
+        const int sky_red = red(sky_only, column(-0.6f));
+        frame.instances.push(square);
+        const de::core::Array<std::byte> sharp = draw(false);
+        const int square_red = red(sharp, column(0.0f));
+        REQUIRE(square_red > sky_red + 100);
+        const uint32_t edge = column(1.0f); // the square's right edge runs through this column
+        const int sharp_edge = red(sharp, edge);
+        CHECK((std::abs(sharp_edge - square_red) < 6 || std::abs(sharp_edge - sky_red) < 6));
+
+        // With TAA, settled: the edge is between the two, inside and outside are as they were, and it
+        // holds still from frame to frame.
+        settle();
+        const de::core::Array<std::byte> settled = draw(true);
+        CHECK(red(settled, edge) > sky_red + 15);
+        CHECK(red(settled, edge) < square_red - 15);
+        CHECK(std::abs(red(settled, column(0.0f)) - square_red) < 6);
+        CHECK(std::abs(red(settled, column(1.5f)) - sky_red) < 6);
+        const de::core::Array<std::byte> next = draw(true);
+        CHECK(std::abs(red(next, edge) - red(settled, edge)) <= 12);
+
+        // A big jump: 0.8 m in a frame. Where it was is sky at once, and it's at its new place at once.
+        frame.instances[0].transform[3] = 0.8f;
+        frame.instances[0].previous_transform[3] = 0.0f;
+        const de::core::Array<std::byte> jumped = draw(true);
+        CHECK(std::abs(red(jumped, column(-0.6f)) - sky_red) < 8);
+        CHECK(std::abs(red(jumped, column(-0.3f)) - sky_red) < 8);
+        CHECK(std::abs(red(jumped, column(1.5f)) - square_red) < 30);
+        frame.instances[0] = square;
+        settle();
+
+        // Steady motion, a third of a pixel to a few pixels a frame: the classic trail is behind the
+        // trailing edge. Two pixels behind it must be sky, every frame; well inside it, the square.
+        const float pixel_m = 3.0f * std::tan(0.5f) * 2.0f / static_cast<float>(kSize);
+        for (const float pixels_per_frame : {0.33f, 1.0f, 3.0f}) {
+            frame.instances[0] = square;
+            settle();
+            float x = 0.0f;
+            for (int i = 0; i < 8; ++i) {
+                const float step = pixels_per_frame * pixel_m;
+                frame.instances[0].previous_transform[3] = x;
+                x += step;
+                frame.instances[0].transform[3] = x;
+                const de::core::Array<std::byte> moved = draw(true);
+                CAPTURE(pixels_per_frame);
+                CAPTURE(i);
+                CHECK(std::abs(red(moved, column(x - 1.0f - pixel_m * 2.0f)) - sky_red) < 12);
+                CHECK(std::abs(red(moved, column(x)) - square_red) < 12);
+            }
+        }
+
+        // It stops, and the image settles where it stopped: no slide, no trail.
+        frame.instances[0].previous_transform[3] = frame.instances[0].transform[3];
+        settle();
+        const float stopped_at = frame.instances[0].transform[3];
+        const de::core::Array<std::byte> stopped = draw(true);
+        CHECK(std::abs(red(stopped, column(stopped_at - 1.0f - pixel_m * 2.0f)) - sky_red) < 6);
+
+        // The camera pans, 2 pixels a frame, past the still square: same for what it uncovers.
+        frame.instances[0] = square;
+        settle();
+        float camera_x = 0.0f;
+        for (int i = 0; i < 6; ++i) {
+            camera_x += pixel_m * 2.0f;
+            frame.camera.transform[3] = camera_x;
+            const de::core::Array<std::byte> panned = draw(true);
+            CAPTURE(i);
+            CHECK(std::abs(red(panned, column(1.0f + pixel_m * 2.0f, camera_x)) - sky_red) < 12);
+            CHECK(std::abs(red(panned, column(0.0f, camera_x)) - square_red) < 12);
+        }
+
+        // Now a dark wall with a red strip on it, about the same depth: next to the strip's edge the old
+        // colour is still among the neighbours, and depth says nothing, so neither clip nor the depth
+        // rule can help; each rule below has to do its part alone. Edges sit on a pixel boundary, so the
+        // jitter (under half a pixel) can't move them over a pixel centre.
+        const auto boundary = [&](int pixel, float camera_x = 0.0f, float distance_m = 3.0f) {
+            return camera_x +
+                   (static_cast<float>(pixel) - static_cast<float>(kSize) * 0.5f) * pixel_m * distance_m / 3.0f;
+        };
+        const auto thing = [](de::asset::AssetHandle what, float x, float z, float scale = 1.0f) {
+            return de::world::RenderInstance{.transform = {scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z},
+                                             .previous_transform = {scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z},
+                                             .mesh = what};
+        };
+        const auto look_from = [&](float camera_x) { frame.camera.transform[3] = camera_x; };
+        constexpr int kEdge = 52; // the strip's right edge, at first
+        const float strip_right = boundary(kEdge);
+        const auto strip_on_wall = [&](float right_edge) {
+            frame.instances.clear();
+            frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+            frame.instances.push(thing(mesh, right_edge - 1.0f, 0.0f));
+        };
+        const auto level = [&](const de::core::Array<std::byte>& pixels, int x) {
+            return red(pixels, static_cast<uint32_t>(x));
+        };
+        look_from(0.0f);
+        strip_on_wall(strip_right);
+        settle();
+        const de::core::Array<std::byte> wall_settled = draw(true);
+        const int wall_red = level(wall_settled, kEdge + 4);
+        const int strip_red = level(wall_settled, kEdge - 4);
+        REQUIRE(strip_red > wall_red + 100);
+        const int kept = (wall_red + strip_red) / 2; // over this, the old colour has stayed
+        CHECK(level(wall_settled, kEdge + 1) < kept);
+        CHECK(level(wall_settled, kEdge - 2) > kept);
+
+        // A cut, two pixels aside: nothing of before stays, though its colour is right there.
+        look_from(boundary(kEdge) - boundary(kEdge - 2));
+        frame.camera.previous_valid = false;
+        const de::core::Array<std::byte> cut = draw(true);
+        CHECK(level(cut, kEdge - 2) < kept);
+
+        // TAA off while the camera moves, then on: the same, across the gap.
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        settle();
+        look_from(boundary(kEdge) - boundary(kEdge - 2));
+        static_cast<void>(draw(false));
+        const de::core::Array<std::byte> back_on = draw(true);
+        CHECK(level(back_on, kEdge - 2) < kept);
+
+        // The camera pans over it: history comes from where the point was, so what the edge left is wall.
+        const auto pan_to = [&](float camera_x) {
+            look_from(camera_x);
+            return draw(true);
+        };
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        strip_on_wall(boundary(kEdge + 9));
+        settle();
+        de::core::Array<std::byte> panned_over;
+        for (int i = 1; i <= 3; ++i) {
+            panned_over = pan_to(pixel_m * 3.0f * static_cast<float>(i));
+        }
+        CHECK(level(panned_over, kEdge) < kept);
+        CHECK(level(panned_over, kEdge - 2) > kept);
+
+        // Panning the strip in from off the screen: the new pixel has no history, whatever the clamped
+        // sample at the screen's edge says.
+        constexpr int kLast = static_cast<int>(kSize) - 1;
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        strip_on_wall(boundary(kLast + 8) + 2.0f); // its left edge: 2 pixels a frame, 4 frames
+        settle();
+        de::core::Array<std::byte> entered;
+        for (int i = 1; i <= 4; ++i) {
+            entered = pan_to(pixel_m * 2.0f * static_cast<float>(i));
+        }
+        CHECK(level(entered, kLast) > kept);
+
+        // Something in front, gone in a frame without moving: the depth there says it wasn't this.
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        strip_on_wall(strip_right);
+        frame.instances.push(thing(mesh, strip_right, 1.0f));
+        settle();
+        frame.instances.pop();
+        const de::core::Array<std::byte> gone = draw(true);
+        CHECK(level(gone, kEdge) < kept);
+        // And in a frame it's there, its edge at once.
+        settle();
+        frame.instances.push(thing(mesh, boundary(kEdge + 4, 0.0f, 2.0f) + 1.0f, 1.0f));
+        const de::core::Array<std::byte> came = draw(true);
+        CHECK(level(came, kEdge + 4) > kept);
+        frame.instances.pop();
+
+        // Another red thing, about the same depth, leaves the strip behind, 3 pixels a frame. The
+        // motion there last frame says the history belonged to it.
+        const float nearer = 0.005f;
+        settle();
+        frame.instances.push(thing(mesh, boundary(kEdge - 13, 0.0f, 3.0f - nearer) + 1.0f, nearer));
+        settle();
+        for (int trailing = kEdge - 10; trailing <= kEdge + 2; trailing += 3) {
+            de::world::RenderInstance& other = frame.instances[frame.instances.size() - 1];
+            other.previous_transform[3] = other.transform[3];
+            other.transform[3] = boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f;
+            const de::core::Array<std::byte> left = draw(true);
+            if (trailing == kEdge + 2) {
+                CHECK(level(left, kEdge) < kept);
+            }
+        }
+        frame.instances.pop();
+
+        // A pixel behind a moving edge takes the edge's motion, a pixel a frame: where it reads history
+        // it was wall too. By its own motion (none), it'd read the thing that was just there.
+        frame.instances.clear();
+        frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+        frame.instances.push(thing(mesh, boundary(10, 0.0f, 3.0f - nearer) + 1.0f, nearer));
+        settle();
+        de::core::Array<std::byte> behind;
+        for (int trailing = 11; trailing <= 24; ++trailing) {
+            de::world::RenderInstance& other = frame.instances[1];
+            other.previous_transform[3] = other.transform[3];
+            other.transform[3] = boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f;
+            behind = draw(true);
+        }
+        CHECK(level(behind, 23) < kept);
+
+        // The sky, the camera pitching 2 pixels a frame. Nothing writes the sky's motion: the horizon
+        // moves by the camera's alone, with no trail, and history holds through the turn, so a horizon
+        // halfway through a pixel doesn't flicker with the jitter.
+        frame.instances.clear();
+        const auto pitch_to = [&](float row) {
+            const float half = static_cast<float>(kSize) * 0.5f;
+            const float angle = std::atan((row - half) / half * std::tan(0.5f));
+            frame.camera.transform[5] = std::cos(angle);
+            frame.camera.transform[6] = -std::sin(angle);
+            frame.camera.transform[9] = std::sin(angle);
+            frame.camera.transform[10] = std::cos(angle);
+            return draw(true);
+        };
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        static_cast<void>(pitch_to(32.5f));
+        settle();
+        int lowest = 255;
+        int highest = 0;
+        for (uint32_t row = 34; row <= 48; row += 2) {
+            const de::core::Array<std::byte> pitched = pitch_to(static_cast<float>(row) + 0.5f);
+            CAPTURE(row);
+            CHECK(static_cast<int>(texel(pitched, kSize / 2, row - 1)[0]) > 90); // sky at once
+            CHECK(static_cast<int>(texel(pitched, kSize / 2, row + 1)[0]) < 40); // the ground at once
+            lowest = std::min(lowest, static_cast<int>(texel(pitched, kSize / 2, row)[0]));
+            highest = std::max(highest, static_cast<int>(texel(pitched, kSize / 2, row)[0]));
+        }
+        CHECK(highest - lowest < 25);
+        frame.camera.transform[5] = 1.0f;
+        frame.camera.transform[6] = 0.0f;
+        frame.camera.transform[9] = 0.0f;
+        frame.camera.transform[10] = 1.0f;
+        frame.camera.previous_valid = false;
+
+        // Another size: new history, nothing breaks.
+        device->begin_frame();
+        uploader->record();
+        graph->begin(kSize / 2, kSize / 2);
+        const de::render::GraphTexture color = graph->import_texture(
+            {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+        renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, {}, de::render::SceneView::Lit, true);
+        graph->execute();
+        device->end_frame();
+
+        frame.instances.clear();
+        assets->release(mesh);
+        assets->release(wall_mesh);
         assets->update();
         device->wait_idle();
         device->destroy(*target);

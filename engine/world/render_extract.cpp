@@ -17,6 +17,7 @@ namespace {
 void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
     const RenderView last = frame.camera;
     const DVec3 last_origin = frame.origin;
+    ++frame.number;
     frame.camera.valid = false;
     frame.camera.previous_valid = false;
     const auto* active = ecs.try_get<ActiveCamera>();

@@ -49,6 +49,7 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     engine.world.ecs().set(world::ActiveCamera{.entity = camera_.id()});
 #if DE_BUILD_DEV
     next_view_ = engine.input.add_action("debug.next_view"_sid, platform::ActionKind::Button);
+    toggle_taa_ = engine.input.add_action("debug.toggle_taa"_sid, platform::ActionKind::Button);
 #endif
     return true;
 }
@@ -116,6 +117,10 @@ bool Viewer::update(Engine& engine, float frame_s) {
         engine.view = static_cast<render::SceneView>((static_cast<uint32_t>(engine.view) + 1) %
                                                      static_cast<uint32_t>(render::SceneView::Count));
         DE_LOG_INFO("render", "view: %s", render::scene_view_name(engine.view));
+    }
+    if (engine.input.state(toggle_taa_).pressed) {
+        engine.taa = !engine.taa;
+        DE_LOG_INFO("render", "TAA %s", engine.taa ? "on" : "off");
     }
 #endif
     return true;

@@ -22,6 +22,8 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 
 24 bytes a pixel plus depth. Motion comes from each instance's pose now and a frame ago (`world::RenderInstance`, six rows per instance in the frame's buffer) through this frame's camera and last frame's (`world::RenderView`: what was drawn, at this frame's render origin); after a camera cut, and on the first frame, the camera adds none. A surface that was behind last frame's camera has a motion off the screen, so its history is rejected. Bounded to 2 either way. Temporal anti-aliasing reads it. `shaders/scene/scene_common.slang` packs and unpacks it.
 
+With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 samples), and motion is measured without it. Depth, motion and the resolved image of a frame are kept for the next: two sets of textures the renderer owns, swapped each frame, imported into the graph, made again when the size changes.
+
 ## The frame
 
 1. `sun shadows`: four cascades in a 2 x 2 depth atlas (`SceneShadows::resolution` each, 2048 by default), every instance drawn into each, without culling. `fit_shadow_cascades` splits the view up to `distance_m` (practical split, `split_lambda`), bounds each slice with a sphere whose size doesn't change as the camera turns, and snaps its center to the texel grid so edges don't swim as the camera moves. Depth is reverse Z toward the sun, and reaches `caster_reach_m` past the sphere for casters outside the view.
@@ -30,7 +32,20 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 4. `deferred light`: one full-screen pass added onto the HDR target. The sun, through the shadow mask: GGX specular with height-correlated Smith visibility and Schlick Fresnel, Lambert diffuse; translucent surfaces get wrapped diffuse and light seen through them with the sun behind. The ambient: a sky/ground hemisphere for diffuse, and in the reflected direction through a fitted environment BRDF for specular (the placeholder for image-based lighting). Where nothing was drawn, the sky: a gradient to the horizon and the sun's disk.
 5. `fog inject`, `fog integrate` (compute; only with `SceneFog::volume_distance_m`): the froxel grid, a column per 8 pixels and 64 slices spaced exponentially out to that distance, or the shadow distance if that's nearer (past the shadows it would add nothing to the closed form). Inject stores each froxel's light per unit of extinction, with the sun's shadows from the atlas (4 samples through the froxel's depth, fading to lit over the last cascade's band as the surfaces do), and its mean extinction, exact from the medium's closed form. Integrate walks each column front to back, each slice in closed form, and stores the in-scatter and optical depth from the camera through that slice (depth interpolates correctly between slices; a channel's transmittance comes from it when it's read). The grid honours `start_m`, `sun_start_m` and `end_m`.
 6. `fog`: the lit image into a new one: each pixel dimmed by the fog between it and the camera and the fog's own light added (`SceneLighting::fog`, `shaders/common/fog.slang`: constant plus height fog, coloured extinction, a two-colour sun lobe and ambient). From the grid as far as it reaches, read at the pixel's depth; past it, or without one, closed form along the ray. If the fog's shaders are broken, no fog (or no grid), not a cleared frame. The sky is fogged as far as `end_m`, so the horizon takes the land's haze. The sun and sky light the fog as they do where the light reaching the camera is mostly scattered in (the transmittance-weighted mean distance), through the column above it. No pass without fog, or in a debug view: the tonemap reads the lit image.
-7. `tonemap`: exposure (`SceneLighting::exposure_ev`) and a filmic curve (the ACES fit) into the target, or a G-buffer channel, the shadow mask or the cascades (`SceneView`, F2 in deengine).
+7. `taa` (only with TAA on, and not in a debug view): each pixel blends into its own history, read where its point was (`shaders/scene/taa.slang`), in a tonemapped space so a bright pixel neither dominates its neighbours nor flickers. The history is read with Catmull-Rom, which stays sharp where bilinear blurs a little more each frame, and keeps 92% unless something argues against it (see Temporal anti-aliasing below). The shadow mask's noise moves with the sample, so its dither averages out too.
+8. `tonemap`: exposure (`SceneLighting::exposure_ev`) and a filmic curve (the ACES fit) into the target, or a G-buffer channel, the shadow mask or the cascades (`SceneView`, F2 in deengine).
+
+## Temporal anti-aliasing
+
+`add_passes(..., taa)` turns it on (`taa on` in `config/engine.settings`, F3 in dev builds). What keeps history from ghosting, in layers; each covers what the others can't:
+
+- **Motion from the nearest surface** in the 3 x 3 around the pixel, so an object's edges travel with it. The sky has no motion written: it takes the camera's.
+- **Colour clip:** history is clipped toward the neighbours' mean, in YCoCg, to the box of the colours around the pixel now. A colour that left can't stay. Most ghosts end here, but not next to an edge, where the old colour is still among the neighbours.
+- **Motion coherence:** history is scaled down by how far the motion at its old place differs from the motion here (in pixels squared): it was about something else. Not for the sky, which has no motion to compare.
+- **Depth:** where only the camera moved the point, its depth is compared with the near and far depths around its old place (last frame's, 3 x 3, the sky as very far, 1% slack). Outside them, a surface there has moved off or come in front, and history goes.
+- **No history at all:** off the screen, on the first frame, after a camera cut, after a frame not drawn with TAA (`RenderFrame::number` has a gap), or at a new size. A pixel without history takes a soft blur of this frame rather than raw aliasing.
+
+No TAA is free of ghosts for what doesn't write depth or motion (particles, transparents): those will need a reactive mask when they arrive.
 
 ## Rules and invariants
 

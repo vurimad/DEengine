@@ -74,7 +74,9 @@ float2 fragment_main(VertexOutput input) : SV_Target
     {
         return float2(1.0, 1.0); // beyond the shadow distance: lit
     }
-    const float noise = gradient_noise(input.position.xy);
+    // With TAA, the noise changes every frame (IGN's own step per frame), and TAA averages it away.
+    const float noise_step = 5.588238 * frame.taa_params.z;
+    const float noise = gradient_noise(input.position.xy + noise_step);
     const float into_band = cascade_band(frame, cascade, distance);
     // The last cascade fades to lit over its band, so the shadow distance has no hard line (only
     // pixels in it to begin with: one handed on from the cascade before isn't in its band).
@@ -96,7 +98,7 @@ float2 fragment_main(VertexOutput input) : SV_Target
     // own texel, and 16 taps across the widest penumbra.
     // IGN of the transposed pixel: its gradient runs another way, so the value isn't the dither's
     // shifted by a constant (an offset pixel would be: IGN is linear inside its fracs).
-    const float angle = gradient_noise(input.position.yx) * 6.2831853;
+    const float angle = gradient_noise(input.position.yx + noise_step) * 6.2831853;
     const float2x2 rotation = float2x2(cos(angle), -sin(angle), sin(angle), cos(angle));
     const float search = frame.shadow_params.w * atlas_texel;
     float blockers = 0.0;

@@ -23,6 +23,8 @@ public struct SceneFrame
     public float4 shadow_params;         // x: blend band (fraction of a cascade), y: atlas texel (uv), z: penumbra scale, w: max penumbra (texels)
     public FogMedium fog;
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
+    public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
+    public float4 taa_params;              // x: near (m), y: last frame's near (m), z: TAA's sample, 0 without TAA
 };
 
 public static const uint kCascadeCount = 4;

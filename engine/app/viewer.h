@@ -40,7 +40,8 @@ private:
     tools::FreeCamera free_camera_;
     flecs::entity camera_;
 #if DE_BUILD_DEV
-    platform::ActionId next_view_{}; // F2: the next G-buffer view
+    platform::ActionId next_view_{};  // F2: the next G-buffer view
+    platform::ActionId toggle_taa_{}; // F3: temporal anti-aliasing on and off, to compare
 #endif
 };
 

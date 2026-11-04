@@ -53,7 +53,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
-    output.clip = output.position;
+    output.clip = mul_rows(push.frame.unjittered_view_proj, world); // TAA's offset is no motion
     const float4 previous_world = float4(dot(push.instances[push.instance * kInstanceRows + 3], local),
                                          dot(push.instances[push.instance * kInstanceRows + 4], local),
                                          dot(push.instances[push.instance * kInstanceRows + 5], local), 1.0);

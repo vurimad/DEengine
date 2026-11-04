@@ -268,7 +268,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .gpu_assets = *gpu_assets,
                   .settings = as_text(settings),
                   .lighting = {},
-                  .view = render::SceneView::Lit};
+                  .view = render::SceneView::Lit,
+                  .taa = setting(as_text(settings), "taa") == "on"};
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
@@ -358,7 +359,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                                                                      .discard = true});
             if (scene_renderer) {
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
-                                           engine.lighting, engine.view);
+                                           engine.lighting, engine.view, engine.taa);
             } else {
                 // No scene renderer: the window is cleared.
                 graph->add_pass(
