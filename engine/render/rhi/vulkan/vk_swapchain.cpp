@@ -239,6 +239,7 @@ core::Result<void> DeviceImpl::create_swapchain() {
     swapchain.requested_height = window_height;
     swapchain.vsync = want_vsync;
     swapchain.image_count = count;
+    swapchain.on_refresh = present_mode == VK_PRESENT_MODE_FIFO_KHR || present_mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
     swapchain_out_of_date = false;
     swapchain_suboptimal = false;
     ignore_suboptimal = only_suboptimal;

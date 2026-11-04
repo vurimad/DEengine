@@ -72,7 +72,7 @@ TEST_CASE("settings are read by name, past comments and blanks") {
 TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds, and hands out the time measured") {
     constexpr double kHz = 240.0;
     constexpr double kInterval = 1.0 / kHz;
-    constexpr int kSettled = 128; // the frames it measures the rate over: the last of them goes in intervals
+    constexpr int kSettled = 120; // the frames it measures the rate over: the last of them goes in intervals
     const auto approx = [](double value) { return doctest::Approx(value).epsilon(1e-9); };
     const auto settle = [&](de::app::FrameClock& clock, double measured) {
         for (int i = 0; i < kSettled; ++i) {
@@ -107,26 +107,89 @@ TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds,
     // A suspend is a long jump, within a couple of intervals of what it measured.
     CHECK(std::abs(rhythm.step(5.0, kHz) - 5.0) <= kInterval * 2.0);
 
-    // A little slower than the display says: an extra interval now and then, so the time adds up.
-    de::app::FrameClock slower_display;
-    settle(slower_display, kInterval * 1.005);
-    CHECK(slower_display.holds_rate());
-    double slow_handed_out = 0.0;
-    for (int i = 0; i < 1000; ++i) {
-        slow_handed_out += slower_display.step(kInterval * 1.005, kHz);
+    // A display a little off what it says, either way: steps of its real interval, no double or short
+    // ones, and the time adds up.
+    for (const double real : {1.005, 0.995}) {
+        de::app::FrameClock off_display;
+        settle(off_display, kInterval * real);
+        CHECK(off_display.holds_rate());
+        double off_handed_out = 0.0;
+        for (int i = 0; i < 1000; ++i) {
+            const double step = off_display.step(kInterval * real, kHz);
+            CHECK(step == doctest::Approx(kInterval * real).epsilon(1e-6));
+            off_handed_out += step;
+        }
+        CHECK(std::abs(off_handed_out - kInterval * real * 1000.0) <= kInterval);
+        CHECK(off_display.step(kInterval * real * 10.0, kHz) >= kInterval * 9.0); // a real jump stays one
     }
-    CHECK(std::abs(slow_handed_out - kInterval * 1005.0) <= kInterval * 2.0);
 
-    // A little faster: it doesn't run fast, and a real jump isn't swallowed by what it's ahead.
-    de::app::FrameClock faster_display;
-    settle(faster_display, kInterval * 0.995);
-    CHECK(faster_display.holds_rate());
-    double fast_handed_out = 0.0;
-    for (int i = 0; i < 1000; ++i) {
-        fast_handed_out += faster_display.step(kInterval * 0.995, kHz);
+    // Missed refreshes are no reason to stop: that's when it's needed. A frame of two intervals goes out
+    // as two, and a hitch's catch-up frames don't matter either.
+    de::app::FrameClock missing;
+    settle(missing, kInterval);
+    for (int window = 0; window < 4; ++window) {
+        for (int i = 0; i < kSettled; ++i) {
+            const double measured = i < 6 ? kInterval * 2.0 : kInterval;
+            const double step = missing.step(measured, kHz);
+            CHECK(step == approx(measured));
+        }
+        CHECK(missing.holds_rate());
     }
-    CHECK(std::abs(fast_handed_out - kInterval * 995.0) <= kInterval * 3.0);
-    CHECK(faster_display.step(kInterval * 10.0, kHz) >= kInterval * 7.0);
+    for (int i = 0; i < kSettled; ++i) {
+        const double measured = i == 0 ? kInterval * 5.0 : (i < 3 ? 0.001 : kInterval);
+        static_cast<void>(missing.step(measured, kHz));
+    }
+    CHECK(missing.holds_rate());
+
+    // A rhythm of three frames, or any that divides the window: on, and it stays on, even steps throughout.
+    de::app::FrameClock three_beats;
+    const auto beat = [&](int i) { return i % 3 == 2 ? kInterval * 3.0 - 0.002 : 0.001; };
+    for (int i = 0; i < kSettled; ++i) {
+        static_cast<void>(three_beats.step(beat(i), kHz));
+    }
+    CHECK(three_beats.holds_rate());
+    for (int i = 0; i < kSettled * 6; ++i) {
+        CHECK(three_beats.step(beat(i), kHz) == approx(kInterval));
+    }
+
+    // A lopsided rhythm, 1.6 and 0.4 intervals: what a frame doesn't use is carried, so the time adds up.
+    de::app::FrameClock lopsided;
+    for (int i = 0; i < kSettled; ++i) {
+        static_cast<void>(lopsided.step(kInterval * (i % 2 == 0 ? 1.6 : 0.4), kHz));
+    }
+    CHECK(lopsided.holds_rate());
+    double lopsided_handed_out = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        lopsided_handed_out += lopsided.step(kInterval * (i % 2 == 0 ? 1.6 : 0.4), kHz);
+    }
+    CHECK(std::abs(lopsided_handed_out - kInterval * 1000.0) <= kInterval * 3.0);
+
+    // Long frames that aren't whole intervals: what a jump doesn't use is carried, not lost.
+    de::app::FrameClock carrying;
+    settle(carrying, kInterval);
+    double carried_handed_out = 0.0;
+    double carried_measured = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        const double measured = i % 20 == 0 ? kInterval * 2.45 : kInterval;
+        carried_handed_out += carrying.step(measured, kHz);
+        carried_measured += measured;
+    }
+    CHECK(carrying.holds_rate());
+    CHECK(std::abs(carried_handed_out - carried_measured) <= kInterval);
+
+    // Far ahead of the time measured, it slows down rather than run fast: steps never 0, since code may
+    // divide by them.
+    de::app::FrameClock ahead;
+    settle(ahead, kInterval);
+    double ahead_handed_out = 0.0;
+    double ahead_measured = 0.0;
+    for (int i = 0; i < 40; ++i) {
+        const double step = ahead.step(kInterval * 0.25, kHz);
+        CHECK(step > 0.0);
+        ahead_handed_out += step;
+        ahead_measured += kInterval * 0.25;
+    }
+    CHECK(std::abs(ahead_handed_out - ahead_measured) <= kInterval * 3.0 + 1e-9);
 
     // Without vsync, as measured, even at the rate.
     de::app::FrameClock no_vsync;
@@ -159,6 +222,11 @@ TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds,
     settle(changing, kInterval * 1.3);
     settle(changing, kInterval * 1.3);
     CHECK(!changing.holds_rate());
+    settle(changing, kInterval); // back on the rate: back on
+    settle(changing, kInterval);
+    CHECK(changing.holds_rate());
+    settle(changing, kInterval * 1.3);
+    settle(changing, kInterval * 1.3);
     CHECK(changing.step(kInterval * 1.3, kHz) == kInterval * 1.3);
 
     // Every frame far longer than an interval: that's not on the intervals either.

@@ -41,6 +41,9 @@ void StatsPanel::record(const FrameStats& stats) {
     frame_ms_[next_] = stats.frame_ms;
     next_ = (next_ + 1) % kFrameHistory;
     count_ = std::min(count_ + 1, kFrameHistory);
+    if (next_ % 32 == 0) {
+        late_ = late_frames(std::span<const float>(frame_ms_, count_));
+    }
     frames_with_allocations_ += stats.heap_allocations > 0 ? 1 : 0;
     last_ = stats;
     // The times are the graph's until its next begin(): kept as a copy (one per frame).
@@ -68,7 +71,7 @@ void StatsPanel::draw(bool* open) const {
     const float average = count_ > 0 ? total / static_cast<float>(count_) : 0.0f;
     ImGui::Text("%.0f fps  %.2f ms  (worst %.2f ms over %zu frames)", average > 0.0f ? 1000.0f / average : 0.0f,
                 average, worst, count_);
-    ImGui::Text("%zu late (loop clock, over 1.5x the usual)", late_frames(std::span<const float>(frame_ms_, count_)));
+    ImGui::Text("%zu late (loop clock, over 1.5x the usual)", late_);
     ImGui::PlotLines("##frame ms", frame_ms_, static_cast<int>(kFrameHistory), static_cast<int>(next_), nullptr, 0.0f,
                      std::max(worst * 1.2f, 1.0f / 0.12f), ImVec2(-1.0f, 60.0f));
     ImGui::TextColored(last_.heap_allocations == 0 ? ImVec4(0.6f, 0.9f, 0.6f, 1.0f) : ImVec4(1.0f, 0.6f, 0.4f, 1.0f),

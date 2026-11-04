@@ -48,6 +48,7 @@ private:
     size_t next_ = 0;
     size_t count_ = 0;
     uint64_t frames_with_allocations_ = 0;
+    size_t late_ = 0; // of the history, counted now and then: it's read as a slow number
     FrameStats last_; // its gpu_passes point at gpu_passes_
     render::PassGpuTime gpu_passes_[render::kMaxTimedPasses] = {};
 };

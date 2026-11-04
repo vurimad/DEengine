@@ -344,7 +344,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 static_cast<double>(input.state(sticks[3]).value));
         }
         // The debug UI's frame; its textures go to the uploader before record().
-        if (debug_ui.begin_frame(*window, static_cast<float>(frame_s))) {
+        if (debug_ui.begin_frame(*window, static_cast<float>(measured_s))) {
             if (show_stats) {
                 stats_panel.draw(&show_stats);
             }

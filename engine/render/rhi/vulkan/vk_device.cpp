@@ -1451,7 +1451,7 @@ void Device::set_vsync(bool vsync) {
 }
 
 bool Device::vsync() const {
-    return impl_->want_vsync;
+    return impl_->swapchain.swapchain != VK_NULL_HANDLE ? impl_->swapchain.on_refresh : impl_->want_vsync;
 }
 
 Format Device::swapchain_format() const {
