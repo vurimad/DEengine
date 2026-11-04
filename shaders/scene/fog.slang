@@ -61,7 +61,9 @@ float4 fragment_main(VertexOutput input) : SV_Target
         // slice, a share of it: the integral starts at nothing.
         const float slices = frame.fog.range.w;
         const float slice = froxel_t(frame.fog, view_depth) * slices;
-        const float3 uvw = float3(input.ndc.x * 0.5 + 0.5, 0.5 - input.ndc.y * 0.5, (slice - 0.5) / slices);
+        // The grid doesn't move with TAA's offset, and this pixel's ray does.
+        const float2 grid_ndc = input.ndc - frame.taa_params.zw;
+        const float3 uvw = float3(grid_ndc.x * 0.5 + 0.5, 0.5 - grid_ndc.y * 0.5, (slice - 0.5) / slices);
         const float4 grid = texture_3d(push.integrated).SampleLevel(sampler_state(push.sampler), uvw, 0.0) * saturate(slice);
         near_transmittance = exp(-grid.a * max(frame.fog.extinction.rgb, float3(0.01)));
         near_scatter = grid.rgb;

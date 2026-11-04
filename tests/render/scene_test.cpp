@@ -845,8 +845,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // The camera at the origin looking down -Z, the sun straight overhead.
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .vertical_fov_rad = 1.0f, .valid = true};
-        const auto draw_on = [&](de::rhi::TextureHandle on, uint32_t size, const de::render::SceneLighting& light,
-                                 bool taa = false) {
+        const auto record_on = [&](de::rhi::TextureHandle on, uint32_t size, const de::render::SceneLighting& light,
+                                   bool taa = false) {
             device->begin_frame();
             uploader->record();
             graph->begin(size, size);
@@ -856,13 +856,18 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
                                  taa);
             graph->execute();
             device->end_frame();
+        };
+        const auto draw_on = [&](de::rhi::TextureHandle on, uint32_t size, const de::render::SceneLighting& light,
+                                 bool taa = false) {
+            record_on(on, size, light, taa);
             return de::test::read_texture(*device, on);
         };
-        const auto render = [&](const de::render::SceneFog& fog) {
+        const auto lit_by = [](const de::render::SceneFog& fog) {
             de::render::SceneLighting light{.sun_direction = {0, 1, 0}};
             light.fog = fog;
-            return draw_on(*target, kSize, light);
+            return light;
         };
+        const auto render = [&](const de::render::SceneFog& fog) { return draw_on(*target, kSize, lit_by(fog)); };
         // As extraction does: what was drawn is the next frame's previous view.
         const auto remember_camera = [&] {
             std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
@@ -1006,14 +1011,21 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         };
         const auto settle = [&](const de::render::SceneFog& fog) {
             for (int i = 0; i < 48; ++i) {
-                static_cast<void>(next_frame(fog));
+                ++frame.number;
+                record_on(*target, kSize, lit_by(fog));
+                remember_camera();
             }
+        };
+        // Back to a frame with no history to read, and none counted.
+        const auto restart = [&] {
+            frame.number = 0;
+            frame.camera.previous_valid = false;
         };
         const auto green = [&](const de::core::Array<std::byte>& image, uint32_t at_x) {
             return static_cast<int>(texel(image, at_x, y)[1]);
         };
         const auto look_from = [&](float camera_x) { frame.camera.transform[3] = camera_x; };
-        // What's what, from one frame each: no roof, and the roof over the whole view.
+        // What's what, from one frame: no roof.
         frame.number = 0;
         const de::core::Array<std::byte> open_sky = render(gridded);
         frame.instances.push(half_roof);
@@ -1082,8 +1094,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             CHECK(std::abs(green(moved, at) - green(still, at)) <= 12);
         }
         frame.camera.transform[3] = 0.0f;
-        frame.number = 0;
-        frame.camera.previous_valid = false;
+        restart();
         frame.instances.clear();
 
         // History at the wrong slice would drift a shadow's edge along the view: with the slices thick, far
@@ -1095,8 +1106,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         for (const float edge_z : {-40.0f, -50.0f, -56.0f}) {
             frame.instances.clear();
             frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, edge_z - 100.0f}, .mesh = mesh});
-            frame.number = 0;
-            frame.camera.previous_valid = false;
+            restart();
             const int single_frame = green(render(far_fog), middle);
             settle(far_fog);
             CAPTURE(edge_z);
@@ -1106,16 +1116,14 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
 
         // Fog that starts nearer: froxels newly in fog held no light last frame, and don't take that as
         // history, so the new fog isn't dim.
-        frame.number = 0;
-        frame.camera.previous_valid = false;
+        restart();
         de::render::SceneFog start_far = far_fog;
         start_far.start_m = 60.0f;
         settle(start_far);
         de::render::SceneFog start_near = far_fog;
         start_near.start_m = 10.0f;
         const de::core::Array<std::byte> moved_start = next_frame(start_near);
-        frame.number = 0;
-        frame.camera.previous_valid = false;
+        restart();
         const int fresh_start = green(render(start_near), middle);
         CHECK(std::abs(green(moved_start, middle) - fresh_start) <= 3);
 
@@ -1126,8 +1134,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         edge_fog.sun_forward[1] = edge_fog.sun_back[1] = 0.3f;
         edge_fog.volume_distance_m = 400.0f;
         edge_fog.start_m = 12.0f;
-        frame.number = 0;
-        frame.camera.previous_valid = false;
+        restart();
         const int still_start = green(render(edge_fog), middle);
         for (int i = 0; i < 48; ++i) {
             frame.camera.transform[11] = -static_cast<float>(i) * 0.7f;
@@ -1143,8 +1150,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         int start_swing = 0;
         for (const float start_m : {6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f}) {
             edge_fog.start_m = start_m;
-            frame.number = 0;
-            frame.camera.previous_valid = false;
+            restart();
             static_cast<void>(render(edge_fog));
             settle(edge_fog);
             int start_lowest = 255;
@@ -1159,8 +1165,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(start_swing <= 2);
 
         // A bad value in one frame's light lasts that frame: it doesn't live on in the history.
-        frame.number = 0;
-        frame.camera.previous_valid = false;
+        restart();
         settle(gridded);
         const de::core::Array<std::byte> before_bad = next_frame(gridded);
         de::render::SceneLighting bad_light{.sun_direction = {0, 1, 0}};
@@ -1170,11 +1175,29 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         ++frame.number;
         static_cast<void>(draw_on(*target, kSize, bad_light));
         remember_camera();
-        de::core::Array<std::byte> after_bad = next_frame(gridded);
-        for (int i = 0; i < 40; ++i) {
-            after_bad = next_frame(gridded);
+        // The frame right after: the light it had is still there. And nothing lives on.
+        same(next_frame(gridded), before_bad, right, y);
+        settle(gridded);
+        same(next_frame(gridded), before_bad, right, y);
+
+        // Very dense fog in a very bright sun: what's stored still fits its format. Over it, it would be
+        // infinite, and stay so through the history once the sun is back to normal.
+        de::render::SceneFog dense = gridded;
+        dense.density_per_m = 1.0f;
+        restart();
+        const int dense_normal = green(render(dense), right);
+        de::render::SceneLighting blinding = lit_by(dense);
+        blinding.sun_color[0] = blinding.sun_color[1] = blinding.sun_color[2] = 5000.0f;
+        for (int i = 0; i < 8; ++i) {
+            ++frame.number;
+            record_on(*target, kSize, blinding);
+            remember_camera();
         }
-        same(after_bad, before_bad, right, y);
+        for (int i = 0; i < 4; ++i) {
+            settle(dense); // from as bright as it stores, it fades like anything else
+        }
+        CHECK(std::abs(green(next_frame(dense), right) - dense_normal) <= 3);
+        restart();
 
         // Sharp shafts, at a grid of realistic size: curtains of shadow along the view. Over frames the
         // samples move, so an edge changes a little from frame to frame; with the history, only a little.
@@ -1197,19 +1220,32 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             shaft_fog.density_per_m = 0.05f;
             shaft_fog.ambient[0] = shaft_fog.ambient[1] = shaft_fog.ambient[2] = 0.01f;
             shaft_fog.volume_distance_m = 80.0f;
-            frame.number = 0;
-            frame.camera.previous_valid = false;
+            restart();
             de::render::SceneLighting shaft_light{.sun_direction = {0.35f, 1.0f, 0.0f}};
             shaft_light.fog = shaft_fog;
+            const auto shaft_settle = [&](int frames, bool taa = false) {
+                for (int i = 0; i < frames; ++i) {
+                    ++frame.number;
+                    record_on(*shaft_target, kShaftSize, shaft_light, taa);
+                    remember_camera();
+                }
+            };
+            const auto max_green_change = [](const de::core::Array<std::byte>& from,
+                                             const de::core::Array<std::byte>& to) {
+                int most = 0;
+                for (size_t at = 1; at < to.size(); at += 4) {
+                    most = std::max(most, std::abs(static_cast<int>(static_cast<uint8_t>(to[at])) -
+                                                   static_cast<int>(static_cast<uint8_t>(from[at]))));
+                }
+                return most;
+            };
             const auto shaft_frame = [&](bool taa = false) {
                 ++frame.number;
                 de::core::Array<std::byte> image = draw_on(*shaft_target, kShaftSize, shaft_light, taa);
                 remember_camera();
                 return image;
             };
-            for (int i = 0; i < 48; ++i) {
-                static_cast<void>(shaft_frame());
-            }
+            shaft_settle(48);
             de::core::Array<std::byte> before = shaft_frame();
             int most_changed = 0;
             int pixels_changed = 0;
@@ -1228,33 +1264,33 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
 
             // The frame after a cut, with no history to average with, isn't jittered: the same as a single
             // frame.
-            frame.number = 0;
-            frame.camera.previous_valid = false;
+            restart();
             const de::core::Array<std::byte> single_shaft = draw_on(*shaft_target, kShaftSize, shaft_light);
-            for (int i = 0; i < 8; ++i) {
-                static_cast<void>(shaft_frame());
-            }
+            shaft_settle(8);
             frame.camera.previous_valid = false;
             const de::core::Array<std::byte> after_cut_shaft = shaft_frame();
-            int cut_most = 0;
-            for (size_t at = 1; at < after_cut_shaft.size(); at += 4) {
-                cut_most = std::max(cut_most, std::abs(static_cast<int>(static_cast<uint8_t>(after_cut_shaft[at])) -
-                                                       static_cast<int>(static_cast<uint8_t>(single_shaft[at]))));
-            }
-            CHECK(cut_most <= 2);
+            CHECK(max_green_change(single_shaft, after_cut_shaft) <= 2);
+
+            // The same where only this froxel has no history: turned right around, every point was behind
+            // last frame's camera, though the frame before was drawn.
+            shaft_settle(8);
+            frame.camera.transform[0] = -1.0f;
+            frame.camera.transform[10] = -1.0f;
+            const de::core::Array<std::byte> turned_around = shaft_frame();
+            restart();
+            const de::core::Array<std::byte> single_turned = draw_on(*shaft_target, kShaftSize, shaft_light);
+            CHECK(max_green_change(single_turned, turned_around) <= 2);
+            frame.camera.transform[0] = 1.0f;
+            frame.camera.transform[10] = 1.0f;
+            restart();
 
             // TAA's offset moves the image, not the grid: over frames the shafts don't blur. What's left
             // from the settled image is what TAA does to it.
-            frame.number = 0;
-            frame.camera.previous_valid = false;
-            for (int i = 0; i < 64; ++i) {
-                static_cast<void>(shaft_frame());
-            }
+            restart();
+            shaft_settle(64);
             const de::core::Array<std::byte> without_taa = shaft_frame();
             frame.camera.previous_valid = false;
-            for (int i = 0; i < 96; ++i) {
-                static_cast<void>(shaft_frame(true));
-            }
+            shaft_settle(96, true);
             const de::core::Array<std::byte> with_taa = shaft_frame(true);
             int taa_total = 0;
             for (size_t at = 1; at < with_taa.size(); at += 4) {
@@ -1264,8 +1300,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             const double taa_mean = static_cast<double>(taa_total) / (static_cast<double>(with_taa.size()) / 4.0);
             CHECK(taa_mean < 0.42);
             frame.instances.clear();
-            frame.number = 0;
-            frame.camera.previous_valid = false;
+            restart();
             device->wait_idle();
             device->destroy(*shaft_target);
         }

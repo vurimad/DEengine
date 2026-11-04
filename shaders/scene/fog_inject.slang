@@ -102,14 +102,23 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         return;
     }
 
+    // Last frame's light at the same place: the middle of this froxel, as stored there.
+    float3 last_light = float3(0.0);
+    bool has_history = false;
+    if (push.history != 0)
+    {
+        const float middle_depth = froxel_depth(frame.fog, (float(froxel.z) + 0.5) / float(slices));
+        has_history = history_light(frame, camera + ray.direction * (middle_depth / ray.view_per_ray), last_light);
+    }
+
     // Each frame's own place in the froxel, a different one per froxel; in its middle with no history
     // to average that with.
     float3 place = float3(0.5);
     FroxelRay sample_ray = ray;
-    if (push.history != 0)
+    if (has_history)
     {
         const float2 at = float2(froxel.xy) + 5.588238 * float(froxel.z);
-        const float3 noise = float3(gradient_noise(at), gradient_noise(at + 47.0), gradient_noise(at + 113.0));
+        const float3 noise = float3(gradient_noise(at), gradient_noise(at.yx), gradient_noise(at * 1.618));
         place = frac(noise + float3(push.jitter_x, push.jitter_y, push.jitter_z));
         sample_ray = froxel_ray(frame, float2(froxel.xy) + place.xy, grid);
     }
@@ -120,9 +129,8 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     float3 light_sum = float3(0.0);
     for (uint i = 0; i < kSamples; ++i)
     {
-        const float along = lerp(fog_near, fog_far, (float(i) + place.z) / float(kSamples));
-        const float view_depth = along * ray.view_per_ray;
-        const float distance = view_depth / sample_ray.view_per_ray;
+        const float distance = lerp(fog_near, fog_far, (float(i) + place.z) / float(kSamples));
+        const float view_depth = distance * sample_ray.view_per_ray;
         const float3 position = camera + sample_ray.direction * distance;
         const float height = position.y - frame.fog.density.w;
         const float weight = fog_density(frame.fog, height);
@@ -137,19 +145,16 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     }
     float3 light = weight_sum > 0.0 ? light_sum / weight_sum : float3(0.0);
 
-    // Blended into last frame's at the same place: the middle of this froxel, as stored there.
-    if (push.history != 0)
+    // A bad value lasts its frame: it mustn't reach the history, or take what's there with it.
+    if (!all(isfinite(light)))
     {
-        const float middle_depth = froxel_depth(frame.fog, (float(froxel.z) + 0.5) / float(slices));
-        float3 last_light;
-        if (history_light(frame, camera + ray.direction * (middle_depth / ray.view_per_ray), last_light))
-        {
-            light = lerp(light, last_light, kFeedback);
-        }
+        light = last_light;
     }
-    if (any(isnan(light)))
+    if (has_history)
     {
-        light = float3(0.0); // one bad value lasts a frame: it mustn't live on in the history
+        light = lerp(light, last_light, kFeedback);
     }
-    storage_3d(push.volume)[froxel] = float4(min(light, kHalfMax) * extinction, extinction);
+    // What's stored is the product, so it's the product that has to fit a half float: over it would be
+    // infinite from then on, through the history.
+    storage_3d(push.volume)[froxel] = float4(min(light, kHalfMax / max(extinction, 1.0)) * extinction, extinction);
 }
