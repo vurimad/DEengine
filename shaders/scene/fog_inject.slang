@@ -5,14 +5,25 @@
 // across a froxel with none doesn't dim it. fog_integrate walks the columns.
 // Over frames the samples move around inside the froxel, and the light blends into last frame's at the
 // same place, so shafts come out smooth from few samples. Extinction is exact, so it takes no history.
+// Fog volumes add their extinction and tint here: lit and shadowed like the rest, at the grid's resolution.
 
 import common.bindless;
 import common.fog;
 import scene.scene_common;
 
+// A fog volume: world::RenderFogVolume, as the renderer writes it.
+struct FogVolumeData
+{
+    float4 to_local[3];   // rows: into its own axes, in meters
+    float4 half_extents;  // w: its soft edge, in meters
+    float4 tint_density;  // w: extinction per meter at its heart
+    float4 shape;         // x: 1 for an ellipsoid
+};
+
 struct FogInjectPush
 {
     SceneFrame* frame;
+    FogVolumeData* fog_volumes;
     uint volume; // RGBA16F 3D, storage: the froxels
     uint atlas;  // the sun's shadow atlas
     uint width;
@@ -22,6 +33,8 @@ struct FogInjectPush
     float jitter_x; // this frame's place for the samples, in [0, 1): across and down a column, along its depth
     float jitter_y;
     float jitter_z;
+    uint fog_volume_count;
+    uint padding;
 };
 
 [[vk::push_constant]]
@@ -44,6 +57,26 @@ float sun_visibility(SceneFrame* frame, float3 position, float view_depth)
     const float2 tile_uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
     const float seen = sample_shadow(push.atlas, atlas_uv(frame, cascade, tile_uv), clip.z);
     return cascade == kCascadeCount - 1 ? lerp(seen, 1.0, cascade_band(frame, cascade, view_depth)) : seen;
+}
+
+// How much of a volume's density a point has: 0 outside, to 1 an edge in from its surface.
+float fog_volume_share(FogVolumeData volume, float3 position)
+{
+    const float3 local = float3(dot(volume.to_local[0], float4(position, 1.0)), dot(volume.to_local[1], float4(position, 1.0)),
+                                dot(volume.to_local[2], float4(position, 1.0)));
+    const float3 half_extents = max(volume.half_extents.xyz, float3(1e-3));
+    float inside;
+    if (volume.shape.x > 0.5)
+    {
+        // Approximately, in meters: right along its smallest axis, and an underestimate elsewhere.
+        inside = (1.0 - length(local / half_extents)) * min(half_extents.x, min(half_extents.y, half_extents.z));
+    }
+    else
+    {
+        const float3 from_faces = half_extents - abs(local);
+        inside = min(from_faces.x, min(from_faces.y, from_faces.z));
+    }
+    return smoothstep(0.0, 1.0, saturate(inside / max(volume.half_extents.w, 1e-3)));
 }
 
 // Last frame's light at a point, if it was in the grid and in fog then.
@@ -95,7 +128,28 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     const float mean_density = fog_far > fog_near ? optical_depth(frame.fog, camera.y, ray.direction.y, fog_near, fog_far) /
                                                         (far_distance - near_distance)
                                                   : 0.0;
-    const float extinction = mean_density * kFroxelDensityScale;
+
+    // The fog volumes around its middle, once, not per sample: extinction stays exact from frame to frame,
+    // and a soft edge doesn't change much across a froxel. They fade out at the grid's reach, where the
+    // fog past it, which can't hold them, takes over.
+    float volume_density = 0.0;
+    float3 volume_tinted = float3(0.0);
+    const float middle_depth = froxel_depth(frame.fog, (float(froxel.z) + 0.5) / float(slices));
+    if (push.fog_volume_count > 0)
+    {
+        const float3 middle = camera + ray.direction * (middle_depth / ray.view_per_ray);
+        const float reach = frame.fog.range.y;
+        const float reach_fade = saturate((reach - middle_depth) / (reach * 0.1));
+        for (uint i = 0; i < push.fog_volume_count; ++i)
+        {
+            const FogVolumeData volume = push.fog_volumes[i];
+            const float density = volume.tint_density.w * fog_volume_share(volume, middle) * reach_fade;
+            volume_density += density;
+            volume_tinted += density * volume.tint_density.rgb;
+        }
+    }
+    const float all_density = mean_density + volume_density;
+    const float extinction = all_density * kFroxelDensityScale;
     if (extinction <= 0.0)
     {
         storage_3d(push.volume)[froxel] = float4(0.0);
@@ -107,7 +161,6 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     bool has_history = false;
     if (push.history != 0)
     {
-        const float middle_depth = froxel_depth(frame.fog, (float(froxel.z) + 0.5) / float(slices));
         has_history = history_light(frame, camera + ray.direction * (middle_depth / ray.view_per_ray), last_light);
     }
 
@@ -125,15 +178,17 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
 
     // Its light: a few samples through the fog in its depth, weighted by the fog there, so a shadow edge
     // inside the slice is a share of the light.
+    const float samples_from = mean_density > 0.0 ? fog_near : near_distance;
+    const float samples_to = mean_density > 0.0 ? fog_far : far_distance;
     float weight_sum = 0.0;
     float3 light_sum = float3(0.0);
     for (uint i = 0; i < kSamples; ++i)
     {
-        const float distance = lerp(fog_near, fog_far, (float(i) + place.z) / float(kSamples));
+        const float distance = lerp(samples_from, samples_to, (float(i) + place.z) / float(kSamples));
         const float view_depth = distance * sample_ray.view_per_ray;
         const float3 position = camera + sample_ray.direction * distance;
         const float height = position.y - frame.fog.density.w;
-        const float weight = fog_density(frame.fog, height);
+        const float weight = fog_density(frame.fog, height) + volume_density;
         float3 light = fog_ambient_light(frame.fog, height);
         if (distance >= frame.fog.sun_back.w)
         {
@@ -143,7 +198,9 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         weight_sum += weight;
         light_sum += weight * light;
     }
-    float3 light = weight_sum > 0.0 ? light_sum / weight_sum : float3(0.0);
+    // A volume's tint on its share of the light.
+    const float3 tint = (float3(mean_density) + volume_tinted) / all_density;
+    float3 light = weight_sum > 0.0 ? light_sum / weight_sum * tint : float3(0.0);
 
     // A bad value lasts its frame: it mustn't reach the history, or take what's there with it.
     if (!all(isfinite(light)))

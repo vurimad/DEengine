@@ -89,8 +89,8 @@ private:
             return;
         }
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
-        static constexpr const char* kKeys[] = {"name",         "mesh",  "position", "rotation",
-                                                "rotation_deg", "scale", "parent",   "static"};
+        static constexpr const char* kKeys[] = {"name",  "mesh",   "position", "rotation",  "rotation_deg",
+                                                "scale", "parent", "static",   "fog_volume"};
         reader.check_keys(kKeys, "cell entity");
         Parsed& parsed = parsed_.back();
         parsed.name = reader.string("name", "");
@@ -166,6 +166,10 @@ private:
             parsed.static_setting = reader.boolean("static", true) ? StaticSetting::Yes : StaticSetting::No;
         }
 
+        if (yyjson_val* fog = yyjson_obj_get(object, "fog_volume"); fog != nullptr) {
+            read_fog_volume(fog, entity, label);
+        }
+
         if (reader.has("mesh")) {
             const std::string_view reference = reader.string("mesh", "");
             SourcePath mesh_path;
@@ -182,6 +186,41 @@ private:
                 entity.mesh = mesh_index(*mesh);
             }
         }
+    }
+
+    void read_fog_volume(yyjson_val* object, CellEntity& entity, const auto& label) {
+        if (!yyjson_is_obj(object)) {
+            diagnostics_.error(path_, "%s: fog_volume should be an object", label.c_str());
+            return;
+        }
+        static constexpr const char* kKeys[] = {"shape", "density", "edge_m", "tint"};
+        KeyReader reader(diagnostics_, path_, object);
+        reader.check_keys(kKeys, "fog volume");
+        asset::CellFogVolume volume;
+        const std::string_view shape = reader.string("shape", "box");
+        if (shape == "ellipsoid") {
+            volume.shape = asset::CellFogShape::Ellipsoid;
+        } else if (shape != "box") {
+            diagnostics_.error(path_, "%s: fog_volume shape should be box or ellipsoid", label.c_str());
+        }
+        const double density = yyjson_get_num(yyjson_obj_get(object, "density"));
+        const double edge = reader.has("edge_m") ? yyjson_get_num(yyjson_obj_get(object, "edge_m")) : 1.0;
+        if (!reader.has("density") || !to_float(density, volume.density_per_m) || density <= 0.0) {
+            diagnostics_.error(path_, "%s: fog_volume needs a density above 0", label.c_str());
+        }
+        if (!to_float(edge, volume.edge_m) || edge < 0.0) {
+            diagnostics_.error(path_, "%s: fog_volume edge_m should be 0 or more", label.c_str());
+        }
+        if (reader.has("tint")) {
+            double tint[3] = {};
+            if (!read_numbers(yyjson_obj_get(object, "tint"), tint, 3) || !to_float(tint[0], volume.tint[0]) ||
+                !to_float(tint[1], volume.tint[1]) || !to_float(tint[2], volume.tint[2]) || tint[0] < 0.0 ||
+                tint[1] < 0.0 || tint[2] < 0.0) {
+                diagnostics_.error(path_, "%s: fog_volume tint should be 3 numbers of 0 or more", label.c_str());
+            }
+        }
+        entity.fog_volume = static_cast<uint32_t>(build_.fog_volumes.size());
+        build_.fog_volumes.push(volume);
     }
 
     // How messages name an entity: its name, or "entity <index in the source>".
@@ -368,6 +407,7 @@ core::Array<std::byte> cook_cell(const CellBuild& build, asset::AssetId id) {
     BlobWriter writer(sizeof(asset::CellAsset));
     asset.entities = writer.append(build.entities.span());
     asset.names = writer.append(build.names.span());
+    asset.fog_volumes = writer.append(build.fog_volumes.span());
     return writer.finish(asset, id, build.meshes.span());
 }
 

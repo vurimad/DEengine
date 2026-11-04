@@ -100,6 +100,13 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
         if (source.mesh != asset::CellEntity::kNone) {
             member.set(MeshInstance{.mesh = scratch.meshes[source.mesh]});
         }
+        if (source.fog_volume != asset::CellEntity::kNone) {
+            const asset::CellFogVolume& fog = asset->fog_volumes.get(asset)[source.fog_volume];
+            member.set(FogVolume{.density_per_m = fog.density_per_m,
+                                 .edge_m = fog.edge_m,
+                                 .tint = {fog.tint[0], fog.tint[1], fog.tint[2]},
+                                 .ellipsoid = fog.shape == asset::CellFogShape::Ellipsoid});
+        }
         const Transform placed =
             attached ? local : Transform{.position = world.position, .rotation = world.rotation, .scale = world.scale};
         member.set(placed).set(world).set(PreviousWorldTransform{.value = world});
