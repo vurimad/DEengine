@@ -989,6 +989,15 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
               doctest::Approx(static_cast<int>(texel(closed_clear, x, y)[1])).epsilon(0.03));
         CHECK(texel(gridded_roofed, x, y)[1] < texel(gridded_clear, x, y)[1] - 40);
         CHECK(texel(gridded_roofed, x, y)[2] > texel(gridded_roofed, x, y)[1]); // the sky's blue is what's left
+        // A grid turned off holds no memory.
+        const auto storage_textures = [&] {
+            return device->memory_stats().counts[static_cast<size_t>(de::rhi::GpuMemoryCategory::StorageTextures)];
+        };
+        const uint32_t textures_with_grid = storage_textures();
+        CHECK(textures_with_grid >= 2);
+        static_cast<void>(render(closed));
+        CHECK(storage_textures() <= textures_with_grid - 2);
+        static_cast<void>(render(gridded));
         // The grid's two passes run only with one.
         CHECK(graph->stats().culled_passes == 0);
         const uint32_t with_grid = graph->stats().passes;

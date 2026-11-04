@@ -1,8 +1,7 @@
 // Froxel fog, step 1: per froxel of a view-aligned grid, the medium's extinction and the light it
 // scatters toward the camera (common.fog), with the sun's shadows from the cascaded atlas. A few
 // samples through the fog in the froxel, so a shadow edge inside it is a share of the light. Writes
-// (light * e, e), e being the mean extinction * kFroxelDensityScale: light weighted by fog, so filtering
-// across a froxel with none doesn't dim it. fog_integrate walks the columns.
+// the light weighted by the mean extinction (common.fog, kFroxelLightScale); fog_integrate walks the columns.
 // Over frames the samples move around inside the froxel, and the light blends into last frame's at the
 // same place, so shafts come out smooth from few samples. Extinction is exact, so it takes no history.
 
@@ -61,12 +60,12 @@ bool history_light(SceneFrame* frame, float3 position, out float3 light)
         return false;
     }
     const float4 last = texture_3d(push.history).SampleLevel(sampler_state(push.sampler), uvw, 0.0);
-    if (last.a <= 0.0)
+    if (!(last.a > 0.0))
     {
         return false;
     }
-    light = last.rgb / last.a;
-    return true;
+    light = last.rgb * kFroxelLightScale / last.a;
+    return all(isfinite(light)); // a bad value lasts its frame
 }
 
 [shader("compute")]
@@ -96,7 +95,7 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
                                                         (far_distance - near_distance)
                                                   : 0.0;
     const float extinction = mean_density * kFroxelDensityScale;
-    if (extinction <= 0.0)
+    if (!(extinction > 0.0))
     {
         storage_3d(push.volume)[froxel] = float4(0.0);
         return;
@@ -155,6 +154,7 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         light = lerp(light, last_light, kFeedback);
     }
     // What's stored is the product, so it's the product that has to fit a half float: over it would be
-    // infinite from then on, through the history.
-    storage_3d(push.volume)[froxel] = float4(min(light, kHalfMax / max(extinction, 1.0)) * extinction, extinction);
+    // infinite from then on.
+    const float weight = extinction / kFroxelLightScale;
+    storage_3d(push.volume)[froxel] = float4(min(light, kHalfMax / max(weight, 1.0)) * weight, extinction);
 }

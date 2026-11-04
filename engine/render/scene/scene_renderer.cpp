@@ -132,6 +132,7 @@ struct FogIntegratePush {
 // this offset, so the first ones aren't vanishingly thin.
 constexpr uint32_t kFroxelTilePixels = 8;
 constexpr uint32_t kFroxelSlices = 64;
+constexpr uint32_t kFroxelJitterSamples = 16; // the places a froxel's samples go through, over and over
 constexpr float kFroxelSliceOffsetM = 2.0f;
 constexpr rhi::Format kFroxelFormat = rhi::Format::RGBA16Float;
 
@@ -307,27 +308,27 @@ struct SceneRendererState {
             texture = {};
         }
         froxels_written[0] = froxels_written[1] = false;
+        froxels_width = 0;
+        froxels_height = 0;
     }
 
     // The kept froxels at this size (a new size starts with no history); false if they can't be made.
-    bool ensure_froxels(uint32_t width, uint32_t height) {
-        if (width == froxels_width && height == froxels_height) {
+    bool ensure_froxels(const rhi::TextureDesc& grid) {
+        if (grid.width == froxels_width && grid.height == froxels_height) {
             return froxel_sets[0].is_valid();
         }
         destroy_froxels();
-        froxels_width = width;
-        froxels_height = height;
+        froxels_width = grid.width;
+        froxels_height = grid.height;
+        rhi::TextureDesc desc = grid;
+        desc.usage = rhi::TextureUsage::Storage | rhi::TextureUsage::Sampled;
+        desc.debug_name = "froxels";
         for (rhi::TextureHandle& texture : froxel_sets) {
-            const core::Result<rhi::TextureHandle> made =
-                device->create_texture({.width = width,
-                                        .height = height,
-                                        .depth = kFroxelSlices,
-                                        .format = kFroxelFormat,
-                                        .usage = rhi::TextureUsage::Storage | rhi::TextureUsage::Sampled,
-                                        .dimension = rhi::TextureDimension::Texture3D,
-                                        .debug_name = "froxels"});
+            const core::Result<rhi::TextureHandle> made = device->create_texture(desc);
             if (!made) {
                 destroy_froxels();
+                froxels_width = grid.width; // not tried again at this size
+                froxels_height = grid.height;
                 return false;
             }
             texture = *made;
@@ -1062,7 +1063,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // The froxel grid, near the camera: each froxel's fog and light, then each column walked front to
     // back (so the composite reads the fog from the camera to any depth with one sample).
     GraphTexture integrated;
-    if (froxels_on) {
+    if (!froxels_on) {
+        state.destroy_froxels(); // a grid no one's using holds no memory
+    } else {
         const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
         const uint32_t grid_height =
             std::max((graph.reference_height() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
@@ -1075,7 +1078,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             GraphTexture volume;
         };
         // Kept across frames when they can be made; if not, the grid works alone, without history.
-        const bool froxels_kept = state.ensure_froxels(grid_width, grid_height);
+        const bool froxels_kept = state.ensure_froxels(grid);
         const bool froxels_have_history =
             froxels_kept && frame.camera.previous_valid && state.froxels_frame + 1 == frame.number &&
             state.froxels_written[state.froxels_current] && state.froxels_reach_m == froxel_reach;
@@ -1099,7 +1102,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             state.froxels_written[state.froxels_current] = true; // the graph leaves it so, even if it's skipped
         }
         // A different place in each froxel every frame.
-        const auto froxel_sample = static_cast<uint32_t>(frame.number % kTaaSamples) + 1;
+        const auto froxel_sample = static_cast<uint32_t>(frame.number % kFroxelJitterSamples) + 1;
         const FogInjectPush injection{.frame = frame_address,
                                       .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
                                       .jitter_x = halton(froxel_sample, 2),
