@@ -1318,9 +1318,10 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         de::render::SceneFog clear_air = gridded;
         clear_air.density_per_m = 0.0f;
         restart();
-        const auto volume_at = [](float x, float y, float z, float half_size, float density, float edge) {
-            de::world::RenderFogVolume volume{.to_local = {1, 0, 0, -x, 0, 1, 0, -y, 0, 0, 1, -z},
-                                              .center = {x, y, z},
+        const auto volume_at = [](float center_x, float center_y, float center_z, float half_size, float density,
+                                  float edge) {
+            de::world::RenderFogVolume volume{.to_local = {1, 0, 0, -center_x, 0, 1, 0, -center_y, 0, 0, 1, -center_z},
+                                              .center = {center_x, center_y, center_z},
                                               .half_extents = {half_size, half_size, half_size},
                                               .density_per_m = density,
                                               .edge_m = edge};
