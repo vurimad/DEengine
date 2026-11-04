@@ -3,3 +3,6 @@
 
 # The world deengine opens (--world overrides): content/world/test/test.world
 world   76d76b87e8562965
+
+# Temporal anti-aliasing at start: on or off (F3 toggles it in dev builds).
+taa     on

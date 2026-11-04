@@ -148,9 +148,10 @@ public:
 
     // Adds the passes that draw frame into target (frame must stay valid until the graph
     // executes). Without a camera, or while the shaders are missing, the target is cleared to
-    // empty.
+    // empty. taa: temporal anti-aliasing, in the lit view (history is kept between calls, at the
+    // graph's reference size).
     void add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format, const world::RenderFrame& frame,
-                    const SceneLighting& lighting, SceneView view = SceneView::Lit,
+                    const SceneLighting& lighting, SceneView view = SceneView::Lit, bool taa = false,
                     rhi::Color empty = kEmptySceneColor);
 
     SceneRendererStats stats() const;

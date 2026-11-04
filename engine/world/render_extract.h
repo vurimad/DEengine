@@ -61,6 +61,7 @@ struct RenderView {
 // at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
 // list of entities; it reads this, rebuilt every frame.
 struct RenderFrame {
+    uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
     DVec3 origin{0.0};         // the render origin: what instance positions are relative to
     uint64_t origin_moves = 0; // counts origin moves: GPU copies made relative to it go stale
     RenderView camera;

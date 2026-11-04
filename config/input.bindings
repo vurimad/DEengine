@@ -32,6 +32,7 @@ free_camera.fast            gamepad:leftstick
 # Debug views (dev builds)
 debug.toggle_stats          key:F1
 debug.next_view             key:F2
+debug.toggle_taa            key:F3
 
 # Raw stick readout, deengine --show-sticks (dev builds)
 debug.stick_left_x          gamepad:leftx

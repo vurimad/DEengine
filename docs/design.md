@@ -507,7 +507,7 @@ The renderer is a GPU-driven deferred PBR pipeline built on a render graph, aime
 11. Post: TAA, SSR, bloom, depth of field, motion blur, tonemapping, color grading LUT, film grain
 12. UI and editor overlays
 
-Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), fog over the scene and the sky (step 9: a froxel grid near the camera with the sun's shadows, the closed form past it), tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
+Built so far (renderer v1): sun shadows, G-buffer, shadow mask, deferred lighting (the sun, a hemisphere ambient, the sky), fog over the scene and the sky (step 9: a froxel grid near the camera with the sun's shadows, the closed form past it), TAA, tonemap, then the debug UI over it. engine/render/scene/README.md has the details.
 
 GPU budget for 120 FPS at 1080p (≈7.5 ms total, RT off):
 
@@ -1202,3 +1202,4 @@ Decisions so far:
 | 2026-11-03 | Fog v1 is an analytic height fog (Elden Ring's medium: constant plus bounded exponential height fog, coloured extinction, two-colour sun lobe, ambient) in a full-screen pass over the scene and the sky; froxels come next with the same model | Most of the atmosphere for a few hundredths of a millisecond; the froxel fog needs this model and this far range anyway |
 | 2026-11-03 | Froxel fog in phases: A the grid with sun shadows, B temporal, C fog volumes, D local lights; 8-pixel columns and 64 slices, on when an environment sets `volume_distance_m` | Each phase is usable alone; 0.2 ms measured for A leaves room in the budget; the closed form stays the far range and the no-grid path |
 | 2026-11-03 | Motion vectors: an instance's pose a frame ago comes from the same two ticks it's interpolated between, stepped back by the frame's share of a tick; no history per entity | Stateless and compact, exact for steady motion, none for what's static or place()d; a change of speed is a small one-frame error, which TAA's rejection covers. The camera keeps real history (what was drawn) in the render frame, since a free camera is place()d every frame; an explicit cut drops it |
+| 2026-11-04 | TAA resolve: Elden Ring's anti-ghosting layers (nearest-depth motion, neighbourhood box, motion coherence, off-screen) with a depth test added, coherence on object motion (the camera's part taken out, written by the pass and kept) rather than total speed, clipping rather than clamping, Catmull-Rom history, blending in a tonemapped space; history kept by the renderer, on by default | Ghosting is what we refuse to show: each layer covers a case the others can't, and the test exercises each alone. Transparents and particles will need a reactive mask when they arrive |

@@ -42,13 +42,15 @@ struct SceneFrame {
     float camera_forward[4] = {};
     float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
     // FogMedium in shaders/common/fog.slang.
-    float fog_density[4] = {};         // constant, height base, falloff, base height (render-origin space)
-    float fog_extinction[4] = {};      // tint, ambient height attenuation
-    float fog_sun_forward[4] = {};     // colour, sun height attenuation
-    float fog_sun_back[4] = {};        // colour, sun start
-    float fog_ambient[4] = {};         // colour, start
-    float fog_range[4] = {};           // end, froxel grid reach, slice offset, slices
-    float previous_view_proj[16] = {}; // last frame's camera, relative to this frame's render origin
+    float fog_density[4] = {};           // constant, height base, falloff, base height (render-origin space)
+    float fog_extinction[4] = {};        // tint, ambient height attenuation
+    float fog_sun_forward[4] = {};       // colour, sun height attenuation
+    float fog_sun_back[4] = {};          // colour, sun start
+    float fog_ambient[4] = {};           // colour, start
+    float fog_range[4] = {};             // end, froxel grid reach, slice offset, slices
+    float previous_view_proj[16] = {};   // last frame's camera, relative to this frame's render origin
+    float unjittered_view_proj[16] = {}; // view_proj without TAA's sub-pixel offset
+    float taa_params[4] = {};            // last frame's near, TAA's sample (0 without TAA)
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -127,6 +129,34 @@ constexpr uint32_t kFroxelTilePixels = 8;
 constexpr uint32_t kFroxelSlices = 64;
 constexpr float kFroxelSliceOffsetM = 2.0f;
 constexpr rhi::Format kFroxelFormat = rhi::Format::RGBA16Float;
+
+// Matches TaaPush in shaders/scene/taa.slang.
+struct TaaPush {
+    uint64_t frame = 0;
+    uint32_t current = 0;
+    uint32_t history = 0;
+    uint32_t depth = 0;
+    uint32_t previous_depth = 0;
+    uint32_t motion = 0;
+    uint32_t previous_object_motion = 0;
+    uint32_t sampler = 0;
+    uint32_t has_history = 0;
+    float exposure = 1.0f;
+};
+
+// TAA's sub-pixel offsets repeat after this many frames.
+constexpr uint32_t kTaaSamples = 16;
+
+// The radical inverse of index in a base: a Halton sequence's value, in (0, 1).
+float halton(uint32_t index, uint32_t base) {
+    float value = 0.0f;
+    float fraction = 1.0f;
+    for (; index > 0; index /= base) {
+        fraction /= static_cast<float>(base);
+        value += fraction * static_cast<float>(index % base);
+    }
+    return value;
+}
 
 // Matches TonemapPush in shaders/scene/tonemap.slang.
 struct TonemapPush {
@@ -223,7 +253,21 @@ struct SceneRendererState {
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render))};
-    SceneShadows shadows;                               // this frame's, within limits
+    SceneShadows shadows; // this frame's, within limits
+    shader::ProgramHandle taa_program;
+    // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
+    struct TemporalSet {
+        rhi::TextureHandle history;
+        rhi::TextureHandle depth;
+        rhi::TextureHandle object_motion;
+        bool written = false;
+    };
+    TemporalSet temporal[2];
+    uint32_t temporal_width = 0; // what they were last made at: a failure isn't tried again at that size
+    uint32_t temporal_height = 0;
+    uint32_t temporal_current = 0;
+    uint64_t temporal_frame = 0; // the RenderFrame whose TAA pass last ran: temporal[temporal_current] then
+    uint32_t taa_sample = 0;
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
@@ -232,12 +276,53 @@ struct SceneRendererState {
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program, fog_inject, fog_integrate}) {
+              shadow_mask, fog_program, fog_inject, fog_integrate, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
             device->destroy(buffer);
         }
+        destroy_temporal();
+    }
+
+    void destroy_temporal() {
+        for (TemporalSet& set : temporal) {
+            for (const rhi::TextureHandle texture : {set.history, set.depth, set.object_motion}) {
+                if (texture.is_valid()) {
+                    device->destroy(texture);
+                }
+            }
+            set = {};
+        }
+    }
+
+    // TAA's textures at this size (a new size starts with no history); false if they can't be made.
+    bool ensure_temporal(uint32_t width, uint32_t height) {
+        if (width == temporal_width && height == temporal_height) {
+            return temporal[0].history.is_valid();
+        }
+        destroy_temporal();
+        temporal_width = width;
+        temporal_height = height;
+        for (TemporalSet& set : temporal) {
+            const auto make = [&](rhi::Format format, rhi::TextureUsage usage, const char* name) {
+                const core::Result<rhi::TextureHandle> texture =
+                    device->create_texture({.width = width,
+                                            .height = height,
+                                            .format = format,
+                                            .usage = usage | rhi::TextureUsage::Sampled,
+                                            .debug_name = name});
+                return texture ? *texture : rhi::TextureHandle{};
+            };
+            set.history = make(kHdrFormat, rhi::TextureUsage::RenderTarget, "taa history");
+            set.depth = make(kDepthFormat, rhi::TextureUsage::DepthStencil, "scene depth");
+            set.object_motion = make(kMotionFormat, rhi::TextureUsage::RenderTarget, "taa object motion");
+            if (!set.history.is_valid() || !set.depth.is_valid() || !set.object_motion.is_valid()) {
+                destroy_temporal();
+                return false;
+            }
+        }
+        return true;
     }
 
     shader::ProgramHandle make(const char* module, const rhi::GraphicsPipelineDesc& state,
@@ -271,6 +356,10 @@ struct SceneRendererState {
         rhi::GraphicsPipelineDesc fogged{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "fog"};
         fogged.color_formats[0] = kHdrFormat;
         fog_program = make("scene.fog", fogged);
+        rhi::GraphicsPipelineDesc resolve{.color_count = 2, .cull = rhi::CullMode::None, .debug_name = "taa"};
+        resolve.color_formats[0] = kHdrFormat;
+        resolve.color_formats[1] = kMotionFormat;
+        taa_program = make("scene.taa", resolve);
         const core::Result<shader::ProgramHandle> inject =
             shaders->create_compute({.module = "scene.fog_inject", .debug_name = "fog inject"});
         fog_inject = inject ? *inject : shader::ProgramHandle{};
@@ -346,14 +435,27 @@ struct SceneRendererState {
 
     // Writes the frame's constants and instance transforms; false without a buffer.
     bool write_frame(rhi::BufferHandle buffer, const world::RenderFrame& frame, const SceneLighting& lighting,
-                     float froxel_reach, float aspect) {
+                     float froxel_reach, uint32_t taa_sample_now, uint32_t width, uint32_t height) {
         const std::span<std::byte> mapped = device->mapped(buffer);
         if (mapped.empty()) {
             return false;
         }
+        const float aspect = static_cast<float>(width) / static_cast<float>(std::max(height, 1U));
         SceneFrame scene;
         camera_view_proj(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m, aspect,
                          scene.view_proj);
+        std::memcpy(scene.unjittered_view_proj, scene.view_proj, sizeof(scene.view_proj));
+        if (taa_sample_now != 0) {
+            // A sub-pixel offset in clip space: x and y move by an offset times w.
+            const float offset_x = (halton(taa_sample_now, 2) - 0.5f) * 2.0f / static_cast<float>(width);
+            const float offset_y = (halton(taa_sample_now, 3) - 0.5f) * 2.0f / static_cast<float>(height);
+            for (int column = 0; column < 4; ++column) {
+                scene.view_proj[column] += offset_x * scene.view_proj[12 + column];
+                scene.view_proj[4 + column] += offset_y * scene.view_proj[12 + column];
+            }
+        }
+        scene.taa_params[0] = frame.camera.previous_valid ? frame.camera.previous_near_m : frame.camera.near_m;
+        scene.taa_params[1] = static_cast<float>(taa_sample_now);
         if (!invert_4x4(scene.view_proj, scene.inv_view_proj)) {
             return false;
         }
@@ -362,7 +464,7 @@ struct SceneRendererState {
             camera_view_proj(frame.camera.previous_transform, frame.camera.previous_vertical_fov_rad,
                              frame.camera.previous_near_m, aspect, scene.previous_view_proj);
         } else {
-            std::memcpy(scene.previous_view_proj, scene.view_proj, sizeof(scene.view_proj));
+            std::memcpy(scene.previous_view_proj, scene.unjittered_view_proj, sizeof(scene.view_proj));
         }
         scene.camera_position[0] = frame.camera.transform[3];
         scene.camera_position[1] = frame.camera.transform[7];
@@ -633,7 +735,7 @@ SceneRenderer& SceneRenderer::operator=(SceneRenderer&& other) noexcept {
 }
 
 void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format,
-                               const world::RenderFrame& frame, const SceneLighting& lighting, SceneView view,
+                               const world::RenderFrame& frame, const SceneLighting& lighting, SceneView view, bool taa,
                                rhi::Color empty) {
     DE_PROFILE_ZONE("scene passes setup");
     SceneRendererState& state = *state_;
@@ -665,13 +767,20 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         foggy && lighting.fog.volume_distance_m > 0.0f && fog_inject.is_valid() && fog_integrate.is_valid();
     const float froxel_reach = froxels_on ? std::min(lighting.fog.volume_distance_m, state.shadows.distance_m) : 0.0f;
     state.stats.froxel_reach_m = froxel_reach;
+    // TAA in the lit view; without its shader or its textures, the frame goes on without it.
+    const rhi::PipelineHandle taa_pipeline = state.shaders->pipeline(state.taa_program);
+    const uint32_t width = graph.reference_width();
+    const uint32_t height = graph.reference_height();
+    const bool taa_on =
+        taa && view == SceneView::Lit && taa_pipeline.is_valid() && state.ensure_temporal(width, height);
+    if (taa_on) {
+        state.taa_sample = state.taa_sample % kTaaSamples + 1;
+    }
     // This frame's constants, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
-    const float aspect =
-        static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
-    const bool written =
-        frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, froxel_reach, aspect);
+    const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, froxel_reach,
+                                                                      taa_on ? state.taa_sample : 0, width, height);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid();
     if (!ready) {
@@ -688,6 +797,45 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
     state.sort_draws(frame);
+
+    // TAA's textures this frame: this frame's depth, object motion and result are kept for the next; last
+    // frame's are read. History needs last frame to have been drawn here, and no camera cut.
+    const bool has_history = taa_on && frame.camera.previous_valid && state.temporal_frame + 1 == frame.number &&
+                             state.temporal[state.temporal_current].written;
+    GraphTexture kept_depth;
+    GraphTexture kept_object_motion;
+    GraphTexture kept_history;
+    GraphTexture last_depth;
+    GraphTexture last_object_motion;
+    GraphTexture last_history;
+    if (taa_on) {
+        const SceneRendererState::TemporalSet& last = state.temporal[state.temporal_current];
+        state.temporal_current ^= 1U;
+        SceneRendererState::TemporalSet& now = state.temporal[state.temporal_current];
+        const rhi::ResourceState was = now.written ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined;
+        const auto keep = [&](rhi::TextureHandle texture, const char* name) {
+            return graph.import_texture({.texture = texture,
+                                         .name = name,
+                                         .state = was,
+                                         .final_state = rhi::ResourceState::ShaderRead,
+                                         .discard = true});
+        };
+        kept_depth = keep(now.depth, "scene depth");
+        kept_object_motion = keep(now.object_motion, "taa object motion");
+        kept_history = keep(now.history, "taa history");
+        if (has_history) {
+            const auto read = [&](rhi::TextureHandle texture, const char* name) {
+                return graph.import_texture({.texture = texture,
+                                             .name = name,
+                                             .state = rhi::ResourceState::ShaderRead,
+                                             .final_state = rhi::ResourceState::ShaderRead});
+            };
+            last_depth = read(last.depth, "last depth");
+            last_object_motion = read(last.object_motion, "last object motion");
+            last_history = read(last.history, "last taa history");
+        }
+        now.written = true; // the graph leaves it in ShaderRead, even if its passes are skipped
+    }
 
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
     struct ShadowPass {
@@ -766,7 +914,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 pass.use(data.targets.gb[i], rhi::ResourceState::RenderTarget);
             }
             data.targets.hdr = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-            data.targets.depth = pass.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
+            data.targets.depth =
+                taa_on ? kept_depth : pass.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
             data.targets.motion = pass.create_texture({.desc = {.format = kMotionFormat}, .reference_scale = 1.0f});
             pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
@@ -961,12 +1110,61 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
 
     const float exposure = std::exp2(lighting.exposure_ev);
+
+    // TAA: this frame into its history (what the tonemap shows, and next frame's history).
+    GraphTexture resolved = fogged;
+    if (taa_on) {
+        graph.add_pass(
+            "taa",
+            [&](PassBuilder& pass) {
+                pass.use(fogged, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(targets.motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                if (has_history) {
+                    pass.use(last_history, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(last_depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(last_object_motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
+                pass.use(kept_history, rhi::ResourceState::RenderTarget);
+                pass.use(kept_object_motion, rhi::ResourceState::RenderTarget);
+            },
+            [fogged, targets, kept_history, kept_object_motion, last_history, last_depth, last_object_motion,
+             has_history, frame_address, taa_pipeline, exposure, renderer = &state,
+             frame_number = frame.number](PassContext& context) {
+                DE_PROFILE_ZONE("taa pass");
+                renderer->temporal_frame = frame_number; // only now: a skipped pass leaves no history
+                const rhi::ColorAttachment colors[2] = {
+                    {.texture = context.texture(kept_history), .load = rhi::LoadOp::DontCare},
+                    {.texture = context.texture(kept_object_motion), .load = rhi::LoadOp::DontCare}};
+                context.list.begin_rendering({.colors = colors});
+                context.list.bind_pipeline(taa_pipeline);
+                const auto index = [&](GraphTexture texture) {
+                    return context.device.texture_index(context.texture(texture));
+                };
+                context.list.push_constants(TaaPush{
+                    .frame = frame_address,
+                    .current = index(fogged),
+                    .history = has_history ? index(last_history) : 0,
+                    .depth = index(targets.depth),
+                    .previous_depth = has_history ? index(last_depth) : 0,
+                    .motion = index(targets.motion),
+                    .previous_object_motion = has_history ? index(last_object_motion) : 0,
+                    .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
+                    .has_history = has_history ? 1U : 0U,
+                    .exposure = exposure,
+                });
+                context.list.draw(3);
+                context.list.end_rendering();
+            });
+        resolved = kept_history;
+    }
+
     const auto view_index = static_cast<uint32_t>(view);
     const uint32_t srgb_target = rhi::format_info(target_format).srgb ? 1 : 0;
     graph.add_pass(
         "tonemap",
         [&](PassBuilder& pass) {
-            pass.use(fogged, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(resolved, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             for (const GraphTexture gb : targets.gb) {
                 pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             }
@@ -974,13 +1172,13 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(targets.motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
-        [targets, fogged, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
+        [targets, resolved, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
             DE_PROFILE_ZONE("tonemap pass");
             const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
             context.list.bind_pipeline(tonemap);
             context.list.push_constants(TonemapPush{
-                .hdr = context.device.texture_index(context.texture(fogged)),
+                .hdr = context.device.texture_index(context.texture(resolved)),
                 .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
                 .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
                 .gb2 = context.device.texture_index(context.texture(targets.gb[2])),

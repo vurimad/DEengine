@@ -13,6 +13,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | `scene/deferred_light.slang` | Deferred lighting: the sun (GGX, Lambert, wrap and backlight for translucency) through the shadow mask, hemisphere ambient, the sky |
 | `scene/fog_inject.slang`, `scene/fog_integrate.slang` | The froxel grid (compute): each froxel's extinction and light, with the sun's shadows; then each column integrated front to back |
 | `scene/fog.slang` | Fog over the lit image and the sky: the grid as far as it reaches, closed form past it (`common.fog`) |
+| `scene/taa.slang` | Temporal anti-aliasing: history reprojected by motion, clipped to the neighbourhood, dropped where object motion or depth says it was about something else; writes the object motion the next frame compares |
 | `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel, the shadow mask or the cascades (debug views) |
 | `imgui.slang` | Dear ImGui's draw lists (the debug UI) |
 | `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color`, `common.fog` (the fog medium, its light, its integral along a ray, the froxel slices) |
