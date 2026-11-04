@@ -263,11 +263,10 @@ struct SceneRendererState {
         bool written = false;
     };
     TemporalSet temporal[2];
-    uint32_t temporal_width = 0;
+    uint32_t temporal_width = 0; // what they were last made at: a failure isn't tried again at that size
     uint32_t temporal_height = 0;
-    bool temporal_made = false; // at that size: a failure isn't tried again until the size changes
     uint32_t temporal_current = 0;
-    uint64_t temporal_frame = 0; // the RenderFrame temporal[temporal_current] was written for
+    uint64_t temporal_frame = 0; // the RenderFrame whose TAA pass last ran: temporal[temporal_current] then
     uint32_t taa_sample = 0;
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
@@ -277,13 +276,12 @@ struct SceneRendererState {
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program, fog_inject, fog_integrate}) {
+              shadow_mask, fog_program, fog_inject, fog_integrate, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
             device->destroy(buffer);
         }
-        shaders->destroy(taa_program);
         destroy_temporal();
     }
 
@@ -296,13 +294,12 @@ struct SceneRendererState {
             }
             set = {};
         }
-        temporal_made = false;
     }
 
     // TAA's textures at this size (a new size starts with no history); false if they can't be made.
     bool ensure_temporal(uint32_t width, uint32_t height) {
         if (width == temporal_width && height == temporal_height) {
-            return temporal_made;
+            return temporal[0].history.is_valid();
         }
         destroy_temporal();
         temporal_width = width;
@@ -325,7 +322,6 @@ struct SceneRendererState {
                 return false;
             }
         }
-        temporal_made = true;
         return true;
     }
 
@@ -838,8 +834,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             last_object_motion = read(last.object_motion, "last object motion");
             last_history = read(last.history, "last taa history");
         }
-        now.written = true;
-        state.temporal_frame = frame.number;
+        now.written = true; // the graph leaves it in ShaderRead, even if its passes are skipped
     }
 
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
@@ -1134,8 +1129,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 pass.use(kept_object_motion, rhi::ResourceState::RenderTarget);
             },
             [fogged, targets, kept_history, kept_object_motion, last_history, last_depth, last_object_motion,
-             has_history, frame_address, taa_pipeline, exposure](PassContext& context) {
+             has_history, frame_address, taa_pipeline, exposure, renderer = &state,
+             frame_number = frame.number](PassContext& context) {
                 DE_PROFILE_ZONE("taa pass");
+                renderer->temporal_frame = frame_number; // only now: a skipped pass leaves no history
                 const rhi::ColorAttachment colors[2] = {
                     {.texture = context.texture(kept_history), .load = rhi::LoadOp::DontCare},
                     {.texture = context.texture(kept_object_motion), .load = rhi::LoadOp::DontCare}};

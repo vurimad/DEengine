@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 using de::asset::AssetId;
 using de::asset::AssetType;
@@ -34,6 +35,10 @@ constexpr AssetId kQuad = AssetId::from_value(0x51);
 constexpr AssetId kRed = AssetId::from_value(0x52);
 constexpr AssetId kWall = AssetId::from_value(0x53);
 constexpr AssetId kDarkGreen = AssetId::from_value(0x54);
+constexpr AssetId kPureGreen = AssetId::from_value(0x55); // no red or blue: no chroma on one axis
+constexpr AssetId kPureGreenMaterial = AssetId::from_value(0x56);
+constexpr AssetId kBad = AssetId::from_value(0x57); // emits NaN
+constexpr AssetId kBadMaterial = AssetId::from_value(0x58);
 constexpr uint32_t kSize = 64;
 
 // A 2 x 2 m square in the XY plane, facing +Z, drawn with one material.
@@ -74,6 +79,19 @@ void put_assets(const de::platform::Vfs& vfs) {
     green.set_param(de::asset::material::kBaseColor, 0.0f, 0.2f, 0.0f, 1.0f);
     const auto cooked_green = de::cooker::cook_material(green, kDarkGreen);
     REQUIRE(vfs.write_file(de::asset::cooked_path(kDarkGreen, AssetType::Material).c_str(), cooked_green.span()).ok());
+    put_quad(vfs, kPureGreen, kPureGreenMaterial);
+    de::cooker::MaterialBuild pure_green;
+    pure_green.set_param(de::asset::material::kBaseColor, 0.0f, 1.0f, 0.0f, 1.0f);
+    const auto cooked_pure = de::cooker::cook_material(pure_green, kPureGreenMaterial);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(kPureGreenMaterial, AssetType::Material).c_str(), cooked_pure.span())
+                .ok());
+    put_quad(vfs, kBad, kBadMaterial);
+    de::cooker::MaterialBuild bad;
+    bad.set_param(de::asset::material::kBaseColor, 0.0f, 0.0f, 0.0f, 1.0f);
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    bad.set_param(de::asset::material::kEmissive, nan, nan, nan, 1.0f);
+    const auto cooked_bad = de::cooker::cook_material(bad, kBadMaterial);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(kBadMaterial, AssetType::Material).c_str(), cooked_bad.span()).ok());
 }
 
 // A mesh of `parts` squares side by side, each with a material of its own sampling a texture of its
@@ -1117,12 +1135,16 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         REQUIRE(renderer.ok());
         const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
         const de::asset::AssetHandle wall_mesh = assets->load<de::asset::MeshAsset>(kWall);
+        const de::asset::AssetHandle green_mesh = assets->load<de::asset::MeshAsset>(kPureGreen);
+        const de::asset::AssetHandle bad_mesh = assets->load<de::asset::MeshAsset>(kBad);
         assets->wait_all();
         gpu_assets->update();
         uploader->flush_and_wait();
         gpu_assets->update();
         REQUIRE(gpu_assets->mesh(mesh) != nullptr);
         REQUIRE(gpu_assets->mesh(wall_mesh) != nullptr);
+        REQUIRE(gpu_assets->mesh(green_mesh) != nullptr);
+        REQUIRE(gpu_assets->mesh(bad_mesh) != nullptr);
         const auto target =
             device->create_texture({.width = kSize,
                                     .height = kSize,
@@ -1139,6 +1161,7 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         const de::world::RenderInstance square{.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
                                                .previous_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
                                                .mesh = mesh};
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
         const auto draw = [&](bool taa) {
             device->begin_frame();
             uploader->record();
@@ -1146,7 +1169,6 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             const de::render::GraphTexture color = graph->import_texture(
                 {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
             ++frame.number; // as extraction does
-            const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
             renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit,
                                  taa);
             graph->execute();
@@ -1269,6 +1291,22 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         }
         CHECK(edge_lowest > sky_red + 15);
         CHECK(edge_highest < square_red - 15);
+        CHECK(edge_highest - edge_lowest < 25);
+
+        // The camera stutters, 8 pixels one way and back every frame, over a world that isn't moving:
+        // that costs the world no history at all, since none of the motion is the world's.
+        frame.camera.transform[3] = 0.0f;
+        frame.camera.previous_valid = false;
+        settle();
+        edge_lowest = 255;
+        edge_highest = 0;
+        for (uint32_t i = 1; i <= 16; ++i) {
+            const uint32_t away = i % 2 == 0 ? 0 : 8;
+            frame.camera.transform[3] = pixel_m * static_cast<float>(away);
+            const int value = red(draw(true), edge - away);
+            edge_lowest = std::min(edge_lowest, value);
+            edge_highest = std::max(edge_highest, value);
+        }
         CHECK(edge_highest - edge_lowest < 25);
 
         // Now a dark wall with a red strip on it, about the same depth: next to the strip's edge the old
@@ -1510,6 +1548,144 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         yaw_to(0.0f);
         frame.camera.previous_valid = false;
 
+        // Pure green on dark green, in white light: no red or blue anywhere, so the colour box has no
+        // extent on one axis. History still holds: a pixel inside the edge is the green, not the 3 x 3's mean.
+        for (float* color : {light.sun_color, light.sky_color, light.ground_color, light.shadow_color}) {
+            color[0] = color[1] = color[2] = 1.0f;
+        }
+        frame.instances.clear();
+        frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+        frame.instances.push(thing(green_mesh, boundary(kEdge) - 1.0f, 0.0f));
+        settle();
+        const de::core::Array<std::byte> single_hue = draw(true);
+        const int inside_edge = texel(single_hue, kEdge - 1, kRow)[1];
+        const int well_inside = texel(single_hue, kEdge - 4, kRow)[1];
+        CHECK(std::abs(inside_edge - well_inside) < 6);
+        light = {.sun_direction = {0, 0, 1}};
+
+        // A wire a fifth of a pixel wide, nothing moving: the jitter hits it now and then, and when it
+        // does that isn't something that came in front. It shows faintly, it doesn't flash.
+        frame.instances.clear();
+        frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+        // Half a meter nearer than the wall: well outside the depth slack.
+        de::world::RenderInstance wire = thing(mesh, boundary(40, 0.0f, 2.5f) + pixel_m * 0.5f * 2.5f / 3.0f, 0.5f);
+        wire.transform[0] = pixel_m * 0.1f * 2.5f / 3.0f;
+        wire.previous_transform[0] = wire.transform[0];
+        frame.instances.push(wire);
+        settle();
+        int wire_highest = 0;
+        for (int i = 0; i < 32; ++i) {
+            wire_highest = std::max(wire_highest, level(draw(true), 40));
+        }
+        CHECK(wire_highest < kept);
+
+        // The camera follows something at about 20 pixels a frame, with the frame rate wobbling. It
+        // stays put on the screen: its history is good, its edge stays smooth.
+        frame.instances.clear();
+        frame.instances.push(thing(mesh, half_pixel_x, 0.0f));
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        settle();
+        float followed_x = 0.0f;
+        const auto follow = [&](float pixels) {
+            followed_x += pixels * pixel_m;
+            look_from(followed_x);
+            de::world::RenderInstance& hero = frame.instances[0];
+            hero.previous_transform[3] = hero.transform[3];
+            hero.transform[3] = half_pixel_x + followed_x;
+            return draw(true);
+        };
+        for (int i = 0; i < 4; ++i) {
+            static_cast<void>(follow(20.0f));
+        }
+        int hero_lowest = 255;
+        int hero_highest = 0;
+        for (int i = 0; i < 8; ++i) {
+            const int value = red(follow(i % 2 == 0 ? 21.0f : 19.0f), edge);
+            hero_lowest = std::min(hero_lowest, value);
+            hero_highest = std::max(hero_highest, value);
+        }
+        CHECK(hero_highest - hero_lowest < 70);
+        CHECK(hero_lowest > sky_red + 15);
+        CHECK(hero_highest < square_red - 15);
+
+        // Something coming straight at the camera, 7% nearer a frame, its edge on the ray through a
+        // pixel: hardly any motion on the screen, but that isn't only the camera. Its edge stays smooth.
+        frame.instances.clear();
+        const float ray_x = pixel_m * 0.5f / 3.0f;
+        frame.instances.push(thing(mesh, ray_x * 3.0f - 1.0f, 0.0f));
+        frame.instances.push(thing(wall_mesh, ray_x * 3.0f + 1.0f, 0.0f));
+        look_from(0.0f);
+        frame.camera.previous_valid = false;
+        settle();
+        float approach_m = 3.0f;
+        int coming_lowest = 255;
+        int coming_highest = 0;
+        for (int i = 0; i < 8; ++i) {
+            approach_m *= 0.93f;
+            const float edge_x = ray_x * approach_m;
+            frame.instances[0].previous_transform[3] = frame.instances[0].transform[3];
+            frame.instances[0].previous_transform[11] = frame.instances[0].transform[11];
+            frame.instances[0].transform[3] = edge_x - 1.0f;
+            frame.instances[0].transform[11] = 3.0f - approach_m;
+            frame.instances[1].previous_transform[3] = frame.instances[1].transform[3];
+            frame.instances[1].previous_transform[11] = frame.instances[1].transform[11];
+            frame.instances[1].transform[3] = edge_x + 1.0f;
+            frame.instances[1].transform[11] = 3.0f - approach_m;
+            const de::core::Array<std::byte> coming = draw(true);
+            const int value = static_cast<int>(texel(coming, kSize / 2, kSize / 2 - 4)[0]);
+            coming_lowest = std::min(coming_lowest, value);
+            coming_highest = std::max(coming_highest, value);
+        }
+        CHECK(coming_highest - coming_lowest < 60);
+
+        // One bad pixel's worth of NaN stays where it is: the pixels around a NaN thing keep their
+        // colour, they don't go black with it.
+        frame.instances.clear();
+        frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
+        frame.instances.push(thing(bad_mesh, boundary(kEdge) - 1.0f, 0.0f));
+        settle();
+        const de::core::Array<std::byte> poisoned = draw(true);
+        CHECK(static_cast<int>(texel(poisoned, kEdge, kRow)[1]) >
+              static_cast<int>(texel(poisoned, kEdge + 3, kRow)[1]) / 2);
+
+        // The sun's disk drifting a third of a pixel a frame: its history is filtered tonemapped, so its
+        // brightness doesn't ring into the sky a few pixels off.
+        frame.instances.clear();
+        look_from(0.0f);
+        light = {.sun_direction = {0.0f, 0.2f, -1.0f}};
+        frame.camera.previous_valid = false;
+        settle();
+        int off_disk_lowest = 255;
+        int off_disk_highest = 0;
+        for (int i = 1; i <= 48; ++i) {
+            yaw_to(-std::atan(static_cast<float>(i) * 0.37f / (static_cast<float>(kSize) * 0.5f) * std::tan(0.5f)));
+            const de::core::Array<std::byte> drifting = draw(true);
+            // The disk's first pixel, along the rows it could be on.
+            int brightest = 0;
+            uint32_t disk_x = 0;
+            uint32_t disk_y = 0;
+            for (uint32_t y = 10; y < 30; ++y) {
+                for (uint32_t x = 2; x + 2 < kSize; ++x) {
+                    const int here = texel(drifting, x, y)[1];
+                    if (here > brightest) {
+                        brightest = here;
+                        disk_x = x;
+                        disk_y = y;
+                    }
+                }
+            }
+            if (i > 8 && disk_x > 4 && disk_x + 4 < kSize) {
+                const int value = texel(drifting, disk_x + 3, disk_y)[1];
+                off_disk_lowest = std::min(off_disk_lowest, value);
+                off_disk_highest = std::max(off_disk_highest, value);
+            }
+        }
+        CHECK(off_disk_highest - off_disk_lowest < 45);
+        light = {.sun_direction = {0, 0, 1}};
+        yaw_to(0.0f);
+        frame.camera.previous_valid = false;
+
         // Another size: new history, nothing breaks.
         device->begin_frame();
         uploader->record();
@@ -1523,6 +1699,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         frame.instances.clear();
         assets->release(mesh);
         assets->release(wall_mesh);
+        assets->release(green_mesh);
+        assets->release(bad_mesh);
         assets->update();
         device->wait_idle();
         device->destroy(*target);

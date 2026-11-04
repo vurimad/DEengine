@@ -34,6 +34,15 @@ static const float kFeedback = 0.92;
 static const float kDepthSlack = 0.01;
 // The sky's depth along the view: farther than anything, and the same however the camera turns.
 static const float kSkyZ = 1e30;
+// Motion may differ by about this share of its speed: a fast thing's frame pacing isn't another thing.
+static const float kMotionTolerance = 0.25;
+// Object motion under this many pixels counts as none: only the camera moved the point.
+static const float kStillPx = 0.05;
+// More than this many of the 9 pixels around one share its depth: it isn't a sliver.
+static const uint kSliverPixels = 4;
+// Room in the colour box beyond its extent, so an axis with none (a neutral or single-hue area has no
+// chroma to speak of) doesn't stop history that only rounding moved along it.
+static const float kBoxPadding = 1e-3;
 
 struct VertexOutput
 {
@@ -55,9 +64,10 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
     return output;
 }
 
+// A bad value counts as black: alone, not with everything that blends with it.
 float3 tonemapped(float3 color)
 {
-    const float3 exposed = max(color, 0.0) * push.exposure;
+    const float3 exposed = select(isfinite(color), max(color, 0.0), 0.0) * push.exposure;
     return exposed / (1.0 + max(exposed.r, max(exposed.g, exposed.b)));
 }
 
@@ -82,14 +92,14 @@ float3 from_ycocg(float3 c)
 float3 clip_to_box(float3 color, float3 box_min, float3 box_max, float3 inside)
 {
     const float3 along = color - inside;
-    const float3 room = max(select(along > 0.0, box_max - inside, inside - box_min), 0.0);
+    const float3 room = max(select(along > 0.0, box_max - inside, inside - box_min), 0.0) + kBoxPadding;
     const float3 ratios = room / max(abs(along), 1e-6);
     const float share = min(ratios.x, min(ratios.y, ratios.z));
     return share < 1.0 ? inside + along * share : color;
 }
 
-// Catmull-Rom over the history, in five bilinear taps: it stays sharp where bilinear would blur a
-// little more every frame.
+// Catmull-Rom over the history, tonemapped, in five bilinear taps: it stays sharp where bilinear would
+// blur a little more every frame, and tonemapped, a highlight's negative lobes don't ring.
 float3 sample_history(float2 uv, float2 size)
 {
     const float2 position = uv * size;
@@ -112,15 +122,10 @@ float3 sample_history(float2 uv, float2 size)
     float total = 0.0;
     for (uint i = 0; i < 5; ++i)
     {
-        sum += sample_texture_level(push.history, push.sampler, taps[i], 0.0).rgb * weights[i];
+        sum += tonemapped(sample_texture_level(push.history, push.sampler, taps[i], 0.0).rgb) * weights[i];
         total += weights[i];
     }
     return max(sum / total, 0.0);
-}
-
-float2 uv_of(float4 clip)
-{
-    return float2(clip.x, -clip.y) / clip.w * 0.5 + 0.5;
 }
 
 [shader("fragment")]
@@ -139,6 +144,8 @@ ResolveOutput fragment_main(VertexOutput input)
     float nearest = 0.0; // the sky, unless a surface is around
     int2 nearest_texel = texel;
     float3 here = float3(0.0);
+    uint same_depth = 0;
+    const float center_depth = load_texture(push.depth, texel).r;
     const int2 last = int2(size) - 1;
     for (int y = -1; y <= 1; ++y)
     {
@@ -156,6 +163,7 @@ ResolveOutput fragment_main(VertexOutput input)
                 here = color;
             }
             const float depth = load_texture(push.depth, at).r;
+            same_depth += abs(depth - center_depth) <= center_depth * kDepthSlack ? 1 : 0;
             if (depth > nearest)
             {
                 nearest = depth;
@@ -183,17 +191,24 @@ ResolveOutput fragment_main(VertexOutput input)
     {
         // The object motion at its old place: if it differs, the history there was about something else.
         const int2 previous_texel = clamp(int2(previous_uv * size), int2(0), last);
-        const float2 difference_px = (object_motion - load_texture(push.previous_object_motion, previous_texel).rg) * size;
-        weight /= 1.0 + dot(difference_px, difference_px);
+        const float2 here_px = object_motion * size;
+        const float2 there_px = load_texture(push.previous_object_motion, previous_texel).rg * size;
+        const float2 difference_px = here_px - there_px;
+        const float speed_squared = max(dot(here_px, here_px), dot(there_px, there_px));
+        weight /= 1.0 + dot(difference_px, difference_px) / (1.0 + kMotionTolerance * kMotionTolerance * speed_squared);
 
         // The depth at its old place, where only the camera moved it (a moving surface's own motion
         // along the view isn't known, and its colour is clipped anyway): a surface that was in front
         // there has moved off, and what's here wasn't seen. Over the texels around it, so neither a
-        // slope at a grazing angle nor an edge the jitter moves counts against itself.
-        if (length(object_motion * size) < 0.5)
+        // slope at a grazing angle nor an edge the jitter moves counts against itself. A sliver the
+        // jitter hits this frame and missed last isn't something that came in front.
+        if (length(object_motion * size) < kStillPx)
         {
-            const float center_depth = load_texture(push.depth, texel).r;
-            const float4 position = float4(position_from_depth(frame, input.ndc, center_depth), 1.0);
+            float4 position = nearest_position;
+            if (any(nearest_texel != texel))
+            {
+                position = float4(position_from_depth(frame, input.ndc, center_depth), 1.0);
+            }
             const float expected = center_depth > 0.0 ? max(mul_rows(frame.previous_view_proj, position).w, 1e-4) : kSkyZ;
             float near_z = kSkyZ;
             float far_z = 0.0;
@@ -207,7 +222,8 @@ ResolveOutput fragment_main(VertexOutput input)
                     far_z = max(far_z, z);
                 }
             }
-            const float outside = max(near_z * (1.0 - kDepthSlack) - expected, expected - far_z * (1.0 + kDepthSlack));
+            const float came = same_depth > kSliverPixels ? near_z * (1.0 - kDepthSlack) - expected : 0.0;
+            const float outside = max(came, expected - far_z * (1.0 + kDepthSlack));
             weight *= saturate(1.0 - outside / expected * 20.0);
         }
     }
@@ -217,7 +233,7 @@ ResolveOutput fragment_main(VertexOutput input)
     float3 kept = soft;
     if (weight > 0.0)
     {
-        const float3 history = to_ycocg(tonemapped(sample_history(previous_uv, size)));
+        const float3 history = to_ycocg(sample_history(previous_uv, size));
         kept = from_ycocg(clip_to_box(history, box_min, box_max, sum / 9.0));
     }
     const float3 color = untonemapped(saturate(lerp(soft, kept, weight)));

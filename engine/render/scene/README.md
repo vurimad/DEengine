@@ -41,11 +41,11 @@ With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 sample
 
 - **Motion from the nearest surface** in the 3 x 3 around the pixel, so an object's edges travel with it. The sky has no motion written: it takes the camera's.
 - **Colour clip:** history is clipped toward the neighbours' mean, in YCoCg, to the box of the colours around the pixel now. A colour that left can't stay. Most ghosts end here, but not next to an edge, where the old colour is still among the neighbours.
-- **Object motion coherence:** history fades by how far the object motion at its old place, as kept last frame, differs from the object motion here (`1 / (1 + pixels squared)`): it was about something else. Without the camera's part, so a camera changing speed costs nothing, and from the nearest surface on both sides, so a silhouette's ring matches itself.
-- **Depth:** where only the camera moved the point, its depth is compared with the near and far depths around its old place (last frame's, 3 x 3, the sky as farther than anything, 1% slack). Outside them, a surface there has moved off or come in front, and history goes.
+- **Object motion coherence:** history fades by how far the object motion at its old place, as kept last frame, differs from the object motion here (pixels squared, forgiving about a quarter of the speed): it was about something else. Without the camera's part, so a camera changing speed costs a static world nothing; in proportion to speed, so frame pacing costs what the camera follows nothing; from the nearest surface on both sides, so a silhouette's ring matches itself.
+- **Depth:** where only the camera moved the point (object motion under 0.05 pixels), its depth is compared with the near and far depths around its old place (last frame's, 3 x 3, the sky as farther than anything, 1% slack). Outside them, a surface there has moved off or come in front, and history goes. Coming in front needs more than a sliver: most of the 3 x 3 at this depth, so a thin thing the jitter hits now and then keeps its history.
 - **No history at all:** off the screen or behind last frame's camera, on the first frame, after a camera cut, after a frame not drawn with TAA (`RenderFrame::number` has a gap), or at a new size. A pixel softens as it loses history, to a soft blur of this frame without any, rather than raw aliasing.
 
-No TAA is free of ghosts for what doesn't write depth or motion (particles, transparents): those will need a reactive mask when they arrive.
+No TAA is free of ghosts for what doesn't write depth or motion (particles, transparents): those will need a reactive mask when they arrive. Thin geometry fades rather than flashes: when the jitter misses it, the colour box has no room for it. Very near the point something flies straight at the camera from, its depth rule can still drop history.
 
 ## Rules and invariants
 
