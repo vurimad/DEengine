@@ -1450,6 +1450,10 @@ void Device::set_vsync(bool vsync) {
     impl_->want_vsync = vsync;
 }
 
+bool Device::vsync() const {
+    return impl_->want_vsync;
+}
+
 Format Device::swapchain_format() const {
     return impl_->swapchain.format;
 }

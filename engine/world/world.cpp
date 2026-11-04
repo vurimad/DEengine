@@ -164,11 +164,11 @@ void World::tick() {
     ++state_->ticks;
 }
 
-FrameStep World::advance(double real_dt_s) {
+FrameStep World::advance(double frame_s) {
     DE_PROFILE_ZONE("world advance");
     WorldState& state = *state_;
     FrameStep step;
-    state.accumulator_s += std::max(real_dt_s, 0.0);
+    state.accumulator_s += std::max(frame_s, 0.0);
     while (state.accumulator_s >= state.tick_dt_s && step.ticks < state.max_ticks_per_frame) {
         tick();
         state.accumulator_s -= state.tick_dt_s;
@@ -182,11 +182,11 @@ FrameStep World::advance(double real_dt_s) {
     state.alpha = static_cast<float>(state.accumulator_s / state.tick_dt_s);
     // Bounded by what the ticks cover: a hitch's dropped time is motion nothing went through.
     state.alpha_step = static_cast<float>(
-        std::min(std::max(real_dt_s, 0.0) / state.tick_dt_s, static_cast<double>(state.max_ticks_per_frame)));
+        std::min(std::max(frame_s, 0.0) / state.tick_dt_s, static_cast<double>(state.max_ticks_per_frame)));
     step.alpha = state.alpha;
     {
         DE_PROFILE_ZONE("world frame");
-        const auto frame_dt = static_cast<ecs_ftime_t>(std::max(real_dt_s, 1e-6)); // 0 would mean "measure it"
+        const auto frame_dt = static_cast<ecs_ftime_t>(std::max(frame_s, 1e-6)); // 0 would mean "measure it"
         state.ecs.frame_begin(frame_dt);
         state.ecs.run_pipeline(state.frame, frame_dt);
         state.ecs.frame_end();

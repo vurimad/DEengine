@@ -12,7 +12,8 @@ namespace de::tools {
 
 // How many of these frames took over 1.5 times their lower quartile: an uneven loop, even at a good frame
 // rate. The lower quartile, so neither one hitch nor a rhythm of short and long frames can hide it.
-size_t late_frames(std::span<const float> frame_ms);
+inline constexpr size_t kFrameHistory = 240;
+size_t late_frames(std::span<const float> frame_ms); // at most kFrameHistory
 
 // One frame's numbers, gathered by whoever runs the frame.
 struct FrameStats {
@@ -43,9 +44,7 @@ public:
     void draw(bool* open) const;
 
 private:
-    static constexpr size_t kHistory = 240;
-
-    float frame_ms_[kHistory] = {};
+    float frame_ms_[kFrameHistory] = {};
     size_t next_ = 0;
     size_t count_ = 0;
     uint64_t frames_with_allocations_ = 0;

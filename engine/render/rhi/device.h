@@ -218,6 +218,7 @@ public:
 
     // Takes effect at the next swapchain acquire.
     void set_vsync(bool vsync);
+    bool vsync() const;
 
     Format swapchain_format() const; // Unknown when headless
     uint32_t swapchain_width() const;

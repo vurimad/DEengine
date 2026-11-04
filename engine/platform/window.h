@@ -42,7 +42,7 @@ public:
     // The drawable size in pixels: what the swapchain must match.
     uint32_t pixel_width() const { return pixel_width_; }
     // The refresh rate of the display the window is on; 0 if it isn't known.
-    double refresh_hz() const;
+    double refresh_hz() const { return refresh_hz_; }
     uint32_t pixel_height() const { return pixel_height_; }
 
     // True during the frame in which the drawable size changed: recreate the swapchain.
@@ -59,11 +59,13 @@ private:
 
     explicit Window(SDL_Window* window);
     void refresh_pixel_size();
+    void refresh_display();
 
     SDL_Window* window_ = nullptr;
     uint32_t window_id_ = 0;
     uint32_t pixel_width_ = 0;
     uint32_t pixel_height_ = 0;
+    double refresh_hz_ = 0.0;
     bool close_requested_ = false;
     bool minimized_ = false;
     bool focused_ = true;

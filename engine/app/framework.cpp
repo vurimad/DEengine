@@ -309,7 +309,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         const uint64_t frame_start_ns = platform::time_ns();
         const double measured_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
         // What the camera and the world move by.
-        const double frame_s = frame_clock.step(measured_s, args.vsync ? window->refresh_hz() : 0.0);
+        const double frame_s = frame_clock.step(measured_s, device->vsync() ? window->refresh_hz() : 0.0);
+        DE_PROFILE_PLOT("frame clock on the refresh rate", static_cast<int64_t>(frame_clock.holds_rate() ? 1 : 0));
         previous_frame_ns = frame_start_ns;
 
         platform::pump_events(*window, input);

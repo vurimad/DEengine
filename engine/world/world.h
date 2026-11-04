@@ -76,7 +76,7 @@ public:
     // Real time since the last call: runs the fixed ticks that fit (the simulation phases), then
     // RenderExtract once. Systems get the fixed step (or the frame time, in RenderExtract) as
     // delta_time.
-    FrameStep advance(double real_dt_s);
+    FrameStep advance(double frame_s);
     // One fixed tick now, without RenderExtract (tests, replays, the headless mode).
     void tick();
 

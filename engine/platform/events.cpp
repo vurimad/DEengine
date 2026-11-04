@@ -29,6 +29,7 @@ void pump_events(Window& window, Input& input) {
     DE_PROFILE_ZONE("pump_events");
     window.resized_ = false;
     bool window_changed = false;
+    bool display_changed = false;
 
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
@@ -50,6 +51,10 @@ void pump_events(Window& window, Input& input) {
         case SDL_EVENT_WINDOW_SHOWN:
         case SDL_EVENT_WINDOW_HIDDEN:
             window_changed = true;
+            break;
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
+            display_changed = true;
             break;
         case SDL_EVENT_WINDOW_FOCUS_GAINED:
             window.focused_ = true;
@@ -122,6 +127,9 @@ void pump_events(Window& window, Input& input) {
         // MAXIMIZED, not RESTORED).
         window.minimized_ = (SDL_GetWindowFlags(window.window_) & SDL_WINDOW_MINIMIZED) != 0;
         window.refresh_pixel_size();
+    }
+    if (display_changed) {
+        window.refresh_display();
     }
 }
 

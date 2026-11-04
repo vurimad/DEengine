@@ -1,5 +1,6 @@
 #include "tools/stats_panel.h"
 
+#include "core/assert.h"
 #include "core/profile.h"
 
 #include <imgui.h>
@@ -18,18 +19,18 @@ double mib(uint64_t bytes) {
 } // namespace
 
 size_t late_frames(std::span<const float> frame_ms) {
-    constexpr size_t kMost = 512;
-    float sorted[kMost];
-    const size_t count = std::min(frame_ms.size(), kMost);
+    DE_ASSERT(frame_ms.size() <= kFrameHistory);
+    const size_t count = frame_ms.size();
     if (count == 0) {
         return 0;
     }
+    float sorted[kFrameHistory];
     std::copy_n(frame_ms.begin(), count, sorted);
     float* const lower_quartile = sorted + (count - 1) / 4;
     std::nth_element(sorted, lower_quartile, sorted + count);
     const float limit = *lower_quartile * 1.5f;
     size_t late = 0;
-    for (const float ms : frame_ms.first(count)) {
+    for (const float ms : frame_ms) {
         late += ms > limit ? 1 : 0;
     }
     return late;
@@ -38,8 +39,8 @@ size_t late_frames(std::span<const float> frame_ms) {
 void StatsPanel::record(const FrameStats& stats) {
     DE_PROFILE_ZONE("stats panel record");
     frame_ms_[next_] = stats.frame_ms;
-    next_ = (next_ + 1) % kHistory;
-    count_ = std::min(count_ + 1, kHistory);
+    next_ = (next_ + 1) % kFrameHistory;
+    count_ = std::min(count_ + 1, kFrameHistory);
     frames_with_allocations_ += stats.heap_allocations > 0 ? 1 : 0;
     last_ = stats;
     // The times are the graph's until its next begin(): kept as a copy (one per frame).
@@ -68,7 +69,7 @@ void StatsPanel::draw(bool* open) const {
     ImGui::Text("%.0f fps  %.2f ms  (worst %.2f ms over %zu frames)", average > 0.0f ? 1000.0f / average : 0.0f,
                 average, worst, count_);
     ImGui::Text("%zu late (loop clock, over 1.5x the usual)", late_frames(std::span<const float>(frame_ms_, count_)));
-    ImGui::PlotLines("##frame ms", frame_ms_, static_cast<int>(kHistory), static_cast<int>(next_), nullptr, 0.0f,
+    ImGui::PlotLines("##frame ms", frame_ms_, static_cast<int>(kFrameHistory), static_cast<int>(next_), nullptr, 0.0f,
                      std::max(worst * 1.2f, 1.0f / 0.12f), ImVec2(-1.0f, 60.0f));
     ImGui::TextColored(last_.heap_allocations == 0 ? ImVec4(0.6f, 0.9f, 0.6f, 1.0f) : ImVec4(1.0f, 0.6f, 0.4f, 1.0f),
                        "heap allocations: %llu this frame (%llu frames with any)",

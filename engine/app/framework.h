@@ -101,6 +101,7 @@ public:
     virtual bool startup(Engine& engine, const FrameworkArgs& args) = 0;
     // Every frame, after input is sampled and before the world advances. False ends the run (the
     // application's quit: the framework has no quit of its own, so the game can ask first).
+    // frame_s is what this frame moves things by (FrameClock): even, not the time measured.
     virtual bool update(Engine& engine, float frame_s) = 0;
     // After the last frame (or a failed start: whenever startup() ran), while the engine is still
     // up: let go of what it holds.

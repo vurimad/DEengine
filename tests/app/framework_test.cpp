@@ -4,6 +4,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <initializer_list>
 #include <string_view>
 
@@ -71,8 +72,13 @@ TEST_CASE("settings are read by name, past comments and blanks") {
 TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds, and hands out the time measured") {
     constexpr double kHz = 240.0;
     constexpr double kInterval = 1.0 / kHz;
-    constexpr int kSettled = 64; // the frames it measures the rate over: the last of them goes in intervals
+    constexpr int kSettled = 128; // the frames it measures the rate over: the last of them goes in intervals
     const auto approx = [](double value) { return doctest::Approx(value).epsilon(1e-9); };
+    const auto settle = [&](de::app::FrameClock& clock, double measured) {
+        for (int i = 0; i < kSettled; ++i) {
+            static_cast<void>(clock.step(measured, kHz));
+        }
+    };
 
     // The loop's clock alternates, 1 and 7.33 ms, averaging the refresh rate: every step is an interval.
     de::app::FrameClock rhythm;
@@ -98,19 +104,29 @@ TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds,
     CHECK(jump <= kInterval * 11.0);
     CHECK(rhythm.step(0.001, kHz) == approx(kInterval));
 
-    // A suspend is a long jump, within an interval of what it measured.
-    CHECK(rhythm.step(5.0, kHz) == doctest::Approx(5.0).epsilon(kInterval));
+    // A suspend is a long jump, within a couple of intervals of what it measured.
+    CHECK(std::abs(rhythm.step(5.0, kHz) - 5.0) <= kInterval * 2.0);
 
-    // A display a little slower than it says: an extra interval now and then, so the time adds up.
-    de::app::FrameClock slightly_off;
-    for (int i = 0; i < kSettled; ++i) {
-        static_cast<void>(slightly_off.step(kInterval * 1.03, kHz));
-    }
-    double off_handed_out = 0.0;
+    // A little slower than the display says: an extra interval now and then, so the time adds up.
+    de::app::FrameClock slower_display;
+    settle(slower_display, kInterval * 1.005);
+    CHECK(slower_display.holds_rate());
+    double slow_handed_out = 0.0;
     for (int i = 0; i < 1000; ++i) {
-        off_handed_out += slightly_off.step(kInterval * 1.03, kHz);
+        slow_handed_out += slower_display.step(kInterval * 1.005, kHz);
     }
-    CHECK(off_handed_out == doctest::Approx(kInterval * 1030.0).epsilon(0.005));
+    CHECK(std::abs(slow_handed_out - kInterval * 1005.0) <= kInterval * 2.0);
+
+    // A little faster: it doesn't run fast, and a real jump isn't swallowed by what it's ahead.
+    de::app::FrameClock faster_display;
+    settle(faster_display, kInterval * 0.995);
+    CHECK(faster_display.holds_rate());
+    double fast_handed_out = 0.0;
+    for (int i = 0; i < 1000; ++i) {
+        fast_handed_out += faster_display.step(kInterval * 0.995, kHz);
+    }
+    CHECK(std::abs(fast_handed_out - kInterval * 995.0) <= kInterval * 3.0);
+    CHECK(faster_display.step(kInterval * 10.0, kHz) >= kInterval * 7.0);
 
     // Without vsync, as measured, even at the rate.
     de::app::FrameClock no_vsync;
@@ -118,25 +134,59 @@ TEST_CASE("the frame clock goes in whole refresh intervals while the rate holds,
         CHECK(no_vsync.step(0.003 + (i % 2) * 0.002, 0.0) == 0.003 + (i % 2) * 0.002);
     }
 
-    // Not holding the rate (too much to draw, or a variable-rate display): as measured.
+    // Not holding the rate (too much to draw): as measured.
     de::app::FrameClock slower;
     for (int i = 0; i < kSettled * 3; ++i) {
         const double measured = 0.0065 + (i % 2) * 0.001;
         CHECK(slower.step(measured, kHz) == measured);
     }
 
-    // It stops, and starts again, as the rate does. Hitches alone don't stop it.
-    de::app::FrameClock changing;
-    for (int i = 0; i < kSettled; ++i) {
-        static_cast<void>(changing.step(kInterval, kHz));
+    // Near it but not on it (a variable-rate display at 235 fps): as measured, no double steps.
+    de::app::FrameClock variable_rate;
+    for (int i = 0; i < kSettled * 3; ++i) {
+        CHECK(variable_rate.step(1.0 / 235.0, kHz) == 1.0 / 235.0);
     }
-    CHECK(changing.step(kInterval, kHz) == approx(kInterval));
+
+    // It stops, and starts again, as the rate does. A hitch alone doesn't stop it.
+    de::app::FrameClock changing;
+    settle(changing, kInterval);
+    CHECK(changing.holds_rate());
     for (int i = 0; i < kSettled; ++i) {
         static_cast<void>(changing.step(i == 10 ? 0.2 : kInterval, kHz));
     }
+    CHECK(changing.holds_rate());
     CHECK(changing.step(0.001, kHz) == approx(kInterval)); // an interval, not what it measured
+    settle(changing, kInterval * 1.3);
+    settle(changing, kInterval * 1.3);
+    CHECK(!changing.holds_rate());
+    CHECK(changing.step(kInterval * 1.3, kHz) == kInterval * 1.3);
+
+    // Every frame far longer than an interval: that's not on the intervals either.
+    de::app::FrameClock heavy;
+    settle(heavy, kInterval);
+    CHECK(heavy.holds_rate());
+    settle(heavy, kInterval * 4.3);
+    settle(heavy, kInterval * 4.3);
+    CHECK(!heavy.holds_rate());
+    CHECK(heavy.step(kInterval * 4.3, kHz) == kInterval * 4.3);
+
+    // Many long frames among even ones aren't hitches, even if the even ones look right.
+    de::app::FrameClock often_long;
+    settle(often_long, kInterval);
     for (int i = 0; i < kSettled * 2; ++i) {
-        static_cast<void>(changing.step(kInterval * 1.3, kHz));
+        static_cast<void>(often_long.step(i % 2 == 0 ? kInterval : kInterval * 4.3, kHz));
     }
-    CHECK(changing.step(kInterval * 1.3, kHz) == doctest::Approx(kInterval * 1.3));
+    CHECK(!often_long.holds_rate());
+
+    // Another display: nothing measured on the last one counts, and no state is left without a rate.
+    de::app::FrameClock moved;
+    settle(moved, kInterval);
+    CHECK(moved.holds_rate());
+    const double at_60_hz = 1.0 / 60.0 + 0.0005;
+    CHECK(moved.step(at_60_hz, 60.0) == at_60_hz);
+    CHECK(!moved.holds_rate());
+    de::app::FrameClock lost_rate;
+    settle(lost_rate, kInterval);
+    CHECK(lost_rate.step(0.001, 0.0) == 0.001);
+    CHECK(!lost_rate.holds_rate());
 }
