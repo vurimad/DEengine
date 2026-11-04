@@ -24,7 +24,7 @@ public struct SceneFrame
     public FogMedium fog;
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
-    public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA
+    public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA, zw: its offset in NDC
 };
 
 public static const uint kCascadeCount = 4;
@@ -197,6 +197,12 @@ public float2 atlas_uv(SceneFrame* frame, uint cascade, float2 tile_uv)
     return cascade_tile(cascade) + clamp(tile_uv, border, 1.0 - border) * 0.5;
 }
 
+// Jimenez's interleaved gradient noise: a well-spread value per pixel, in [0, 1).
+public float gradient_noise(float2 pixel)
+{
+    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
+}
+
 // The ray through a point of the froxel grid's columns (grid_size across and down; a column's middle is
 // its index plus a half).
 public struct FroxelRay
@@ -207,7 +213,8 @@ public struct FroxelRay
 
 public FroxelRay froxel_ray(SceneFrame* frame, float2 at, uint2 grid_size)
 {
-    const float2 ndc = float2(at.x / float(grid_size.x) * 2.0 - 1.0, 1.0 - at.y / float(grid_size.y) * 2.0);
+    // Without TAA's offset: the grid doesn't move with it, or its history would blur.
+    const float2 ndc = float2(at.x / float(grid_size.x) * 2.0 - 1.0, 1.0 - at.y / float(grid_size.y) * 2.0) + frame.taa_params.zw;
     FroxelRay ray;
     // From a point 100 m or so out, not the near plane: the difference from the camera stays precise
     // far from the render origin.

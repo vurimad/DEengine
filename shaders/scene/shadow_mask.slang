@@ -49,12 +49,6 @@ static const float2 kPoisson[16] = {
     float2(0.14383161, -0.14100790),
 };
 
-// Jimenez's interleaved gradient noise: a well-spread value per pixel, in [0, 1).
-float gradient_noise(float2 pixel)
-{
-    return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
-}
-
 [shader("fragment")]
 float2 fragment_main(VertexOutput input) : SV_Target
 {

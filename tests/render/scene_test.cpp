@@ -845,18 +845,30 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // The camera at the origin looking down -Z, the sun straight overhead.
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .vertical_fov_rad = 1.0f, .valid = true};
-        const auto render = [&](const de::render::SceneFog& fog) {
+        const auto draw_on = [&](de::rhi::TextureHandle on, uint32_t size, const de::render::SceneLighting& light,
+                                 bool taa = false) {
             device->begin_frame();
             uploader->record();
-            graph->begin(kSize, kSize);
+            graph->begin(size, size);
             const de::render::GraphTexture color = graph->import_texture(
-                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-            de::render::SceneLighting light{.sun_direction = {0, 1, 0}};
-            light.fog = fog;
-            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit);
+                {.texture = on, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light, de::render::SceneView::Lit,
+                                 taa);
             graph->execute();
             device->end_frame();
-            return de::test::read_texture(*device, *target);
+            return de::test::read_texture(*device, on);
+        };
+        const auto render = [&](const de::render::SceneFog& fog) {
+            de::render::SceneLighting light{.sun_direction = {0, 1, 0}};
+            light.fog = fog;
+            return draw_on(*target, kSize, light);
+        };
+        // As extraction does: what was drawn is the next frame's previous view.
+        const auto remember_camera = [&] {
+            std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
+            frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
+            frame.camera.previous_near_m = frame.camera.near_m;
+            frame.camera.previous_valid = true;
         };
         // Looking a little down, past anything: a fog of the sun's light alone, and of the sky's.
         const uint32_t x = kSize / 2;
@@ -989,10 +1001,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const auto next_frame = [&](const de::render::SceneFog& fog) {
             ++frame.number;
             de::core::Array<std::byte> image = render(fog);
-            std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
-            frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
-            frame.camera.previous_near_m = frame.camera.near_m;
-            frame.camera.previous_valid = true;
+            remember_camera();
             return image;
         };
         const auto settle = [&](const de::render::SceneFog& fog) {
@@ -1110,6 +1119,63 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const int fresh_start = green(render(start_near), middle);
         CHECK(std::abs(green(moved_start, middle) - fresh_start) <= 3);
 
+        // Fog starting inside the grid, the camera moving along the view: the start moves with it, past
+        // froxels with no fog. They don't darken the fog next to them.
+        de::render::SceneFog edge_fog = closed;
+        edge_fog.density_per_m = 0.15f;
+        edge_fog.sun_forward[1] = edge_fog.sun_back[1] = 0.3f;
+        edge_fog.volume_distance_m = 400.0f;
+        edge_fog.start_m = 12.0f;
+        frame.number = 0;
+        frame.camera.previous_valid = false;
+        const int still_start = green(render(edge_fog), middle);
+        for (int i = 0; i < 48; ++i) {
+            frame.camera.transform[11] = -static_cast<float>(i) * 0.7f;
+            static_cast<void>(next_frame(edge_fog));
+        }
+        const int moving_start = green(next_frame(edge_fog), middle);
+        CHECK(std::abs(moving_start - still_start) <= 6);
+        frame.camera.transform[11] = 0.0f;
+        frame.camera.previous_valid = false;
+
+        // Wherever the fog starts inside a froxel, its samples stay in the fog: no frame with none of them
+        // in it, gone dark and fading back.
+        int start_swing = 0;
+        for (const float start_m : {6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f, 13.0f, 14.0f}) {
+            edge_fog.start_m = start_m;
+            frame.number = 0;
+            frame.camera.previous_valid = false;
+            static_cast<void>(render(edge_fog));
+            settle(edge_fog);
+            int start_lowest = 255;
+            int start_highest = 0;
+            for (int i = 0; i < 16; ++i) {
+                const int level = green(next_frame(edge_fog), middle);
+                start_lowest = std::min(start_lowest, level);
+                start_highest = std::max(start_highest, level);
+            }
+            start_swing = std::max(start_swing, start_highest - start_lowest);
+        }
+        CHECK(start_swing <= 2);
+
+        // A bad value in one frame's light lasts that frame: it doesn't live on in the history.
+        frame.number = 0;
+        frame.camera.previous_valid = false;
+        settle(gridded);
+        const de::core::Array<std::byte> before_bad = next_frame(gridded);
+        de::render::SceneLighting bad_light{.sun_direction = {0, 1, 0}};
+        bad_light.fog = gridded;
+        bad_light.sun_color[0] = bad_light.sun_color[1] = bad_light.sun_color[2] =
+            std::numeric_limits<float>::quiet_NaN();
+        ++frame.number;
+        static_cast<void>(draw_on(*target, kSize, bad_light));
+        remember_camera();
+        de::core::Array<std::byte> after_bad = next_frame(gridded);
+        for (int i = 0; i < 40; ++i) {
+            after_bad = next_frame(gridded);
+        }
+        same(after_bad, before_bad, right, y);
+
         // Sharp shafts, at a grid of realistic size: curtains of shadow along the view. Over frames the
         // samples move, so an edge changes a little from frame to frame; with the history, only a little.
         {
@@ -1133,24 +1199,13 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             shaft_fog.volume_distance_m = 80.0f;
             frame.number = 0;
             frame.camera.previous_valid = false;
-            const auto shaft_frame = [&] {
+            de::render::SceneLighting shaft_light{.sun_direction = {0.35f, 1.0f, 0.0f}};
+            shaft_light.fog = shaft_fog;
+            const auto shaft_frame = [&](bool taa = false) {
                 ++frame.number;
-                device->begin_frame();
-                uploader->record();
-                graph->begin(kShaftSize, kShaftSize);
-                const de::render::GraphTexture color = graph->import_texture(
-                    {.texture = *shaft_target, .name = "shaft target", .final_state = de::rhi::ResourceState::CopySrc});
-                de::render::SceneLighting light{.sun_direction = {0.35f, 1.0f, 0.0f}};
-                light.fog = shaft_fog;
-                renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, light,
-                                     de::render::SceneView::Lit);
-                graph->execute();
-                device->end_frame();
-                std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
-                frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
-                frame.camera.previous_near_m = frame.camera.near_m;
-                frame.camera.previous_valid = true;
-                return de::test::read_texture(*device, *shaft_target);
+                de::core::Array<std::byte> image = draw_on(*shaft_target, kShaftSize, shaft_light, taa);
+                remember_camera();
+                return image;
             };
             for (int i = 0; i < 48; ++i) {
                 static_cast<void>(shaft_frame());
@@ -1168,8 +1223,46 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
                 }
                 before = std::move(after);
             }
-            CHECK(pixels_changed > 0);
-            CHECK(most_changed <= 8);
+            CHECK(pixels_changed > 10000); // each froxel settles at its own moving place
+            CHECK(most_changed <= 3);      // and only a little: the history, and a different place per froxel
+
+            // The frame after a cut, with no history to average with, isn't jittered: the same as a single
+            // frame.
+            frame.number = 0;
+            frame.camera.previous_valid = false;
+            const de::core::Array<std::byte> single_shaft = draw_on(*shaft_target, kShaftSize, shaft_light);
+            for (int i = 0; i < 8; ++i) {
+                static_cast<void>(shaft_frame());
+            }
+            frame.camera.previous_valid = false;
+            const de::core::Array<std::byte> after_cut_shaft = shaft_frame();
+            int cut_most = 0;
+            for (size_t at = 1; at < after_cut_shaft.size(); at += 4) {
+                cut_most = std::max(cut_most, std::abs(static_cast<int>(static_cast<uint8_t>(after_cut_shaft[at])) -
+                                                       static_cast<int>(static_cast<uint8_t>(single_shaft[at]))));
+            }
+            CHECK(cut_most <= 2);
+
+            // TAA's offset moves the image, not the grid: over frames the shafts don't blur. What's left
+            // from the settled image is what TAA does to it.
+            frame.number = 0;
+            frame.camera.previous_valid = false;
+            for (int i = 0; i < 64; ++i) {
+                static_cast<void>(shaft_frame());
+            }
+            const de::core::Array<std::byte> without_taa = shaft_frame();
+            frame.camera.previous_valid = false;
+            for (int i = 0; i < 96; ++i) {
+                static_cast<void>(shaft_frame(true));
+            }
+            const de::core::Array<std::byte> with_taa = shaft_frame(true);
+            int taa_total = 0;
+            for (size_t at = 1; at < with_taa.size(); at += 4) {
+                taa_total += std::abs(static_cast<int>(static_cast<uint8_t>(with_taa[at])) -
+                                      static_cast<int>(static_cast<uint8_t>(without_taa[at])));
+            }
+            const double taa_mean = static_cast<double>(taa_total) / (static_cast<double>(with_taa.size()) / 4.0);
+            CHECK(taa_mean < 0.42);
             frame.instances.clear();
             frame.number = 0;
             frame.camera.previous_valid = false;

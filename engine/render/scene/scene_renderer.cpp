@@ -50,7 +50,7 @@ struct SceneFrame {
     float fog_range[4] = {};             // end, froxel grid reach, slice offset, slices
     float previous_view_proj[16] = {};   // last frame's camera, relative to this frame's render origin
     float unjittered_view_proj[16] = {}; // view_proj without TAA's sub-pixel offset
-    float taa_params[4] = {};            // last frame's near, TAA's sample (0 without TAA)
+    float taa_params[4] = {};            // last frame's near, TAA's sample (0 without TAA), its offset in NDC
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -117,7 +117,6 @@ struct FogInjectPush {
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
     float jitter_z = 0.0f;
-    uint32_t jittered = 0;
 };
 
 // Matches FogIntegratePush in shaders/scene/fog_integrate.slang.
@@ -504,6 +503,8 @@ struct SceneRendererState {
                 scene.view_proj[column] += offset_x * scene.view_proj[12 + column];
                 scene.view_proj[4 + column] += offset_y * scene.view_proj[12 + column];
             }
+            scene.taa_params[2] = offset_x;
+            scene.taa_params[3] = offset_y;
         }
         scene.taa_params[0] = frame.camera.previous_valid ? frame.camera.previous_near_m : frame.camera.near_m;
         scene.taa_params[1] = static_cast<float>(taa_sample_now);
@@ -1097,15 +1098,13 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                                  .discard = true});
             state.froxels_written[state.froxels_current] = true; // the graph leaves it so, even if it's skipped
         }
-        // A different place in each froxel every frame; none on a frame that counts no frames (no history
-        // to average with).
+        // A different place in each froxel every frame.
         const auto froxel_sample = static_cast<uint32_t>(frame.number % kTaaSamples) + 1;
         const FogInjectPush injection{.frame = frame_address,
                                       .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
-                                      .jitter_x = halton(froxel_sample, 2) - 0.5f,
-                                      .jitter_y = halton(froxel_sample, 3) - 0.5f,
-                                      .jitter_z = halton(froxel_sample, 5),
-                                      .jittered = froxels_kept && frame.number != 0 ? 1U : 0U};
+                                      .jitter_x = halton(froxel_sample, 2),
+                                      .jitter_y = halton(froxel_sample, 3),
+                                      .jitter_z = halton(froxel_sample, 5)};
         const GraphTexture froxels =
             graph
                 .add_pass<GridPass>(
