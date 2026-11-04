@@ -52,7 +52,7 @@ struct FrameStep {
 //
 //     auto world = World::create({.jobs = &jobs});
 //     world->ecs().system<Transform, const Velocity>("move").kind(world->phase(Phase::PreSim))...;
-//     each frame: world->advance(frame_seconds);   // ticks as needed, then RenderExtract
+//     each frame: world->advance(frame_s);   // ticks as needed, then RenderExtract
 //
 // Never call ecs().progress(): the phases run only through advance() and tick(). Move-only.
 class World {
@@ -73,10 +73,10 @@ public:
     // The phase entity a system goes in: .kind(world.phase(Phase::Combat)).
     flecs::entity phase(Phase phase) const;
 
-    // Real time since the last call: runs the fixed ticks that fit (the simulation phases), then
+    // The time this frame moves things by: runs the fixed ticks that fit (the simulation phases), then
     // RenderExtract once. Systems get the fixed step (or the frame time, in RenderExtract) as
     // delta_time.
-    FrameStep advance(double real_dt_s);
+    FrameStep advance(double frame_s);
     // One fixed tick now, without RenderExtract (tests, replays, the headless mode).
     void tick();
 

@@ -261,3 +261,17 @@ TEST_CASE("the stats panel draws whatever the frame's numbers are") {
     CHECK(open);
     CHECK(ImGui::GetDrawData()->TotalVtxCount > 0);
 }
+
+TEST_CASE("late frames are found whatever the frame rate, a rhythm or a hitch") {
+    const float steady[] = {4.2f, 4.1f, 4.2f, 4.1f, 4.2f, 4.1f};
+    CHECK(de::tools::late_frames(steady) == 0);
+    const float alternating[] = {1.0f, 7.3f, 1.0f, 7.3f, 1.0f, 7.3f}; // 240 fps on average, half of them late
+    CHECK(de::tools::late_frames(alternating) == 3);
+    const float missed_vsync[] = {16.7f, 33.3f, 16.7f, 33.3f, 16.7f, 33.3f}; // its mean's 1.5x is over them all
+    CHECK(de::tools::late_frames(missed_vsync) == 3);
+    const float hitch[] = {4.0f, 4.0f, 4.0f, 400.0f, 4.0f, 4.0f}; // doesn't lift the limit over the others
+    CHECK(de::tools::late_frames(hitch) == 1);
+    const float hitch_in_rhythm[] = {1000.0f, 7.3f, 1.0f, 7.3f, 1.0f, 7.3f, 1.0f, 7.3f}; // nor hide a rhythm
+    CHECK(de::tools::late_frames(hitch_in_rhythm) == 5);
+    CHECK(de::tools::late_frames({}) == 0);
+}

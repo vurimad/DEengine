@@ -1,5 +1,6 @@
 # The framework (the engine's systems and the frame loop) and the applications it runs.
 add_library(de_app STATIC
+    frame_clock.h
     framework.cpp
     framework.h
     viewer.cpp

@@ -218,6 +218,9 @@ public:
 
     // Takes effect at the next swapchain acquire.
     void set_vsync(bool vsync);
+    // Whether frames present on the display's refresh now: what the swapchain does, which may not be what
+    // was asked (the surface decides); what was asked until there's a swapchain.
+    bool vsync() const;
 
     Format swapchain_format() const; // Unknown when headless
     uint32_t swapchain_width() const;

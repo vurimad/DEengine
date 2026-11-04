@@ -179,6 +179,7 @@ struct FrameSlot {
 };
 
 struct Swapchain {
+    bool on_refresh = true; // what it does, whatever was asked: its present mode waits for the refresh
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     Format format = Format::Unknown;
     VkFormat vk_format = VK_FORMAT_UNDEFINED;

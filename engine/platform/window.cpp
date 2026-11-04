@@ -36,6 +36,7 @@ Window::Window(SDL_Window* window) : window_(window), window_id_(SDL_GetWindowID
     minimized_ = (flags & SDL_WINDOW_MINIMIZED) != 0;
     focused_ = (flags & SDL_WINDOW_INPUT_FOCUS) != 0;
     refresh_pixel_size();
+    refresh_display();
     resized_ = false;
 }
 
@@ -47,8 +48,8 @@ Window::~Window() {
 
 Window::Window(Window&& other) noexcept
     : window_(std::exchange(other.window_, nullptr)), window_id_(other.window_id_), pixel_width_(other.pixel_width_),
-      pixel_height_(other.pixel_height_), close_requested_(other.close_requested_), minimized_(other.minimized_),
-      focused_(other.focused_), resized_(other.resized_) {}
+      pixel_height_(other.pixel_height_), refresh_hz_(other.refresh_hz_), close_requested_(other.close_requested_),
+      minimized_(other.minimized_), focused_(other.focused_), resized_(other.resized_) {}
 
 Window& Window::operator=(Window&& other) noexcept {
     if (this != &other) {
@@ -59,6 +60,7 @@ Window& Window::operator=(Window&& other) noexcept {
         window_id_ = other.window_id_;
         pixel_width_ = other.pixel_width_;
         pixel_height_ = other.pixel_height_;
+        refresh_hz_ = other.refresh_hz_;
         close_requested_ = other.close_requested_;
         minimized_ = other.minimized_;
         focused_ = other.focused_;
@@ -69,6 +71,11 @@ Window& Window::operator=(Window&& other) noexcept {
 
 void Window::set_title(const char* title) {
     SDL_SetWindowTitle(window_, title);
+}
+
+void Window::refresh_display() {
+    const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
+    refresh_hz_ = mode != nullptr ? static_cast<double>(mode->refresh_rate) : 0.0;
 }
 
 void Window::refresh_pixel_size() {

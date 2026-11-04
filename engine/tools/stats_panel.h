@@ -10,6 +10,13 @@
 
 namespace de::tools {
 
+inline constexpr size_t kFrameHistory = 240;
+
+// How many of these frames (at most kFrameHistory) took over 1.5 times their lower quartile: an uneven
+// loop, even at a good frame rate. The lower quartile, so neither one hitch nor a rhythm of short and long
+// frames can hide it.
+size_t late_frames(std::span<const float> frame_ms);
+
 // One frame's numbers, gathered by whoever runs the frame.
 struct FrameStats {
     float frame_ms = 0.0f;         // CPU time from one frame's start to the next
@@ -36,15 +43,15 @@ public:
 
     void record(const FrameStats& stats);
     // A window the user can close: open is set to false then.
-    void draw(bool* open) const;
+    void draw(bool* open);
 
 private:
-    static constexpr size_t kHistory = 240;
-
-    float frame_ms_[kHistory] = {};
+    float frame_ms_[kFrameHistory] = {};
     size_t next_ = 0;
     size_t count_ = 0;
     uint64_t frames_with_allocations_ = 0;
+    size_t late_ = 0; // of the history, counted now and then while drawn: it's read as a slow number
+    uint32_t draws_until_late_ = 0;
     FrameStats last_; // its gpu_passes point at gpu_passes_
     render::PassGpuTime gpu_passes_[render::kMaxTimedPasses] = {};
 };
