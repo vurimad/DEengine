@@ -1,3 +1,4 @@
+#include "app/frame_clock.h"
 #include "app/framework.h"
 #include "core/log.h"
 
@@ -65,4 +66,38 @@ TEST_CASE("settings are read by name, past comments and blanks") {
     CHECK(de::app::setting(text, "empty").empty());
     CHECK(de::app::setting(text, "missing").empty());
     CHECK(de::app::setting(text, "engine").empty()); // only in a comment
+}
+
+TEST_CASE("the frame clock evens out a rhythm, and hands out the time measured") {
+    // A loop that alternates 1 and 7 ms, as two frames back to back do: a steady 4 ms, once it's full.
+    de::app::FrameClock clock;
+    for (int i = 0; i < 12; ++i) {
+        static_cast<void>(clock.step(i % 2 == 0 ? 0.001 : 0.007));
+    }
+    for (int i = 0; i < 24; ++i) {
+        CHECK(clock.step(i % 2 == 0 ? 0.001 : 0.007) == doctest::Approx(0.004));
+    }
+
+    // From the first frame: not diluted by a window that hasn't filled.
+    de::app::FrameClock fresh;
+    CHECK(fresh.step(0.004) == doctest::Approx(0.004));
+    CHECK(fresh.step(0.006) == doctest::Approx(0.005));
+
+    // A hitch is spread, not lost: over the frames that see it, the time adds up to what was measured.
+    de::app::FrameClock hitched;
+    for (int i = 0; i < 12; ++i) {
+        static_cast<void>(hitched.step(0.004));
+    }
+    double handed_out = 0.0;
+    double measured = 0.0;
+    double largest = 0.0;
+    for (int i = 0; i < 12; ++i) {
+        const double step = i == 0 ? 0.100 : 0.004;
+        const double out = hitched.step(step);
+        measured += step;
+        handed_out += out;
+        largest = out > largest ? out : largest;
+    }
+    CHECK(handed_out == doctest::Approx(measured));
+    CHECK(largest < 0.015); // not the whole 100 ms at once
 }

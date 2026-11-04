@@ -1,5 +1,6 @@
 #include "app/framework.h"
 
+#include "app/frame_clock.h"
 #include "asset/registry.h"
 #include "core/array.h"
 #include "core/fixed_string.h"
@@ -299,13 +300,15 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     // --- The frame loop ---------------------------------------------------------------------------
     uint64_t frame = 0;
     uint64_t previous_frame_ns = platform::time_ns();
+    FrameClock frame_clock;
     uint64_t title_start_ns = previous_frame_ns;
     uint32_t title_frames = 0;
     bool was_minimized = false;
     while (!window->close_requested()) {
         const uint64_t frame_start_allocations = core::heap_allocation_count(); // every thread, jobs included
         const uint64_t frame_start_ns = platform::time_ns();
-        const double frame_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
+        const double measured_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
+        const double frame_s = frame_clock.step(measured_s); // what the camera and the world move by
         previous_frame_ns = frame_start_ns;
 
         platform::pump_events(*window, input);
@@ -397,7 +400,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         const uint64_t allocations = core::heap_allocation_count() - frame_start_allocations;
         DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
 #if DE_BUILD_DEV
-        stats_panel.record({.frame_ms = static_cast<float>(frame_s * 1000.0),
+        stats_panel.record({.frame_ms = static_cast<float>(measured_s * 1000.0),
                             .heap_allocations = allocations,
                             .device = device->stats(),
                             .memory = device->memory_stats(),

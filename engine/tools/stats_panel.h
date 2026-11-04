@@ -10,6 +10,9 @@
 
 namespace de::tools {
 
+// How many of these frames took over 1.5 times their average: uneven pacing, even at a good frame rate.
+size_t late_frames(std::span<const float> frame_ms);
+
 // One frame's numbers, gathered by whoever runs the frame.
 struct FrameStats {
     float frame_ms = 0.0f;         // CPU time from one frame's start to the next

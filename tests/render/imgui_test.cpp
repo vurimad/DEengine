@@ -261,3 +261,13 @@ TEST_CASE("the stats panel draws whatever the frame's numbers are") {
     CHECK(open);
     CHECK(ImGui::GetDrawData()->TotalVtxCount > 0);
 }
+
+TEST_CASE("late frames are what runs over the average, whatever the frame rate") {
+    const float steady[] = {4.2f, 4.1f, 4.2f, 4.1f, 4.2f, 4.1f};
+    CHECK(de::tools::late_frames(steady) == 0);
+    const float alternating[] = {1.0f, 7.3f, 1.0f, 7.3f, 1.0f, 7.3f}; // 240 fps on average, half of them late
+    CHECK(de::tools::late_frames(alternating) == 3);
+    const float hitch[] = {4.0f, 4.0f, 4.0f, 40.0f, 4.0f, 4.0f};
+    CHECK(de::tools::late_frames(hitch) == 1);
+    CHECK(de::tools::late_frames({}) == 0);
+}

@@ -16,7 +16,7 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 ## How a frame runs
 
 ```cpp
-device.begin_frame();                                    // waits for the frame kFramesInFlight ago, frees what it destroyed
+device.begin_frame();                                    // waits for the previous frame, frees what the one kFramesInFlight ago destroyed
 TextureHandle backbuffer = device.acquire_swapchain_texture(); // invalid while minimized
 CommandList list = device.begin_command_list();
 list.barrier({.texture = backbuffer, .before = ResourceState::Present, .after = ResourceState::RenderTarget, .discard = true});
