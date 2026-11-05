@@ -67,6 +67,7 @@ struct PendingUpload {
     const TextureDesc* desc = nullptr;
     bool dropped = false;
     bool overwrite = false; // over something uploaded before, which the GPU may still read
+    bool unread = false;    // BufferRange::Unread: never an overwrite
     bool generate = false;  // the mips after the uploaded ones are generated on the GPU
 };
 
@@ -91,6 +92,8 @@ struct BufferState {
     ResourceState write = ResourceState::Undefined;
     ShaderStages write_stages = ShaderStages::None;
     uint64_t batch = 0;
+    uint64_t batch_first = 0; // the span of what the batch uploads to it
+    uint64_t batch_end = 0;
 };
 
 // Moves the live entries [head, size) to the front once enough are done.
@@ -126,6 +129,9 @@ struct UploaderState {
     core::HashMap<TextureHandle, MipStates> texture_states{render_heap()};
     core::HashMap<BufferHandle, BufferState> buffer_states{render_heap()};
     core::HashMap<BufferHandle, uint32_t> buffer_queued{render_heap()}; // uploads waiting to be recorded
+    uint32_t overwrites = 0;
+    uint64_t buffer_uploads_queued = 0; // ever: the tickets
+    uint64_t buffer_uploads_recorded = 0;
     size_t purge_at = 256;
 
     uint64_t batch = 0; // record batches so far
@@ -597,7 +603,7 @@ core::Result<void> Uploader::upload_texture(TextureHandle texture, std::span<con
 }
 
 core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data,
-                                           ResourceState after, ShaderStages after_stages) {
+                                           ResourceState after, ShaderStages after_stages, BufferRange range) {
     UploaderState& state = *state_;
     const BufferDesc* desc = state.device->buffer_desc(buffer);
     if (desc == nullptr) {
@@ -618,7 +624,8 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
                           .buffer_offset = offset,
                           .after = after,
                           .after_stages = after_stages,
-                          .bytes = data.size()};
+                          .bytes = data.size(),
+                          .unread = range == BufferRange::Unread};
     const std::span<std::byte> staging = stage(state, data.size(), pending);
     if (staging.empty()) {
         return core::fail(core::ErrorCode::OutOfMemory, "no memory for the upload's staging");
@@ -628,6 +635,7 @@ core::Result<void> Uploader::upload_buffer(BufferHandle buffer, uint64_t offset,
     state.queued_bytes += data.size();
     state.queue.push(pending);
     ++state.buffer_queued.find_or_insert(buffer);
+    ++state.buffer_uploads_queued;
     return {};
 }
 
@@ -643,10 +651,10 @@ void Uploader::record() {
     reclaim(state);
     purge_states(state);
 
-    // This frame's batch: FIFO, within the budget (an upload bigger than it goes alone), and each
-    // resource at most once (barriers in one command are unordered, so a second upload to the same
-    // resource waits for the next batch). Uploads to resources destroyed since they were queued are
-    // dropped.
+    // This frame's batch: FIFO, within the budget (an upload bigger than it goes alone), and never
+    // two uploads to the same place (barriers in one command are unordered, so a second upload to a
+    // texture, or one overlapping another to a buffer, waits for the next batch). Uploads to
+    // resources destroyed since they were queued are dropped.
     const uint64_t batch = ++state.batch;
     const size_t first = state.queue_head;
     size_t last = first;
@@ -662,23 +670,45 @@ void Uploader::record() {
             if (batch_bytes > 0 && batch_bytes + upload.bytes > state.desc.frame_budget_bytes) {
                 break;
             }
-            uint64_t* stamp = nullptr;
             if (upload.texture) {
                 MipStates& mips = state.texture_states.find_or_insert(upload.texture_handle);
                 upload.overwrite = mips.initialized;
-                stamp = &mips.batch;
+                if (mips.batch == batch) {
+                    break;
+                }
+                mips.batch = batch;
             } else {
                 BufferState& buffer = state.buffer_states.find_or_insert(upload.buffer_handle);
-                upload.overwrite = buffer.reads != ResourceState::Undefined || buffer.write != ResourceState::Undefined;
-                stamp = &buffer.batch;
+                upload.overwrite = !upload.unread && (buffer.reads != ResourceState::Undefined ||
+                                                      buffer.write != ResourceState::Undefined);
+                const uint64_t upload_end = upload.buffer_offset + upload.bytes;
+                if (buffer.batch != batch) {
+                    buffer.batch = batch;
+                    buffer.batch_first = upload.buffer_offset;
+                    buffer.batch_end = upload_end;
+                } else {
+                    // Outside the span needs no search: the usual case, a pool filling upward.
+                    if (upload_end > buffer.batch_first && upload.buffer_offset < buffer.batch_end) {
+                        bool overlaps = false;
+                        for (size_t earlier = first; earlier < last && !overlaps; ++earlier) {
+                            const PendingUpload& other = state.queue[earlier];
+                            overlaps = !other.texture && !other.dropped &&
+                                       other.buffer_handle == upload.buffer_handle &&
+                                       upload_end > other.buffer_offset &&
+                                       upload.buffer_offset < other.buffer_offset + other.bytes;
+                        }
+                        if (overlaps) {
+                            break;
+                        }
+                    }
+                    buffer.batch_first = std::min(buffer.batch_first, upload.buffer_offset);
+                    buffer.batch_end = std::max(buffer.batch_end, upload_end);
+                }
             }
-            if (*stamp == batch) {
-                break; // a second upload to this resource
-            }
-            *stamp = batch;
             batch_bytes += upload.bytes;
             if (upload.overwrite) {
                 ++overwrites;
+                ++state.overwrites;
             } else {
                 ++fresh;
             }
@@ -790,6 +820,7 @@ void Uploader::record() {
 
     for (size_t i = first; i < last; ++i) {
         if (!state.queue[i].texture) {
+            ++state.buffer_uploads_recorded;
             uint32_t* queued = state.buffer_queued.find(state.queue[i].buffer_handle);
             if (queued != nullptr && --*queued == 0) {
                 state.buffer_queued.remove(state.queue[i].buffer_handle);
@@ -830,6 +861,14 @@ bool Uploader::ready(BufferHandle buffer) const {
     return state.buffer_queued.find(buffer) == nullptr;
 }
 
+uint64_t Uploader::buffer_upload_ticket() const {
+    return state_->buffer_uploads_queued;
+}
+
+bool Uploader::recorded(uint64_t buffer_upload_ticket) const {
+    return state_->buffer_uploads_recorded >= buffer_upload_ticket;
+}
+
 bool Uploader::idle() const {
     return state_->queue_head == state_->queue.size();
 }
@@ -847,6 +886,7 @@ UploaderStats Uploader::stats() const {
         .staging_bytes_in_use = in_use,
         .staging_bytes = state.desc.staging_bytes,
         .uploaded_bytes = state.uploaded_bytes,
+        .overwrites = state.overwrites,
         .dedicated_staging = state.dedicated,
         .dropped_uploads = state.dropped,
         .transfer_queue = state.transfer,

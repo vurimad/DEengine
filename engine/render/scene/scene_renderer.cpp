@@ -221,12 +221,11 @@ void copy3(const float (&from)[3], float (&to)[4]) {
 
 // A mesh part to draw this frame, and its kind: [masked][double-sided] as two bits.
 struct PartDraw {
-    uint64_t vertices = 0;
-    rhi::BufferHandle indices;
     uint32_t instance = 0;
     uint32_t material = 0;
     uint32_t first_index = 0;
     uint32_t index_count = 0;
+    uint32_t vertex_offset = 0;
 };
 
 constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, masked, masked double-sided
@@ -242,20 +241,14 @@ constexpr bool is_double_sided(uint32_t kind) {
     return (kind & 1U) != 0;
 }
 
-// Draws parts with the bound pipeline, binding index buffers as they change. Returns the draws.
+// Draws parts with the bound pipeline and the geometry pool's index buffer. Returns the draws.
 template <typename Push>
 uint32_t draw_parts(rhi::CommandList& list, std::span<const PartDraw> parts, Push push) {
-    rhi::BufferHandle bound;
     for (const PartDraw& part : parts) {
-        if (!(part.indices == bound)) {
-            list.bind_index_buffer(part.indices, 0, rhi::IndexType::Uint32);
-            bound = part.indices;
-        }
         push.instance = part.instance;
-        push.vertices = part.vertices;
         push.material = part.material;
         list.push_constants(push);
-        list.draw_indexed(part.index_count, 1, part.first_index);
+        list.draw_indexed(part.index_count, 1, part.first_index, static_cast<int32_t>(part.vertex_offset));
     }
     return static_cast<uint32_t>(parts.size());
 }
@@ -471,13 +464,13 @@ struct SceneRendererState {
                 continue;
             }
             ++stats.drawn;
-            for (const GpuMeshPart& part : mesh->parts) {
-                draws[draw_kind(gpu_assets->material_flags(part.material))].push({.vertices = mesh->vertex_address,
-                                                                                  .indices = mesh->indices,
-                                                                                  .instance = static_cast<uint32_t>(i),
-                                                                                  .material = part.material,
-                                                                                  .first_index = part.first_index,
-                                                                                  .index_count = part.index_count});
+            for (const GpuMeshPart& part : mesh->lod_parts(0)) {
+                draws[draw_kind(gpu_assets->material_flags(part.material))].push(
+                    {.instance = static_cast<uint32_t>(i),
+                     .material = part.material,
+                     .first_index = part.first_index,
+                     .index_count = part.index_count,
+                     .vertex_offset = mesh->vertex_offset});
             }
         }
     }
@@ -1083,6 +1076,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             SceneRendererState& renderer = *data.state;
             ShadowCasterPush push{.frame = data.frame_address,
                                   .instances = data.frame_address + kInstancesOffset,
+                                  .vertices = renderer.gpu_assets->pool_vertex_address(),
                                   .materials = renderer.gpu_assets->material_table_address(),
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
@@ -1092,6 +1086,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                      .width = data.cascade_size,
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
+                context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
                 push.cascade = cascade;
                 // Casters cull nothing (thin geometry casts from both sides): the kinds differ only
                 // by the alpha test.
@@ -1151,8 +1146,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             colors[4] = {.texture = context.texture(data.targets.motion)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
+            context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
             const GBufferPush push{.frame = data.frame_address,
                                    .instances = data.frame_address + kInstancesOffset,
+                                   .vertices = renderer.gpu_assets->pool_vertex_address(),
                                    .materials = renderer.gpu_assets->material_table_address(),
                                    .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {

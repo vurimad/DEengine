@@ -18,6 +18,8 @@ add_library(de_core STATIC
     fixed_string.h
     frame_allocator.cpp
     frame_allocator.h
+    range_allocator.cpp
+    range_allocator.h
     function_ref.h
     hash.cpp
     hash.h
