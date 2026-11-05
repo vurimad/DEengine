@@ -126,7 +126,7 @@ public struct FogVolumeData
     public float4 half_extents; // w: its soft edge, in meters
     public float4 tint_density; // w: extinction per meter at its heart
     public float4 shape;        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
-    public float4 noise;        // xyz: how far its noise has moved, in tiles, wrapped to [0, 4); w: its tiles a meter
+    public float4 noise;        // xyz: how far the noise has moved past the render origin, in tiles, wrapped to [0, 4); w: its tiles a meter
 };
 
 // The fog noise's size: render::kFogNoiseSize.
@@ -159,14 +159,21 @@ float fog_volume_share(FogVolumeData volume, float3 local)
     return edge * smoothstep(0.0, 1.0, saturate((half_extents.y - local.y) / volume.shape.z));
 }
 
+// The mip of the fog noise that a footprint in meters can hold, for a layer of this many tiles a meter.
+float fog_noise_mip(float footprint_m, float tiles_per_m)
+{
+    return log2(max(footprint_m * tiles_per_m * kFogNoiseSize, 1.0));
+}
+
 // That share, with noise eating into it: most where there's least noise, and where there's least fog,
-// so its heart keeps a body and its edges go to wisps. Three sizes. A tile 4 times the noise's size gives the
-// big shapes that are all a far slice can hold, and hides the repeats of the smaller ones. Each goes at a
-// whole multiple of a quarter of the offset, which wraps at 4 tiles, so wrapping is a whole number of tiles
-// for each, and the smallest boils slowly through the others.
-// Spacing is how far apart the ray's points are, in meters: noise finer than that would land on different
-// bumps as the camera moves and crawl, so it reads the mip those points can resolve.
-float fog_volume_noisy_share(FogVolumeData volume, float3 local, uint noise, float spacing)
+// so its heart keeps a body and its edges go to wisps. The noise is anchored to the world, not the volume, so
+// volumes don't repeat each other's wisps, turning one doesn't sweep its noise around, and two that meet line
+// up. Three sizes. A tile 4 times the noise's size gives the big shapes that are all a far slice can hold,
+// and hides the repeats of the smaller ones. Each goes at a whole multiple of a quarter of the offset, which
+// wraps at 4 tiles, so wrapping is a whole number of tiles for each, and the smallest boils slowly through the
+// others. A footprint is the size of what a point stands for: noise finer than that would land on different
+// bumps as the camera moves and crawl, so each size reads the mip it can hold.
+float fog_volume_noisy_share(FogVolumeData volume, float3 local, float3 position, uint noise, float footprint_m)
 {
     const float share = fog_volume_share(volume, local);
     const float amount = volume.shape.y;
@@ -176,11 +183,12 @@ float fog_volume_noisy_share(FogVolumeData volume, float3 local, uint noise, flo
     }
     Texture3D tiles = texture_3d(noise);
     const SamplerState wrapping = sampler_state(kSamplerLinearWrap);
-    const float3 at = local * volume.noise.w;
-    const float mip = log2(max(spacing * volume.noise.w * kFogNoiseSize, 1.0));
-    const float huge = tiles.SampleLevel(wrapping, at * 0.25 - volume.noise.xyz * 0.25, max(mip - 2.0, 0.0)).r;
-    const float large = tiles.SampleLevel(wrapping, at - volume.noise.xyz, mip).r;
-    const float small = tiles.SampleLevel(wrapping, at * 2.3 - volume.noise.xyz * 2.0, mip + 1.2).r;
+    const float tiles_per_m = volume.noise.w;
+    const float3 at = position * tiles_per_m - volume.noise.xyz;
+    const float huge = tiles.SampleLevel(wrapping, at * 0.25, fog_noise_mip(footprint_m, tiles_per_m * 0.25)).r;
+    const float large = tiles.SampleLevel(wrapping, at, fog_noise_mip(footprint_m, tiles_per_m)).r;
+    const float small = tiles.SampleLevel(wrapping, position * tiles_per_m * 2.3 - volume.noise.xyz * 2.0,
+                                          fog_noise_mip(footprint_m, tiles_per_m * 2.3)).r;
     // Stretched: the texture's values bunch around the middle, and fog this soft needs real gaps to show them.
     return saturate(share - amount * (1.0 - smoothstep(0.3, 0.7, huge * 0.55 + large * 0.3 + small * 0.15)));
 }
@@ -190,8 +198,8 @@ float fog_volume_noisy_share(FogVolumeData volume, float3 local, uint noise, flo
 // along the ray they can't all miss it, and they don't slide through it as the grid's slices do with the
 // camera. It fades out over the last tenth of the grid's reach, where the fog past it, which can't hold it,
 // takes over. Widens span to what of the ray it covers.
-float fog_volume_optical_depth(FogVolumeData volume, uint noise, float3 camera, float3 direction, float view_per_ray, float reach,
-                               float from_distance, float to_distance, inout float2 span)
+float fog_volume_optical_depth(FogVolumeData volume, uint noise, float column_per_m, float3 camera, float3 direction, float view_per_ray,
+                               float reach, float from_distance, float to_distance, inout float2 span)
 {
     const float3 origin = float3(dot(volume.to_local[0], float4(camera, 1.0)), dot(volume.to_local[1], float4(camera, 1.0)),
                                  dot(volume.to_local[2], float4(camera, 1.0)));
@@ -230,22 +238,25 @@ float fog_volume_optical_depth(FogVolumeData volume, uint noise, float3 camera, 
         return 0.0;
     }
     span = float2(min(span.x, enter), max(span.y, leave));
-    const float spacing = (leave - enter) / float(kFogVolumeSamples);
+    // What a point stands for: its share of what's being asked about, not of the part in this volume, or the mip
+    // would sweep as a volume's edge crosses a slice; and at least as wide as the grid's columns there.
+    const float depth_footprint_m = (to_distance - from_distance) / float(kFogVolumeSamples);
     float sum = 0.0;
     for (uint i = 0; i < kFogVolumeSamples; ++i)
     {
         const float distance = lerp(enter, leave, (float(i) + 0.5) / float(kFogVolumeSamples));
         const float reach_fade = saturate((reach - distance * view_per_ray) / (reach * 0.1));
-        sum += fog_volume_noisy_share(volume, origin + along * distance, noise, spacing) * reach_fade;
+        const float footprint_m = max(depth_footprint_m, distance * column_per_m);
+        sum += fog_volume_noisy_share(volume, origin + along * distance, camera + direction * distance, noise, footprint_m) * reach_fade;
     }
     return volume.tint_density.w * sum * (leave - enter) / float(kFogVolumeSamples);
 }
 
 // All the volumes in a slice's mask, along a ray between two distances: (their tint by optical depth,
 // their optical depth), and the span of the ray they cover: empty (x > y) if none. Noise is a bindless index;
-// 0: their shapes without it.
-public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, uint noise, float3 camera, float3 direction, float view_per_ray,
-                                float reach, float from_distance, float to_distance, out float2 span)
+// 0: their shapes without it. column_per_m: how wide the grid's columns are, per meter along the ray.
+public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, uint noise, float column_per_m, float3 camera, float3 direction,
+                                float view_per_ray, float reach, float from_distance, float to_distance, out float2 span)
 {
     span = float2(1e30, -1e30);
     float4 total = float4(0.0);
@@ -254,7 +265,7 @@ public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, uint noise, 
         for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
         {
             const FogVolumeData volume = volumes[word * 32 + firstbitlow(bits)];
-            const float depth = fog_volume_optical_depth(volume, noise, camera, direction, view_per_ray, reach, from_distance, to_distance, span);
+            const float depth = fog_volume_optical_depth(volume, noise, column_per_m, camera, direction, view_per_ray, reach, from_distance, to_distance, span);
             total += float4(volume.tint_density.rgb * depth, depth);
         }
     }

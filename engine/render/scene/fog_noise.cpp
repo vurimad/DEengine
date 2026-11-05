@@ -3,6 +3,7 @@
 #include "core/allocator.h"
 #include "core/array.h"
 #include "core/assert.h"
+#include "core/hash.h"
 
 #include <algorithm>
 #include <cmath>
@@ -11,19 +12,14 @@ namespace de::render {
 
 namespace {
 
-// A well-mixed number for a lattice point (wrapped to the period by the caller, which is what tiles).
-uint32_t lattice_hash(int x, int y, int z, uint32_t seed) {
-    uint32_t h = static_cast<uint32_t>(x) * 0x8DA6B343U ^ static_cast<uint32_t>(y) * 0xD8163841U ^
-                 static_cast<uint32_t>(z) * 0xCB1AB31FU ^ seed;
-    h ^= h >> 15U;
-    h *= 0x2C1B3C6DU;
-    h ^= h >> 12U;
-    h *= 0x297A2D39U;
-    h ^= h >> 15U;
-    return h;
+// A well-mixed number for a lattice point (wrapped to the period by the caller, which is what tiles): 64 bits,
+// so what's made from it can each have bits of its own.
+uint64_t lattice_hash(int x, int y, int z, uint32_t seed) {
+    return core::mix64((uint64_t{static_cast<uint8_t>(x)} << 40U) | (uint64_t{static_cast<uint8_t>(y)} << 32U) |
+                       (uint64_t{static_cast<uint8_t>(z)} << 24U) | seed);
 }
 
-float unit(uint32_t bits) {
+float unit(uint64_t bits) {
     return static_cast<float>(bits & 0xFFFFU) / 65535.0f;
 }
 
@@ -44,7 +40,7 @@ float gradient_noise(float x, float y, float z, int period, uint32_t seed) {
     const float fy = y - static_cast<float>(y0);
     const float fz = z - static_cast<float>(z0);
     const auto corner = [&](int dx, int dy, int dz) {
-        const uint32_t h = lattice_hash(wrap(x0 + dx, period), wrap(y0 + dy, period), wrap(z0 + dz, period), seed);
+        const uint64_t h = lattice_hash(wrap(x0 + dx, period), wrap(y0 + dy, period), wrap(z0 + dz, period), seed);
         // A direction from the sphere, from two of the hash's numbers.
         const float up = unit(h) * 2.0f - 1.0f;
         const float around = unit(h >> 16U) * 6.2831853f;
@@ -55,9 +51,11 @@ float gradient_noise(float x, float y, float z, int period, uint32_t seed) {
     const float u = fade(fx);
     const float v = fade(fy);
     const float w = fade(fz);
-    const auto mix = [](float a, float b, float t) { return a + (b - a) * t; };
-    return mix(mix(mix(corner(0, 0, 0), corner(1, 0, 0), u), mix(corner(0, 1, 0), corner(1, 1, 0), u), v),
-               mix(mix(corner(0, 0, 1), corner(1, 0, 1), u), mix(corner(0, 1, 1), corner(1, 1, 1), u), v), w) *
+    return std::lerp(std::lerp(std::lerp(corner(0, 0, 0), corner(1, 0, 0), u),
+                               std::lerp(corner(0, 1, 0), corner(1, 1, 0), u), v),
+                     std::lerp(std::lerp(corner(0, 0, 1), corner(1, 0, 1), u),
+                               std::lerp(corner(0, 1, 1), corner(1, 1, 1), u), v),
+                     w) *
            1.5f;
 }
 
@@ -70,11 +68,11 @@ float billows(float x, float y, float z, int period, uint32_t seed) {
     for (int dz = -1; dz <= 1; ++dz) {
         for (int dy = -1; dy <= 1; ++dy) {
             for (int dx = -1; dx <= 1; ++dx) {
-                const uint32_t h =
+                const uint64_t h =
                     lattice_hash(wrap(x0 + dx, period), wrap(y0 + dy, period), wrap(z0 + dz, period), seed);
                 const float px = static_cast<float>(x0 + dx) + unit(h);
                 const float py = static_cast<float>(y0 + dy) + unit(h >> 16U);
-                const float pz = static_cast<float>(z0 + dz) + unit(h * 0x9E3779B1U);
+                const float pz = static_cast<float>(z0 + dz) + unit(h >> 32U);
                 const float ax = x - px;
                 const float ay = y - py;
                 const float az = z - pz;
@@ -120,7 +118,7 @@ void make_fog_noise(std::span<uint8_t> out) {
     }
     const float scale = 255.0f / std::max(highest - lowest, 1e-6f);
     for (size_t i = 0; i < top_bytes; ++i) {
-        out[i] = static_cast<uint8_t>((values[i] - lowest) * scale + 0.5f);
+        out[i] = static_cast<uint8_t>(std::lround((values[i] - lowest) * scale));
     }
     // Each mip: the mean of the 8 texels above each of its own. A cube halves evenly, so it still tiles.
     size_t above = 0;

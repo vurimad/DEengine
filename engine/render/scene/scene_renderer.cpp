@@ -115,7 +115,8 @@ struct GpuFogVolume {
     float half_extents[4] = {}; // w: edge, in meters
     float tint_density[4] = {}; // w: extinction per meter
     float shape[4] = {};        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
-    float noise[4] = {};        // xyz: how far its noise has moved, in tiles, wrapped to [0, 4); w: its tiles a meter
+    float noise[4] = {}; // xyz: how far the noise has moved past the render origin, in tiles, wrapped to [0, 4); w: its
+                         // tiles a meter
 };
 static_assert(sizeof(GpuFogVolume) == 112);
 
@@ -622,10 +623,10 @@ struct SceneRendererState {
             gpu.shape[0] = volume.ellipsoid ? 1.0f : 0.0f;
             gpu.shape[1] = volume.noise_amount;
             gpu.shape[2] = volume.height_fade_m;
-            gpu.noise[0] = volume.noise_offset[0];
-            gpu.noise[1] = volume.noise_offset[1];
-            gpu.noise[2] = volume.noise_offset[2];
-            gpu.noise[3] = volume.noise_per_m;
+            gpu.noise[0] = volume.noise_offset_tiles[0];
+            gpu.noise[1] = volume.noise_offset_tiles[1];
+            gpu.noise[2] = volume.noise_offset_tiles[2];
+            gpu.noise[3] = volume.noise_tiles_per_m;
             std::memcpy(mapped.data() + kFogVolumesOffset + k * sizeof(GpuFogVolume), &gpu, sizeof(gpu));
         }
         std::memcpy(mapped.data() + kFogSliceMasksOffset, slice_masks, sizeof(slice_masks));

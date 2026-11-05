@@ -1770,7 +1770,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const auto mist_ahead = [&](float depth, float half_depth) {
             de::world::RenderFogVolume volume = volume_at(0.0f, 0.0f, -depth, 15.0f, 0.2f, 1.0f);
             volume.half_extents[2] = half_depth;
-            volume.noise_per_m = 0.25f;
+            volume.noise_tiles_per_m = 0.25f;
             return volume;
         };
         const auto green_change = [](const de::core::Array<std::byte>& from, const de::core::Array<std::byte>& to) {
@@ -1791,7 +1791,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             return total;
         };
         frame.fog_volumes.push(mist_ahead(20.0f, 8.0f));
-        frame.fog_volumes[0].noise_per_m = 0.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.0f;
         const de::core::Array<std::byte> shape_only = render(clear_air);
         frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
         const de::core::Array<std::byte> amount_zero = render(clear_air);
@@ -1801,18 +1801,37 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const de::core::Array<std::byte> noisy = render(clear_air);
         CHECK(shape_in(noisy) > shape_in(shape_only) + 20);
         // Moved, the pattern moves; by whole tiles in all its sizes, it's the same.
-        frame.fog_volumes[0].noise_offset[0] = 0.5f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 0.5f;
         const de::core::Array<std::byte> drifted = render(clear_air);
         CHECK(green_change(noisy, drifted) > 6);
-        frame.fog_volumes[0].noise_offset[0] = 4.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f;
         const de::core::Array<std::byte> wrapped_offset = render(clear_air);
         CHECK(green_change(noisy, wrapped_offset) <= 1);
+        // The noise is the world's: moving a volume, or turning it, moves its shape and leaves the noise where it is.
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 0.0f;
+        const de::core::Array<std::byte> before_moving = render(clear_air);
+        const de::world::RenderFogVolume unmoved = frame.fog_volumes[0];
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].to_local[3] = -1.5f; // 1.5 m along x
+        frame.fog_volumes[0].center[0] = 1.5f;
+        const de::core::Array<std::byte> moved_volume = render(clear_air);
+        CHECK(green_change(moved_volume, before_moving) <= 3);
+        const float turned_axes[12] = {0, 0, 1, 20, 0, 1, 0, 0, -1, 0, 0, 0};
+        frame.fog_volumes[0] = unmoved;
+        std::memcpy(frame.fog_volumes[0].to_local, turned_axes, sizeof(turned_axes));
+        frame.fog_volumes[0].half_extents[0] = 8.0f;
+        frame.fog_volumes[0].half_extents[2] = 15.0f;
+        const de::core::Array<std::byte> turned_volume = render(clear_air);
+        CHECK(green_change(turned_volume, before_moving) <= 3);
         // With a tile large enough to show every size: 4 tiles is a whole number of tiles for each.
         frame.fog_volumes[0] = mist_ahead(14.0f, 3.0f);
         frame.fog_volumes[0].noise_amount = 1.0f;
-        frame.fog_volumes[0].noise_per_m = 0.05f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.05f;
         const de::core::Array<std::byte> large_tile = render(clear_air);
-        frame.fog_volumes[0].noise_offset[0] = 4.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f;
         const de::core::Array<std::byte> large_tile_wrapped = render(clear_air);
         CHECK(green_change(large_tile, large_tile_wrapped) <= 1);
         // A height fade thins it toward its top, not its bottom.
@@ -1826,21 +1845,30 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(std::abs(at_pixel(faded, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) <
               std::abs(at_pixel(not_fading, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) - 8);
         CHECK(std::abs(at_pixel(faded, heart, toward_bottom, 1) - at_pixel(not_fading, heart, toward_bottom, 1)) <= 3);
-        // Slid through thick far slices with noise finer than they can hold, it reads a coarse enough mip not to
-        // crawl: frame to frame, little changes.
+        // Slices sliding through still noise finer than they can hold: moving the camera, little changes from step
+        // to step, as each size reads a coarse enough mip. A thin volume too: its short span in a slice doesn't make
+        // finer points of it. And sideways, past columns wider than the slices are deep at this size of image.
         wall_at(58.0f);
-        int noise_step = 0;
-        const auto slid_mist = [&](int step) {
+        const auto noise_crawl = [&](float half_depth, float density, int axis) {
             frame.fog_volumes.clear();
-            frame.fog_volumes.push(mist_ahead(44.0f + static_cast<float>(step) * 0.3f, 6.0f));
+            frame.fog_volumes.push(mist_ahead(44.0f, half_depth));
+            frame.fog_volumes[0].density_per_m = density;
             frame.fog_volumes[0].noise_amount = 1.0f;
-            frame.fog_volumes[0].noise_per_m = 1.0f;
-            return render(clear_air);
+            frame.fog_volumes[0].noise_tiles_per_m = 1.0f;
+            const auto camera_at = [&](int step) {
+                frame.camera.transform[axis] = static_cast<float>(step) * 0.3f;
+                return render(clear_air);
+            };
+            int most = 0;
+            for (int i = 0; i < 12; i += 2) {
+                most = std::max(most, green_change(camera_at(i), camera_at(i + 1)));
+            }
+            frame.camera.transform[axis] = 0.0f;
+            return most;
         };
-        for (int i = 0; i < 12; i += 2) {
-            noise_step = std::max(noise_step, green_change(slid_mist(i), slid_mist(i + 1)));
-        }
-        CHECK(noise_step <= 16); // 23 without the coarser mip
+        CHECK(noise_crawl(6.0f, 0.2f, 11) <= 14); // 31 at the finest mip
+        CHECK(noise_crawl(0.6f, 2.0f, 11) <= 16);
+        CHECK(noise_crawl(6.0f, 0.2f, 3) <= 15); // 40 at the finest mip, 17 by depth alone
         frame.instances.clear();
         frame.fog_volumes.clear();
         restart();

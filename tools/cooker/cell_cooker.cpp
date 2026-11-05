@@ -222,7 +222,7 @@ private:
             }
         }
         const double noise_size = reader.number("noise_size_m", static_cast<double>(volume.noise_size_m));
-        if (!to_float(noise_size, volume.noise_size_m) || noise_size <= 0.0) {
+        if (!to_float(noise_size, volume.noise_size_m) || volume.noise_size_m <= 0.0f) {
             diagnostics_.error(path_, "%s: fog_volume noise_size_m should be above 0", label.c_str());
         }
         const double noise_amount = reader.number("noise_amount", 0.0);

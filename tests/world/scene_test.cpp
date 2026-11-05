@@ -198,29 +198,35 @@ TEST_CASE("render extraction: fog volumes, relative to the render origin, and th
     world->advance(1.0 / 60.0);
     CHECK(frame.fog_volumes.empty());
 
-    // Its noise: tiles a meter, and how far it's drifted by the world's time, along the world's axes as the
-    // volume's own axes see them. Yawed, the world's x is its z.
+    // Its noise: tiles a meter, and how far it's drifted by the world's time, along the world's axes whatever way
+    // the volume is turned.
     const flecs::entity windy = ecs.entity().set(de::world::FogVolume{
         .noise_size_m = 10.0f, .noise_amount = 0.5f, .drift_mps = {5.0f, 0.0f, 0.0f}, .height_fade_m = 2.0f});
     de::world::place(windy, Transform{.position = {0.0, 0.0, 0.0}, .rotation = yaw, .scale = {4.0f, 2.0f, 1.0f}});
     world->advance(1.0 / 60.0);
     REQUIRE(frame.fog_volumes.size() == 1);
-    CHECK(near(frame.fog_volumes[0].noise_per_m, 0.1, 1e-6));
+    CHECK(near(frame.fog_volumes[0].noise_tiles_per_m, 0.1, 1e-6));
     CHECK(frame.fog_volumes[0].noise_amount == 0.5f);
     CHECK(frame.fog_volumes[0].height_fade_m == 2.0f);
-    const float offset_before = frame.fog_volumes[0].noise_offset[2];
+    const float offset_before = frame.fog_volumes[0].noise_offset_tiles[0];
     for (int i = 0; i < 30; ++i) {
         world->advance(1.0 / 60.0);
     }
-    const float moved = frame.fog_volumes[0].noise_offset[2] - offset_before;
+    const float moved = frame.fog_volumes[0].noise_offset_tiles[0] - offset_before;
     CHECK(near(moved < -1.0f ? moved + 4.0f : moved, 0.25, 1e-3)); // half a second at half a tile per second
-    CHECK(near(frame.fog_volumes[0].noise_offset[0], 0.0, 1e-3));
+    CHECK(near(frame.fog_volumes[0].noise_offset_tiles[2], 0.0, 1e-3));
+    // Turning it changes nothing about its noise, however long the world has run.
+    const float offset_unturned = frame.fog_volumes[0].noise_offset_tiles[0];
+    de::world::place(windy,
+                     Transform{.position = {0.0, 0.0, 0.0}, .rotation = yaw_deg(10.0f), .scale = {4.0f, 2.0f, 1.0f}});
+    world->advance(0.0);
+    CHECK(near(frame.fog_volumes[0].noise_offset_tiles[0], offset_unturned, 1e-3));
     // It wraps at 4 tiles, however long the world runs, without a jump in between.
-    float last_offset = frame.fog_volumes[0].noise_offset[2];
+    float last_offset = frame.fog_volumes[0].noise_offset_tiles[0];
     bool wrapped = false;
     for (int i = 0; i < 600; ++i) {
         world->advance(1.0 / 60.0);
-        const float offset = frame.fog_volumes[0].noise_offset[2];
+        const float offset = frame.fog_volumes[0].noise_offset_tiles[0];
         CHECK(offset >= 0.0f);
         CHECK(offset < 4.0f);
         wrapped = wrapped || offset < last_offset - 3.0f;
@@ -229,6 +235,21 @@ TEST_CASE("render extraction: fog volumes, relative to the render origin, and th
     }
     CHECK(wrapped);
     windy.destruct();
+
+    // As the render origin moves, the noise stays put in the world: at a whole origin step, its offset takes up
+    // what positions relative to the origin lost (2048 m at 0.1 tiles a meter: 204.8 tiles).
+    const flecs::entity still = ecs.entity().set(de::world::FogVolume{.noise_size_m = 10.0f, .noise_amount = 0.5f});
+    de::world::place(still, Transform{.position = {2048.0, 0.0, 0.0}});
+    const flecs::entity eye = ecs.entity().set(de::world::Camera{});
+    de::world::place(eye, Transform{.position = {2048.0, 0.0, 0.0}});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.fog_volumes.size() == 1);
+    REQUIRE(frame.origin.x == 2048.0);
+    CHECK(near(frame.fog_volumes[0].noise_offset_tiles[0], 4.0 - 0.8, 1e-3)); // -204.8, wrapped to [0, 4)
+    CHECK(near(frame.fog_volumes[0].noise_offset_tiles[1], 0.0, 1e-3));
+    still.destruct();
+    eye.destruct();
 }
 
 TEST_CASE("a cell owns its entities and its assets: deleting it unloads both, in any number of cells") {

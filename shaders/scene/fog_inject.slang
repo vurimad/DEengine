@@ -109,7 +109,8 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     float2 volume_span = float2(near_distance, far_distance);
     if (push.fog_volume_count > 0)
     {
-        const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], push.noise, camera, ray.direction, ray.view_per_ray,
+        const float column_per_m = length(froxel_ray(frame, float2(froxel.xy) + float2(1.5, 0.5), grid).direction - ray.direction);
+        const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], push.noise, column_per_m, camera, ray.direction, ray.view_per_ray,
                                                frame.fog.range.y, near_distance, far_distance, volume_span);
         const float scale = min(1.0 / (far_distance - near_distance), kMostVolumeDensity / max(along.a, 1e-6));
         volume_density = along.a * scale;

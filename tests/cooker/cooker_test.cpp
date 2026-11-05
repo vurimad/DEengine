@@ -1224,6 +1224,7 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "mist_e", "fog_volume": {"density_per_m": 5}},
     {"name": "mist_f", "fog_volume": {"density_per_m": 0.2, "edge_m": "wide"}},
     {"name": "mist_g", "fog_volume": {"density_per_m": 0.2, "noise_amount": 2, "noise_size_m": 0, "drift_mps": [1, 2], "height_fade_m": -1}},
+    {"name": "mist_h", "fog_volume": {"density_per_m": 0.2, "noise_size_m": 1e-60}},
   ],
 })");
     write_src(sandbox, "content/world/cell_5_5.cell", R"({
@@ -1260,6 +1261,7 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "mist_e: fog_volume needs a density_per_m above 0, up to 4"));
     CHECK(has_message(report, broken, "'edge_m' should be a number"));
     CHECK(has_message(report, broken, "mist_g: fog_volume noise_size_m should be above 0"));
+    CHECK(has_message(report, broken, "mist_h: fog_volume noise_size_m should be above 0"));
     CHECK(has_message(report, broken, "mist_g: fog_volume noise_amount should be from 0 to 1"));
     CHECK(has_message(report, broken, "mist_g: fog_volume drift_mps should be 3 numbers"));
     CHECK(has_message(report, broken, "mist_g: fog_volume height_fade_m should be 0 or more"));

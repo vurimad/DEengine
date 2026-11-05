@@ -78,9 +78,9 @@ struct RenderFogVolume {
     float edge_m = 1.0f;
     float tint[3] = {1.0f, 1.0f, 1.0f};
     bool ellipsoid = false;
-    float noise_per_m = 0.0f; // the noise's tile a meter
+    float noise_tiles_per_m = 0.0f;
     float noise_amount = 0.0f;
-    float noise_offset[3] = {}; // how far its noise has moved, in its own axes, in tiles, wrapped to [0, 4)
+    float noise_offset_tiles[3] = {}; // past the render origin, in the world's axes, wrapped to [0, 4)
     float height_fade_m = 0.0f;
 };
 
