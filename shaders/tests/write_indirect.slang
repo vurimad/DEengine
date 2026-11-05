@@ -1,6 +1,6 @@
 // Test shader: writes what an indirect draw or dispatch reads. mode 0: a count, then draws of a column each
-// (tests.indirect_columns), one per instance index. mode 1: a dispatch of count groups, each writing its
-// group's index + 1 to the output.
+// (tests.indirect_columns), one per instance index. mode 1: a dispatch of count groups. groups_main writes each
+// group's place, in digits, to its own word.
 
 struct WriteIndirectPush
 {
@@ -38,5 +38,5 @@ void compute_main()
 [numthreads(1, 1, 1)]
 void groups_main(uint3 group: SV_DispatchThreadID)
 {
-    push.output[group.x] = group.x + 1;
+    push.output[group.x + group.y * 4 + group.z * 16] = group.x + group.y * 10 + group.z * 100 + 1;
 }

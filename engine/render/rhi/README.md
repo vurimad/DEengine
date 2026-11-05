@@ -68,6 +68,8 @@ device.end_frame();                                      // one submit for all l
 
 A count buffer needs `Indirect` usage and `IndirectArgument` state too.
 
+Nothing checks what a shader writes into arguments. An indirect dispatch has to stay within `Capabilities::max_dispatch_groups`, and past it what happens is undefined.
+
 ## Not yet
 
 - Async compute submission (render graph v3), multi-threaded command recording, sampled views and render targets of single mips or layers (attachments use mip 0 and layer 0 of single-mip, single-layer textures for now), stencil copies.

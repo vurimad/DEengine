@@ -468,6 +468,7 @@ void CommandList::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t 
 void CommandList::bind_index_buffer(BufferHandle buffer, uint64_t offset, IndexType type) {
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
+    impl_->index_buffer_bound = true;
     vkCmdBindIndexBuffer(impl_->cmd, impl_->device->buffer(buffer).buffer, offset,
                          type == IndexType::Uint16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
 }
@@ -477,6 +478,7 @@ void CommandList::draw_indexed(uint32_t index_count, uint32_t instance_count, ui
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
+    DE_ASSERT_MSG(impl_->index_buffer_bound, "indexed draws need bind_index_buffer");
     vkCmdDrawIndexed(impl_->cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
@@ -516,68 +518,75 @@ uint32_t indirect_stride(uint32_t stride, uint32_t packed) {
     return stride != 0 ? stride : packed;
 }
 
-// Whether a buffer can hold these arguments: its usage, and all of them inside it.
-[[maybe_unused]] bool indirect_fits(const Buffer& buffer, uint64_t offset, uint32_t count, uint32_t stride,
-                                    uint64_t one) {
-    return core::has_any(buffer.desc.usage, BufferUsage::Indirect) && offset % 4 == 0 &&
-           (count == 0 || (offset + (uint64_t{count} - 1) * stride + one <= buffer.desc.size));
+[[maybe_unused]] uint64_t indirect_end(uint64_t offset, uint32_t count, uint32_t stride, uint64_t one) {
+    return count == 0 ? offset : offset + (uint64_t{count} - 1) * stride + one;
+}
+
+// What every indirect call needs of its arguments. The stride to pass on.
+uint32_t check_indirect_draws(const CommandListImpl& impl, BufferHandle args, uint64_t offset, uint32_t count,
+                              uint32_t stride, uint32_t one) {
+    DE_ASSERT_MSG(impl.queue != QueueType::Transfer, "transfer lists only copy");
+    DE_ASSERT_MSG(impl.in_rendering && impl.graphics_bound, "draws need begin_rendering and a graphics pipeline");
+    const uint32_t used_stride = indirect_stride(stride, one);
+    [[maybe_unused]] const Buffer& buffer = impl.device->buffer(args);
+    DE_ASSERT_MSG(core::has_any(buffer.desc.usage, BufferUsage::Indirect), "indirect arguments need Indirect usage");
+    DE_ASSERT_MSG(offset % 4 == 0, "indirect arguments are 4-byte aligned");
+    DE_ASSERT_MSG(indirect_end(offset, count, used_stride, one) <= buffer.desc.size,
+                  "indirect arguments have to fit in the buffer");
+    DE_ASSERT_MSG(count <= impl.device->capabilities.max_draw_indirect_count, "too many draws for one call");
+    return used_stride;
+}
+
+// And the counted forms: the count in its own place, not read as part of a draw.
+void check_indirect_count(const CommandListImpl& impl, BufferHandle args, uint64_t offset, BufferHandle count_buffer,
+                          uint64_t count_offset, uint32_t max_draws, uint32_t stride, uint32_t one) {
+    [[maybe_unused]] const Buffer& counts = impl.device->buffer(count_buffer);
+    DE_ASSERT_MSG(core::has_any(counts.desc.usage, BufferUsage::Indirect), "an indirect count needs Indirect usage");
+    DE_ASSERT_MSG(count_offset % 4 == 0 && count_offset + 4 <= counts.desc.size,
+                  "an indirect count is 4-byte aligned, in the buffer");
+    DE_ASSERT_MSG(!(args == count_buffer) || count_offset + 4 <= offset ||
+                      count_offset >= indirect_end(offset, max_draws, stride, one),
+                  "an indirect count can't lie among the draws");
 }
 
 } // namespace
 
 void CommandList::draw_indirect(BufferHandle args, uint64_t offset, uint32_t draw_count, uint32_t stride) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
-    const uint32_t used_stride = indirect_stride(stride, sizeof(DrawIndirectArgs));
-    const Buffer& buffer = impl_->device->buffer(args);
-    DE_ASSERT_MSG(indirect_fits(buffer, offset, draw_count, used_stride, sizeof(DrawIndirectArgs)),
-                  "indirect arguments need Indirect usage, 4-byte alignment and to fit in the buffer");
-    DE_ASSERT_MSG(draw_count <= impl_->device->capabilities.max_draw_indirect_count, "too many draws for one call");
-    vkCmdDrawIndirect(impl_->cmd, buffer.buffer, offset, draw_count, used_stride);
+    const uint32_t used_stride =
+        check_indirect_draws(*impl_, args, offset, draw_count, stride, sizeof(DrawIndirectArgs));
+    vkCmdDrawIndirect(impl_->cmd, impl_->device->buffer(args).buffer, offset, draw_count, used_stride);
 }
 
 void CommandList::draw_indexed_indirect(BufferHandle args, uint64_t offset, uint32_t draw_count, uint32_t stride) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
-    const uint32_t used_stride = indirect_stride(stride, sizeof(DrawIndexedIndirectArgs));
-    const Buffer& buffer = impl_->device->buffer(args);
-    DE_ASSERT_MSG(indirect_fits(buffer, offset, draw_count, used_stride, sizeof(DrawIndexedIndirectArgs)),
-                  "indirect arguments need Indirect usage, 4-byte alignment and to fit in the buffer");
-    DE_ASSERT_MSG(draw_count <= impl_->device->capabilities.max_draw_indirect_count, "too many draws for one call");
-    vkCmdDrawIndexedIndirect(impl_->cmd, buffer.buffer, offset, draw_count, used_stride);
+    DE_ASSERT_MSG(impl_->index_buffer_bound, "indexed draws need bind_index_buffer");
+    const uint32_t used_stride =
+        check_indirect_draws(*impl_, args, offset, draw_count, stride, sizeof(DrawIndexedIndirectArgs));
+    vkCmdDrawIndexedIndirect(impl_->cmd, impl_->device->buffer(args).buffer, offset, draw_count, used_stride);
 }
 
 void CommandList::draw_indirect_count(BufferHandle args, uint64_t offset, BufferHandle count_buffer,
                                       uint64_t count_offset, uint32_t max_draws, uint32_t stride) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
-    const uint32_t used_stride = indirect_stride(stride, sizeof(DrawIndirectArgs));
-    const Buffer& buffer = impl_->device->buffer(args);
-    const Buffer& counts = impl_->device->buffer(count_buffer);
-    DE_ASSERT_MSG(indirect_fits(buffer, offset, max_draws, used_stride, sizeof(DrawIndirectArgs)) &&
-                      indirect_fits(counts, count_offset, 1, 4, 4),
-                  "indirect arguments need Indirect usage, 4-byte alignment and to fit in the buffer");
-    DE_ASSERT_MSG(max_draws <= impl_->device->capabilities.max_draw_indirect_count, "too many draws for one call");
-    vkCmdDrawIndirectCount(impl_->cmd, buffer.buffer, offset, counts.buffer, count_offset, max_draws, used_stride);
+    const uint32_t used_stride =
+        check_indirect_draws(*impl_, args, offset, max_draws, stride, sizeof(DrawIndirectArgs));
+    check_indirect_count(*impl_, args, offset, count_buffer, count_offset, max_draws, used_stride,
+                         sizeof(DrawIndirectArgs));
+    vkCmdDrawIndirectCount(impl_->cmd, impl_->device->buffer(args).buffer, offset,
+                           impl_->device->buffer(count_buffer).buffer, count_offset, max_draws, used_stride);
 }
 
 void CommandList::draw_indexed_indirect_count(BufferHandle args, uint64_t offset, BufferHandle count_buffer,
                                               uint64_t count_offset, uint32_t max_draws, uint32_t stride) {
     DE_ASSERT(impl_ != nullptr);
-    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
-    DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
-    const uint32_t used_stride = indirect_stride(stride, sizeof(DrawIndexedIndirectArgs));
-    const Buffer& buffer = impl_->device->buffer(args);
-    const Buffer& counts = impl_->device->buffer(count_buffer);
-    DE_ASSERT_MSG(indirect_fits(buffer, offset, max_draws, used_stride, sizeof(DrawIndexedIndirectArgs)) &&
-                      indirect_fits(counts, count_offset, 1, 4, 4),
-                  "indirect arguments need Indirect usage, 4-byte alignment and to fit in the buffer");
-    DE_ASSERT_MSG(max_draws <= impl_->device->capabilities.max_draw_indirect_count, "too many draws for one call");
-    vkCmdDrawIndexedIndirectCount(impl_->cmd, buffer.buffer, offset, counts.buffer, count_offset, max_draws,
-                                  used_stride);
+    DE_ASSERT_MSG(impl_->index_buffer_bound, "indexed draws need bind_index_buffer");
+    const uint32_t used_stride =
+        check_indirect_draws(*impl_, args, offset, max_draws, stride, sizeof(DrawIndexedIndirectArgs));
+    check_indirect_count(*impl_, args, offset, count_buffer, count_offset, max_draws, used_stride,
+                         sizeof(DrawIndexedIndirectArgs));
+    vkCmdDrawIndexedIndirectCount(impl_->cmd, impl_->device->buffer(args).buffer, offset,
+                                  impl_->device->buffer(count_buffer).buffer, count_offset, max_draws, used_stride);
 }
 
 void CommandList::dispatch_indirect(BufferHandle args, uint64_t offset) {
@@ -586,8 +595,10 @@ void CommandList::dispatch_indirect(BufferHandle args, uint64_t offset) {
     DE_ASSERT_MSG(!impl_->in_rendering && impl_->compute_bound,
                   "dispatches need a compute pipeline, outside begin_rendering");
     const Buffer& buffer = impl_->device->buffer(args);
-    DE_ASSERT_MSG(indirect_fits(buffer, offset, 1, sizeof(DispatchIndirectArgs), sizeof(DispatchIndirectArgs)),
-                  "indirect arguments need Indirect usage, 4-byte alignment and to fit in the buffer");
+    DE_ASSERT_MSG(core::has_any(buffer.desc.usage, BufferUsage::Indirect), "indirect arguments need Indirect usage");
+    DE_ASSERT_MSG(offset % 4 == 0, "indirect arguments are 4-byte aligned");
+    DE_ASSERT_MSG(offset + sizeof(DispatchIndirectArgs) <= buffer.desc.size,
+                  "indirect arguments have to fit in the buffer");
     vkCmdDispatchIndirect(impl_->cmd, buffer.buffer, offset);
 }
 

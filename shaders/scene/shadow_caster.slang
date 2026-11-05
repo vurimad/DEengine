@@ -26,7 +26,7 @@ struct VertexOutput
 };
 
 [shader("vertex")]
-VertexOutput vertex_main(uint vertex_id: SV_VertexID)
+VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const float4 local = float4(vertex.position, 1.0);

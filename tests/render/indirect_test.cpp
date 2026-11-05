@@ -102,6 +102,18 @@ struct Bench {
 
 } // namespace
 
+TEST_CASE("indirect limits are the GPU's, within what the spec promises") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const Capabilities& caps = device->capabilities();
+    CHECK(caps.max_draw_indirect_count >= 65535); // with multiDrawIndirect, which the device requires
+    for (const uint32_t groups : caps.max_dispatch_groups) {
+        CHECK(groups >= 65535);
+    }
+}
+
 TEST_CASE("indirect draws read their arguments, and the shaders see what they say") {
     auto device = make_device();
     if (!device) {
@@ -139,7 +151,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         return graph->import_buffer({.buffer = args, .name = "args", .state = ResourceState::Undefined});
     };
 
-    SUBCASE("a draw's own numbers, and several in one call") {
+    { // a draw's own numbers, and several in one call
         write_args(std::array{
             DrawIndirectArgs{.vertex_count = 6, .instance_count = 2, .first_instance = 1},
             DrawIndirectArgs{.vertex_count = 6, .instance_count = 1, .first_vertex = 12, .first_instance = 5}});
@@ -157,7 +169,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[5].draw == 2); // SV_DrawIndex tells them apart
     }
 
-    SUBCASE("the shader-visible IDs leave out the draw's own first vertex and first instance") {
+    { // the shader-visible IDs leave out the draw's own first vertex and first instance
         // What a shared buffer has to work around: these two don't say where in it a draw is.
         write_args(std::array{
             DrawIndirectArgs{.vertex_count = 6, .instance_count = 1, .first_vertex = 12, .first_instance = 3}});
@@ -172,7 +184,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[3].vulkan_vertex_sixths == 3); // SV_VulkanVertexID: 12 to 17, what a shared buffer needs
     }
 
-    SUBCASE("indexed, from a shared index buffer: first index and vertex offset") {
+    { // indexed, from a shared index buffer: first index and vertex offset
         const std::array<uint32_t, 8> shared = {99, 99, 0, 1, 2, 3, 4, 5};
         std::memcpy(device->mapped(indices).data(), shared.data(), sizeof(shared));
         device->flush_mapped(indices);
@@ -197,7 +209,82 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[0].instance == 0);
     }
 
-    SUBCASE("a count from a buffer, indexed: up to the most asked for") {
+    { // several indexed draws in one call, packed, and a vertex offset below zero
+        const std::array<uint32_t, 6> shared = {6, 7, 8, 9, 10, 11};
+        std::memcpy(device->mapped(indices).data(), shared.data(), sizeof(shared));
+        device->flush_mapped(indices);
+        write_args(std::array{DrawIndexedIndirectArgs{.index_count = 6, .vertex_offset = -6, .first_instance = 1},
+                              DrawIndexedIndirectArgs{.index_count = 6, .first_instance = 6}});
+        begin();
+        const GraphBuffer used = import_args();
+        const GraphBuffer index_buffer = graph->import_buffer({.buffer = indices, .name = "indices"});
+        bench.frame(
+            [&](PassBuilder& pass) {
+                pass.use(used, ResourceState::IndirectArgument);
+                pass.use(index_buffer, ResourceState::IndexBuffer);
+            },
+            [&](PassContext& context, CommandList& list) {
+                list.bind_index_buffer(context.buffer(index_buffer), 0, IndexType::Uint32);
+                list.draw_indexed_indirect(context.buffer(used), 0, 2);
+            });
+        const auto seen = bench.read();
+        CHECK(seen[1].instance == 2);
+        CHECK(seen[1].vulkan_vertex_sixths == 1); // 6 to 11, less 6
+        CHECK(seen[6].instance == 7);
+        CHECK(seen[6].draw == 2);
+        CHECK(seen[6].vulkan_vertex_sixths == 2); // 6 to 11
+    }
+
+    { // the counted forms, with a stride
+        std::array<uint32_t, 32> spaced{};
+        spaced[0] = 2;     // the count
+        spaced[4 + 0] = 6; // a draw, 32 bytes on from the last
+        spaced[4 + 1] = 1;
+        spaced[4 + 3] = 2;
+        spaced[12 + 0] = 6;
+        spaced[12 + 1] = 1;
+        spaced[12 + 3] = 5;
+        write_args(spaced);
+        begin();
+        const GraphBuffer used = import_args();
+        bench.frame([&](PassBuilder& pass) { pass.use(used, ResourceState::IndirectArgument); },
+                    [&](PassContext& context, CommandList& list) {
+                        list.draw_indirect_count(context.buffer(used), 16, context.buffer(used), 0, 2, 32);
+                    });
+        const auto seen = bench.read();
+        CHECK(seen[2].instance == 3);
+        CHECK(seen[5].instance == 6);
+        const std::array<uint32_t, 6> shared = {0, 1, 2, 3, 4, 5};
+        std::memcpy(device->mapped(indices).data(), shared.data(), sizeof(shared));
+        device->flush_mapped(indices);
+        std::array<uint32_t, 32> spaced_indexed{};
+        spaced_indexed[0] = 2;
+        spaced_indexed[4 + 0] = 6;
+        spaced_indexed[4 + 1] = 1;
+        spaced_indexed[4 + 4] = 3;
+        spaced_indexed[12 + 0] = 6;
+        spaced_indexed[12 + 1] = 1;
+        spaced_indexed[12 + 4] = 4;
+        write_args(spaced_indexed);
+        begin();
+        const GraphBuffer used_indexed = import_args();
+        const GraphBuffer index_buffer = graph->import_buffer({.buffer = indices, .name = "indices"});
+        bench.frame(
+            [&](PassBuilder& pass) {
+                pass.use(used_indexed, ResourceState::IndirectArgument);
+                pass.use(index_buffer, ResourceState::IndexBuffer);
+            },
+            [&](PassContext& context, CommandList& list) {
+                list.bind_index_buffer(context.buffer(index_buffer), 0, IndexType::Uint32);
+                list.draw_indexed_indirect_count(context.buffer(used_indexed), 16, context.buffer(used_indexed), 0, 2,
+                                                 32);
+            });
+        const auto seen_indexed = bench.read();
+        CHECK(seen_indexed[3].instance == 4);
+        CHECK(seen_indexed[4].instance == 5);
+    }
+
+    { // a count from a buffer, indexed: up to the most asked for
         const std::array<uint32_t, 6> shared = {0, 1, 2, 3, 4, 5};
         std::memcpy(device->mapped(indices).data(), shared.data(), sizeof(shared));
         device->flush_mapped(indices);
@@ -225,7 +312,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[3].instance == 0); // the count says 4; only 3 were allowed
     }
 
-    SUBCASE("a count in a buffer of its own") {
+    { // a count in a buffer of its own
         const BufferHandle counts = *device->create_buffer(
             {.size = 16, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "counts"});
         const uint32_t count = 2;
@@ -252,7 +339,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         device->destroy(counts);
     }
 
-    SUBCASE("SV_DrawIndex counts from 0 in each call, wherever its offset starts") {
+    { // SV_DrawIndex counts from 0 in each call, wherever its offset starts
         write_args(std::array{DrawIndirectArgs{.vertex_count = 6, .first_instance = 1},
                               DrawIndirectArgs{.vertex_count = 6, .first_instance = 2},
                               DrawIndirectArgs{.vertex_count = 6, .first_instance = 3}});
@@ -268,8 +355,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[3].draw == 2);
     }
 
-    SUBCASE("left out, an instance count is 1, as it is for a plain draw") {
-        CHECK(device->capabilities().max_draw_indirect_count >= 1);
+    { // left out, an instance count is 1, as it is for a plain draw
         write_args(std::array{DrawIndirectArgs{.vertex_count = 6}});
         begin();
         const GraphBuffer used = import_args();
@@ -278,7 +364,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(bench.read()[0].instance == 1);
     }
 
-    SUBCASE("arguments apart by a stride") {
+    { // arguments apart by a stride
         std::array<uint32_t, 16> spaced{};
         spaced[0] = 6;
         spaced[1] = 1;
@@ -297,7 +383,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[6].instance == 7);
     }
 
-    SUBCASE("written by compute in the same frame, with a count: the whole path") {
+    { // written by compute in the same frame, with a count: the whole path
         const auto write = kit.compute("tests.write_indirect");
         const PipelineHandle writer = kit.pipeline(write);
         struct Written {
@@ -440,12 +526,14 @@ TEST_CASE("an indirect dispatch reads each field of its arguments") {
     const PipelineHandle groups = kit.pipeline(*groups_program);
     const BufferHandle args = *device->create_buffer(
         {.size = 64, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "args"});
-    const BufferHandle values = *device->create_buffer({.size = 64,
+    const BufferHandle values = *device->create_buffer({.size = 128,
                                                         .usage = BufferUsage::Storage | BufferUsage::CopyDst,
                                                         .memory = MemoryLocation::Readback,
                                                         .debug_name = "values"});
     // At an offset, with the other two left out: they're 1, as they are for a plain dispatch.
     const DispatchIndirectArgs arguments{.groups_x = 2};
+    const DispatchIndirectArgs all_three{.groups_x = 2, .groups_y = 3, .groups_z = 2};
+    std::memcpy(device->mapped(args).data() + 32, &all_three, sizeof(all_three));
     std::memcpy(device->mapped(args).data() + 12, &arguments, sizeof(arguments));
     device->flush_mapped(args);
     device->begin_frame();
@@ -455,7 +543,7 @@ TEST_CASE("an indirect dispatch reads each field of its arguments") {
         graph->import_buffer({.buffer = values, .name = "values", .final_state = ResourceState::HostRead});
     graph->add_pass(
         "clear values", [&](PassBuilder& pass) { pass.use(out, ResourceState::CopyDst); },
-        [out](PassContext& context) { context.list.fill_buffer(context.buffer(out), 0, 64, 0); });
+        [out](PassContext& context) { context.list.fill_buffer(context.buffer(out), 0, 128, 0); });
     graph->add_pass(
         "run groups",
         [&](PassBuilder& pass) {
@@ -475,6 +563,45 @@ TEST_CASE("an indirect dispatch reads each field of its arguments") {
     CHECK(read_u32(*device, values, 0) == 1);
     CHECK(read_u32(*device, values, 1) == 2);
     CHECK(read_u32(*device, values, 2) == 0);
+    CHECK(read_u32(*device, values, 4) == 0); // one group high, one deep
+
+    // Each axis its own: 2 x 3 x 2 groups, each in its own word.
+    device->begin_frame();
+    graph->begin(1, 1);
+    const GraphBuffer used_all = graph->import_buffer({.buffer = args, .name = "args"});
+    const GraphBuffer out_all =
+        graph->import_buffer({.buffer = values, .name = "values", .final_state = ResourceState::HostRead});
+    graph->add_pass(
+        "clear values", [&](PassBuilder& pass) { pass.use(out_all, ResourceState::CopyDst); },
+        [out_all](PassContext& context) { context.list.fill_buffer(context.buffer(out_all), 0, 128, 0); });
+    graph->add_pass(
+        "run groups",
+        [&](PassBuilder& pass) {
+            pass.use(used_all, ResourceState::IndirectArgument);
+            pass.use(out_all, ResourceState::ShaderWrite, ShaderStages::Compute);
+        },
+        [groups, used_all, out_all](PassContext& context) {
+            context.list.bind_pipeline(groups);
+            context.list.push_constants(
+                WriteIndirectPush{.output = context.device.buffer_address(context.buffer(out_all))});
+            context.list.dispatch_indirect(context.buffer(used_all), 32);
+        });
+    graph->execute();
+    device->end_frame();
+    device->wait_idle();
+    device->invalidate_mapped(values);
+    for (uint32_t z = 0; z < 2; ++z) {
+        for (uint32_t y = 0; y < 3; ++y) {
+            for (uint32_t x = 0; x < 2; ++x) {
+                CAPTURE(x);
+                CAPTURE(y);
+                CAPTURE(z);
+                CHECK(read_u32(*device, values, x + y * 4 + z * 16) == x + y * 10 + z * 100 + 1);
+            }
+        }
+    }
+    CHECK(read_u32(*device, values, 2) == 0);  // two groups wide
+    CHECK(read_u32(*device, values, 12) == 0); // three high: 3 * 4 is a fourth row
     device->destroy(args);
     device->destroy(values);
     check_clean(*device);

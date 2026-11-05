@@ -617,6 +617,9 @@ struct Capabilities {
     uint32_t max_compute_group_size[3] = {};
     uint32_t max_compute_group_invocations = 0;
     uint32_t max_draw_indirect_count = 0; // draws in one indirect call; the spec promises only 65535
+    // Groups in one dispatch, along each axis. An indirect dispatch's arguments have to stay within it: nothing
+    // checks what a shader wrote, and past it what happens is undefined. The spec promises 65535.
+    uint32_t max_dispatch_groups[3] = {};
     uint32_t subgroup_size = 0;
     uint64_t uniform_buffer_alignment = 0; // offsets into uniform buffers are multiples of this
     uint64_t storage_buffer_alignment = 0;
