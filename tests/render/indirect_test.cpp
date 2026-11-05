@@ -14,7 +14,6 @@
 using namespace de::rhi;
 using de::render::GraphBuffer;
 using de::render::GraphTexture;
-using de::render::ImportedBuffer;
 using de::render::PassBuilder;
 using de::render::PassContext;
 using de::render::RenderGraph;
@@ -82,13 +81,12 @@ struct Bench {
             [&](PassBuilder& pass) {
                 setup(pass);
                 pass.never_cull();
-                color_ =
+                color =
                     graph.import_texture({.texture = target, .name = "target", .final_state = ResourceState::CopySrc});
-                pass.use(color_, ResourceState::RenderTarget);
+                pass.use(color, ResourceState::RenderTarget);
             },
             [this, &draw](PassContext& context) {
-                const ColorAttachment attachment{
-                    .texture = context.texture(color_), .load = LoadOp::Clear, .clear = {}};
+                const ColorAttachment attachment{.texture = context.texture(color), .load = LoadOp::Clear, .clear = {}};
                 context.list.begin_rendering({.colors = std::span(&attachment, 1)});
                 context.list.bind_pipeline(columns);
                 context.list.push_constants(ColumnsPush{});
@@ -97,7 +95,7 @@ struct Bench {
             });
         const GraphBuffer out =
             graph.import_buffer({.buffer = readback, .name = "readback", .final_state = ResourceState::HostRead});
-        const GraphTexture from = color_;
+        const GraphTexture from = color;
         graph.add_pass(
             "read target",
             [&](PassBuilder& pass) {
@@ -112,7 +110,7 @@ struct Bench {
         device.wait_idle();
     }
 
-    GraphTexture color_;
+    GraphTexture color;
 };
 
 } // namespace
@@ -136,12 +134,17 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
                                                           .format = Format::RGBA8Unorm,
                                                           .usage = TextureUsage::RenderTarget | TextureUsage::CopySrc,
                                                           .debug_name = "target"});
-    const BufferHandle readback = *device->create_buffer({.size = kWidth * 4,
+    const BufferHandle readback = *device->create_buffer({.size = uint64_t{kWidth} * 4,
                                                           .usage = BufferUsage::CopyDst,
                                                           .memory = MemoryLocation::Readback,
                                                           .debug_name = "readback"});
-    Bench bench{
-        .device = *device, .kit = kit, .graph = *graph, .columns = columns, .target = target, .readback = readback, .color_ = {}};
+    Bench bench{.device = *device,
+                .kit = kit,
+                .graph = *graph,
+                .columns = columns,
+                .target = target,
+                .readback = readback,
+                .color = {}};
 
     const BufferHandle args = *device->create_buffer(
         {.size = 256, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "args"});
