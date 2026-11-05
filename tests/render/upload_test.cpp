@@ -389,6 +389,110 @@ TEST_CASE("uploads to one resource are recorded in order, a batch apart") {
     check_clean(*device);
 }
 
+TEST_CASE("uploads to separate places in one buffer go in one batch, and a later one to the same place waits") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
+    REQUIRE(uploader.ok());
+    const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth});
+    const auto base = pattern(64, 1);
+    const auto low = pattern(16, 2);
+    const auto high = pattern(16, 3);
+    const auto below = pattern(8, 4);
+    const auto inside = pattern(8, 5);
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(base), ResourceState::CopySrc).ok());
+    uploader->flush_and_wait();
+
+    // Upward, then below all of them: none touch.
+    REQUIRE(uploader->upload_buffer(buffer, 16, as_span(low), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 48, as_span(high), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 8, as_span(below), ResourceState::CopySrc).ok());
+    // Inside the span so far, though it touches none of them: that's kept simple, and it waits.
+    REQUIRE(uploader->upload_buffer(buffer, 36, as_span(inside), ResourceState::CopySrc).ok());
+    record_frame(*device, *uploader);
+    CHECK(uploader->stats().queued_uploads == 1);
+    uploader->flush_and_wait();
+
+    const auto bytes = read_buffer(*device, buffer);
+    CHECK(same_bytes(as_span(bytes).first(8), as_span(base).first(8)));
+    CHECK(same_bytes(as_span(bytes).subspan(8, 8), as_span(below)));
+    CHECK(same_bytes(as_span(bytes).subspan(16, 16), as_span(low)));
+    CHECK(same_bytes(as_span(bytes).subspan(32, 4), as_span(base).subspan(32, 4)));
+    CHECK(same_bytes(as_span(bytes).subspan(36, 8), as_span(inside)));
+    CHECK(same_bytes(as_span(bytes).subspan(44, 4), as_span(base).subspan(44, 4)));
+    CHECK(same_bytes(as_span(bytes).subspan(48, 16), as_span(high)));
+    device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("a ticket says when a buffer upload is recorded, however many are queued behind it") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    // A byte of budget: one upload a frame.
+    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 1, .use_transfer_queue = transfer_path(*device)});
+    REQUIRE(uploader.ok());
+    const auto buffer = *device->create_buffer({.size = 1024, .usage = kBufferCopyBoth});
+    const auto data = pattern(8, 1);
+    CHECK(uploader->recorded(uploader->buffer_upload_ticket())); // none yet: nothing to wait for
+
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(data), ResourceState::CopySrc).ok());
+    const uint64_t first = uploader->buffer_upload_ticket();
+    CHECK_FALSE(uploader->recorded(first));
+    REQUIRE(uploader->upload_buffer(buffer, 8, as_span(data), ResourceState::CopySrc).ok());
+    const uint64_t second = uploader->buffer_upload_ticket();
+    CHECK(second != first);
+
+    // Always another queued, so the buffer is never ready. The tickets still come.
+    REQUIRE(uploader->upload_buffer(buffer, 16, as_span(data), ResourceState::CopySrc).ok());
+    record_frame(*device, *uploader);
+    CHECK(uploader->recorded(first));
+    CHECK_FALSE(uploader->recorded(second));
+    CHECK_FALSE(uploader->ready(buffer));
+    REQUIRE(uploader->upload_buffer(buffer, 24, as_span(data), ResourceState::CopySrc).ok());
+    record_frame(*device, *uploader);
+    CHECK(uploader->recorded(second));
+    CHECK_FALSE(uploader->ready(buffer));
+    uploader->flush_and_wait();
+    CHECK(uploader->ready(buffer));
+    CHECK(uploader->recorded(uploader->buffer_upload_ticket()));
+    device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("a texture upload doesn't count towards a buffer upload's ticket") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 1, .use_transfer_queue = transfer_path(*device)});
+    REQUIRE(uploader.ok());
+    const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth});
+    const auto texture = *device->create_texture(
+        {.width = 4, .height = 4, .format = Format::R8Unorm, .usage = TextureUsage::CopyDst | TextureUsage::Sampled});
+    const auto texels = pattern(16, 1);
+    const auto data = pattern(8, 2);
+    REQUIRE(uploader->upload_texture(texture, as_span(texels)).ok());
+    const uint64_t before = uploader->buffer_upload_ticket();
+    CHECK(uploader->recorded(before)); // the texture isn't one of them
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(data), ResourceState::CopySrc).ok());
+    const uint64_t ticket = uploader->buffer_upload_ticket();
+    CHECK(ticket != before);
+    record_frame(*device, *uploader); // the texture
+    CHECK_FALSE(uploader->recorded(ticket));
+    record_frame(*device, *uploader); // the buffer
+    CHECK(uploader->recorded(ticket));
+    device->destroy(buffer);
+    device->destroy(texture);
+    device->wait_idle();
+    check_clean(*device);
+}
+
 TEST_CASE("the staging ring wraps and reuses memory the GPU is done with") {
     auto device = make_device();
     if (!device) {
@@ -546,9 +650,9 @@ TEST_CASE("long streams of uploads keep their order and bookkeeping") {
     if (!device) {
         return;
     }
-    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
+    auto uploader = Uploader::create(*device, {.frame_budget_bytes = 1, .use_transfer_queue = transfer_path(*device)});
     REQUIRE(uploader.ok());
-    // Rounds of 100 small uploads to one buffer, recorded one per frame (each waits for the last):
+    // Rounds of 100 small uploads to one buffer, recorded one per frame (a byte of budget):
     // the queue and the ring's region list fill up, drain and compact many times over.
     constexpr uint32_t kRounds = 3;
     constexpr uint32_t kPerRound = 100;

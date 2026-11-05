@@ -7,6 +7,7 @@
 #include "core/array.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "core/range_allocator.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/scene/fog_noise.h"
@@ -68,7 +69,13 @@ struct MeshEntry {
     asset::AssetHandle handle;
     GpuMesh gpu;
     core::Array<GpuMeshPart> parts{render_heap()};
+    core::Array<GpuMeshLod> lods{render_heap()};
     uint64_t bytes = 0;
+    uint64_t first_vertex = 0;
+    uint64_t vertex_count = 0;
+    uint64_t first_index = 0;
+    uint64_t index_count = 0;
+    uint64_t upload_ticket = 0;        // the uploader's, when both its uploads are recorded
     uint64_t needs_table = UINT64_MAX; // the table upload its parts' materials are in (set in update)
     bool ready = false;
     bool missing = false; // a material it names failed: its parts are resolved again when one loads
@@ -90,6 +97,24 @@ struct GpuAssetsState {
     core::Array<uint32_t> free_slots{render_heap()};      // material table slots, reused last first
     rhi::BufferHandle material_table;
     uint64_t material_table_address = 0;
+    rhi::BufferHandle pool_vertices;
+    rhi::BufferHandle pool_indices;
+    uint64_t pool_vertex_address = 0;
+    core::RangeAllocator vertex_ranges;
+    core::RangeAllocator index_ranges;
+    // A mesh's old place, freed once the frames that may still draw from it are done.
+    struct RetiredRange {
+        uint64_t first_vertex = 0;
+        uint64_t vertex_count = 0;
+        uint64_t first_index = 0;
+        uint64_t index_count = 0;
+        uint64_t free_at_frame = 0;
+    };
+    core::Array<RetiredRange> retired_ranges{render_heap()};
+    uint32_t meshes_dropped = 0;
+
+    GpuAssetsState(uint32_t vertices, uint32_t indices)
+        : vertex_ranges(render_heap(), vertices), index_ranges(render_heap(), indices) {}
     uint32_t max_materials = 0;
     rhi::TextureHandle defaults[DefaultCount];
     rhi::TextureHandle fog_noise;
@@ -116,10 +141,8 @@ struct GpuAssetsState {
         for (const auto& [key, texture] : textures) {
             device->destroy(texture.texture);
         }
-        for (const auto& [key, mesh] : meshes) {
-            device->destroy(mesh.gpu.vertices);
-            device->destroy(mesh.gpu.indices);
-        }
+        device->destroy(pool_vertices);
+        device->destroy(pool_indices);
         device->destroy(fog_noise);
         for (const rhi::TextureHandle texture : defaults) {
             device->destroy(texture);
@@ -374,76 +397,102 @@ struct GpuAssetsState {
 
     // --- Meshes ------------------------------------------------------------------------------
 
-    rhi::BufferHandle make_buffer(std::span<const std::byte> data, rhi::BufferUsage usage, const char* name) {
-        const core::Result<rhi::BufferHandle> buffer = device->create_buffer(
-            {.size = data.size(), .usage = usage | rhi::BufferUsage::CopyDst, .debug_name = name});
-        if (!buffer) {
-            DE_LOG_ERROR("render", "%s: %s", name, buffer.error().message);
-            return {};
-        }
-        const rhi::ResourceState after = core::has_any(usage, rhi::BufferUsage::Index) ? rhi::ResourceState::IndexBuffer
-                                                                                       : rhi::ResourceState::ShaderRead;
-        if (const core::Result<void> queued = uploader->upload_buffer(*buffer, 0, data, after); !queued) {
-            // Not a buffer that never gets its contents: none, and the mesh isn't drawn.
-            DE_LOG_ERROR("render", "%s upload: %s", name, queued.error().message);
-            device->destroy(*buffer);
-            return {};
-        }
-        return *buffer;
-    }
-
     void load_mesh(asset::AssetHandle handle) {
         const auto* asset = assets->get<asset::MeshAsset>(handle);
         if (asset == nullptr || asset->lods.count == 0 || asset->vertices.count == 0 || asset->indices.count == 0) {
             return;
         }
         const uint64_t key = key_of(handle);
-        unload_mesh(handle); // reloaded: the old buffers go (after the frames using them)
-        MeshEntry& entry = meshes.find_or_insert(key);
-        const auto vertices = std::as_bytes(asset->vertices.get(asset));
-        const auto indices = std::as_bytes(asset->indices.get(asset));
-        entry.handle = handle;
-        entry.gpu.vertices = make_buffer(vertices, rhi::BufferUsage::Storage, "mesh vertices");
-        entry.gpu.indices = make_buffer(indices, rhi::BufferUsage::Index, "mesh indices");
-        if (!entry.gpu.vertices.is_valid() || !entry.gpu.indices.is_valid()) {
-            device->destroy(entry.gpu.vertices);
-            device->destroy(entry.gpu.indices);
-            meshes.remove(key); // never drawn (logged)
+        unload_mesh(handle); // reloaded: its old place is freed (after the frames using it)
+        const auto vertices = asset->vertices.get(asset);
+        const auto indices = asset->indices.get(asset);
+        const uint64_t first_vertex = vertex_ranges.allocate(vertices.size());
+        const uint64_t first_index = first_vertex == core::RangeAllocator::kNone
+                                         ? core::RangeAllocator::kNone
+                                         : index_ranges.allocate(indices.size());
+        if (first_index == core::RangeAllocator::kNone) {
+            if (first_vertex != core::RangeAllocator::kNone) {
+                vertex_ranges.free(first_vertex, vertices.size());
+            }
+            DE_LOG_ERROR(
+                "render",
+                "mesh %s doesn't fit in the geometry pool (%zu vertices, %zu indices; %llu and %llu free in one piece)",
+                asset::format_asset_id(asset->header.id).c_str(), vertices.size(), indices.size(),
+                static_cast<unsigned long long>(vertex_ranges.largest_free()),
+                static_cast<unsigned long long>(index_ranges.largest_free()));
+            ++meshes_dropped;
             return;
         }
-        entry.gpu.vertex_address = device->buffer_address(entry.gpu.vertices);
-        entry.bytes = vertices.size() + indices.size();
+        const core::Result<void> queued_vertices =
+            uploader->upload_buffer(pool_vertices, first_vertex * sizeof(asset::MeshVertex), std::as_bytes(vertices),
+                                    rhi::ResourceState::ShaderRead);
+        const core::Result<void> queued_indices =
+            queued_vertices ? uploader->upload_buffer(pool_indices, first_index * sizeof(uint32_t),
+                                                      std::as_bytes(indices), rhi::ResourceState::IndexBuffer)
+                            : queued_vertices;
+        if (!queued_indices) {
+            // Not drawn, with its place free again. Vertices already queued still land there, before anything queued
+            // by the next mesh to get that place.
+            DE_LOG_ERROR("render", "mesh upload: %s", queued_indices.error().message);
+            vertex_ranges.free(first_vertex, vertices.size());
+            index_ranges.free(first_index, indices.size());
+            return;
+        }
+        MeshEntry& entry = meshes.find_or_insert(key);
+        entry.handle = handle;
+        entry.first_vertex = first_vertex;
+        entry.vertex_count = vertices.size();
+        entry.first_index = first_index;
+        entry.index_count = indices.size();
+        entry.upload_ticket = uploader->buffer_upload_ticket();
+        entry.gpu.vertex_offset = static_cast<uint32_t>(first_vertex);
+        std::memcpy(entry.gpu.bounds_min, asset->bounds.min, sizeof(entry.gpu.bounds_min));
+        std::memcpy(entry.gpu.bounds_max, asset->bounds.max, sizeof(entry.gpu.bounds_max));
+        std::memcpy(entry.gpu.bounds_center, asset->bounds.center, sizeof(entry.gpu.bounds_center));
+        entry.gpu.bounds_radius_m = asset->bounds.radius;
+        entry.bytes = vertices.size_bytes() + indices.size_bytes();
         bytes += entry.bytes;
         resolve_parts(entry);
         entry.needs_table = UINT64_MAX;
         pending_meshes.push(key);
     }
 
-    // The mesh's LOD 0 parts and the table slots of their materials (the default for one that's
+    // The mesh's parts, of every LOD, and the table slots of their materials (the default for one that's
     // missing, remembered so they're resolved again when it loads).
     void resolve_parts(MeshEntry& entry) {
         entry.parts.clear();
+        entry.lods.clear();
         entry.missing = false;
         const auto* asset = assets->get<asset::MeshAsset>(entry.handle);
         if (asset != nullptr) {
-            const asset::MeshLod& lod = asset->lods.get(asset)[0];
             const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
             const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
-            for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
-                const asset::MeshPart& part = parts[p];
-                const asset::AssetId material = slots[part.material_slot].material;
-                const uint32_t slot = material_slot(material);
-                entry.missing = entry.missing || (slot == 0 && material.is_valid());
-                entry.parts.push({.first_index = part.first_index, .index_count = part.index_count, .material = slot});
+            for (const asset::MeshLod& lod : asset->lods.get(asset)) {
+                entry.lods.push({.error_m = lod.error,
+                                 .first_part = static_cast<uint32_t>(entry.parts.size()),
+                                 .part_count = lod.part_count});
+                for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
+                    const asset::MeshPart& part = parts[p];
+                    const asset::AssetId material = slots[part.material_slot].material;
+                    const uint32_t slot = material_slot(material);
+                    entry.missing = entry.missing || (slot == 0 && material.is_valid());
+                    entry.parts.push({.first_index = static_cast<uint32_t>(entry.first_index) + part.first_index,
+                                      .index_count = part.index_count,
+                                      .material = slot});
+                }
             }
         }
         entry.gpu.parts = entry.parts.span();
+        entry.gpu.lods = entry.lods.span();
     }
 
     void unload_mesh(asset::AssetHandle handle) {
         if (const MeshEntry* entry = meshes.find(key_of(handle)); entry != nullptr) {
-            device->destroy(entry->gpu.vertices);
-            device->destroy(entry->gpu.indices);
+            retired_ranges.push({.first_vertex = entry->first_vertex,
+                                 .vertex_count = entry->vertex_count,
+                                 .first_index = entry->first_index,
+                                 .index_count = entry->index_count,
+                                 .free_at_frame = device->frame_index() + rhi::kFramesInFlight + 1});
             bytes -= entry->bytes;
             meshes.remove(key_of(handle)); // a pending key that's gone is skipped
         }
@@ -451,10 +500,12 @@ struct GpuAssetsState {
 };
 
 core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
+    DE_ASSERT_MSG(desc.pool_vertices <= uint32_t{INT32_MAX}, "a draw's vertex offset is signed");
     if (desc.device == nullptr || desc.uploader == nullptr || desc.assets == nullptr || desc.max_materials == 0) {
         return core::fail(core::ErrorCode::InvalidArgument, "GpuAssets needs a device, an uploader and a registry");
     }
-    auto* state = ::new (render_heap().allocate(sizeof(GpuAssetsState), alignof(GpuAssetsState))) GpuAssetsState();
+    auto* state = ::new (render_heap().allocate(sizeof(GpuAssetsState), alignof(GpuAssetsState)))
+        GpuAssetsState(desc.pool_vertices, desc.pool_indices);
     state->device = desc.device;
     state->uploader = desc.uploader;
     state->assets = desc.assets;
@@ -511,6 +562,23 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
     }
     state->material_table = *table;
     state->material_table_address = desc.device->buffer_address(*table);
+    const core::Result<rhi::BufferHandle> pool_vertices =
+        desc.device->create_buffer({.size = uint64_t{desc.pool_vertices} * sizeof(asset::MeshVertex),
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "geometry pool vertices"});
+    if (!pool_vertices) {
+        return core::fail(pool_vertices.error());
+    }
+    state->pool_vertices = *pool_vertices;
+    state->pool_vertex_address = desc.device->buffer_address(*pool_vertices);
+    const core::Result<rhi::BufferHandle> pool_indices =
+        desc.device->create_buffer({.size = uint64_t{desc.pool_indices} * sizeof(uint32_t),
+                                    .usage = rhi::BufferUsage::Index | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "geometry pool indices"});
+    if (!pool_indices) {
+        return core::fail(pool_indices.error());
+    }
+    state->pool_indices = *pool_indices;
     // Slot 0 is the default material; the rest are handed out from the front.
     GpuMaterial fallback;
     fallback.base_color_texture = state->default_index[White];
@@ -599,14 +667,33 @@ void GpuAssets::update() {
         if (entry->needs_table == UINT64_MAX) {
             entry->needs_table = state.table_uploads; // every material it names is written by now
         }
-        if (state.table_recorded >= entry->needs_table && state.uploader->ready(entry->gpu.vertices) &&
-            state.uploader->ready(entry->gpu.indices)) {
+        if (state.table_recorded >= entry->needs_table && state.uploader->recorded(entry->upload_ticket)) {
             entry->ready = true;
         } else {
             state.pending_meshes[kept++] = key;
         }
     }
     state.pending_meshes.resize(kept);
+    // The places of meshes that are gone, once no frame still in flight can draw from them.
+    kept = 0;
+    for (size_t i = 0; i < state.retired_ranges.size(); ++i) {
+        const GpuAssetsState::RetiredRange& range = state.retired_ranges[i];
+        if (state.device->frame_index() >= range.free_at_frame) {
+            state.vertex_ranges.free(range.first_vertex, range.vertex_count);
+            state.index_ranges.free(range.first_index, range.index_count);
+        } else {
+            state.retired_ranges[kept++] = range;
+        }
+    }
+    state.retired_ranges.resize(kept);
+}
+
+uint64_t GpuAssets::pool_vertex_address() const {
+    return state_->pool_vertex_address;
+}
+
+rhi::BufferHandle GpuAssets::pool_index_buffer() const {
+    return state_->pool_indices;
 }
 
 const GpuMesh* GpuAssets::mesh(asset::AssetHandle mesh) const {
@@ -633,7 +720,10 @@ GpuAssetsStats GpuAssets::stats() const {
             .textures = static_cast<uint32_t>(state.textures.size()),
             .materials = static_cast<uint32_t>(state.materials.size()),
             .pending = static_cast<uint32_t>(state.dirty_materials.size() + state.pending_meshes.size()),
-            .bytes = state.bytes};
+            .bytes = state.bytes,
+            .meshes_dropped = state.meshes_dropped,
+            .pool_vertices_free = state.vertex_ranges.free_total(),
+            .pool_indices_free = state.index_ranges.free_total()};
 }
 
 } // namespace de::render

@@ -48,27 +48,46 @@ struct GpuMaterial {
 };
 static_assert(sizeof(GpuMaterial) == 80);
 
-// A range of a mesh's indices drawn with one material (LOD 0).
+// A range of the pool's indices drawn with one material.
 struct GpuMeshPart {
-    uint32_t first_index = 0;
+    uint32_t first_index = 0; // in the pool's index buffer
     uint32_t index_count = 0;
     uint32_t material = 0; // index into the material table
 };
 
-// A mesh on the GPU: its vertices (asset::MeshVertex, pulled by address) and 32-bit indices.
+// One level of detail: LOD 0 first, coarser after.
+struct GpuMeshLod {
+    float error_m = 0.0f; // object space: how far this LOD may lie from LOD 0
+    uint32_t first_part = 0;
+    uint32_t part_count = 0;
+};
+
+// A mesh on the GPU: its place in the geometry pool. Its indices count from its own first vertex, which a draw
+// passes as its vertex offset.
 struct GpuMesh {
-    rhi::BufferHandle vertices;
-    rhi::BufferHandle indices;
-    uint64_t vertex_address = 0;
-    std::span<const GpuMeshPart> parts; // valid until the next update() or the mesh is unloaded
+    uint32_t vertex_offset = 0;
+    float bounds_min[3] = {};
+    float bounds_max[3] = {};
+    float bounds_center[3] = {}; // of the bounding sphere
+    float bounds_radius_m = 0.0f;
+    // These are valid until the next update() or the mesh is unloaded.
+    std::span<const GpuMeshPart> parts; // of every LOD
+    std::span<const GpuMeshLod> lods;
+
+    std::span<const GpuMeshPart> lod_parts(size_t lod) const {
+        return parts.subspan(lods[lod].first_part, lods[lod].part_count);
+    }
 };
 
 struct GpuAssetsStats {
-    uint32_t meshes = 0;    // uploaded and drawable
-    uint32_t textures = 0;  // on the GPU
-    uint32_t materials = 0; // in the table
-    uint32_t pending = 0;   // waiting for their uploads (meshes) or textures (materials)
-    uint64_t bytes = 0;     // of vertices, indices and texels
+    uint32_t meshes = 0;         // uploaded and drawable
+    uint32_t textures = 0;       // on the GPU
+    uint32_t materials = 0;      // in the table
+    uint32_t pending = 0;        // waiting for their uploads (meshes) or textures (materials)
+    uint64_t bytes = 0;          // of vertices, indices and texels
+    uint32_t meshes_dropped = 0; // didn't fit in the geometry pool, so aren't drawn (logged)
+    uint64_t pool_vertices_free = 0;
+    uint64_t pool_indices_free = 0;
 };
 
 struct GpuAssetsDesc {
@@ -76,12 +95,15 @@ struct GpuAssetsDesc {
     rhi::Uploader* uploader = nullptr;
     asset::AssetRegistry* assets = nullptr;
     uint32_t max_materials = 4096;
+    // The geometry pool: every mesh's vertices and indices, in two buffers made once, whatever's loaded.
+    uint32_t pool_vertices = 8U << 20U; // 32 bytes each: 256 MiB
+    uint32_t pool_indices = 32U << 20U; // 4 bytes each: 128 MiB
 };
 
 struct GpuAssetsState;
 
-// The GPU copies of what the asset registry has loaded (docs/design.md, Rendering): meshes as
-// vertex and index buffers, textures with their bindless index, materials in one table shaders
+// The GPU copies of what the asset registry has loaded (docs/design.md, Rendering): meshes in one
+// shared vertex and index buffer, textures with their bindless index, materials in one table shaders
 // index. It listens to the registry: an asset uploads when it's Ready, again when it's Reloaded,
 // and goes when it's Unloaded, so the registry stays the only owner of what's loaded and this only
 // mirrors the GPU side, keyed by the registry's handles.
@@ -107,6 +129,9 @@ public:
     // Null unless the mesh is uploaded (or for a stale handle).
     const GpuMesh* mesh(asset::AssetHandle mesh) const;
     uint64_t material_table_address() const;
+    // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
+    uint64_t pool_vertex_address() const;
+    rhi::BufferHandle pool_index_buffer() const;
     // A material table entry's flags (as last written: a reloaded material changes them), which pick
     // how it draws: alpha-tested (Masked) and without back-face culling (DoubleSided). None for an
     // index past the table.

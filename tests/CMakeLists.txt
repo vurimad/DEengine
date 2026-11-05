@@ -25,6 +25,7 @@ add_executable(de_tests
     core/log_test.cpp
     core/memory_test.cpp
     core/pool_test.cpp
+    core/range_allocator_test.cpp
     core/result_test.cpp
     core/slot_map_test.cpp
     core/string_id_test.cpp
@@ -43,6 +44,7 @@ add_executable(de_tests
     render/memory_test.cpp
     render/mips_test.cpp
     render/rhi_test.cpp
+    render/geometry_pool_test.cpp
     render/scene_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp

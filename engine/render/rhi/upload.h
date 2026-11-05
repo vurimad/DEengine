@@ -80,8 +80,9 @@ struct UploaderStats {
 // handles all uploads to a resource.
 //
 // Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
-// GPU in the order they were queued. Destroying a texture or buffer with uploads still queued is
-// fine: they are dropped. Single-threaded, like the device. Move-only; the device must outlive it.
+// GPU in the order they were queued, one batch a frame, where a batch holds as many as the budget allows
+// but only one to a texture, or to any one place in a buffer. Destroying a texture or buffer with uploads still queued
+// is fine: they are dropped. Single-threaded, like the device. Move-only; the device must outlive it.
 class Uploader {
 public:
     static core::Result<Uploader> create(Device& device, const UploaderDesc& desc = {});
@@ -119,6 +120,11 @@ public:
     // True once no upload to the buffer is waiting to be recorded (false for a stale handle): the
     // GPU work recorded after this frame's record() sees every upload queued to it so far.
     [[nodiscard]] bool ready(BufferHandle buffer) const;
+    // For a buffer that's always being uploaded to, where ready() may never come. The ticket of the buffer upload
+    // queued last, and whether that's been recorded: as for ready(), with every upload queued up to it. Uploads
+    // are recorded oldest first, so a later ticket means the earlier ones too.
+    [[nodiscard]] uint64_t buffer_upload_ticket() const;
+    [[nodiscard]] bool recorded(uint64_t buffer_upload_ticket) const;
     UploaderStats stats() const;
 
 private:
