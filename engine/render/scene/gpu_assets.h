@@ -71,6 +71,13 @@ static_assert(sizeof(GpuMeshInfo) == 32);
 // How a part draws: [masked][double-sided] as two bits, each kind a pipeline state.
 inline constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, masked, masked double-sided
 
+inline constexpr uint32_t kNoMeshSlot = UINT32_MAX;
+
+// The most parts of each kind a mesh draws in any LOD.
+struct GpuMeshKinds {
+    uint32_t parts[kDrawKindCount] = {};
+};
+
 constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
     return (core::has_any(flags, GpuMaterialFlags::Masked) ? 2U : 0U) |
            (core::has_any(flags, GpuMaterialFlags::DoubleSided) ? 1U : 0U);
@@ -90,8 +97,7 @@ static_assert(sizeof(GpuMeshLod) == 12);
 struct GpuMesh {
     uint32_t vertex_offset = 0;
     uint32_t table_slot = 0; // in the mesh table
-    uint32_t kind_parts[kDrawKindCount] =
-        {}; // the most parts of each kind in any LOD, by what the material table says now
+    GpuMeshKinds kinds;      // by what the material table says now
     float bounds_min[3] = {};
     float bounds_max[3] = {};
     float bounds_center[3] = {}; // of the bounding sphere
@@ -164,6 +170,16 @@ public:
     // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
     uint64_t pool_vertex_address() const;
     rhi::BufferHandle pool_index_buffer() const;
+    // A mesh's slot in the mesh table, for as long as it's loaded, reloads and all: what an instance can keep. It may
+    // be asked for before the mesh has loaded. Until the mesh can be drawn, its entry says it has no LODs. kNoMeshSlot
+    // if the table is full. The caller has to stop using it before the mesh unloads.
+    uint32_t mesh_slot(asset::AssetHandle mesh);
+    // Whether the mesh table holds anything to read yet: until then, nothing may cull against it.
+    bool mesh_table_ready() const;
+    // How many slots have come free: what lets an instance that got kNoMeshSlot try again.
+    uint64_t mesh_slots_released() const;
+    // By mesh slot: 0 for each kind unless the mesh can be drawn.
+    std::span<const GpuMeshKinds> mesh_kinds() const;
     // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, GpuMeshLod and GpuMeshPart.
     uint64_t mesh_table_address() const;
     uint64_t lod_table_address() const;

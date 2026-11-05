@@ -157,6 +157,343 @@ TEST_CASE("render extraction: interpolated instances and the active camera, noth
     CHECK(near(frame.instances[0].transform[3], 6.0, 1e-2)); // halfway from 1 to 11
 }
 
+namespace {
+
+// The rows extraction really sent this frame.
+size_t sent_rows(const de::world::RenderFrame& frame) {
+    size_t sent = 0;
+    for (const de::world::RenderInstance& instance : frame.instances) {
+        sent += instance.slot != de::world::kSkipRenderInstance ? 1 : 0;
+    }
+    return sent;
+}
+
+const de::world::RenderInstance* sent_for(const de::world::RenderFrame& frame, uint32_t slot) {
+    for (const de::world::RenderInstance& instance : frame.instances) {
+        if (instance.slot == slot) {
+            return &instance;
+        }
+    }
+    return nullptr;
+}
+
+constexpr double kTick = 1.0 / 60.0;
+
+} // namespace
+
+TEST_CASE("render extraction: what doesn't change is sent once") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    for (int i = 0; i < 700; ++i) { // more than a chunk
+        const flecs::entity rock = ecs.entity().set(MeshInstance{.mesh = {.index = 3, .generation = 1}});
+        de::world::place(rock, Transform{.position = {static_cast<double>(i), 0.0, 0.0}});
+    }
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(sent_rows(frame) == 700);
+    CHECK(frame.slot_count == 700);
+    // A tick for what's new to settle, and then nothing at all, however many frames go by.
+    world->advance(kTick);
+    world->advance(kTick);
+    for (int i = 0; i < 20; ++i) {
+        world->advance(kTick / 3.0);
+        CHECK(frame.instances.empty());
+        CHECK(frame.slot_count == 700);
+        CHECK_FALSE(frame.all_instances);
+    }
+}
+
+TEST_CASE("render extraction: what moves is sent every frame, and once more when it stops") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock = ecs.entity().set(MeshInstance{});
+    de::world::place(rock, Transform{.position = {1.0, 0.0, 0.0}});
+    rock.add<de::world::StaticTransform>(); // keeps it out of the mover's table
+    const flecs::entity mover = ecs.entity().set(MeshInstance{});
+    de::world::place(mover, Transform{.position = {5.0, 0.0, 0.0}});
+    const uint32_t mover_slot = mover.get<de::world::RenderSlot>().slot;
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+
+    // It moves. Every frame shows it somewhere new, ticks or not, and the other isn't sent.
+    mover.set(Transform{.position = {15.0, 0.0, 0.0}});
+    world->advance(kTick * 1.25); // a tick, and a quarter left over
+    REQUIRE(sent_for(frame, mover_slot) != nullptr);
+    CHECK(sent_rows(frame) == 1);
+    const float first_x = sent_for(frame, mover_slot)->transform[3];
+    world->advance(kTick * 0.25); // no tick, just further between the same two
+    REQUIRE(sent_for(frame, mover_slot) != nullptr);
+    CHECK(sent_rows(frame) == 1);
+    CHECK(sent_for(frame, mover_slot)->transform[3] > first_x);
+    CHECK(sent_for(frame, mover_slot)->transform[3] != sent_for(frame, mover_slot)->previous_transform[3]);
+
+    // It stops, and stays still for the next tick: one last row, whose motion is none, and then nothing.
+    world->advance(kTick);
+    world->advance(kTick);
+    const auto last_write = [&] {
+        for (int i = 0; i < 8; ++i) {
+            world->advance(kTick);
+            const de::world::RenderInstance* sent = sent_for(frame, mover_slot);
+            if (sent == nullptr) {
+                return false;
+            }
+            if (sent->transform[3] == sent->previous_transform[3]) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // It may already have been sent, in the frames above: then nothing's left to send, which the next check shows.
+    static_cast<void>(last_write());
+    world->advance(kTick);
+    world->advance(kTick);
+    CHECK(frame.instances.empty());
+}
+
+TEST_CASE("render extraction: between ticks, a mover is sent and what shares its table isn't") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity neighbour = ecs.entity().set(MeshInstance{});
+    de::world::place(neighbour, Transform{.position = {1.0, 0.0, 0.0}});
+    const flecs::entity mover = ecs.entity().set(MeshInstance{});
+    de::world::place(mover, Transform{.position = {5.0, 0.0, 0.0}});
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const uint32_t mover_slot = mover.get<de::world::RenderSlot>().slot;
+    const de::world::RenderFrame& frame = world->render_frame();
+    mover.set(Transform{.position = {15.0, 0.0, 0.0}});
+    world->advance(kTick * 1.25); // the tick wrote to their table, but only one of them changed
+    CHECK(sent_rows(frame) == 1);
+    CHECK(sent_for(frame, mover_slot) != nullptr);
+    world->advance(kTick * 0.25); // no tick: what's moving, still
+    CHECK(sent_rows(frame) == 1);
+    CHECK(sent_for(frame, mover_slot) != nullptr);
+}
+
+TEST_CASE("render extraction: a mover's last row has no motion in it") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity mover = ecs.entity().set(MeshInstance{});
+    de::world::place(mover, Transform{.position = {5.0, 0.0, 0.0}});
+    const uint32_t slot = mover.get<de::world::RenderSlot>().slot;
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    mover.set(Transform{.position = {15.0, 0.0, 0.0}});
+    const de::world::RenderFrame& frame = world->render_frame();
+    bool moved = false;
+    float last_x = 0.0f;
+    float last_previous_x = 0.0f;
+    for (int i = 0; i < 12; ++i) {
+        world->advance(kTick);
+        if (const de::world::RenderInstance* sent = sent_for(frame, slot); sent != nullptr) {
+            moved = moved || sent->transform[3] != sent->previous_transform[3];
+            last_x = sent->transform[3];
+            last_previous_x = sent->previous_transform[3];
+        }
+    }
+    CHECK(moved);
+    CHECK(last_x == 15.0f);
+    CHECK(last_previous_x == 15.0f); // what the renderer's left holding draws no motion
+    CHECK(frame.instances.empty());
+}
+
+TEST_CASE("render extraction: a static entity placed somewhere new is sent") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock = ecs.entity().add<de::world::StaticTransform>().set(MeshInstance{});
+    de::world::place(rock, Transform{.position = {1.0, 0.0, 0.0}});
+    const uint32_t slot = rock.get<de::world::RenderSlot>().slot;
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+    de::world::place(rock, Transform{.position = {2.0, 0.0, 0.0}});
+    world->advance(kTick);
+    REQUIRE(sent_for(frame, slot) != nullptr);
+    CHECK(sent_for(frame, slot)->transform[3] == 2.0f);
+    CHECK(sent_for(frame, slot)->previous_transform[3] == 2.0f);
+}
+
+TEST_CASE("render extraction: a new mesh on an entity is sent") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock =
+        ecs.entity().add<de::world::StaticTransform>().set(MeshInstance{.mesh = {.index = 3, .generation = 1}});
+    de::world::place(rock, Transform{});
+    const uint32_t slot = rock.get<de::world::RenderSlot>().slot;
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+    rock.set(MeshInstance{.mesh = {.index = 4, .generation = 1}});
+    world->advance(kTick);
+    REQUIRE(sent_for(frame, slot) != nullptr);
+    CHECK(sent_for(frame, slot)->mesh.index == 4);
+}
+
+TEST_CASE("render extraction: spawning next to a thousand rocks sends one row") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const auto rock_at = [&](double x_m) {
+        const flecs::entity rock = ecs.entity().add<de::world::StaticTransform>().set(MeshInstance{});
+        de::world::place(rock, Transform{.position = {x_m, 0.0, 0.0}});
+        return rock;
+    };
+    for (int i = 0; i < 1000; ++i) {
+        rock_at(static_cast<double>(i));
+    }
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+
+    const flecs::entity another = rock_at(-1.0);
+    world->advance(kTick);
+    CHECK(sent_rows(frame) == 1);
+    REQUIRE(sent_for(frame, another.get<de::world::RenderSlot>().slot) != nullptr);
+    // And going: nothing about the others changed.
+    another.destruct();
+    world->advance(kTick);
+    CHECK(sent_rows(frame) == 0);
+    CHECK(frame.freed_slots.size() == 1);
+}
+
+TEST_CASE("render extraction: all of them can wait for a camera") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock = ecs.entity().set(MeshInstance{});
+    de::world::place(rock, Transform{});
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    // The renderer asks, with nothing to look through: nothing's built for nothing to draw it.
+    world->resync_render_instances();
+    world->advance(kTick);
+    CHECK_FALSE(frame.camera.valid);
+    CHECK(frame.instances.empty());
+    CHECK_FALSE(frame.all_instances);
+    // When there's a camera, they're all sent.
+    const flecs::entity eye = ecs.entity().set(Camera{});
+    de::world::place(eye, Transform{});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    world->advance(kTick);
+    REQUIRE(frame.camera.valid);
+    CHECK(frame.all_instances);
+    CHECK(sent_rows(frame) == 1);
+}
+
+TEST_CASE("render extraction: slots come and go with entities and their meshes") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const auto make = [&] {
+        const flecs::entity rock = ecs.entity().set(MeshInstance{});
+        de::world::place(rock, Transform{});
+        return rock;
+    };
+    const flecs::entity a = make();
+    const flecs::entity b = make();
+    const uint32_t a_slot = a.get<de::world::RenderSlot>().slot;
+    const uint32_t b_slot = b.get<de::world::RenderSlot>().slot;
+    CHECK(a_slot != b_slot);
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.slot_count == 2);
+    CHECK(frame.freed_slots.empty());
+
+    // Destroyed: its slot is freed, once, and goes to whatever needs one next.
+    a.destruct();
+    world->advance(kTick);
+    REQUIRE(frame.freed_slots.size() == 1);
+    CHECK(frame.freed_slots[0] == a_slot);
+    world->advance(kTick);
+    CHECK(frame.freed_slots.empty());
+    const flecs::entity c = make();
+    CHECK(c.get<de::world::RenderSlot>().slot == a_slot);
+    world->advance(kTick);
+    CHECK(frame.slot_count == 2); // it didn't grow
+    CHECK(sent_for(frame, a_slot) != nullptr);
+
+    // Its mesh taken away, the entity stays and the slot goes. Its mesh back, it has one again.
+    b.remove<MeshInstance>();
+    world->advance(kTick);
+    REQUIRE(frame.freed_slots.size() == 1);
+    CHECK(frame.freed_slots[0] == b_slot);
+    CHECK_FALSE(b.has<de::world::RenderSlot>());
+    b.set(MeshInstance{});
+    CHECK(b.has<de::world::RenderSlot>());
+    world->advance(kTick);
+    CHECK(sent_for(frame, b.get<de::world::RenderSlot>().slot) != nullptr);
+}
+
+TEST_CASE("render extraction: all of them, when the render origin moves or the renderer asks") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    constexpr int kCount = 10;
+    for (int i = 0; i < kCount; ++i) {
+        const flecs::entity rock = ecs.entity().set(MeshInstance{});
+        de::world::place(rock, Transform{.position = {static_cast<double>(i), 0.0, 0.0}});
+    }
+    const flecs::entity eye = ecs.entity().set(Camera{});
+    de::world::place(eye, Transform{.position = {0.0, 0.0, 10.0}});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+
+    world->resync_render_instances();
+    const flecs::entity gone = ecs.entity().set(MeshInstance{}); // freed slots don't matter when it's all of them
+    de::world::place(gone, Transform{});
+    world->advance(kTick);
+    CHECK(frame.all_instances);
+    CHECK(sent_rows(frame) == kCount + 1);
+    gone.destruct();
+    world->resync_render_instances();
+    world->advance(kTick);
+    CHECK(frame.all_instances);
+    CHECK(frame.freed_slots.empty());
+    CHECK(sent_rows(frame) == kCount);
+    world->advance(kTick);
+    CHECK_FALSE(frame.all_instances);
+    world->advance(kTick); // its table changed when it went, which takes a tick to settle
+    world->advance(kTick);
+    CHECK(frame.instances.empty());
+
+    // The origin moves: every row is relative to it, so every row is sent, once.
+    const uint64_t moves = frame.origin_moves;
+    de::world::place(eye, Transform{.position = {5000.0, 0.0, 10.0}});
+    for (int i = 0; i < 4 && frame.origin_moves == moves; ++i) {
+        world->advance(kTick);
+    }
+    REQUIRE(frame.origin_moves == moves + 1);
+    CHECK(frame.all_instances);
+    CHECK(sent_rows(frame) == kCount);
+    world->advance(kTick);
+    CHECK_FALSE(frame.all_instances);
+    CHECK(frame.instances.empty());
+}
+
 TEST_CASE("render extraction: fog volumes, relative to the render origin, and the shape of what's placed") {
     auto world = World::create();
     REQUIRE(world.ok());

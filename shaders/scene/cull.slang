@@ -21,8 +21,8 @@ static const uint kDrawListCount = 4 + 2 * kCascadeCount;
 
 struct CullPush
 {
-    float4* instances;     // kInstanceRows per instance
-    uint* instance_meshes; // per instance, its slot in the mesh table, or kNoMesh
+    float4* instances;     // kInstanceRows per slot, staying between frames
+    uint* instance_meshes; // per slot, its slot in the mesh table, or kNoMesh
     GpuMeshInfo* meshes;
     GpuMeshLod* lods;
     GpuMeshPart* parts;
@@ -86,12 +86,20 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     {
         return;
     }
+    // No mesh, or none ready to draw, is no LODs. Not an early return: llvmpipe, which runs a group's invocations as
+    // lanes of one, crashes in what follows when only the first lane has gone (a slot 0 with nothing in it).
     const uint mesh_slot = push.instance_meshes[instance];
-    if (mesh_slot == kNoMesh)
+    GpuMeshInfo mesh;
+    mesh.center = float3(0.0);
+    mesh.radius = 0.0;
+    mesh.vertex_offset = 0;
+    mesh.first_lod = 0;
+    mesh.lod_count = 0;
+    mesh.padding = 0;
+    if (mesh_slot != kNoMesh)
     {
-        return;
+        mesh = push.meshes[mesh_slot];
     }
-    const GpuMeshInfo mesh = push.meshes[mesh_slot];
     const float4 row0 = push.instances[instance * kInstanceRows + 0];
     const float4 row1 = push.instances[instance * kInstanceRows + 1];
     const float4 row2 = push.instances[instance * kInstanceRows + 2];
@@ -107,7 +115,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     for (uint v = 0; v < kCullViewCount; ++v)
     {
         GpuCullView* view = push.views + v;
-        if (!in_view(view, center, radius))
+        if (mesh.lod_count == 0 || !in_view(view, center, radius))
         {
             continue;
         }
@@ -125,7 +133,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
             uint index;
             InterlockedAdd(push.counts[list], 1, index);
             const GpuDrawList draws = push.lists[list];
-            if (index >= draws.capacity) // only if a material's flags changed since the lists were sized
+            if (index >= draws.capacity) // a material changed kind, or a mesh is on its way out
             {
                 continue;
             }

@@ -96,12 +96,16 @@ struct SceneRendererDesc {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
+    // Made once, 100 bytes each: 51 MiB. An instance whose slot is past it isn't drawn, until something asks for all
+    // the instances, and even then it keeps that slot: this is a limit to stay under, not one to touch.
+    uint32_t max_instances = 512U * 1024U;
 };
 
 struct SceneRendererStats {
     uint32_t fog_volumes = 0;         // in the froxel grid this frame
     uint32_t fog_volumes_dropped = 0; // in reach, but past the limit of the nearest 64
-    uint32_t instances = 0;           // in the frame
+    uint32_t instances = 0;           // there are now
+    uint32_t instance_updates = 0;    // this frame, what changed
     uint32_t drawn = 0;               // with their mesh on the GPU
     uint32_t draws = 0;               // parts to cull for the G-buffer (one per instance's mesh part)
     uint32_t shadow_draws = 0;        // and for the shadow cascades
@@ -165,6 +169,10 @@ public:
     // How far a LOD may lie from LOD 0 where it's picked: this many pixels on screen, and shadow map texels in a
     // cascade. 0 draws LOD 0 everywhere, to compare with.
     void set_lod_error_pixels(float pixels);
+
+    // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
+    // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).
+    bool instances_stale() const;
 
     SceneRendererStats stats() const;
 

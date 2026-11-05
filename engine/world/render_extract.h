@@ -2,6 +2,7 @@
 
 #include "asset/registry.h"
 #include "core/array.h"
+#include "core/hash_map.h"
 #include "core/math.h"
 #include "world/transform.h"
 
@@ -19,6 +20,13 @@ namespace de::world {
 // does (its cell), and outlives it.
 struct MeshInstance {
     asset::AssetHandle mesh;
+};
+
+// An entity's place in the renderer's instance data, which stays between frames. Comes and goes with its MeshInstance,
+// given and freed by observers.
+struct RenderSlot {
+    uint32_t slot = 0;
+    uint64_t sent = 0; // a hash of what the renderer was last sent: what a write to its table may not have changed
 };
 
 // Fog in the shape of a box or an ellipsoid around the entity: its world scale is its half extents.
@@ -47,13 +55,18 @@ struct ActiveCamera {
     bool cut = false;
 };
 
-// One mesh to draw this frame: where (relative to the frame's render origin) and what.
+// Where an instance goes in the renderer's data, which stays between frames.
+inline constexpr uint32_t kAutoRenderSlot = UINT32_MAX;         // its index in RenderFrame::instances
+inline constexpr uint32_t kSkipRenderInstance = UINT32_MAX - 1; // nothing to do for this row
+
+// A mesh to draw from now on: where (relative to the frame's render origin) and what.
 struct RenderInstance {
     float transform[12] = {};          // 3x4, rows x, y, z, translation in the last column
     float previous_transform[12] = {}; // where it was a frame ago (for motion vectors), same origin
     asset::AssetHandle mesh;
+    uint32_t slot = kAutoRenderSlot;
 };
-static_assert(sizeof(RenderInstance) == 104);
+static_assert(sizeof(RenderInstance) == 108);
 
 struct RenderView {
     float transform[12] = {}; // the camera's 3x4, relative to the render origin
@@ -86,7 +99,8 @@ struct RenderFogVolume {
 
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
 // at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
-// list of entities; it reads this, rebuilt every frame.
+// list of entities. Instances are what changed since the last frame, for it to keep: all of them only
+// when the render origin moves, or when the renderer asks (World::resync_render_instances).
 struct RenderFrame {
     uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
     DVec3 origin{0.0};         // the render origin: what instance positions are relative to
@@ -94,6 +108,9 @@ struct RenderFrame {
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // draw nothing from now on
+    uint32_t slot_count = 0;    // slots in use may be below this. 0: instances.size()
+    bool all_instances = false; // these are all there are: forget any others
     core::Array<RenderFogVolume> fog_volumes{core::heap_allocator(core::MemoryTag::Render)};
 };
 
@@ -109,10 +126,21 @@ struct RenderExtractScratch {
         const WorldTransform* current = nullptr;
         const PreviousWorldTransform* previous = nullptr;
         const MeshInstance* meshes = nullptr;
+        RenderSlot* slots = nullptr;
+        uint64_t table = 0;
         uint32_t count = 0;
-        uint32_t first = 0; // where its rows go in RenderFrame::instances
+        uint32_t first = 0;     // where its rows go in RenderFrame::instances
+        bool write_all = false; // something wrote to its table: every row is sent, not only what's moving
+        bool any_moving = false;
     };
     core::Array<Chunk> chunks{core::heap_allocator(core::MemoryTag::Render)};
+    // The frame each table last had something moving in it: what to look at though nothing wrote to it.
+    core::HashMap<uint64_t, uint64_t> moving_tables{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> free_slots{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
+    uint32_t next_slot = 0;
+    uint64_t sent_origin_moves = 0;
+    bool resync = false; // send all of them, next frame
 };
 
 struct RenderExtractDesc {
@@ -125,12 +153,19 @@ struct RenderExtractDesc {
 };
 
 // Adds the RenderExtract systems that fill desc.frame: the active camera, then interpolated world
-// transforms of everything with a MeshInstance, relative to the render origin. Each instance's pose
+// transforms of what changed with a MeshInstance, relative to the render origin. Each instance's pose
 // a frame ago comes from the same two ticks, stepped back by alpha_step (a frame longer than a tick
 // goes back past the previous tick, by the same motion): no history per entity, exact for steady
-// motion, and none for what hasn't moved or was place()d. Every table's rows are cut into
-// chunks and run as one parallel job over all of them. After the first frames it doesn't allocate
-// (the arrays keep their capacity).
+// motion, and none for what hasn't moved or was place()d.
+//
+// A table nothing wrote to, with nothing moving in it, costs next to nothing, whatever its size. In a table
+// something wrote to, which spawning anything into it does, each row is checked against a hash of what it last
+// sent. What stopped moving is sent once more when its previous transform catches up, in a tick: that row has no
+// motion in it. Those tables' rows are cut into chunks and run as one parallel job. After the first frames it doesn't
+// allocate (the arrays keep their capacity).
+//
+// An entity leaves the renderer when it loses its MeshInstance or goes. Disabling it (flecs::Disabled) only stops
+// updates: it stays drawn where it was.
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
 } // namespace de::world

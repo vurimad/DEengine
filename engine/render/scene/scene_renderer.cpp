@@ -260,15 +260,31 @@ constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
 // The counts the cull writes: per draw list, then the triangles it kept for the camera and for the cascades.
 constexpr uint32_t kCullCounterCount = kDrawListCount + 2;
 constexpr uint32_t kNoMesh = UINT32_MAX;
-// The views and lists, then the instances: their rows, and then their slots in the mesh table.
+// The views and lists, then what changed in the instances, which stay on the GPU between frames.
 constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
 constexpr uint64_t kDrawListsOffset = kCullViewsOffset + kCullViewCount * sizeof(GpuCullView);
-constexpr uint64_t kInstancesOffset = kDrawListsOffset + kDrawListCount * sizeof(GpuDrawList);
+constexpr uint64_t kInstanceUpdatesOffset = kDrawListsOffset + kDrawListCount * sizeof(GpuDrawList);
+
+// Matches InstanceUpdate in shaders/scene/instance_update.slang.
+struct GpuInstanceUpdate {
+    float rows[24] = {};
+    uint32_t slot = 0;
+    uint32_t mesh = 0;
+    uint32_t padding[2] = {};
+};
+static_assert(sizeof(GpuInstanceUpdate) == 112);
+static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
+
+constexpr uint64_t frame_bytes(uint64_t update_count) {
+    return kInstanceUpdatesOffset + std::max<uint64_t>(update_count, 1) * sizeof(GpuInstanceUpdate);
+}
 
 // What the frame's instances may draw, which sizes what the cull writes.
 struct CullPlan {
     GpuDrawList lists[kDrawListCount];
-    uint32_t instances = 0;
+    uint32_t slots = 0;        // to cull
+    uint32_t updates = 0;      // changes to apply
+    uint32_t clear_first = 0;  // from here to slots, they hold nothing yet
     uint32_t drawn = 0;        // instances whose mesh is on the GPU
     uint32_t draws = 0;        // their parts, into the G-buffer
     uint32_t shadow_draws = 0; // and into the cascades
@@ -295,14 +311,13 @@ struct CullPush {
     uint32_t instance_count = 0;
 };
 
-constexpr uint64_t instance_meshes_offset(uint64_t instance_count) {
-    return kInstancesOffset + instance_count * kInstanceBytes;
-}
-
-constexpr uint64_t frame_bytes(uint64_t instance_count) {
-    return instance_meshes_offset(std::max<uint64_t>(instance_count, 1)) +
-           std::max<uint64_t>(instance_count, 1) * sizeof(uint32_t);
-}
+// Matches InstanceUpdatePush in shaders/scene/instance_update.slang.
+struct InstanceUpdatePush {
+    uint64_t updates = 0;
+    uint64_t instances = 0;
+    uint64_t instance_meshes = 0;
+    uint32_t count = 0;
+};
 
 // Scales a plane so that it measures meters.
 void normalize_plane(float (&plane)[4]) {
@@ -348,6 +363,29 @@ struct SceneRendererState {
     shader::ProgramHandle fog_inject;
     shader::ProgramHandle fog_integrate;
     shader::ProgramHandle cull;
+    shader::ProgramHandle instance_update;
+    // The instances, on the GPU between frames, and what the CPU keeps of them: each slot's mesh, to size the draw
+    // lists without walking the instances.
+    rhi::BufferHandle instance_rows;
+    rhi::BufferHandle instance_meshes;
+    uint64_t instance_rows_address = 0;
+    uint64_t instance_meshes_address = 0;
+    uint32_t max_instances = 0;
+    uint32_t cleared_slots = 0;                        // slots the GPU knows hold nothing or something real
+    core::Array<uint32_t> slot_written{render_heap()}; // the update each slot was last in
+    uint32_t update_number = 0;
+    uint32_t used_mesh_slots = 0; // none past this has instances
+    bool warned_mesh_table = false;
+    // Some instance has no mesh slot because the table was full: when one comes free, it needs sending again.
+    bool waiting_for_mesh_slot = false;
+    uint64_t mesh_slots_released_seen = 0;
+    bool instance_buffers_read = false; // and the graph has left them for reading
+    bool instances_stale_now = false;
+    bool warned_instance_limit = false;
+    uint64_t last_frame_number = 0;
+    core::Array<uint32_t> slot_meshes{render_heap()};
+    core::Array<uint32_t> mesh_instances{render_heap()}; // by mesh slot
+    uint32_t live_instances = 0;
     // What each frame slot's cull kept, to read once that slot comes round again and its frame is done.
     rhi::BufferHandle cull_readback[rhi::kFramesInFlight];
     CullPlan cull_readback_plan[rhi::kFramesInFlight];
@@ -388,7 +426,7 @@ struct SceneRendererState {
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program, fog_inject, fog_integrate, cull, taa_program}) {
+              shadow_mask, fog_program, fog_inject, fog_integrate, cull, instance_update, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -397,6 +435,8 @@ struct SceneRendererState {
         for (const rhi::BufferHandle buffer : cull_readback) {
             device->destroy(buffer);
         }
+        device->destroy(instance_rows);
+        device->destroy(instance_meshes);
         destroy_temporal();
         destroy_froxels();
     }
@@ -518,6 +558,9 @@ struct SceneRendererState {
         const core::Result<shader::ProgramHandle> cull_program =
             shaders->create_compute({.module = "scene.cull", .debug_name = "gpu cull"});
         cull = cull_program ? *cull_program : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> update_program =
+            shaders->create_compute({.module = "scene.instance_update", .debug_name = "instance update"});
+        instance_update = update_program ? *update_program : shader::ProgramHandle{};
         const core::Result<shader::ProgramHandle> integrate =
             shaders->create_compute({.module = "scene.fog_integrate", .debug_name = "fog integrate"});
         fog_integrate = integrate ? *integrate : shader::ProgramHandle{};
@@ -715,7 +758,82 @@ struct SceneRendererState {
         stats.fog_volumes_dropped = dropped;
     }
 
-    // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
+    // One slot's mesh, as the CPU knows it.
+    void set_slot_mesh(uint32_t slot, uint32_t mesh) {
+        const uint32_t was = slot_meshes[slot];
+        if (was != kNoMesh) {
+            --mesh_instances[was];
+            --live_instances;
+        }
+        if (mesh != kNoMesh) {
+            ++mesh_instances[mesh];
+            ++live_instances;
+            used_mesh_slots = std::max(used_mesh_slots, mesh + 1);
+        }
+        slot_meshes[slot] = mesh;
+    }
+
+    // What changed, as records for the update pass to scatter, and what the CPU keeps of it.
+    void write_instance_updates(std::span<std::byte> mapped, const world::RenderFrame& frame, CullPlan& plan) {
+        auto* const updates = reinterpret_cast<GpuInstanceUpdate*>(mapped.data() + kInstanceUpdatesOffset);
+        const auto wanted_slots =
+            frame.slot_count != 0 ? frame.slot_count : static_cast<uint32_t>(frame.instances.size());
+        plan.slots = std::min(wanted_slots, max_instances);
+        if (wanted_slots > max_instances && !warned_instance_limit) {
+            DE_LOG_ERROR("render", "%u instances, past the limit of %u: the rest aren't drawn", wanted_slots,
+                         max_instances);
+            warned_instance_limit = true;
+        }
+        // All of them, or a list that has shrunk: what's gone from it won't say so.
+        const uint32_t kept_slots = frame.all_instances ? 0 : plan.slots;
+        for (uint32_t slot = kept_slots; slot < slot_meshes.size(); ++slot) {
+            set_slot_mesh(slot, kNoMesh);
+        }
+        slot_meshes.resize(plan.slots, kNoMesh);
+        slot_written.resize(plan.slots, 0);
+        // Slots coming into use may hold anything, or what was there before the list last shrank.
+        plan.clear_first = frame.all_instances ? 0 : cleared_slots;
+        ++update_number;
+
+        uint32_t count = 0;
+        for (size_t i = 0; i < frame.instances.size(); ++i) {
+            const world::RenderInstance& instance = frame.instances[i];
+            const uint32_t slot = instance.slot == world::kAutoRenderSlot ? static_cast<uint32_t>(i) : instance.slot;
+            if (slot >= plan.slots) { // past the limit, or kSkipRenderInstance
+                continue;
+            }
+            DE_ASSERT_MSG(slot_written[slot] != update_number, "two records for a slot would land in either order");
+            slot_written[slot] = update_number;
+            const uint32_t mesh = gpu_assets->mesh_slot(instance.mesh);
+            if (mesh == kNoMesh && instance.mesh.is_valid()) {
+                waiting_for_mesh_slot = true;
+                mesh_slots_released_seen = gpu_assets->mesh_slots_released();
+                if (!warned_mesh_table) {
+                    DE_LOG_ERROR("render",
+                                 "the mesh table is full, or a mesh went before its instances: they aren't drawn");
+                    warned_mesh_table = true;
+                }
+            }
+            set_slot_mesh(slot, mesh);
+            GpuInstanceUpdate& update = updates[count++];
+            std::memcpy(update.rows, instance.transform, kInstanceBytes / 2);
+            std::memcpy(update.rows + 12, instance.previous_transform, kInstanceBytes / 2);
+            update.slot = slot;
+            update.mesh = mesh;
+        }
+        // The records land in any order, so a slot freed and taken again in one frame gets only the one above.
+        for (const uint32_t slot : frame.freed_slots) {
+            if (slot < plan.slots && slot_written[slot] != update_number) {
+                set_slot_mesh(slot, kNoMesh);
+                updates[count].slot = slot;
+                updates[count].mesh = kNoMesh;
+                ++count;
+            }
+        }
+        plan.updates = count;
+    }
+
+    // The cull's views, what changed in the instances, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
                          uint32_t height, CullPlan& plan) {
         // At 0, LOD 0 everywhere, however small a LOD's error.
@@ -758,25 +876,27 @@ struct SceneRendererState {
         }
         std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
 
-        auto* const instance_meshes =
-            reinterpret_cast<uint32_t*>(mapped.data() + instance_meshes_offset(frame.instances.size()));
-        uint32_t kind_parts[kDrawKindCount] = {};
-        plan = {};
-        plan.instances = static_cast<uint32_t>(frame.instances.size());
-        for (size_t i = 0; i < frame.instances.size(); ++i) {
-            const GpuMesh* mesh = gpu_assets->mesh(frame.instances[i].mesh);
-            instance_meshes[i] = mesh != nullptr ? mesh->table_slot : kNoMesh;
-            if (mesh != nullptr) {
-                ++plan.drawn;
-                for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
-                    kind_parts[kind] += mesh->kind_parts[kind];
-                }
+        write_instance_updates(mapped, frame, plan);
+        // What the instances can draw, from how many there are of each mesh.
+        uint64_t kind_parts[kDrawKindCount] = {};
+        const std::span<const GpuMeshKinds> kinds = gpu_assets->mesh_kinds();
+        for (size_t mesh = 0; mesh < used_mesh_slots; ++mesh) {
+            const uint32_t count = mesh_instances[mesh];
+            if (count == 0) {
+                continue;
             }
+            bool drawable = false;
+            for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+                kind_parts[kind] += uint64_t{count} * kinds[mesh].parts[kind];
+                drawable = drawable || kinds[mesh].parts[kind] > 0;
+            }
+            plan.drawn += drawable ? count : 0;
         }
         // Each list holds all that could land in it, so the cull needs no first pass to count them.
         uint32_t slot = 0;
         const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
-        const auto add_list = [&](uint32_t index, uint32_t capacity) {
+        const auto add_list = [&](uint32_t index, uint64_t wanted) {
+            const auto capacity = static_cast<uint32_t>(std::min<uint64_t>(wanted, UINT32_MAX));
             // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
             // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
             if (capacity > call_limit && !warned_draw_limit) {
@@ -791,12 +911,12 @@ struct SceneRendererState {
         };
         for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
             add_list(kind, kind_parts[kind]);
-            plan.draws += kind_parts[kind];
+            plan.draws += static_cast<uint32_t>(kind_parts[kind]);
         }
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             add_list(cascade_list(c, false), kind_parts[0] + kind_parts[1]);
             add_list(cascade_list(c, true), kind_parts[2] + kind_parts[3]);
-            plan.shadow_draws += kind_parts[0] + kind_parts[1] + kind_parts[2] + kind_parts[3];
+            plan.shadow_draws += static_cast<uint32_t>(kind_parts[0] + kind_parts[1] + kind_parts[2] + kind_parts[3]);
         }
         std::memcpy(mapped.data() + kDrawListsOffset, plan.lists, sizeof(plan.lists));
         // A power of two, so a graph buffer lasts while the counts move around.
@@ -894,15 +1014,9 @@ struct SceneRendererState {
         scene.fog_range[2] = kFroxelSliceOffsetM;
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
-        for (size_t i = 0; i < frame.instances.size(); ++i) {
-            static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
-            std::byte* const rows = mapped.data() + kInstancesOffset + i * kInstanceBytes;
-            std::memcpy(rows, frame.instances[i].transform, kInstanceBytes / 2);
-            std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
-        }
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
         write_cull_data(mapped, frame, scene, height, plan);
-        device->flush_mapped(buffer, 0, frame_bytes(frame.instances.size()));
+        device->flush_mapped(buffer, 0, frame_bytes(plan.updates));
         return true;
     }
 };
@@ -1091,8 +1205,29 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->device = desc.device;
     state->shaders = desc.shaders;
     state->gpu_assets = desc.gpu_assets;
+    state->max_instances = desc.max_instances;
+    state->mesh_instances.resize(desc.gpu_assets->mesh_kinds().size(), 0);
+    SceneRenderer renderer(state);
+    const core::Result<rhi::BufferHandle> rows =
+        desc.device->create_buffer({.size = uint64_t{desc.max_instances} * kInstanceBytes,
+                                    .usage = rhi::BufferUsage::Storage,
+                                    .debug_name = "instance rows"});
+    if (!rows) {
+        return core::fail(rows.error());
+    }
+    state->instance_rows = *rows;
+    state->instance_rows_address = desc.device->buffer_address(*rows);
+    const core::Result<rhi::BufferHandle> meshes =
+        desc.device->create_buffer({.size = uint64_t{desc.max_instances} * sizeof(uint32_t),
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "instance meshes"});
+    if (!meshes) {
+        return core::fail(meshes.error());
+    }
+    state->instance_meshes = *meshes;
+    state->instance_meshes_address = desc.device->buffer_address(*meshes);
     state->make_scene_programs();
-    return SceneRenderer(state);
+    return renderer;
 }
 
 SceneRenderer::~SceneRenderer() {
@@ -1125,8 +1260,15 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.shadows.max_penumbra_texels =
         std::clamp(state.shadows.max_penumbra_texels, Limits::kMinPenumbraTexels, Limits::kMaxPenumbraTexels);
     state.make_tonemap(target_format);
-    state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
+    state.stats = {};
     state.read_cull_stats();
+    // A frame not drawn left a gap in the numbers (hand-made frames have no numbers).
+    state.instances_stale_now = frame.number != 0 && frame.number != state.last_frame_number + 1;
+    if (state.waiting_for_mesh_slot && state.gpu_assets->mesh_slots_released() != state.mesh_slots_released_seen) {
+        state.waiting_for_mesh_slot = false;
+        state.instances_stale_now = true; // they're sent again, next frame
+    }
+    state.last_frame_number = frame.number;
     const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
     const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
@@ -1136,6 +1278,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
     const rhi::PipelineHandle cull = state.shaders->pipeline(state.cull);
+    const rhi::PipelineHandle instance_update = state.shaders->pipeline(state.instance_update);
     const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
     const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
     // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
@@ -1173,15 +1316,17 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     // This frame's constants and draws, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
-        frame.camera.valid ? state.frame_buffer(frame_bytes(frame.instances.size())) : rhi::BufferHandle{};
+        frame.camera.valid ? state.frame_buffer(frame_bytes(frame.instances.size() + frame.freed_slots.size()))
+                           : rhi::BufferHandle{};
     CullPlan plan;
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, plan, frame, lighting, froxel_reach,
                                                                       taa_on ? state.taa_sample : 0, width, height);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
-                       cull.is_valid();
+                       cull.is_valid() && instance_update.is_valid();
     if (!ready) {
-        // Nothing to look through, or shaders missing: the target is cleared.
+        // Nothing to look through, or shaders missing: the target is cleared, and this frame's changes are lost.
+        state.instances_stale_now = true;
         graph.add_pass(
             "scene (cleared)", [&](PassBuilder& pass) { pass.use(target, rhi::ResourceState::RenderTarget); },
             [target, empty](PassContext& context) {
@@ -1193,6 +1338,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
+    state.stats.instances = state.live_instances;
+    state.stats.instance_updates = plan.updates;
     state.stats.drawn = plan.drawn;
     state.stats.draws = plan.draws;
     state.stats.shadow_draws = plan.shadow_draws;
@@ -1214,6 +1361,47 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.fill_buffer(context.buffer(data.counts), 0, kCullCounterCount * sizeof(uint32_t), 0);
         });
     const GraphBuffer draw_counts = cull_clear.counts;
+
+    // What changed in the instances. They stay between frames, so the graph is told how they were left.
+    const GraphBuffer instance_rows_graph = graph.import_buffer(
+        {.buffer = state.instance_rows,
+         .name = "instance rows",
+         .state = state.instance_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
+         .final_state = rhi::ResourceState::ShaderRead});
+    const GraphBuffer instance_meshes_graph = graph.import_buffer(
+        {.buffer = state.instance_meshes,
+         .name = "instance meshes",
+         .state = state.instance_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
+         .final_state = rhi::ResourceState::ShaderRead});
+    state.instance_buffers_read = true;
+    if (plan.clear_first < plan.slots) {
+        graph.add_pass(
+            "instances clear", [&](PassBuilder& pass) { pass.use(instance_meshes_graph, rhi::ResourceState::CopyDst); },
+            [instance_meshes_graph, first = uint64_t{plan.clear_first} * sizeof(uint32_t),
+             bytes = uint64_t{plan.slots - plan.clear_first} * sizeof(uint32_t)](PassContext& context) {
+                context.list.fill_buffer(context.buffer(instance_meshes_graph), first, bytes, kNoMesh);
+            });
+    }
+    state.cleared_slots = plan.slots;
+    if (plan.updates > 0) {
+        graph.add_pass(
+            "instance update",
+            [&](PassBuilder& pass) {
+                pass.use(instance_rows_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                pass.use(instance_meshes_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            },
+            [renderer = &state, pipeline = instance_update, frame_address,
+             updates = plan.updates](PassContext& context) {
+                DE_PROFILE_ZONE("instance update pass");
+                const InstanceUpdatePush push{.updates = frame_address + kInstanceUpdatesOffset,
+                                              .instances = renderer->instance_rows_address,
+                                              .instance_meshes = renderer->instance_meshes_address,
+                                              .count = updates};
+                context.list.bind_pipeline(pipeline);
+                context.list.push_constants(push);
+                context.list.dispatch((updates + 63) / 64);
+            });
+    }
     struct CullPass {
         SceneRendererState* state = nullptr;
         GraphBuffer counts;
@@ -1236,16 +1424,19 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                              .debug_name = "draw lists"});
             pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             pass.use(data.counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
         },
         [](const CullPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gpu cull pass");
             const SceneRendererState& renderer = *data.state;
-            if (data.plan.instances == 0) {
+            // Before the mesh table holds anything, there's nothing to cull against.
+            if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
                 return;
             }
             const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));
-            const CullPush push{.instances = data.frame_address + kInstancesOffset,
-                                .instance_meshes = data.frame_address + instance_meshes_offset(data.plan.instances),
+            const CullPush push{.instances = renderer.instance_rows_address,
+                                .instance_meshes = renderer.instance_meshes_address,
                                 .meshes = renderer.gpu_assets->mesh_table_address(),
                                 .lods = renderer.gpu_assets->lod_table_address(),
                                 .parts = renderer.gpu_assets->part_table_address(),
@@ -1255,10 +1446,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                 .args = draws,
                                 .records = draws + data.plan.records_offset(),
                                 .counts = renderer.device->buffer_address(context.buffer(data.counts)),
-                                .instance_count = data.plan.instances};
+                                .instance_count = data.plan.slots};
             context.list.bind_pipeline(data.pipeline);
             context.list.push_constants(push);
-            context.list.dispatch((data.plan.instances + 63) / 64);
+            context.list.dispatch((data.plan.slots + 63) / 64);
         });
     const GraphBuffer draw_lists = cull_pass.draws;
 
@@ -1331,6 +1522,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             data.atlas = pass.create_texture(
                 {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
             pass.use(data.atlas, rhi::ResourceState::DepthWrite);
+            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
         },
         [](const ShadowPass& data, PassContext& context) {
             DE_PROFILE_ZONE("shadow pass");
@@ -1338,7 +1530,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             const rhi::BufferHandle args = context.buffer(data.draws);
             const rhi::BufferHandle counts = context.buffer(data.counts);
             ShadowCasterPush push{.frame = data.frame_address,
-                                  .instances = data.frame_address + kInstancesOffset,
+                                  .instances = renderer.instance_rows_address,
                                   .vertices = renderer.gpu_assets->pool_vertex_address(),
                                   .materials = renderer.gpu_assets->material_table_address(),
                                   .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
@@ -1411,6 +1603,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
+            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
         },
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
@@ -1425,7 +1618,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.begin_rendering({.colors = colors, .depth = &depth});
             context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
             const GBufferPush push{.frame = data.frame_address,
-                                   .instances = data.frame_address + kInstancesOffset,
+                                   .instances = renderer.instance_rows_address,
                                    .vertices = renderer.gpu_assets->pool_vertex_address(),
                                    .materials = renderer.gpu_assets->material_table_address(),
                                    .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
@@ -1780,6 +1973,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
 
 void SceneRenderer::set_lod_error_pixels(float pixels) {
     state_->lod_error_pixels = pixels;
+}
+
+bool SceneRenderer::instances_stale() const {
+    return state_->instances_stale_now;
 }
 
 SceneRendererStats SceneRenderer::stats() const {

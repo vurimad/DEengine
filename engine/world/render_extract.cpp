@@ -5,6 +5,7 @@
 #include "core/profile.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -63,7 +64,10 @@ void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
 } // namespace
 
 void register_render_components(flecs::world& ecs) {
-    ecs.component<MeshInstance>("de::MeshInstance").member<asset::AssetHandle>("mesh");
+    ecs.component<RenderSlot>("de::RenderSlot");
+    ecs.component<MeshInstance>("de::MeshInstance")
+        .member<asset::AssetHandle>("mesh")
+        .add(flecs::With, ecs.component<RenderSlot>());
     ecs.component<Camera>("de::Camera").member<float>("vertical_fov_rad").member<float>("near_m");
     ecs.component<ActiveCamera>("de::ActiveCamera").member<flecs::entity_t>("entity");
     ecs.component<FogVolume>("de::FogVolume");
@@ -73,23 +77,61 @@ namespace {
 
 constexpr uint32_t kChunkRows = 512;
 
+// What a row depends on. Word by word: there's padding in these structs.
+uint64_t sent_hash(const WorldTransform& current, const WorldTransform& previous, asset::AssetHandle mesh) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    const auto mix = [&hash](uint64_t word) {
+        hash ^= word;
+        hash *= 0x100000001b3ULL;
+        hash ^= hash >> 29U;
+    };
+    const auto mix_transform = [&mix](const WorldTransform& transform) {
+        for (int axis = 0; axis < 3; ++axis) {
+            mix(std::bit_cast<uint64_t>(transform.position[axis]));
+            mix(std::bit_cast<uint32_t>(transform.scale[axis]));
+        }
+        for (int axis = 0; axis < 4; ++axis) {
+            mix(std::bit_cast<uint32_t>(transform.rotation[axis]));
+        }
+    };
+    mix_transform(current);
+    mix_transform(previous);
+    mix((uint64_t{mesh.index} << 32U) | mesh.generation);
+    return hash;
+}
+
 struct ExtractJob {
-    const RenderExtractScratch* scratch = nullptr;
+    RenderExtractScratch* scratch = nullptr;
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
     float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
     DVec3 origin{0.0};
+    bool all = false; // every row, whatever it last sent
 };
 
 void extract_chunks(size_t begin, size_t end, void* context) {
     const ExtractJob& job = *static_cast<const ExtractJob*>(context);
     for (size_t c = begin; c < end; ++c) {
-        const RenderExtractScratch::Chunk& chunk = job.scratch->chunks[c];
+        RenderExtractScratch::Chunk& chunk = job.scratch->chunks[c];
         for (uint32_t i = 0; i < chunk.count; ++i) {
             RenderInstance& instance = job.instances[chunk.first + i];
+            const bool still = same_transform(chunk.previous[i].value, chunk.current[i]);
+            chunk.any_moving = chunk.any_moving || !still;
+            if (still && !chunk.write_all) {
+                instance.slot = kSkipRenderInstance;
+                continue;
+            }
+            // Something wrote to its table, but spawning a neighbour does that too.
+            RenderSlot& slot = chunk.slots[i];
+            const uint64_t hash = sent_hash(chunk.current[i], chunk.previous[i].value, chunk.meshes[i].mesh);
+            if (still && hash == slot.sent && !job.all) {
+                instance.slot = kSkipRenderInstance;
+                continue;
+            }
+            slot.sent = hash;
             to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), job.origin,
                           instance.transform);
-            if (same_transform(chunk.previous[i].value, chunk.current[i])) {
+            if (still) {
                 std::memcpy(instance.previous_transform, instance.transform,
                             sizeof(instance.transform)); // most of a world
             } else {
@@ -97,6 +139,7 @@ void extract_chunks(size_t begin, size_t end, void* context) {
                               instance.previous_transform);
             }
             instance.mesh = chunk.meshes[i].mesh;
+            instance.slot = slot.slot;
         }
     }
 }
@@ -104,8 +147,26 @@ void extract_chunks(size_t begin, size_t end, void* context) {
 } // namespace
 
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc) {
+    // A slot from when an entity gets a MeshInstance, until it loses it or goes.
+    ecs.observer<RenderSlot>("de::GiveRenderSlot").event(flecs::OnAdd).each([scratch = desc.scratch](RenderSlot& slot) {
+        if (!scratch->free_slots.empty()) {
+            slot.slot = scratch->free_slots.back();
+            scratch->free_slots.pop();
+        } else {
+            slot.slot = scratch->next_slot++;
+        }
+    });
+    ecs.observer<RenderSlot>("de::FreeRenderSlot")
+        .event(flecs::OnRemove)
+        .each([scratch = desc.scratch](RenderSlot& slot) {
+            scratch->free_slots.push(slot.slot);
+            scratch->freed_slots.push(slot.slot);
+        });
+    ecs.observer<MeshInstance>("de::DropRenderSlot")
+        .event(flecs::OnRemove)
+        .each([](flecs::entity entity, MeshInstance&) { entity.remove<RenderSlot>(); });
     // No terms, so it runs every frame, meshes or not: the camera (which may move the origin the
-    // instances are made relative to), and a fresh instance list.
+    // instances are made relative to), and a fresh list of what changed.
     ecs.system("de::ExtractRenderView").kind(phase).run([desc](flecs::iter& it) {
         DE_PROFILE_ZONE("render extract view");
         extract_camera(it.world(), *desc.alpha, *desc.frame);
@@ -163,25 +224,55 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
         });
     // Every table cut into chunks first (the column pointers stay valid: nothing structural happens
     // during the phase), then one parallel job over all chunks, whatever the tables' sizes.
-    ecs.system<const WorldTransform, const PreviousWorldTransform, const MeshInstance>("de::ExtractRenderInstances")
+    ecs.system<const WorldTransform, const PreviousWorldTransform, const MeshInstance, RenderSlot>(
+           "de::ExtractRenderInstances")
         .kind(phase)
+        .term_at(3)
+        .out() // written only: changes to it alone don't make a table "changed"
+        .detect_changes()
         .run([desc](flecs::iter& it) {
             DE_PROFILE_ZONE("render extract");
             RenderFrame& out = *desc.frame;
             RenderExtractScratch& scratch = *desc.scratch;
             scratch.chunks.clear();
+            // All of them: the origin they're relative to moved, or the renderer lost track.
+            const bool all = scratch.resync || scratch.sent_origin_moves != out.origin_moves;
+            if (all && !out.camera.valid) {
+                // Nothing would draw it. It's sent when something can, and tables stay marked as changed until then.
+                out.all_instances = false;
+                out.instances.clear();
+                while (it.next()) {
+                    it.skip();
+                }
+                return;
+            }
+            scratch.resync = false;
+            scratch.sent_origin_moves = out.origin_moves;
+            out.all_instances = all;
             uint32_t rows = 0;
             while (it.next()) {
+                const bool changed = it.changed();
+                const auto table = reinterpret_cast<uint64_t>(it.c_ptr()->table);
+                const uint64_t* moved_at = scratch.moving_tables.find(table);
+                const bool was_moving = moved_at != nullptr && *moved_at + 1 == out.number;
+                if (!all && !changed && !was_moving) {
+                    it.skip();
+                    continue;
+                }
                 const auto current = it.field<const WorldTransform>(0);
                 const auto previous = it.field<const PreviousWorldTransform>(1);
                 const auto meshes = it.field<const MeshInstance>(2);
+                const auto slots = it.field<RenderSlot>(3);
                 const auto count = static_cast<uint32_t>(it.count());
                 for (uint32_t first = 0; first < count; first += kChunkRows) {
                     scratch.chunks.push({.current = &current[first],
                                          .previous = &previous[first],
                                          .meshes = &meshes[first],
+                                         .slots = &slots[first],
+                                         .table = table,
                                          .count = std::min(kChunkRows, count - first),
-                                         .first = rows + first});
+                                         .first = rows + first,
+                                         .write_all = all || changed});
                 }
                 rows += count;
             }
@@ -190,13 +281,26 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                            .instances = out.instances.data(),
                            .alpha = *desc.alpha,
                            .previous_alpha = *desc.alpha - *desc.alpha_step,
-                           .origin = out.origin};
+                           .origin = out.origin,
+                           .all = all};
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
             } else {
                 extract_chunks(0, scratch.chunks.size(), &job);
             }
-            DE_PROFILE_PLOT("render instances", static_cast<int64_t>(rows));
+            for (const RenderExtractScratch::Chunk& chunk : scratch.chunks) {
+                if (chunk.any_moving) {
+                    scratch.moving_tables.find_or_insert(chunk.table) = out.number;
+                }
+            }
+            // What's gone since the last frame. All of them means anything not among them, so these aren't needed.
+            out.freed_slots.clear();
+            if (!all) {
+                out.freed_slots.assign(scratch.freed_slots.span());
+            }
+            scratch.freed_slots.clear();
+            out.slot_count = scratch.next_slot;
+            DE_PROFILE_PLOT("render instance rows", static_cast<int64_t>(rows));
         });
 }
 
