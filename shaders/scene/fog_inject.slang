@@ -106,10 +106,11 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     // to frame. However many overlap, it fits what the froxels store.
     float volume_density = 0.0;
     float3 volume_tinted = float3(0.0);
+    float2 volume_span = float2(near_distance, far_distance);
     if (push.fog_volume_count > 0)
     {
         const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], push.noise, camera, ray.direction, ray.view_per_ray,
-                                               frame.fog.range.y, near_distance, far_distance);
+                                               frame.fog.range.y, near_distance, far_distance, volume_span);
         const float scale = min(1.0 / (far_distance - near_distance), kMostVolumeDensity / max(along.a, 1e-6));
         volume_density = along.a * scale;
         volume_tinted = along.rgb * scale;
@@ -144,9 +145,16 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     }
 
     // Its light: a few samples through the fog in its depth, weighted by the fog there, so a shadow edge
-    // inside the slice is a share of the light.
-    const float samples_from = mean_density > 0.0 ? fog_near : near_distance;
-    const float samples_to = mean_density > 0.0 ? fog_far : far_distance;
+    // inside the slice is a share of the light. Where the fog is the volumes', that's where they are, not
+    // the air around them in a slice far thicker than they are.
+    float samples_from = mean_density > 0.0 ? fog_near : near_distance;
+    float samples_to = mean_density > 0.0 ? fog_far : far_distance;
+    if (volume_density > 0.0)
+    {
+        const float volume_share = volume_density / all_density;
+        samples_from = lerp(samples_from, volume_span.x, volume_share);
+        samples_to = lerp(samples_to, volume_span.y, volume_share);
+    }
     float weight_sum = 0.0;
     float3 light_sum = float3(0.0);
     for (uint i = 0; i < kSamples; ++i)
