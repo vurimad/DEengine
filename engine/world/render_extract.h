@@ -47,13 +47,18 @@ struct ActiveCamera {
     bool cut = false;
 };
 
-// One mesh to draw this frame: where (relative to the frame's render origin) and what.
+// Where an instance goes in the renderer's data, which stays between frames.
+inline constexpr uint32_t kAutoRenderSlot = UINT32_MAX;         // its index in RenderFrame::instances
+inline constexpr uint32_t kSkipRenderInstance = UINT32_MAX - 1; // nothing to do for this row
+
+// A mesh to draw from now on: where (relative to the frame's render origin) and what.
 struct RenderInstance {
     float transform[12] = {};          // 3x4, rows x, y, z, translation in the last column
     float previous_transform[12] = {}; // where it was a frame ago (for motion vectors), same origin
     asset::AssetHandle mesh;
+    uint32_t slot = kAutoRenderSlot;
 };
-static_assert(sizeof(RenderInstance) == 104);
+static_assert(sizeof(RenderInstance) == 108);
 
 struct RenderView {
     float transform[12] = {}; // the camera's 3x4, relative to the render origin
@@ -94,6 +99,9 @@ struct RenderFrame {
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // draw nothing from now on
+    uint32_t slot_count = 0;    // slots in use may be below this. 0: instances.size()
+    bool all_instances = false; // these are all there are: forget any others
     core::Array<RenderFogVolume> fog_volumes{core::heap_allocator(core::MemoryTag::Render)};
 };
 

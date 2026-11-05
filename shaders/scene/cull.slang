@@ -21,8 +21,8 @@ static const uint kDrawListCount = 4 + 2 * kCascadeCount;
 
 struct CullPush
 {
-    float4* instances;     // kInstanceRows per instance
-    uint* instance_meshes; // per instance, its slot in the mesh table, or kNoMesh
+    float4* instances;     // kInstanceRows per slot, staying between frames
+    uint* instance_meshes; // per slot, its slot in the mesh table, or kNoMesh
     GpuMeshInfo* meshes;
     GpuMeshLod* lods;
     GpuMeshPart* parts;
@@ -92,6 +92,10 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         return;
     }
     const GpuMeshInfo mesh = push.meshes[mesh_slot];
+    if (mesh.lod_count == 0) // not ready to draw
+    {
+        return;
+    }
     const float4 row0 = push.instances[instance * kInstanceRows + 0];
     const float4 row1 = push.instances[instance * kInstanceRows + 1];
     const float4 row2 = push.instances[instance * kInstanceRows + 2];
