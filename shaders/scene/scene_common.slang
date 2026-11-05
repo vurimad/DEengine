@@ -32,6 +32,14 @@ public static const uint kCascadeCount = 4;
 // An instance in the frame's buffer: three rows of its transform, then three of last frame's.
 public static const uint kInstanceRows = 6;
 
+// What one draw of a mesh part needs beyond its place in the geometry pool. A draw's first instance is
+// the index of its first record, so a draw of N instances reads N records: SV_VulkanInstanceID finds it.
+public struct GpuDraw
+{
+    public uint instance; // its row in the instance data
+    public uint material; // its slot in the material table
+};
+
 // A cascade's tile in the 2x2 shadow atlas: uv offset (each tile is half the atlas).
 public float2 cascade_tile(uint cascade)
 {
