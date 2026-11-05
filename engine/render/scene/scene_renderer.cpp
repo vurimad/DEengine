@@ -345,7 +345,9 @@ struct SceneRendererState {
     // What each frame slot's cull kept, to read once that slot comes round again and its frame is done.
     rhi::BufferHandle cull_readback[rhi::kFramesInFlight];
     CullPlan cull_readback_plan[rhi::kFramesInFlight];
-    bool cull_readback_written[rhi::kFramesInFlight] = {};
+    bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
+    bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
+    bool warned_draw_limit = false;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -545,6 +547,7 @@ struct SceneRendererState {
         if (!cull_readback_written[slot]) {
             return;
         }
+        cull_readback_written[slot] = false;
         device->invalidate_mapped(cull_readback[slot]);
         const std::span<const std::byte> mapped = device->mapped(cull_readback[slot]);
         uint32_t counts[kDrawListCount];
@@ -555,14 +558,12 @@ struct SceneRendererState {
         }
     }
 
-    // A list the cull filled, with the bound pipeline and the geometry pool's index buffer. Nothing to record if
-    // nothing could be in it. A device's limit on one call is at least 65535, and on desktops far more.
+    // A list the cull filled, with the bound pipeline and the geometry pool's index buffer.
     void draw_list(rhi::CommandList& list, rhi::BufferHandle args, rhi::BufferHandle counts, const CullPlan& plan,
                    uint32_t index) {
         const GpuDrawList& draws = plan.lists[index];
         list.draw_indexed_indirect_count(args, uint64_t{draws.first_slot} * sizeof(rhi::DrawIndexedIndirectArgs),
-                                         counts, uint64_t{index} * sizeof(uint32_t),
-                                         std::min(draws.capacity, device->capabilities().max_draw_indirect_count));
+                                         counts, uint64_t{index} * sizeof(uint32_t), draws.capacity);
         ++stats.indirect_calls;
     }
 
@@ -713,16 +714,17 @@ struct SceneRendererState {
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
         // plane.
         views[0] = {.plane_count = 4, .first_list = 0, .lists_by_kind = 1};
-        set_side_planes(views[0], scene.unjittered_view_proj);
-        // A cascade: its sides and the far end of its depth (z >= 0). Nearer the sun than its near end stays in: what's
-        // up there can still cast into the tile, as depth clipping decides.
+        set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
+        // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
+        // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             GpuCullView& view = views[1 + c];
-            view = {.plane_count = 5, .first_list = cascade_list(c, false), .lists_by_kind = 0};
+            view = {.plane_count = 6, .first_list = cascade_list(c, false), .lists_by_kind = 0};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             set_side_planes(view, view_proj);
             std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
             normalize_plane(view.planes[4]);
+            set_plane(view.planes[5], view_proj, 2, -1.0f);
         }
         std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
 
@@ -743,9 +745,19 @@ struct SceneRendererState {
         }
         // Each list holds all that could land in it, so the cull needs no first pass to count them.
         uint32_t slot = 0;
+        const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
         const auto add_list = [&](uint32_t index, uint32_t capacity) {
-            plan.lists[index] = {.first_slot = slot, .capacity = capacity};
-            slot += capacity;
+            // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
+            // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
+            if (capacity > call_limit && !warned_draw_limit) {
+                DE_LOG_WARN("render",
+                            "a draw list holds %u draws, and this device draws %u in a call: the rest are lost",
+                            capacity, call_limit);
+                warned_draw_limit = true;
+            }
+            const uint32_t kept = std::min(capacity, call_limit);
+            plan.lists[index] = {.first_slot = slot, .capacity = kept};
+            slot += kept;
         };
         for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
             add_list(kind, kind_parts[kind]);
@@ -1413,21 +1425,25 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                          .debug_name = "draw counts readback"});
         state.cull_readback[cull_slot] = readback ? *readback : rhi::BufferHandle{};
     }
-    state.cull_readback_written[cull_slot] = state.cull_readback[cull_slot].is_valid();
-    if (state.cull_readback_written[cull_slot]) {
+    if (state.cull_readback[cull_slot].is_valid()) {
         state.cull_readback_plan[cull_slot] = plan;
-        const GraphBuffer readback = graph.import_buffer({.buffer = state.cull_readback[cull_slot],
-                                                          .name = "draw counts readback",
-                                                          .final_state = rhi::ResourceState::HostRead});
+        const GraphBuffer readback =
+            graph.import_buffer({.buffer = state.cull_readback[cull_slot],
+                                 .name = "draw counts readback",
+                                 .state = state.cull_readback_used[cull_slot] ? rhi::ResourceState::HostRead
+                                                                              : rhi::ResourceState::Undefined,
+                                 .final_state = rhi::ResourceState::HostRead});
+        state.cull_readback_used[cull_slot] = true;
         graph.add_pass(
             "cull stats",
             [&](PassBuilder& pass) {
                 pass.use(draw_counts, rhi::ResourceState::CopySrc);
                 pass.use(readback, rhi::ResourceState::CopyDst);
             },
-            [draw_counts, readback](PassContext& context) {
+            [draw_counts, readback, written = &state.cull_readback_written[cull_slot]](PassContext& context) {
                 context.list.copy_buffer(context.buffer(draw_counts), 0, context.buffer(readback), 0,
                                          kDrawListCount * sizeof(uint32_t));
+                *written = true;
             });
     }
 

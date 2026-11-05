@@ -611,6 +611,45 @@ TEST_CASE("a caster out of the camera's view still casts its shadow") {
     });
 }
 
+TEST_CASE("a cascade drops casters past either end of its depth") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
+        CHECK(in_reach > 0);
+        // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
+        frame.instances[0].transform[11] = 5000.0f;
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        // And past the far end of every cascade.
+        frame.instances[0].transform[11] = -5000.0f;
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+    });
+}
+
+TEST_CASE("what the cull kept isn't reported again for frames that drew nothing") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        frame.camera.valid = false;
+        for (uint32_t i = 0; i < 2 * de::rhi::kFramesInFlight + 1; ++i) {
+            scene.submit(frame);
+        }
+        CHECK(scene.renderer.stats().visible_draws == 0);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+    });
+}
+
 TEST_CASE("a material that changes how it draws keeps its meshes drawn") {
     with_pool({.hot_reload = true}, [](const PoolScene& scene) {
         constexpr AssetId kChanging = AssetId::from_value(0xb00);

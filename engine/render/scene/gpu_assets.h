@@ -162,10 +162,6 @@ public:
     // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, and GpuMeshPart.
     uint64_t mesh_table_address() const;
     uint64_t part_table_address() const;
-    // A material table entry's flags (as last written: a reloaded material changes them), which pick
-    // how it draws: alpha-tested (Masked) and without back-face culling (DoubleSided). None for an
-    // index past the table.
-    GpuMaterialFlags material_flags(uint32_t material) const;
     // The fog noise's bindless index (3D, fog_noise.h), or 0 until it's uploaded.
     uint32_t fog_noise_index() const;
 

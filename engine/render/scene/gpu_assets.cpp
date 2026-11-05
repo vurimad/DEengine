@@ -86,7 +86,8 @@ struct MeshEntry {
     uint64_t upload_ticket = 0;        // the uploader's, when both its uploads are recorded
     uint64_t needs_table = UINT64_MAX; // the table upload its parts' materials are in (set in update)
     bool ready = false;
-    bool missing = false; // a material it names failed: its parts are resolved again when one loads
+    bool missing = false;     // a material it names failed: its parts are resolved again when one loads
+    bool parts_stale = false; // the part table has older parts than these
 };
 
 enum DefaultTexture : uint32_t { White, FlatNormal, DefaultCount };
@@ -117,7 +118,11 @@ struct GpuAssetsState {
     uint64_t part_table_address = 0;
     core::RangeAllocator part_ranges;
     core::Array<uint32_t> free_mesh_slots{render_heap()};
-    bool draw_kinds_changed = false; // a material's flags did: meshes count their parts' kinds again
+    // A material's flags changed: meshes count their parts' kinds again once the GPU sees them too, so the draw lists
+    // go on fitting what the cull finds in the table. This table upload has them.
+    bool draw_kinds_changed = false;
+    bool recount_draw_kinds = false;
+    uint64_t recount_after_upload = 0;
     // A mesh's old place, freed once the last frame that may have drawn from it is done.
     struct RetiredPlace {
         PoolPlace place;
@@ -310,11 +315,7 @@ struct GpuAssetsState {
             for (auto [mesh_key, mesh] : meshes) {
                 if (mesh.missing && resolve_parts(mesh)) {
                     // The GPU may be reading the old ones until this is recorded; it can't draw a part it lost.
-                    if (const core::Result<void> queued = upload_parts(mesh, rhi::BufferRange::MayBeRead); queued) {
-                        mesh.upload_ticket = uploader->buffer_upload_ticket();
-                    } else {
-                        DE_LOG_ERROR("render", "mesh parts upload: %s", queued.error().message);
-                    }
+                    mesh.parts_stale = true; // update() uploads them
                     mesh.ready = false;
                     mesh.needs_table = UINT64_MAX;
                     pending_meshes.push(mesh_key);
@@ -440,9 +441,7 @@ struct GpuAssetsState {
     void free_place(const PoolPlace& place) {
         vertex_ranges.free(place.first_vertex, place.vertex_count);
         index_ranges.free(place.first_index, place.index_count);
-        if (place.part_count > 0) {
-            part_ranges.free(place.first_part, place.part_count);
-        }
+        part_ranges.free(place.first_part, place.part_count);
         free_mesh_slots.push(place.table_slot);
     }
 
@@ -806,13 +805,18 @@ void GpuAssets::update() {
         }
     }
     state.dirty_materials.resize(kept);
+    state.upload_table();
     if (state.draw_kinds_changed) {
+        state.recount_draw_kinds = true;
+        state.recount_after_upload = state.table_uploads;
+        state.draw_kinds_changed = false;
+    }
+    if (state.recount_draw_kinds && state.table_recorded >= state.recount_after_upload) {
         for (auto [key, mesh] : state.meshes) {
             GpuAssetsState::count_kinds(mesh, state.table);
         }
-        state.draw_kinds_changed = false;
+        state.recount_draw_kinds = false;
     }
-    state.upload_table();
     // Retired textures go once the table that no longer points at them is recorded.
     kept = 0;
     for (size_t i = 0; i < state.retired.size(); ++i) {
@@ -833,6 +837,17 @@ void GpuAssets::update() {
         }
         if (entry->needs_table == UINT64_MAX) {
             entry->needs_table = state.table_uploads; // every material it names is written by now
+        }
+        if (entry->parts_stale) {
+            // Tried again each update if it fails: the part table has to catch up before this mesh draws again.
+            if (const core::Result<void> queued = state.upload_parts(*entry, rhi::BufferRange::MayBeRead); queued) {
+                entry->upload_ticket = state.uploader->buffer_upload_ticket();
+                entry->parts_stale = false;
+            } else {
+                DE_LOG_ERROR("render", "mesh parts upload: %s", queued.error().message);
+                state.pending_meshes[kept++] = key;
+                continue;
+            }
         }
         if (state.table_recorded >= entry->needs_table && state.uploader->recorded(entry->upload_ticket)) {
             entry->ready = true;
@@ -863,11 +878,6 @@ rhi::BufferHandle GpuAssets::pool_index_buffer() const {
 const GpuMesh* GpuAssets::mesh(asset::AssetHandle mesh) const {
     const MeshEntry* entry = state_->meshes.find(key_of(mesh));
     return entry != nullptr && entry->ready ? &entry->gpu : nullptr;
-}
-
-GpuMaterialFlags GpuAssets::material_flags(uint32_t material) const {
-    const GpuAssetsState& state = *state_;
-    return material < state.table.size() ? state.table[material].flags : GpuMaterialFlags::None;
 }
 
 uint64_t GpuAssets::material_table_address() const {
