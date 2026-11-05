@@ -119,6 +119,18 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.vsync = !has_flag(out, "--no-vsync");
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
+    out.fullscreen = has_flag(out, "--fullscreen");
+    if (const char* window = flag_value(out, "--window")) {
+        char* end = nullptr;
+        const unsigned long width = std::strtoul(window, &end, 10);
+        const unsigned long height = end != window && *end == 'x' ? std::strtoul(end + 1, &end, 10) : 0;
+        if (*end != '\0' || width == 0 || height == 0 || width > 16384 || height > 16384) {
+            DE_LOG_ERROR("engine", "--window should be a size like 2560x1440: '%s'", window);
+            return false;
+        }
+        out.window_width = static_cast<uint32_t>(width);
+        out.window_height = static_cast<uint32_t>(height);
+    }
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -179,7 +191,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     if (!vfs) {
         return EXIT_FAILURE;
     }
-    auto window = platform::Window::create({.title = "DEengine"});
+    auto window = platform::Window::create({.title = "DEengine",
+                                            .width_points = args.window_width,
+                                            .height_points = args.window_height,
+                                            .fullscreen = args.fullscreen});
     if (!window) {
         return EXIT_FAILURE;
     }
@@ -405,6 +420,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // The "zero heap allocations per frame" rule, made visible in the profiler and the panel.
         const uint64_t allocations = core::heap_allocation_count() - frame_start_allocations;
         DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
+        if (scene_renderer) {
+            const render::SceneRendererStats drawn = scene_renderer->stats();
+            DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
+            DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
+        }
 #if DE_BUILD_DEV
         const flecs::world& ecs = engine.world.ecs();
         const auto* active_camera = ecs.try_get<world::ActiveCamera>();

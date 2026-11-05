@@ -41,6 +41,30 @@ TEST_CASE("the framework's flags are parsed") {
     CHECK(de::app::flag_value(args, "--game-dir") == nullptr);
 }
 
+TEST_CASE("a window size is two whole numbers") {
+    {
+        CommandLine line({"--window", "2560x1440", "--fullscreen"});
+        de::app::FrameworkArgs args;
+        REQUIRE(line.parse(args));
+        CHECK(args.window_width == 2560);
+        CHECK(args.window_height == 1440);
+        CHECK(args.fullscreen);
+    }
+    {
+        CommandLine line({"--frames", "1"});
+        de::app::FrameworkArgs args;
+        REQUIRE(line.parse(args));
+        CHECK(args.window_width == 1600);
+        CHECK(args.window_height == 900);
+        CHECK_FALSE(args.fullscreen);
+    }
+    for (const char* value : {"2560", "2560x", "x1440", "0x1440", "2560x0", "2560x1440p", "wide", "99999x1440", ""}) {
+        CommandLine line({"--window", value});
+        de::app::FrameworkArgs args;
+        CHECK_FALSE(line.parse(args));
+    }
+}
+
 TEST_CASE("a deadzone that isn't a number in range is rejected") {
     const de::core::LogLevel saved = de::core::log_level();
     de::core::set_log_level(de::core::LogLevel::Fatal); // the rejections log errors by design
