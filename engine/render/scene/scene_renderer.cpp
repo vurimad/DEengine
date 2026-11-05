@@ -114,9 +114,10 @@ struct GpuFogVolume {
     float to_local[12] = {};
     float half_extents[4] = {}; // w: edge, in meters
     float tint_density[4] = {}; // w: extinction per meter
-    float shape[4] = {};        // x: 1 for an ellipsoid
+    float shape[4] = {};        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
+    float noise[4] = {};        // xyz: how far its noise has moved, in tiles; w: its tiles a meter
 };
-static_assert(sizeof(GpuFogVolume) == 96);
+static_assert(sizeof(GpuFogVolume) == 112);
 
 // Matches FogInjectPush in shaders/scene/fog_inject.slang.
 struct FogInjectPush {
@@ -133,7 +134,7 @@ struct FogInjectPush {
     float jitter_y = 0.0f;
     float jitter_z = 0.0f;
     uint32_t fog_volume_count = 0;
-    uint32_t padding = 0;
+    uint32_t noise = 0;
 };
 
 // Matches FogIntegratePush in shaders/scene/fog_integrate.slang.
@@ -628,6 +629,12 @@ struct SceneRendererState {
             gpu.tint_density[2] = volume.tint[2];
             gpu.tint_density[3] = volume.density_per_m;
             gpu.shape[0] = volume.ellipsoid ? 1.0f : 0.0f;
+            gpu.shape[1] = volume.noise_amount;
+            gpu.shape[2] = volume.height_fade_m;
+            gpu.noise[0] = volume.noise_offset[0];
+            gpu.noise[1] = volume.noise_offset[1];
+            gpu.noise[2] = volume.noise_offset[2];
+            gpu.noise[3] = volume.noise_per_m;
             std::memcpy(mapped.data() + kFogVolumesOffset + k * sizeof(GpuFogVolume), &gpu, sizeof(gpu));
         }
         std::memcpy(mapped.data() + kFogSliceMasksOffset, slice_masks, sizeof(slice_masks));
@@ -1310,6 +1317,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                         push.fog_volumes = fog_volumes_address;
                         push.fog_slice_masks = fog_volumes_address + (kFogSliceMasksOffset - kFogVolumesOffset);
                         push.fog_volume_count = renderer->fog_volumes_now;
+                        push.noise = renderer->gpu_assets->fog_noise_index();
                         push.history =
                             froxels_have_history ? context.device.texture_index(context.texture(last_froxels)) : 0;
                         context.list.push_constants(push);

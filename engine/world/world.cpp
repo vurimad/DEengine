@@ -62,6 +62,7 @@ struct WorldState {
     uint64_t ticks = 0;
     float alpha = 0.0f;
     float alpha_step = 0.0f; // how much of a tick the last advance() took
+    double time_s = 0.0;     // at the last advance()'s interpolation point
     core::JobSystem* jobs = nullptr;
     int64_t merges = 0; // flecs' merge count at the last advance()
 };
@@ -114,6 +115,7 @@ core::Result<World> World::create(const WorldDesc& desc) {
                         .scratch = &state->extract_scratch,
                         .alpha = &state->alpha,
                         .alpha_step = &state->alpha_step,
+                        .time_s = &state->time_s,
                         .jobs = desc.jobs});
     return World(state);
 }
@@ -183,6 +185,7 @@ FrameStep World::advance(double frame_s) {
     // Bounded by what the ticks cover: a hitch's dropped time is motion nothing went through.
     state.alpha_step = static_cast<float>(
         std::min(std::max(frame_s, 0.0) / state.tick_dt_s, static_cast<double>(state.max_ticks_per_frame)));
+    state.time_s = (static_cast<double>(state.ticks) + static_cast<double>(state.alpha)) * state.tick_dt_s;
     step.alpha = state.alpha;
     {
         DE_PROFILE_ZONE("world frame");

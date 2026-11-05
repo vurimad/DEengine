@@ -9,6 +9,8 @@
 // medium and adds what no closed form can: the sun's shadows in the fog. Past the grid, the ray goes
 // on in closed form.
 
+import common.bindless;
+
 // The medium and its light, in render-origin space (the CPU's render::SceneFog, packed).
 public struct FogMedium
 {
@@ -121,7 +123,8 @@ public struct FogVolumeData
     public float4 to_local[3];  // rows: into its own axes, in meters
     public float4 half_extents; // w: its soft edge, in meters
     public float4 tint_density; // w: extinction per meter at its heart
-    public float4 shape;        // x: 1 for an ellipsoid
+    public float4 shape;        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
+    public float4 noise;        // xyz: how far its noise has moved, in tiles; w: its tiles a meter
 };
 
 // Points tested through the part of a ray inside a volume.
@@ -144,14 +147,39 @@ float fog_volume_share(FogVolumeData volume, float3 local)
         const float3 from_faces = half_extents - abs(local);
         inside = min(from_faces.x, min(from_faces.y, from_faces.z));
     }
-    return smoothstep(0.0, 1.0, saturate(inside / max(min(volume.half_extents.w, smallest), 1e-3)));
+    const float edge = smoothstep(0.0, 1.0, saturate(inside / max(min(volume.half_extents.w, smallest), 1e-3)));
+    if (volume.shape.z <= 0.0)
+    {
+        return edge;
+    }
+    return edge * smoothstep(0.0, 1.0, saturate((half_extents.y - local.y) / volume.shape.z));
+}
+
+// That share, with noise eating into it: most where there's least noise, and where there's least fog,
+// so its heart keeps a body and its edges go to wisps. Two sizes: the second, boiling slowly through the
+// first, goes at twice the first's wrapped offset, so that wrapping is still a whole number of tiles.
+float fog_volume_noisy_share(FogVolumeData volume, float3 local, uint noise)
+{
+    const float share = fog_volume_share(volume, local);
+    const float amount = volume.shape.y;
+    if (noise == 0 || amount <= 0.0 || share <= 0.0)
+    {
+        return share;
+    }
+    Texture3D tiles = texture_3d(noise);
+    const SamplerState wrapping = sampler_state(kSamplerLinearWrap);
+    const float3 at = local * volume.noise.w;
+    const float large = tiles.SampleLevel(wrapping, at - volume.noise.xyz, 0.0).r;
+    const float small = tiles.SampleLevel(wrapping, at * 2.3 - volume.noise.xyz * 2.0, 0.0).r;
+    // Stretched: the texture's values bunch around the middle, and fog this soft needs real gaps to show them.
+    return saturate(share - amount * (1.0 - smoothstep(0.3, 0.7, large * 0.7 + small * 0.3)));
 }
 
 // A volume's optical depth along a ray between two distances. The ray is clipped to the volume first and
 // tested through what's left, so the points belong to the volume, not to what asked: however thin it is
 // they can't all miss it, and they don't slide through it as the grid's slices do with the camera. It
 // fades out over the last tenth of the grid's reach, where the fog past it, which can't hold it, takes over.
-float fog_volume_optical_depth(FogVolumeData volume, float3 camera, float3 direction, float view_per_ray, float reach,
+float fog_volume_optical_depth(FogVolumeData volume, uint noise, float3 camera, float3 direction, float view_per_ray, float reach,
                                float from_distance, float to_distance)
 {
     const float3 origin = float3(dot(volume.to_local[0], float4(camera, 1.0)), dot(volume.to_local[1], float4(camera, 1.0)),
@@ -195,14 +223,14 @@ float fog_volume_optical_depth(FogVolumeData volume, float3 camera, float3 direc
     {
         const float distance = lerp(enter, leave, (float(i) + 0.5) / float(kFogVolumeSamples));
         const float reach_fade = saturate((reach - distance * view_per_ray) / (reach * 0.1));
-        sum += fog_volume_share(volume, origin + along * distance) * reach_fade;
+        sum += fog_volume_noisy_share(volume, origin + along * distance, noise) * reach_fade;
     }
     return volume.tint_density.w * sum * (leave - enter) / float(kFogVolumeSamples);
 }
 
 // All the volumes in a slice's mask, along a ray between two distances: (their tint by optical depth,
-// their optical depth).
-public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, float3 camera, float3 direction, float view_per_ray,
+// their optical depth). Noise is a bindless index; 0: their shapes without it.
+public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, uint noise, float3 camera, float3 direction, float view_per_ray,
                                 float reach, float from_distance, float to_distance)
 {
     float4 total = float4(0.0);
@@ -211,7 +239,7 @@ public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, float3 camer
         for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
         {
             const FogVolumeData volume = volumes[word * 32 + firstbitlow(bits)];
-            const float depth = fog_volume_optical_depth(volume, camera, direction, view_per_ray, reach, from_distance, to_distance);
+            const float depth = fog_volume_optical_depth(volume, noise, camera, direction, view_per_ray, reach, from_distance, to_distance);
             total += float4(volume.tint_density.rgb * depth, depth);
         }
     }

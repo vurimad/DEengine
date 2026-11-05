@@ -13,12 +13,16 @@ core::Result<void> CellAsset::validate(std::span<const std::byte> file) const {
     const std::span<const AssetRef> dependencies = header.dependencies.get(file.data());
     const std::span<const CellEntity> all = entities.get(file.data());
     for (const CellFogVolume& volume : fog_volumes.get(file.data())) {
-        const bool good = std::isfinite(volume.density_per_m) && volume.density_per_m >= 0.0f &&
-                          volume.density_per_m <= kMaxFogVolumeDensityPerM && std::isfinite(volume.edge_m) &&
-                          volume.edge_m >= 0.0f && std::isfinite(volume.tint[0]) && std::isfinite(volume.tint[1]) &&
-                          std::isfinite(volume.tint[2]) && volume.tint[0] >= 0.0f && volume.tint[1] >= 0.0f &&
-                          volume.tint[2] >= 0.0f &&
-                          (volume.shape == CellFogShape::Box || volume.shape == CellFogShape::Ellipsoid);
+        const bool good =
+            std::isfinite(volume.density_per_m) && volume.density_per_m >= 0.0f &&
+            volume.density_per_m <= kMaxFogVolumeDensityPerM && std::isfinite(volume.edge_m) && volume.edge_m >= 0.0f &&
+            std::isfinite(volume.tint[0]) && std::isfinite(volume.tint[1]) && std::isfinite(volume.tint[2]) &&
+            volume.tint[0] >= 0.0f && volume.tint[1] >= 0.0f && volume.tint[2] >= 0.0f &&
+            (volume.shape == CellFogShape::Box || volume.shape == CellFogShape::Ellipsoid) &&
+            std::isfinite(volume.noise_size_m) && volume.noise_size_m > 0.0f && std::isfinite(volume.noise_amount) &&
+            volume.noise_amount >= 0.0f && volume.noise_amount <= 1.0f && std::isfinite(volume.drift_mps[0]) &&
+            std::isfinite(volume.drift_mps[1]) && std::isfinite(volume.drift_mps[2]) &&
+            std::isfinite(volume.height_fade_m) && volume.height_fade_m >= 0.0f;
         if (!good) {
             return core::fail(ErrorCode::CorruptData, "cell fog volume has bad values");
         }

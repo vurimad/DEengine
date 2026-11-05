@@ -193,7 +193,8 @@ private:
             diagnostics_.error(path_, "%s: fog_volume should be an object", label.c_str());
             return;
         }
-        static constexpr const char* kKeys[] = {"shape", "density_per_m", "edge_m", "tint"};
+        static constexpr const char* kKeys[] = {"shape",        "density_per_m", "edge_m",    "tint",
+                                                "noise_size_m", "noise_amount",  "drift_mps", "height_fade_m"};
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
         reader.check_keys(kKeys, "fog volume");
         asset::CellFogVolume volume;
@@ -219,6 +220,26 @@ private:
                 tint[1] < 0.0 || tint[2] < 0.0) {
                 diagnostics_.error(path_, "%s: fog_volume tint should be 3 numbers of 0 or more", label.c_str());
             }
+        }
+        const double noise_size = reader.number("noise_size_m", static_cast<double>(volume.noise_size_m));
+        if (!to_float(noise_size, volume.noise_size_m) || noise_size <= 0.0) {
+            diagnostics_.error(path_, "%s: fog_volume noise_size_m should be above 0", label.c_str());
+        }
+        const double noise_amount = reader.number("noise_amount", 0.0);
+        if (!to_float(noise_amount, volume.noise_amount) || noise_amount < 0.0 || noise_amount > 1.0) {
+            diagnostics_.error(path_, "%s: fog_volume noise_amount should be from 0 to 1", label.c_str());
+        }
+        if (reader.has("drift_mps")) {
+            double drift[3] = {};
+            if (!read_numbers(yyjson_obj_get(object, "drift_mps"), drift, 3) ||
+                !to_float(drift[0], volume.drift_mps[0]) || !to_float(drift[1], volume.drift_mps[1]) ||
+                !to_float(drift[2], volume.drift_mps[2])) {
+                diagnostics_.error(path_, "%s: fog_volume drift_mps should be 3 numbers", label.c_str());
+            }
+        }
+        const double height_fade = reader.number("height_fade_m", 0.0);
+        if (!to_float(height_fade, volume.height_fade_m) || height_fade < 0.0) {
+            diagnostics_.error(path_, "%s: fog_volume height_fade_m should be 0 or more", label.c_str());
         }
         entity.fog_volume = static_cast<uint32_t>(build_.fog_volumes.size());
         build_.fog_volumes.push(volume);

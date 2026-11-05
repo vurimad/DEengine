@@ -1,6 +1,8 @@
 # The scene on the GPU (docs/design.md, Rendering): GPU copies of loaded assets, and the pass that
 # draws what the world extracts each frame.
 add_library(de_render_scene STATIC
+    fog_noise.cpp
+    fog_noise.h
     gpu_assets.cpp
     gpu_assets.h
     scene_renderer.cpp

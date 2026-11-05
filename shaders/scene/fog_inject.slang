@@ -25,7 +25,7 @@ struct FogInjectPush
     float jitter_y;
     float jitter_z;
     uint fog_volume_count;
-    uint padding;
+    uint noise; // the fog volumes' noise (common.fog); 0: not yet uploaded
 };
 
 [[vk::push_constant]]
@@ -108,7 +108,7 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
     float3 volume_tinted = float3(0.0);
     if (push.fog_volume_count > 0)
     {
-        const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], camera, ray.direction, ray.view_per_ray,
+        const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], push.noise, camera, ray.direction, ray.view_per_ray,
                                                frame.fog.range.y, near_distance, far_distance);
         const float scale = min(1.0 / (far_distance - near_distance), kMostVolumeDensity / max(along.a, 1e-6));
         volume_density = along.a * scale;

@@ -4,10 +4,12 @@
 #include "asset/mesh_format.h"
 #include "asset/texture_format.h"
 #include "core/allocator.h"
+#include "core/array.h"
 #include "core/log.h"
 #include "core/profile.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
+#include "render/scene/fog_noise.h"
 
 #include <algorithm>
 #include <cstring>
@@ -90,6 +92,7 @@ struct GpuAssetsState {
     uint64_t material_table_address = 0;
     uint32_t max_materials = 0;
     rhi::TextureHandle defaults[DefaultCount];
+    rhi::TextureHandle fog_noise;
     uint32_t default_index[DefaultCount] = {};
     uint64_t bytes = 0;
     // The table as last written, and the slots changed since it was last uploaded: one upload per
@@ -116,6 +119,9 @@ struct GpuAssetsState {
         for (const auto& [key, mesh] : meshes) {
             device->destroy(mesh.gpu.vertices);
             device->destroy(mesh.gpu.indices);
+        }
+        if (fog_noise.is_valid()) {
+            device->destroy(fog_noise);
         }
         for (const rhi::TextureHandle texture : defaults) {
             device->destroy(texture);
@@ -476,6 +482,27 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
         }
     }
 
+    const core::Result<rhi::TextureHandle> noise_texture =
+        desc.device->create_texture({.width = kFogNoiseSize,
+                                     .height = kFogNoiseSize,
+                                     .depth = kFogNoiseSize,
+                                     .format = rhi::Format::R8Unorm,
+                                     .usage = rhi::TextureUsage::Sampled | rhi::TextureUsage::CopyDst,
+                                     .dimension = rhi::TextureDimension::Texture3D,
+                                     .debug_name = "fog noise"});
+    if (!noise_texture) {
+        return core::fail(noise_texture.error());
+    }
+    state->fog_noise = *noise_texture;
+    core::Array<uint8_t> noise_texels(core::heap_allocator(core::MemoryTag::Render));
+    noise_texels.resize(kFogNoiseBytes);
+    make_fog_noise(noise_texels.span());
+    if (const core::Result<void> queued =
+            desc.uploader->upload_texture(*noise_texture, std::as_bytes(noise_texels.span()));
+        !queued) {
+        return core::fail(queued.error());
+    }
+
     const core::Result<rhi::BufferHandle> table =
         desc.device->create_buffer({.size = uint64_t{desc.max_materials} * sizeof(GpuMaterial),
                                     .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
@@ -522,6 +549,10 @@ GpuAssets& GpuAssets::operator=(GpuAssets&& other) noexcept {
         const GpuAssets discarded(std::exchange(state_, std::exchange(other.state_, nullptr)));
     }
     return *this;
+}
+
+uint32_t GpuAssets::fog_noise_index() const {
+    return state_->uploader->ready(state_->fog_noise) ? state_->device->texture_index(state_->fog_noise) : 0;
 }
 
 void GpuAssets::update() {
