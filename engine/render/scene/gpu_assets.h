@@ -174,6 +174,10 @@ public:
     // be asked for before the mesh has loaded. Until the mesh can be drawn, its entry says it has no LODs. kNoMeshSlot
     // if the table is full. The caller has to stop using it before the mesh unloads.
     uint32_t mesh_slot(asset::AssetHandle mesh);
+    // Whether the mesh table holds anything to read yet: until then, nothing may cull against it.
+    bool mesh_table_ready() const;
+    // How many slots have come free: what lets an instance that got kNoMeshSlot try again.
+    uint64_t mesh_slots_released() const;
     // By mesh slot: 0 for each kind unless the mesh can be drawn.
     std::span<const GpuMeshKinds> mesh_kinds() const;
     // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, GpuMeshLod and GpuMeshPart.

@@ -435,6 +435,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         }
         device->end_frame();
         if (!backbuffer.is_valid()) {
+            world->resync_render_instances();           // what changes while nothing's drawn would be lost
             platform::sleep_ns(5 * platform::kNsPerMs); // minimized: nothing to show, don't spin a core
         }
 

@@ -12,7 +12,6 @@
 #include <glm/mat4x4.hpp>
 
 #include <algorithm>
-#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -377,6 +376,9 @@ struct SceneRendererState {
     uint32_t update_number = 0;
     uint32_t used_mesh_slots = 0; // none past this has instances
     bool warned_mesh_table = false;
+    // Some instance has no mesh slot because the table was full: when one comes free, it needs sending again.
+    bool waiting_for_mesh_slot = false;
+    uint64_t mesh_slots_released_seen = 0;
     bool instance_buffers_read = false; // and the graph has left them for reading
     bool instances_stale_now = false;
     bool warned_instance_limit = false;
@@ -803,10 +805,14 @@ struct SceneRendererState {
             DE_ASSERT_MSG(slot_written[slot] != update_number, "two records for a slot would land in either order");
             slot_written[slot] = update_number;
             const uint32_t mesh = gpu_assets->mesh_slot(instance.mesh);
-            if (mesh == kNoMesh && instance.mesh.is_valid() && !warned_mesh_table) {
-                DE_LOG_ERROR("render",
-                             "the mesh table is full, or a mesh went before its instances: they aren't drawn");
-                warned_mesh_table = true;
+            if (mesh == kNoMesh && instance.mesh.is_valid()) {
+                waiting_for_mesh_slot = true;
+                mesh_slots_released_seen = gpu_assets->mesh_slots_released();
+                if (!warned_mesh_table) {
+                    DE_LOG_ERROR("render",
+                                 "the mesh table is full, or a mesh went before its instances: they aren't drawn");
+                    warned_mesh_table = true;
+                }
             }
             set_slot_mesh(slot, mesh);
             GpuInstanceUpdate& update = updates[count++];
@@ -1258,6 +1264,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.read_cull_stats();
     // A frame not drawn left a gap in the numbers (hand-made frames have no numbers).
     state.instances_stale_now = frame.number != 0 && frame.number != state.last_frame_number + 1;
+    if (state.waiting_for_mesh_slot && state.gpu_assets->mesh_slots_released() != state.mesh_slots_released_seen) {
+        state.waiting_for_mesh_slot = false;
+        state.instances_stale_now = true; // they're sent again, next frame
+    }
     state.last_frame_number = frame.number;
     const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
     const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
@@ -1383,7 +1393,6 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             [renderer = &state, pipeline = instance_update, frame_address,
              updates = plan.updates](PassContext& context) {
                 DE_PROFILE_ZONE("instance update pass");
-                fprintf(stderr, "DIAG update pass %u\n", updates); fflush(stderr);
                 const InstanceUpdatePush push{.updates = frame_address + kInstanceUpdatesOffset,
                                               .instances = renderer->instance_rows_address,
                                               .instance_meshes = renderer->instance_meshes_address,
@@ -1420,9 +1429,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         },
         [](const CullPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gpu cull pass");
-            fprintf(stderr, "DIAG cull slots %u draws %u\n", data.plan.slots, data.plan.draws); fflush(stderr);
             const SceneRendererState& renderer = *data.state;
-            if (data.plan.slots == 0) {
+            // Before the mesh table holds anything, there's nothing to cull against.
+            if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
                 return;
             }
             const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));

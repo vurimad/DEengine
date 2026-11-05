@@ -269,9 +269,10 @@ TEST_CASE("render extraction: between ticks, a mover is sent and what shares its
     const uint32_t mover_slot = mover.get<de::world::RenderSlot>().slot;
     const de::world::RenderFrame& frame = world->render_frame();
     mover.set(Transform{.position = {15.0, 0.0, 0.0}});
-    world->advance(kTick * 1.25); // the tick: something wrote to the table, so both are sent
-    CHECK(sent_rows(frame) == 2);
-    world->advance(kTick * 0.25); // no tick: only what's moving
+    world->advance(kTick * 1.25); // the tick wrote to their table, but only one of them changed
+    CHECK(sent_rows(frame) == 1);
+    CHECK(sent_for(frame, mover_slot) != nullptr);
+    world->advance(kTick * 0.25); // no tick: what's moving, still
     CHECK(sent_rows(frame) == 1);
     CHECK(sent_for(frame, mover_slot) != nullptr);
 }
@@ -341,6 +342,62 @@ TEST_CASE("render extraction: a new mesh on an entity is sent") {
     world->advance(kTick);
     REQUIRE(sent_for(frame, slot) != nullptr);
     CHECK(sent_for(frame, slot)->mesh.index == 4);
+}
+
+TEST_CASE("render extraction: spawning next to a thousand rocks sends one row") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const auto rock_at = [&](double x_m) {
+        const flecs::entity rock = ecs.entity().add<de::world::StaticTransform>().set(MeshInstance{});
+        de::world::place(rock, Transform{.position = {x_m, 0.0, 0.0}});
+        return rock;
+    };
+    for (int i = 0; i < 1000; ++i) {
+        rock_at(static_cast<double>(i));
+    }
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.instances.empty());
+
+    const flecs::entity another = rock_at(-1.0);
+    world->advance(kTick);
+    CHECK(sent_rows(frame) == 1);
+    REQUIRE(sent_for(frame, another.get<de::world::RenderSlot>().slot) != nullptr);
+    // And going: nothing about the others changed.
+    another.destruct();
+    world->advance(kTick);
+    CHECK(sent_rows(frame) == 0);
+    CHECK(frame.freed_slots.size() == 1);
+}
+
+TEST_CASE("render extraction: all of them can wait for a camera") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock = ecs.entity().set(MeshInstance{});
+    de::world::place(rock, Transform{});
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    for (int i = 0; i < 3; ++i) {
+        world->advance(kTick);
+    }
+    // The renderer asks, with nothing to look through: nothing's built for nothing to draw it.
+    world->resync_render_instances();
+    world->advance(kTick);
+    CHECK_FALSE(frame.camera.valid);
+    CHECK(frame.instances.empty());
+    CHECK_FALSE(frame.all_instances);
+    // When there's a camera, they're all sent.
+    const flecs::entity eye = ecs.entity().set(Camera{});
+    de::world::place(eye, Transform{});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    world->advance(kTick);
+    REQUIRE(frame.camera.valid);
+    CHECK(frame.all_instances);
+    CHECK(sent_rows(frame) == 1);
 }
 
 TEST_CASE("render extraction: slots come and go with entities and their meshes") {

@@ -26,6 +26,7 @@ struct MeshInstance {
 // given and freed by observers.
 struct RenderSlot {
     uint32_t slot = 0;
+    uint64_t sent = 0; // a hash of what the renderer was last sent: what a write to its table may not have changed
 };
 
 // Fog in the shape of a box or an ellipsoid around the entity: its world scale is its half extents.
@@ -125,7 +126,7 @@ struct RenderExtractScratch {
         const WorldTransform* current = nullptr;
         const PreviousWorldTransform* previous = nullptr;
         const MeshInstance* meshes = nullptr;
-        const RenderSlot* slots = nullptr;
+        RenderSlot* slots = nullptr;
         uint64_t table = 0;
         uint32_t count = 0;
         uint32_t first = 0;     // where its rows go in RenderFrame::instances
@@ -157,12 +158,14 @@ struct RenderExtractDesc {
 // goes back past the previous tick, by the same motion): no history per entity, exact for steady
 // motion, and none for what hasn't moved or was place()d.
 //
-// A table nothing wrote to, with nothing moving in it, costs next to nothing, whatever its size. A table
-// something wrote to sends all its rows, so what moves shouldn't share one with what doesn't (StaticTransform
-// keeps them apart). What stopped moving is sent once more when its previous transform catches up, in a tick,
-// which writes to its table: that row has no motion in it. Those tables' rows are
-// cut into chunks and run as one parallel job. After the first frames it doesn't allocate (the arrays keep
-// their capacity).
+// A table nothing wrote to, with nothing moving in it, costs next to nothing, whatever its size. In a table
+// something wrote to, which spawning anything into it does, each row is checked against a hash of what it last
+// sent. What stopped moving is sent once more when its previous transform catches up, in a tick: that row has no
+// motion in it. Those tables' rows are cut into chunks and run as one parallel job. After the first frames it doesn't
+// allocate (the arrays keep their capacity).
+//
+// An entity leaves the renderer when it loses its MeshInstance or goes. Disabling it (flecs::Disabled) only stops
+// updates: it stays drawn where it was.
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
 } // namespace de::world

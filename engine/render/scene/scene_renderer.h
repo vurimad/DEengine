@@ -96,7 +96,9 @@ struct SceneRendererDesc {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
-    uint32_t max_instances = 512U * 1024U; // made once, 100 bytes each: 51 MiB. Past it, an instance isn't drawn
+    // Made once, 100 bytes each: 51 MiB. An instance whose slot is past it isn't drawn, until something asks for all
+    // the instances, and even then it keeps that slot: this is a limit to stay under, not one to touch.
+    uint32_t max_instances = 512U * 1024U;
 };
 
 struct SceneRendererStats {

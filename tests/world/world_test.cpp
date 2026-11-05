@@ -144,6 +144,9 @@ TEST_CASE("each instance knows where it was a frame ago, from the same two ticks
         const de::world::RenderFrame& frame = world->render_frame();
         const bool want_statue = entity == statue; // told apart by where they are: it's far behind
         for (const de::world::RenderInstance& instance : frame.instances) {
+            if (instance.slot == de::world::kSkipRenderInstance) {
+                continue;
+            }
             const float x = previous ? instance.previous_transform[3] : instance.transform[3];
             if (want_statue == (instance.transform[3] < -50.0f)) {
                 return x;
@@ -155,6 +158,9 @@ TEST_CASE("each instance knows where it was a frame ago, from the same two ticks
     world->advance(kTick * 1.25); // a tick, and a quarter of the next
     const float first = instance_x(mover, false);
     CHECK(first == doctest::Approx(0.25f));
+    // What doesn't move has no motion, and isn't sent again.
+    CHECK(instance_x(statue, false) == doctest::Approx(-100.0f));
+    CHECK(instance_x(statue, true) == doctest::Approx(-100.0f));
     // Half a tick later, no tick between: a frame ago is where it was drawn.
     world->advance(kTick * 0.5);
     CHECK(instance_x(mover, false) == doctest::Approx(0.75f));
@@ -163,9 +169,6 @@ TEST_CASE("each instance knows where it was a frame ago, from the same two ticks
     world->advance(kTick * 0.5);
     CHECK(instance_x(mover, false) == doctest::Approx(1.25f));
     CHECK(instance_x(mover, true) == doctest::Approx(0.75f));
-    // What doesn't move has no motion.
-    CHECK(instance_x(statue, false) == doctest::Approx(-100.0f));
-    CHECK(instance_x(statue, true) == doctest::Approx(-100.0f));
     // place(): no motion, however far it jumped.
     de::world::place(mover, Transform{.position = {3.0, 0.0, 0.0}});
     world->advance(kTick * 0.1);

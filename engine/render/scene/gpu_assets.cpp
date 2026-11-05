@@ -125,6 +125,8 @@ struct GpuAssetsState {
     core::Array<uint32_t> free_mesh_slots{render_heap()};
     core::HashMap<uint64_t, uint32_t> mesh_slots{render_heap()}; // by the handle's key
     core::Array<GpuMeshKinds> slot_kinds{render_heap()};
+    uint64_t empty_table_ticket = 0; // the upload that makes every slot in the mesh table say it has no mesh
+    uint64_t mesh_slots_released = 0;
     // A material's flags changed: meshes count their parts' kinds again once the GPU sees them too, so the draw lists
     // go on fitting what the cull finds in the table. This table upload has them.
     bool draw_kinds_changed = false;
@@ -478,6 +480,8 @@ struct GpuAssetsState {
         if (const uint32_t* slot = mesh_slots.find(key); slot != nullptr) {
             free_mesh_slots.push(*slot);
             mesh_slots.remove(key);
+            ++mesh_slots_released;
+            retry_dropped_meshes(); // what didn't fit may have been short of a slot, not a place
         }
     }
 
@@ -489,10 +493,10 @@ struct GpuAssetsState {
         }
     }
 
-    // A slot whose old entry hasn't gone yet: a new one has to wait, so they land in the right order.
+    // A slot whose old entry isn't gone yet: a new one has to wait, so they land in the right order.
     bool slot_clear_pending(uint32_t slot) const {
         for (const RetiredPlace& gone : retired_places) {
-            if (gone.mesh_slot == slot && !gone.table_cleared) {
+            if (gone.mesh_slot == slot && gone.last_frame == UINT64_MAX) {
                 return true;
             }
         }
@@ -691,7 +695,7 @@ struct GpuAssetsState {
             if (gone.table_cleared && gone.last_frame == UINT64_MAX && uploader->recorded(gone.table_ticket)) {
                 gone.last_frame = device->frame_index();
                 // The cull won't find it from this frame on. Before now, the draw lists still needed room for it. A new
-                // entry for this slot is queued after this one, so it can't be ready yet.
+                // mesh in this slot waits for this (slot_clear_pending), so it can't be ready yet.
                 slot_kinds[gone.mesh_slot] = {};
             }
             if (gone.last_frame != UINT64_MAX && completed >= gone.last_frame) {
@@ -705,7 +709,11 @@ struct GpuAssetsState {
         if (!freed) {
             return;
         }
-        // Each is either still too big, and stays, or leaves the list in load_mesh.
+        retry_dropped_meshes();
+    }
+
+    // Each is either still too big, and stays, or leaves the list in load_mesh.
+    void retry_dropped_meshes() {
         for (size_t i = 0; i < dropped_meshes.size();) {
             const auto* asset = assets->get<asset::MeshAsset>(dropped_meshes[i]);
             if (asset == nullptr) {
@@ -839,6 +847,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
             !queued) {
             return core::fail(queued.error());
         }
+        state->empty_table_ticket = desc.uploader->buffer_upload_ticket();
     }
     // Slot 0 is the default material; the rest are handed out from the front.
     GpuMaterial fallback;
@@ -981,6 +990,14 @@ void GpuAssets::update() {
 uint32_t GpuAssets::mesh_slot(asset::AssetHandle mesh) {
     // Nothing would ever give back a slot for a handle that's already gone.
     return state_->assets->asset(mesh).id.is_valid() ? state_->take_mesh_slot(mesh) : kNoMeshSlot;
+}
+
+bool GpuAssets::mesh_table_ready() const {
+    return state_->uploader->recorded(state_->empty_table_ticket);
+}
+
+uint64_t GpuAssets::mesh_slots_released() const {
+    return state_->mesh_slots_released;
 }
 
 std::span<const GpuMeshKinds> GpuAssets::mesh_kinds() const {
