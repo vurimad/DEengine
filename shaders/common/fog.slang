@@ -115,6 +115,35 @@ public float froxel_t(FogMedium medium, float depth)
     return log(depth / offset + 1.0) / log(medium.range.y / offset + 1.0);
 }
 
+// A fog volume: world::RenderFogVolume, as the renderer writes it.
+public struct FogVolumeData
+{
+    public float4 to_local[3];  // rows: into its own axes, in meters
+    public float4 half_extents; // w: its soft edge, in meters
+    public float4 tint_density; // w: extinction per meter at its heart
+    public float4 shape;        // x: 1 for an ellipsoid
+};
+
+// How much of a volume's density a point has: 0 outside, to 1 an edge in from its surface.
+public float fog_volume_share(FogVolumeData volume, float3 position)
+{
+    const float3 local = float3(dot(volume.to_local[0], float4(position, 1.0)), dot(volume.to_local[1], float4(position, 1.0)),
+                                dot(volume.to_local[2], float4(position, 1.0)));
+    const float3 half_extents = max(volume.half_extents.xyz, float3(1e-3));
+    float inside;
+    if (volume.shape.x > 0.5)
+    {
+        // Approximately, in meters: right along its smallest axis, and an underestimate elsewhere.
+        inside = (1.0 - length(local / half_extents)) * min(half_extents.x, min(half_extents.y, half_extents.z));
+    }
+    else
+    {
+        const float3 from_faces = half_extents - abs(local);
+        inside = min(from_faces.x, min(from_faces.y, from_faces.z));
+    }
+    return smoothstep(0.0, 1.0, saturate(inside / max(volume.half_extents.w, 1e-3)));
+}
+
 // The fog along a ray (direction unit, sun_direction unit and toward the sun) from from_distance to
 // distance meters, within where fog starts and ends.
 public FogResult fog_between(FogMedium medium, float3 camera, float3 direction, float from_distance, float distance,

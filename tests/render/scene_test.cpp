@@ -1399,6 +1399,12 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.instances.clear();
         CHECK(at_pixel(roofed_box, heart, heart, 1) < at_pixel(box, heart, heart, 1) - 15);
 
+        // Where the sun's haze starts is about the world's fog: a volume nearer than that is still lit.
+        de::render::SceneFog late_sun = clear_air;
+        late_sun.sun_start_m = 30.0f;
+        const de::core::Array<std::byte> late_sun_box = render(late_sun);
+        CHECK(std::abs(at_pixel(late_sun_box, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+
         // Over frames it holds, like the rest of the grid, and goes when it goes.
         settle(clear_air);
         const de::core::Array<std::byte> settled_box = next_frame(clear_air);
@@ -1419,12 +1425,25 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes.push(volume_at(0.0f, 40.0f, -10.0f, 3.0f, 0.5f, 0.5f));
         static_cast<void>(render(clear_air));
         CHECK(renderer->stats().fog_volumes == 0);
+        // With the air clear, ones out of view don't keep the fog passes on.
+        CHECK(renderer->stats().froxel_reach_m == 0.0f);
+        const uint32_t out_of_view_passes = graph->stats().passes;
         frame.fog_volumes.clear();
+        static_cast<void>(render(clear_air));
+        CHECK(graph->stats().passes == out_of_view_passes);
         frame.fog_volumes.push(volume_at(7.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f)); // 4 m aside, and the view reaches 5.5
         const de::core::Array<std::byte> reaching_in = render(clear_air);
         CHECK(renderer->stats().fog_volumes == 1);
         CHECK(std::abs(at_pixel(reaching_in, screen(4.7f), heart, 1) - at_pixel(no_volume, screen(4.7f), heart, 1)) >
               8);
+        CHECK(graph->stats().passes > out_of_view_passes);
+        frame.fog_volumes.clear();
+
+        // The grid's reach is in view depth: far to the side of the view, past it by distance but not by
+        // depth, it's still in.
+        frame.fog_volumes.push(volume_at(30.0f, 0.0f, -59.0f, 1.5f, 0.5f, 0.5f));
+        static_cast<void>(render(clear_air));
+        CHECK(renderer->stats().fog_volumes == 1);
         frame.fog_volumes.clear();
 
         // Long along the view: it reaches across many slices, and it's in them all.
@@ -1447,6 +1466,75 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(std::abs(at_pixel(late_in_mask, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
         frame.fog_volumes.clear();
 
+        // However many overlap, it fits what the froxels store: all that fog looks like the most they hold.
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 12.0f, 0.5f));
+        const de::core::Array<std::byte> densest = render(clear_air);
+        frame.fog_volumes.clear();
+        for (int i = 0; i < 64; ++i) {
+            frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 4.0f, 0.5f));
+        }
+        const de::core::Array<std::byte> stacked = render(clear_air);
+        CHECK(std::abs(at_pixel(stacked, heart, heart, 1) - at_pixel(densest, heart, heart, 1)) <= 3);
+        CHECK(std::abs(at_pixel(stacked, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
+        frame.fog_volumes.clear();
+
+        // A wall ending the view inside a slice with mist in it, far off, where a slice (here 48 to 50.8 m) is
+        // as thick as the mist: it shows the mist in front of it, however much of the slice that is.
+        const auto wall_at = [&](float depth) {
+            frame.instances.clear();
+            frame.instances.push({.transform = {100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -depth}, .mesh = mesh});
+        };
+        const auto mist_slab = [&](float center_depth, float half_depth) {
+            de::world::RenderFogVolume slab_ahead = volume_at(0.0f, 0.0f, -center_depth, 6.0f, 1.0f, 0.1f);
+            slab_ahead.half_extents[2] = half_depth;
+            return slab_ahead;
+        };
+        const auto mist_in_slice = [&] {
+            wall_at(48.3f); // in front of the mist, in the same slice
+            const de::core::Array<std::byte> before_bare = render(clear_air);
+            frame.fog_volumes.push(mist_slab(49.8f, 0.9f));
+            const de::core::Array<std::byte> before_mist = render(clear_air);
+            frame.fog_volumes.pop();
+            CHECK(std::abs(at_pixel(before_mist, heart, heart, 1) - at_pixel(before_bare, heart, heart, 1)) <= 3);
+
+            wall_at(49.6f); // behind the mist, in the same slice
+            frame.fog_volumes.push(mist_slab(48.7f, 0.6f));
+            const de::core::Array<std::byte> behind_mist = render(clear_air);
+            wall_at(53.0f); // and well past it
+            const de::core::Array<std::byte> far_past_mist = render(clear_air);
+            frame.fog_volumes.pop();
+            const de::core::Array<std::byte> far_past_bare = render(clear_air);
+            const int all_of_it = at_pixel(far_past_mist, heart, heart, 1) - at_pixel(far_past_bare, heart, heart, 1);
+            CHECK(all_of_it > 20);
+            CHECK(std::abs(at_pixel(behind_mist, heart, heart, 1) - at_pixel(far_past_mist, heart, heart, 1)) <
+                  all_of_it / 4);
+            frame.instances.clear();
+        };
+        mist_in_slice();
+        // The same for a volume in the mask's second half (the others are above the view's middle).
+        for (int i = 0; i < 40; ++i) {
+            frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 2.0f, 20.0f, -49.0f, 3.0f, 0.5f, 0.5f));
+        }
+        mist_in_slice();
+        frame.fog_volumes.clear();
+
+        // Slid along the view, through thick far slices, the mist doesn't come and go: its fog is that of
+        // several points through a slice's depth.
+        int least_seen = 255;
+        int most_seen = 0;
+        wall_at(55.0f);
+        for (int i = 0; i < 16; ++i) {
+            frame.fog_volumes.clear();
+            frame.fog_volumes.push(mist_slab(40.0f + static_cast<float>(i) * 0.35f, 1.5f));
+            frame.fog_volumes[0].density_per_m = 0.4f;
+            const de::core::Array<std::byte> slid = render(clear_air);
+            least_seen = std::min(least_seen, at_pixel(slid, heart, heart, 1));
+            most_seen = std::max(most_seen, at_pixel(slid, heart, heart, 1));
+        }
+        CHECK(most_seen - least_seen <= 20);
+        frame.instances.clear();
+        frame.fog_volumes.clear();
+
         // Out of reach, or behind the camera: not sent. Too many: the nearest.
         frame.fog_volumes.push(volume_at(0.0f, 0.0f, -500.0f, 3.0f, 0.5f, 0.5f));
         frame.fog_volumes.push(volume_at(0.0f, 0.0f, 50.0f, 3.0f, 0.5f, 0.5f));
@@ -1462,6 +1550,13 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(renderer->stats().fog_volumes == 64);
         CHECK(renderer->stats().fog_volumes_dropped == 7);
         CHECK(std::abs(at_pixel(crowded, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        // Nearest by its surface, not its middle: one the camera is inside stays, though its middle is farther
+        // than all of those.
+        frame.fog_volumes.pop();
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -45.0f, 50.0f, 0.1f, 0.5f));
+        const de::core::Array<std::byte> crowded_around = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 64);
+        CHECK(std::abs(at_pixel(crowded_around, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
         frame.fog_volumes.clear();
         restart();
 

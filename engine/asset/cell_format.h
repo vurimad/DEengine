@@ -19,6 +19,8 @@ DE_ENUM_FLAGS(CellEntityFlags)
 
 enum class CellFogShape : uint32_t { Box, Ellipsoid };
 
+inline constexpr float kMaxFogVolumeDensityPerM = 4.0f;
+
 // A fog volume a cell places: its size is its entity's scale (half extents, in meters).
 struct CellFogVolume {
     float density_per_m = 0.1f; // extinction at its heart, on top of the world's fog
@@ -62,7 +64,7 @@ struct CellAsset {
 
     // Arrays inside the file; parents earlier in the list, meshes among the dependencies (and of
     // type Mesh), names inside the names array, finite transforms, and fog volumes in the list, with
-    // finite values, a density and edge of 0 or more, and a known shape.
+    // finite values, a density up to the limit, an edge of 0 or more, and a known shape.
     core::Result<void> validate(std::span<const std::byte> file) const;
 
     std::string_view name(const void* file, const CellEntity& entity) const {

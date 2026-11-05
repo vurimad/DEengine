@@ -65,9 +65,6 @@ struct RenderView {
     bool previous_valid = false;
 };
 
-// What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
-// at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
-// list of entities; it reads this, rebuilt every frame.
 // One fog volume this frame, relative to the frame's render origin.
 struct RenderFogVolume {
     float to_local[12] = {}; // rows: a point relative to the origin into the volume's own axes, in meters
@@ -79,6 +76,9 @@ struct RenderFogVolume {
     bool ellipsoid = false;
 };
 
+// What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
+// at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
+// list of entities; it reads this, rebuilt every frame.
 struct RenderFrame {
     uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
     DVec3 origin{0.0};         // the render origin: what instance positions are relative to

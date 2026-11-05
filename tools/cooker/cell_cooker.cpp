@@ -203,10 +203,11 @@ private:
         } else if (shape != "box") {
             diagnostics_.error(path_, "%s: fog_volume shape should be box or ellipsoid", label.c_str());
         }
-        const double density = yyjson_get_num(yyjson_obj_get(object, "density"));
-        const double edge = reader.has("edge_m") ? yyjson_get_num(yyjson_obj_get(object, "edge_m")) : 1.0;
-        if (!reader.has("density") || !to_float(density, volume.density_per_m) || density <= 0.0) {
-            diagnostics_.error(path_, "%s: fog_volume needs a density above 0", label.c_str());
+        const double density = reader.number("density", 0.0);
+        const double edge = reader.number("edge_m", 1.0);
+        if (density <= 0.0 || density > static_cast<double>(asset::kMaxFogVolumeDensityPerM) ||
+            !to_float(density, volume.density_per_m)) {
+            diagnostics_.error(path_, "%s: fog_volume needs a density above 0, up to 4", label.c_str());
         }
         if (!to_float(edge, volume.edge_m) || edge < 0.0) {
             diagnostics_.error(path_, "%s: fog_volume edge_m should be 0 or more", label.c_str());

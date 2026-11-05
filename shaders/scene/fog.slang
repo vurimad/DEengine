@@ -14,6 +14,10 @@ struct FogPush
     uint depth;
     uint integrated; // the froxel grid, integrated: (in-scatter, optical depth); unused without one
     uint sampler;    // linear clamp
+    FogVolumeData* fog_volumes;
+    uint2* fog_slice_masks; // per slice, a bit per volume that reaches it
+    uint fog_volume_count;
+    uint padding;
 };
 
 [[vk::push_constant]]
@@ -24,6 +28,51 @@ struct VertexOutput
     float4 position : SV_Position;
     float2 ndc : TEXCOORD;
 };
+
+// Points tested along a pixel's ray, in front of its surface and through its slice.
+static const uint kVolumeFrontSamples = 4;
+
+// How much of a pixel's slice's fog to count, when its surface is inside the slice. A slice holds one mean,
+// and at distance a slice is as thick as a whole volume: taking a share by depth alone puts the volume's
+// fog in front of ground it's really behind, and the other way round, and the error sweeps across the
+// volume as slices slide over the ground with the camera. So the volumes' share is what's really in front.
+// The fog in the slice stays where it was: it's nearly even across one.
+float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray, uint slice, float by_depth, float view_depth)
+{
+    const uint2 mask = push.fog_slice_masks[slice];
+    if ((mask.x | mask.y) == 0)
+    {
+        return by_depth;
+    }
+    const float slices = frame.fog.range.w;
+    const float near_depth = froxel_depth(frame.fog, float(slice) / slices);
+    const float far_depth = froxel_depth(frame.fog, float(slice + 1) / slices);
+    const float3 camera = frame.camera_position.xyz;
+    float in_front = 0.0;
+    float through = 0.0;
+    for (uint i = 0; i < kVolumeFrontSamples; ++i)
+    {
+        const float place = (float(i) + 0.5) / float(kVolumeFrontSamples);
+        const float3 front_point = camera + direction * (lerp(near_depth, view_depth, place) / view_per_ray);
+        const float3 slice_point = camera + direction * (lerp(near_depth, far_depth, place) / view_per_ray);
+        for (uint word = 0; word < 2; ++word)
+        {
+            for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
+            {
+                const FogVolumeData volume = push.fog_volumes[word * 32 + firstbitlow(bits)];
+                in_front += volume.tint_density.w * fog_volume_share(volume, front_point);
+                through += volume.tint_density.w * fog_volume_share(volume, slice_point);
+            }
+        }
+    }
+    const float span = far_depth - near_depth;
+    in_front *= (view_depth - near_depth) / float(kVolumeFrontSamples);
+    through *= span / float(kVolumeFrontSamples);
+    const float3 middle = camera + direction * (lerp(near_depth, far_depth, 0.5) / view_per_ray);
+    const float world_fog = fog_density(frame.fog, middle.y - frame.fog.density.w) * span;
+    const float all_fog = through + world_fog;
+    return all_fog > 0.0 ? saturate((in_front + world_fog * by_depth) / all_fog) : by_depth;
+}
 
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id: SV_VertexID)
@@ -60,7 +109,12 @@ float4 fragment_main(VertexOutput input) : SV_Target
         // Slice k holds the integral through its far edge, at the texture's k + 0.5. Inside the first
         // slice, a share of it: the integral starts at nothing.
         const float slices = frame.fog.range.w;
-        const float slice = froxel_t(frame.fog, view_depth) * slices;
+        float slice = froxel_t(frame.fog, view_depth) * slices;
+        if (push.fog_volume_count > 0 && slice < slices)
+        {
+            const float first = floor(slice);
+            slice = first + fog_share_in_slice(frame, direction, view_per_ray, uint(first), slice - first, view_depth);
+        }
         // The grid doesn't move with TAA's offset, and this pixel's ray does.
         const float2 grid_ndc = input.ndc - frame.taa_params.zw;
         const float3 uvw = float3(grid_ndc.x * 0.5 + 0.5, 0.5 - grid_ndc.y * 0.5, (slice - 0.5) / slices);

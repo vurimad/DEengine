@@ -114,23 +114,34 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
     // A few, not worth a job. Moving ones are where they're seen, like anything else.
     ecs.system<const WorldTransform, const PreviousWorldTransform, const FogVolume>("de::ExtractRenderFogVolumes")
         .kind(phase)
-        .each([desc](const WorldTransform& current, const PreviousWorldTransform& previous, const FogVolume& volume) {
-            const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
-            const Vec3 center(seen.position - desc.frame->origin);
-            const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
-            RenderFogVolume out{
-                .density_per_m = volume.density_per_m, .edge_m = volume.edge_m, .ellipsoid = volume.ellipsoid};
-            for (int row = 0; row < 3; ++row) {
-                const Vec3 axis(to_axes[0][row], to_axes[1][row], to_axes[2][row]);
-                out.to_local[static_cast<size_t>(row) * 4 + 0] = axis.x;
-                out.to_local[static_cast<size_t>(row) * 4 + 1] = axis.y;
-                out.to_local[static_cast<size_t>(row) * 4 + 2] = axis.z;
-                out.to_local[static_cast<size_t>(row) * 4 + 3] = -glm::dot(axis, center);
-                out.center[row] = center[row];
-                out.half_extents[row] = std::abs(seen.scale[row]);
-                out.tint[row] = volume.tint[row];
+        .run([desc](flecs::iter& it) {
+            DE_PROFILE_ZONE("render extract fog volumes");
+            while (it.next()) {
+                const auto currents = it.field<const WorldTransform>(0);
+                const auto previouses = it.field<const PreviousWorldTransform>(1);
+                const auto volumes = it.field<const FogVolume>(2);
+                for (const auto entity_row : it) {
+                    const WorldTransform& current = currents[entity_row];
+                    const PreviousWorldTransform& previous = previouses[entity_row];
+                    const FogVolume& volume = volumes[entity_row];
+                    const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
+                    const Vec3 center(seen.position - desc.frame->origin);
+                    const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
+                    RenderFogVolume out{
+                        .density_per_m = volume.density_per_m, .edge_m = volume.edge_m, .ellipsoid = volume.ellipsoid};
+                    for (int row = 0; row < 3; ++row) {
+                        const Vec3 axis(to_axes[0][row], to_axes[1][row], to_axes[2][row]);
+                        out.to_local[static_cast<size_t>(row) * 4 + 0] = axis.x;
+                        out.to_local[static_cast<size_t>(row) * 4 + 1] = axis.y;
+                        out.to_local[static_cast<size_t>(row) * 4 + 2] = axis.z;
+                        out.to_local[static_cast<size_t>(row) * 4 + 3] = -glm::dot(axis, center);
+                        out.center[row] = center[row];
+                        out.half_extents[row] = std::abs(seen.scale[row]);
+                        out.tint[row] = volume.tint[row];
+                    }
+                    desc.frame->fog_volumes.push(out);
+                }
             }
-            desc.frame->fog_volumes.push(out);
         });
     // Every table cut into chunks first (the column pointers stay valid: nothing structural happens
     // during the phase), then one parallel job over all chunks, whatever the tables' sizes.

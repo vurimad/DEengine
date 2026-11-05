@@ -287,7 +287,7 @@ std::vector<std::byte> sample_material() {
 }
 
 // A cell with a parent, two meshes, and names.
-std::vector<std::byte> sample_cell() {
+std::vector<std::byte> sample_cell(float fog_density_per_m = 0.2f) {
     de::cooker::CellBuild build;
     build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
     build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
@@ -297,7 +297,7 @@ std::vector<std::byte> sample_cell() {
     }
     build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
-    build.fog_volumes.push({.density_per_m = 0.2f});
+    build.fog_volumes.push({.density_per_m = fog_density_per_m});
     build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
 }
@@ -342,6 +342,9 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     REQUIRE(load_in_place<ShaderAsset>(shader_file.bytes()).ok());
     Buffer cell_file(cell);
     REQUIRE(load_in_place<CellAsset>(cell_file.bytes()).ok());
+    // Denser than the froxels can hold: the cooker won't write one, and a file that has it is refused.
+    Buffer too_dense_file(sample_cell(5.0f));
+    CHECK_FALSE(load_in_place<CellAsset>(too_dense_file.bytes()).ok());
 
     constexpr int kRounds = 4000;
     fuzz<MeshAsset>(mesh, 1, kRounds);
