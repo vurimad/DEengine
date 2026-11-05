@@ -40,6 +40,43 @@ public struct GpuDraw
     public uint material; // its slot in the material table
 };
 
+// The tables and lists of the GPU cull (scene.cull). All of these match C++ structs of the same name: the first
+// two in engine/render/scene/gpu_assets.h, the rest in scene_renderer.cpp.
+public struct GpuMeshInfo
+{
+    public float3 center; // of its bounding sphere, in object space
+    public float radius;
+    public uint vertex_offset; // its first vertex in the geometry pool
+    public uint first_part;    // of LOD 0, in the part table
+    public uint part_count;
+    public uint padding;
+};
+
+public struct GpuMeshPart
+{
+    public uint first_index; // in the geometry pool
+    public uint index_count;
+    public uint material;
+};
+
+public static const uint kCullViewCount = 1 + kCascadeCount; // the camera, then each cascade
+public static const uint kNoMesh = 0xffffffffu;
+
+public struct GpuCullView
+{
+    public float4 planes[6]; // inside: dot(xyz, p) + w >= 0, in render-origin space
+    public uint plane_count;
+    public uint first_list;
+    public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
+    public uint padding;
+};
+
+public struct GpuDrawList
+{
+    public uint first_slot;
+    public uint capacity;
+};
+
 // A cascade's tile in the 2x2 shadow atlas: uv offset (each tile is half the atlas).
 public float2 cascade_tile(uint cascade)
 {

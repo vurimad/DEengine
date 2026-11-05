@@ -414,6 +414,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
                 DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
                 DE_PROFILE_PLOT("indirect calls", static_cast<int64_t>(drawn.indirect_calls));
+                DE_PROFILE_PLOT("visible draws", static_cast<int64_t>(drawn.visible_draws));
+                DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
                 static_cast<void>(drawn);
             }
         }

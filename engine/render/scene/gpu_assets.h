@@ -48,12 +48,33 @@ struct GpuMaterial {
 };
 static_assert(sizeof(GpuMaterial) == 80);
 
-// A range of the pool's indices drawn with one material.
+// A range of the pool's indices drawn with one material. An entry of the part table too, as
+// GpuMeshPart in shaders/scene/scene_common.slang.
 struct GpuMeshPart {
     uint32_t first_index = 0; // in the pool's index buffer
     uint32_t index_count = 0;
     uint32_t material = 0; // index into the material table
 };
+static_assert(sizeof(GpuMeshPart) == 12);
+
+// An entry of the mesh table, as GpuMeshInfo in shaders/scene/scene_common.slang.
+struct GpuMeshInfo {
+    float center[3] = {};
+    float radius_m = 0.0f;
+    uint32_t vertex_offset = 0;
+    uint32_t first_part = 0; // of LOD 0, in the part table
+    uint32_t part_count = 0;
+    uint32_t padding = 0;
+};
+static_assert(sizeof(GpuMeshInfo) == 32);
+
+// How a part draws: [masked][double-sided] as two bits, each kind a pipeline state.
+inline constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, masked, masked double-sided
+
+constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
+    return (core::has_any(flags, GpuMaterialFlags::Masked) ? 2U : 0U) |
+           (core::has_any(flags, GpuMaterialFlags::DoubleSided) ? 1U : 0U);
+}
 
 // One level of detail: LOD 0 first, coarser after.
 struct GpuMeshLod {
@@ -66,6 +87,8 @@ struct GpuMeshLod {
 // passes as its vertex offset.
 struct GpuMesh {
     uint32_t vertex_offset = 0;
+    uint32_t table_slot = 0;                  // in the mesh table
+    uint32_t kind_parts[kDrawKindCount] = {}; // LOD 0's parts of each kind, by what the material table says now
     float bounds_min[3] = {};
     float bounds_max[3] = {};
     float bounds_center[3] = {}; // of the bounding sphere
@@ -88,6 +111,7 @@ struct GpuAssetsStats {
     uint32_t meshes_dropped = 0; // don't fit in the geometry pool now, so aren't drawn: tried again as space comes back
     uint64_t pool_vertices_free = 0;
     uint64_t pool_indices_free = 0;
+    uint64_t table_parts_free = 0;
 };
 
 struct GpuAssetsDesc {
@@ -98,6 +122,9 @@ struct GpuAssetsDesc {
     // The geometry pool: every mesh's vertices and indices, in two buffers made once, whatever's loaded.
     uint32_t pool_vertices = 8U << 20U; // 32 bytes each: 256 MiB
     uint32_t pool_indices = 32U << 20U; // 4 bytes each: 128 MiB
+    // The tables the GPU cull reads, made once too. Meshes of more than this don't fit, like the pool.
+    uint32_t max_meshes = 16384;
+    uint32_t max_parts = 256U * 1024U;
 };
 
 struct GpuAssetsState;
@@ -132,6 +159,9 @@ public:
     // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
     uint64_t pool_vertex_address() const;
     rhi::BufferHandle pool_index_buffer() const;
+    // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, and GpuMeshPart.
+    uint64_t mesh_table_address() const;
+    uint64_t part_table_address() const;
     // A material table entry's flags (as last written: a reloaded material changes them), which pick
     // how it draws: alpha-tested (Masked) and without back-face culling (DoubleSided). None for an
     // index past the table.
