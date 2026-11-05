@@ -1,5 +1,6 @@
 #include "world/render_extract.h"
 
+#include "core/assert.h"
 #include "core/job_system.h"
 #include "core/profile.h"
 
@@ -124,6 +125,7 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                     const WorldTransform& current = currents[entity_row];
                     const PreviousWorldTransform& previous = previouses[entity_row];
                     const FogVolume& volume = volumes[entity_row];
+                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f); // cooked ones are checked at load
                     const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
                     const Vec3 center(seen.position - desc.frame->origin);
                     const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));

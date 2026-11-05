@@ -1618,6 +1618,18 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         fog_past_grid.start_m = 500.0f;
         fog_past_grid.sun_start_m = 500.0f;
         mist_in_slice(fog_past_grid);
+        // Nor does fog that starts partway through the slice, behind the mist, take the mist's light.
+        wall_at(49.6f);
+        frame.fog_volumes.push(mist_slab(48.7f, 0.6f));
+        const de::core::Array<std::byte> mist_alone = render(clear_air);
+        de::render::SceneFog fog_behind_mist = clear_air;
+        fog_behind_mist.density_per_m = 0.3f;
+        fog_behind_mist.start_m = 49.9f;
+        fog_behind_mist.sun_start_m = 49.9f;
+        const de::core::Array<std::byte> mist_before_fog = render(fog_behind_mist);
+        frame.fog_volumes.pop();
+        frame.instances.clear();
+        CHECK(std::abs(at_pixel(mist_before_fog, heart, heart, 1) - at_pixel(mist_alone, heart, heart, 1)) <= 4);
         // The same for a volume in the mask's second half (the others are above the view's middle).
         for (int i = 0; i < 40; ++i) {
             frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 2.0f, 20.0f, -49.0f, 3.0f, 0.5f, 0.5f));
