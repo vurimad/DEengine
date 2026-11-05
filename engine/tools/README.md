@@ -7,7 +7,7 @@ Debug and editor tools inside the engine, drawn with Dear ImGui (docs/design.md,
 | File | What it gives |
 | --- | --- |
 | `debug_ui.h` | The ImGui context on the Tools heap (docking on, no ini file), and `DebugUi`: context, platform side and renderer made and torn down together |
-| `stats_panel.h` | `StatsPanel`: frame time and history, heap allocations per frame, GPU memory by category, GPU time per pass, the render graph, uploads and the device (F1 in deengine) |
+| `stats_panel.h` | `StatsPanel`: frame time and history, heap allocations per frame, GPU memory by category, GPU time per pass, the render graph, uploads and the device, and where the camera is, to come back to a spot (F1 in deengine) |
 | `free_camera.h` | `FreeCamera`: a fly camera driven by input actions, placing its entity each frame; `add_free_camera_actions` |
 
 ## Rules and invariants

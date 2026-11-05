@@ -26,6 +26,8 @@
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
 #include "tools/stats_panel.h"
+#include "world/render_extract.h"
+#include "world/transform.h"
 #include "world/world.h"
 
 #include <cstdio>
@@ -404,14 +406,24 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         const uint64_t allocations = core::heap_allocation_count() - frame_start_allocations;
         DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
 #if DE_BUILD_DEV
-        stats_panel.record({.frame_ms = static_cast<float>(measured_s * 1000.0),
-                            .heap_allocations = allocations,
-                            .device = device->stats(),
-                            .memory = device->memory_stats(),
-                            .graph = graph->stats(),
-                            .uploads = uploader->stats(),
-                            .gpu_passes = graph->gpu_times(),
-                            .gpu_frame_ms = graph->gpu_frame_ms()});
+        const flecs::world& ecs = engine.world.ecs();
+        const auto* active_camera = ecs.try_get<world::ActiveCamera>();
+        const auto* camera_place =
+            active_camera != nullptr && active_camera->entity != 0 && ecs.is_alive(active_camera->entity)
+                ? ecs.entity(active_camera->entity).try_get<world::WorldTransform>()
+                : nullptr;
+        stats_panel.record(
+            {.frame_ms = static_cast<float>(measured_s * 1000.0),
+             .heap_allocations = allocations,
+             .device = device->stats(),
+             .memory = device->memory_stats(),
+             .graph = graph->stats(),
+             .uploads = uploader->stats(),
+             .gpu_passes = graph->gpu_times(),
+             .gpu_frame_ms = graph->gpu_frame_ms(),
+             .has_camera = camera_place != nullptr,
+             .camera_position = camera_place != nullptr ? camera_place->position : DVec3(0.0),
+             .camera_rotation = camera_place != nullptr ? camera_place->rotation : Quat(1.0f, 0.0f, 0.0f, 0.0f)});
 #endif
         DE_PROFILE_FRAME();
         ++frame;
