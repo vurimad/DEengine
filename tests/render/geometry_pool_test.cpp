@@ -20,6 +20,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
 #include <span>
 
@@ -114,6 +115,8 @@ void put_material(const de::platform::Vfs& vfs, AssetId id, float red, float gre
 struct PoolOptions {
     uint32_t pool_vertices = 1024;
     uint32_t pool_indices = 1024;
+    uint32_t max_meshes = 64;
+    uint32_t max_parts = 1024;
     uint64_t frame_budget_bytes = uint64_t{16} << 20U;
     bool hot_reload = false;
 };
@@ -182,6 +185,14 @@ struct PoolScene {
         return de::test::read_texture(device, target);
     }
 
+    // Draws this frame until what the cull kept can be read: read_cull_stats reads a slot's last frame.
+    void submit_for_stats(const de::world::RenderFrame& frame, const de::render::SceneLighting& lighting = {},
+                          de::render::SceneView view = de::render::SceneView::BaseColor) const {
+        for (uint32_t i = 0; i < de::rhi::kFramesInFlight + 1; ++i) {
+            submit(frame, lighting, view);
+        }
+    }
+
     // Frames until nothing in flight can hold a place back, and the update that frees them.
     void settle() const {
         device.wait_idle();
@@ -225,7 +236,9 @@ void with_pool(const PoolOptions& options, Body body) {
                                                          .uploader = &*uploader,
                                                          .assets = &*assets,
                                                          .pool_vertices = options.pool_vertices,
-                                                         .pool_indices = options.pool_indices});
+                                                         .pool_indices = options.pool_indices,
+                                                         .max_meshes = options.max_meshes,
+                                                         .max_parts = options.max_parts});
         REQUIRE(gpu_assets.ok());
         auto renderer =
             de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
@@ -433,6 +446,270 @@ TEST_CASE("a shadow caster reads its own instance and material") {
     });
 }
 
+TEST_CASE("the cull keeps what's in view and drops the rest") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh, mesh, mesh, mesh});
+        frame.instances[1].transform[3] = -50.0f; // far to the left
+        frame.instances[2].transform[11] = 10.0f; // behind the camera, which is at z = 3
+        frame.instances[3].transform[7] = 50.0f;  // far above
+        scene.submit_for_stats(frame);
+        const de::render::SceneRendererStats stats = scene.renderer.stats();
+        CHECK(stats.drawn == 4);
+        CHECK(stats.draws == 4); // what it was given
+        CHECK(stats.visible_draws == 1);
+        CHECK(stats.shadow_draws == 16);
+        CHECK(stats.visible_shadow_draws < 16);
+        CHECK(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}
+
+TEST_CASE("the cull keeps what only reaches into the view, by the size it's drawn at") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        // 10 m wide, its center 6 m to the right: well out of the view (1.64 m to either side), its left edge in it.
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        const float transform[12] = {10, 0, 0, 6, 0, 10, 0, 0, 0, 0, 10, 0};
+        std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        CHECK(is_red(pixels, kRight));
+        CHECK_FALSE(is_red(pixels, kLeft));
+
+        // The same on one axis only: its bounds grow with its longest axis, whichever that is.
+        const float wide[12] = {10, 0, 0, 6, 0, 1, 0, 0, 0, 0, 1, 0};
+        std::memcpy(frame.instances[0].transform, wide, sizeof(wide));
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const float tall[12] = {1, 0, 0, 0, 0, 10, 0, 6, 0, 0, 1, 0};
+        std::memcpy(frame.instances[0].transform, tall, sizeof(tall));
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const float deep[12] = {1, 0, 0, 2.5f, 0, 1, 0, 0, 0, 0, 10, 0};
+        std::memcpy(frame.instances[0].transform, deep, sizeof(deep));
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws ==
+              1); // a flat square, so it isn't really: a sphere is all the cull knows
+    });
+}
+
+TEST_CASE("the cull finds a mesh's bounds wherever its vertices are") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kSides, kRed, {30.0f}); // its vertices are 30 m from its origin
+        const AssetHandle mesh = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 0); // the origin is in view, the square isn't
+        frame.instances[0].transform[3] = -30.0f;
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1); // and now it's at the origin
+        CHECK(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}
+
+TEST_CASE("the cull adds every part of a mesh, each with its own material") {
+    with_pool({}, [](const PoolScene& scene) {
+        constexpr AssetId kTwoParts = AssetId::from_value(0xb10);
+        de::cooker::ModelData model;
+        for (const float center : {-1.0f, 1.0f}) {
+            de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
+            primitive.material = center < 0.0f ? 0 : 1;
+            const float corners[4][2] = {{-0.5f, -0.5f}, {0.5f, -0.5f}, {0.5f, 0.5f}, {-0.5f, 0.5f}};
+            for (const auto& corner : corners) {
+                de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
+                vertex.position[0] = center + corner[0];
+                vertex.position[1] = corner[1];
+                vertex.normal[1] = 0.0f;
+                vertex.normal[2] = 1.0f;
+            }
+            for (const uint32_t index : {0U, 1U, 2U, 0U, 2U, 3U}) {
+                primitive.indices.push(index);
+            }
+            static_cast<void>(model.materials.emplace());
+        }
+        de::cooker::Diagnostics diagnostics;
+        const AssetId materials[] = {kRed, kGreen};
+        const auto cooked = de::cooker::cook_mesh(model, materials, {.lod_count = 1}, kTwoParts, "test", diagnostics);
+        REQUIRE(cooked.ok());
+        REQUIRE(scene.vfs.write_file(de::asset::cooked_path(kTwoParts, AssetType::Mesh).c_str(), cooked->span()).ok());
+        const AssetHandle mesh = scene.load(kTwoParts);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        REQUIRE(scene.gpu_assets.mesh(mesh) != nullptr);
+        CHECK(scene.gpu_assets.mesh(mesh)->lod_parts(0).size() == 2);
+        const de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().draws == 2);
+        CHECK(scene.renderer.stats().visible_draws == 2);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        CHECK(is_red(pixels, kLeft));
+        CHECK(is_green(pixels, kRight));
+    });
+}
+
+TEST_CASE("a material that arrives after its mesh reaches the part table") {
+    with_pool({.hot_reload = true}, [](const PoolScene& scene) {
+        constexpr AssetId kLate = AssetId::from_value(0xb20);
+        put_squares(scene.vfs, kCenter, kLate, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        const auto before = scene.draw({mesh});
+        CHECK(texel(before, kMiddle, kMiddle)[1] > 200); // the default: white
+        CHECK(texel(before, kMiddle, kMiddle)[2] > 200);
+
+        put_material(scene.vfs, kLate, 0.0f, 1.0f);
+        for (int i = 0; i < 100 && scene.gpu_assets.stats().materials == 0; ++i) {
+            scene.empty_frame();
+        }
+        REQUIRE(scene.gpu_assets.stats().materials == 1);
+        scene.uploader.flush_and_wait();
+        const auto after = scene.draw({mesh});
+        CHECK(texel(after, kMiddle, kMiddle)[1] > 200);
+        CHECK(texel(after, kMiddle, kMiddle)[2] < 50); // its own: green
+    });
+}
+
+TEST_CASE("the cull reaches every instance") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        constexpr uint32_t kCount = 130; // two groups of 64 and a bit
+        for (uint32_t i = 0; i < kCount; ++i) {
+            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+        }
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == kCount);
+    });
+}
+
+TEST_CASE("a caster out of the camera's view still casts its shadow") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        // A 2 m wall at z = 0, and a 0.5 m square at z = 2, x = 1.1. The camera at z = 3 sees 0.55 m to either side at
+        // that depth, so not the square, but with the sun at (1, 0, 2) its shadow lands 1 m to its left: x = 0.1 on the
+        // wall.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.instances.push({.transform = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}, .mesh = mesh});
+        frame.instances.push({.transform = {0.5f, 0, 0, 1.1f, 0, 0.5f, 0, 0, 0, 0, 0.5f, 2}, .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        CHECK(texel(pixels, kMiddle + 2, kMiddle)[0] < 40);   // the shadow
+        CHECK(texel(pixels, kMiddle - 12, kMiddle)[0] > 215); // lit
+    });
+}
+
+TEST_CASE("a cascade drops casters past either end of its depth") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
+        CHECK(in_reach > 0);
+        // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
+        frame.instances[0].transform[11] = 5000.0f;
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        // And past the far end of every cascade.
+        frame.instances[0].transform[11] = -5000.0f;
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+    });
+}
+
+TEST_CASE("what the cull kept isn't reported again for frames that drew nothing") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        frame.camera.valid = false;
+        for (uint32_t i = 0; i < 2 * de::rhi::kFramesInFlight + 1; ++i) {
+            scene.submit(frame);
+        }
+        CHECK(scene.renderer.stats().visible_draws == 0);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+    });
+}
+
+TEST_CASE("a material that changes how it draws keeps its meshes drawn") {
+    with_pool({.hot_reload = true}, [](const PoolScene& scene) {
+        constexpr AssetId kChanging = AssetId::from_value(0xb00);
+        const auto put_changing = [&](de::asset::AlphaMode mode) {
+            de::cooker::MaterialBuild build;
+            build.alpha_mode = mode;
+            build.set_param(de::asset::material::kBaseColor, 1.0f, 0.0f, 0.0f, 1.0f);
+            const auto material = de::cooker::cook_material(build, kChanging);
+            REQUIRE(
+                scene.vfs.write_file(de::asset::cooked_path(kChanging, AssetType::Material).c_str(), material.span())
+                    .ok());
+        };
+        put_changing(de::asset::AlphaMode::Opaque);
+        put_squares(scene.vfs, kCenter, kChanging, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        CHECK(is_red(scene.draw({mesh}), kMiddle));
+
+        // Opaque's draw list holds it now; once masked, it goes in another, which has to have room.
+        put_changing(de::asset::AlphaMode::Masked);
+        const uint32_t reloads = scene.assets.stats().reloads;
+        for (int i = 0; i < 100 && scene.assets.stats().reloads == reloads; ++i) {
+            scene.empty_frame();
+        }
+        REQUIRE(scene.assets.stats().reloads > reloads);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const auto pixels = scene.draw({mesh});
+        CHECK(is_red(pixels, kMiddle));
+    });
+}
+
+TEST_CASE("a mesh takes up no room in the tables once it's gone, and doesn't fit when they're full") {
+    // Out of mesh slots, or out of room for parts, though the pool has room.
+    for (const PoolOptions options :
+         {PoolOptions{.max_meshes = 1, .max_parts = 16}, PoolOptions{.max_meshes = 16, .max_parts = 1}}) {
+        with_pool(options, [](const PoolScene& scene) {
+            put_squares(scene.vfs, kCenter, kRed, {0.0f});
+            put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+            const AssetHandle center = scene.load(kCenter);
+            const AssetHandle sides = scene.load(kSides);
+            scene.uploader.flush_and_wait();
+            scene.gpu_assets.update();
+            CHECK(scene.gpu_assets.mesh(center) != nullptr);
+            CHECK(scene.gpu_assets.mesh(sides) == nullptr);
+            CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
+
+            scene.assets.release(center);
+            scene.assets.update();
+            scene.settle();
+            scene.uploader.flush_and_wait();
+            scene.gpu_assets.update();
+            REQUIRE(scene.gpu_assets.mesh(sides) != nullptr);
+            CHECK(scene.gpu_assets.stats().meshes_dropped == 0);
+            const auto pixels = scene.draw({sides});
+            CHECK(is_green(pixels, kLeft));
+        });
+    }
+}
+
 TEST_CASE("many meshes reach the pool in one frame") {
     with_pool({}, [](const PoolScene& scene) {
         constexpr int kCount = 16;
@@ -457,14 +734,17 @@ TEST_CASE("a mesh in the pool isn't drawn before all of it is recorded") {
         put_squares(scene.vfs, kSides, kRed, {-1.0f, 1.0f});
         static_cast<void>(scene.load(kCenter));
         scene.uploader.flush_and_wait();
-        // Its material is on the GPU already, so it's waiting for only its own two uploads.
+        // Its material is on the GPU already, so it's waiting for only its own four uploads.
         const AssetHandle sides = scene.load(kSides);
         CHECK(scene.gpu_assets.mesh(sides) == nullptr);
         CHECK(scene.gpu_assets.stats().pending > 0);
-        scene.empty_frame(); // the vertices
-        scene.gpu_assets.update();
-        CHECK(scene.gpu_assets.mesh(sides) == nullptr);
-        scene.empty_frame(); // the indices
+        for (const char* upload : {"the vertices", "the indices", "its parts"}) {
+            scene.empty_frame();
+            scene.gpu_assets.update();
+            CAPTURE(upload);
+            CHECK(scene.gpu_assets.mesh(sides) == nullptr);
+        }
+        scene.empty_frame(); // its entry in the mesh table
         scene.gpu_assets.update();
         CHECK(scene.gpu_assets.mesh(sides) != nullptr);
     });
@@ -584,9 +864,17 @@ TEST_CASE("a mesh that doesn't fit in the pool is left out, whichever buffer is 
         // Nothing of it stays taken.
         CHECK(stats.pool_vertices_free == vertices_free);
         CHECK(stats.pool_indices_free == indices_free);
-        // What's in the pool draws; what isn't is skipped.
-        const auto pixels = scene.draw({center, sides});
+        // What's in the pool draws; what isn't is skipped, wherever it stands. The third has room for what the second
+        // would add if it took some other mesh's place, as it's out of view.
+        de::world::RenderFrame frame = PoolScene::frame_of({center, sides, center});
+        frame.instances[1].transform[3] = 1.0f;
+        frame.instances[2].transform[3] = 50.0f;
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().draws == 2);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
         CHECK(is_red(pixels, kMiddle));
+        CHECK_FALSE(is_red(pixels, kRight));
         CHECK_FALSE(is_green(pixels, kLeft));
     };
     with_pool({.pool_vertices = 6, .pool_indices = 1024},

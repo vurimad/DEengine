@@ -103,10 +103,13 @@ struct SceneRendererStats {
     uint32_t fog_volumes_dropped = 0; // in reach, but past the limit of the nearest 64
     uint32_t instances = 0;           // in the frame
     uint32_t drawn = 0;               // with their mesh on the GPU
-    uint32_t draws = 0;               // into the G-buffer (one per mesh part), many to an indirect call
-    uint32_t shadow_draws = 0;        // into the shadow cascades
+    uint32_t draws = 0;               // parts to cull for the G-buffer (one per instance's mesh part)
+    uint32_t shadow_draws = 0;        // and for the shadow cascades
     uint32_t indirect_calls = 0;      // what the CPU records for all of them
-    float froxel_reach_m = 0.0f;      // the froxel grid's reach (no farther than the shadows); 0: no grid
+    // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.
+    uint32_t visible_draws = 0;
+    uint32_t visible_shadow_draws = 0;
+    float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 
 // A cascade of the sun's shadow map: where it reaches along the view, and its projection.

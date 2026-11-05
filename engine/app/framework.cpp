@@ -411,9 +411,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             graph->execute();
             if (scene_renderer) { // a frame that drew: minimized, these would repeat the last one's
                 const render::SceneRendererStats drawn = scene_renderer->stats();
-                DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
-                DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
+                DE_PROFILE_PLOT("draws to cull", static_cast<int64_t>(drawn.draws));
+                DE_PROFILE_PLOT("shadow draws to cull", static_cast<int64_t>(drawn.shadow_draws));
                 DE_PROFILE_PLOT("indirect calls", static_cast<int64_t>(drawn.indirect_calls));
+                DE_PROFILE_PLOT("visible draws", static_cast<int64_t>(drawn.visible_draws));
+                DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
                 static_cast<void>(drawn);
             }
         }
@@ -476,9 +478,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         scene_renderer ? scene_renderer->stats() : render::SceneRendererStats{};
     DE_LOG_INFO(
         "render",
-        "gpu assets: %u meshes, %u textures, %u materials, %llu bytes; last frame drew %u of %u instances in %u draws",
+        "gpu assets: %u meshes, %u textures, %u materials, %llu bytes; last frame had %u of %u instances on the GPU, "
+        "%u of %u draws visible",
         gpu_stats.meshes, gpu_stats.textures, gpu_stats.materials, static_cast<unsigned long long>(gpu_stats.bytes),
-        scene_stats.drawn, scene_stats.instances, scene_stats.draws);
+        scene_stats.drawn, scene_stats.instances, scene_stats.visible_draws, scene_stats.draws);
     if (gpu_stats.meshes_dropped > 0) {
         DE_LOG_WARN("render", "%u meshes didn't fit in the geometry pool", gpu_stats.meshes_dropped);
     }

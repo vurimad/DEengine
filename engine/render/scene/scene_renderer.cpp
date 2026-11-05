@@ -208,7 +208,6 @@ constexpr uint32_t kMaxFogVolumes = 64;
 static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
 // Per slice of the grid, which volumes reach it: a froxel tests only those.
 constexpr uint64_t kFogSliceMasksOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
-constexpr uint64_t kInstancesOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
 constexpr uint64_t kInstanceBytes = 96; // six float4 rows: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
@@ -224,39 +223,105 @@ void copy3(const float (&from)[3], float (&to)[4]) {
     to[2] = from[2];
 }
 
-// A mesh part to draw this frame, and its kind: [masked][double-sided] as two bits.
-struct PartDraw {
-    uint32_t instance = 0;
-    uint32_t material = 0;
-    uint32_t first_index = 0;
-    uint32_t index_count = 0;
-    uint32_t vertex_offset = 0;
-};
-
-constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, masked, masked double-sided
-
-constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
-    return (core::has_any(flags, GpuMaterialFlags::Masked) ? 2U : 0U) |
-           (core::has_any(flags, GpuMaterialFlags::DoubleSided) ? 1U : 0U);
-}
 constexpr bool is_masked(uint32_t kind) {
     return (kind & 2U) != 0;
 }
 constexpr bool is_double_sided(uint32_t kind) {
     return (kind & 1U) != 0;
 }
-// Shadow casters differ only by the alpha test, so the kinds up to here share a pipeline, and the rest another.
-constexpr uint32_t kFirstMaskedKind = 2;
-static_assert(!is_masked(kFirstMaskedKind - 1) && is_masked(kFirstMaskedKind));
+// The draw lists the GPU cull fills: a list per kind for the camera, then opaque and masked for each cascade, whose
+// casters differ only by the alpha test.
+constexpr uint32_t kCameraListCount = kDrawKindCount;
+constexpr uint32_t kDrawListCount = kCameraListCount + 2 * kShadowCascadeCount;
 
-// Where a frame's data is in its buffer: a record and arguments per draw, in order of kind. Kind k's are
-// [draw_first[k], draw_first[k + 1]).
-struct FrameLayout {
-    uint32_t draw_first[kDrawKindCount + 1] = {};
-    uint64_t draw_records_offset = 0;
-    uint64_t draw_args_offset = 0;
-    uint64_t bytes = 0;
+constexpr uint32_t cascade_list(uint32_t cascade, bool masked) {
+    return kCameraListCount + (2 * cascade) + (masked ? 1U : 0U);
+}
+
+// Matches GpuCullView and GpuDrawList in shaders/scene/scene_common.slang.
+struct GpuCullView {
+    float planes[6][4] = {};
+    uint32_t plane_count = 0;
+    uint32_t first_list = 0;
+    uint32_t lists_by_kind = 0;
+    uint32_t padding = 0;
 };
+static_assert(sizeof(GpuCullView) == 112);
+
+struct GpuDrawList {
+    uint32_t first_slot = 0;
+    uint32_t capacity = 0;
+};
+
+constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
+constexpr uint32_t kNoMesh = UINT32_MAX;
+// The views and lists, then the instances: their rows, and then their slots in the mesh table.
+constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
+constexpr uint64_t kDrawListsOffset = kCullViewsOffset + kCullViewCount * sizeof(GpuCullView);
+constexpr uint64_t kInstancesOffset = kDrawListsOffset + kDrawListCount * sizeof(GpuDrawList);
+
+// What the frame's instances may draw, which sizes what the cull writes.
+struct CullPlan {
+    GpuDrawList lists[kDrawListCount];
+    uint32_t instances = 0;
+    uint32_t drawn = 0;        // instances whose mesh is on the GPU
+    uint32_t draws = 0;        // their parts, into the G-buffer
+    uint32_t shadow_draws = 0; // and into the cascades
+    uint64_t slot_capacity = 0;
+
+    // The draw arguments come first in the cull's buffer, then the records.
+    uint64_t records_offset() const { return slot_capacity * sizeof(rhi::DrawIndexedIndirectArgs); }
+    uint64_t buffer_bytes() const { return records_offset() + slot_capacity * sizeof(GpuDraw); }
+};
+
+// Matches CullPush in shaders/scene/cull.slang.
+struct CullPush {
+    uint64_t instances = 0;
+    uint64_t instance_meshes = 0;
+    uint64_t meshes = 0;
+    uint64_t parts = 0;
+    uint64_t materials = 0;
+    uint64_t views = 0;
+    uint64_t lists = 0;
+    uint64_t args = 0;
+    uint64_t records = 0;
+    uint64_t counts = 0;
+    uint32_t instance_count = 0;
+};
+
+constexpr uint64_t instance_meshes_offset(uint64_t instance_count) {
+    return kInstancesOffset + instance_count * kInstanceBytes;
+}
+
+constexpr uint64_t frame_bytes(uint64_t instance_count) {
+    return instance_meshes_offset(std::max<uint64_t>(instance_count, 1)) +
+           std::max<uint64_t>(instance_count, 1) * sizeof(uint32_t);
+}
+
+// Scales a plane so that it measures meters.
+void normalize_plane(float (&plane)[4]) {
+    const float length_squared = (plane[0] * plane[0]) + (plane[1] * plane[1]) + (plane[2] * plane[2]);
+    const float scale = 1.0f / std::sqrt(std::max(length_squared, 1e-12f));
+    for (float& value : plane) {
+        value *= scale;
+    }
+}
+
+// The plane where w + sign * a row of a matrix is 0, inside where it's positive.
+void set_plane(float (&plane)[4], const float* view_proj, uint32_t row, float sign) {
+    for (uint32_t k = 0; k < 4; ++k) {
+        plane[k] = view_proj[12 + k] + (sign * view_proj[(row * 4) + k]);
+    }
+    normalize_plane(plane);
+}
+
+// The sides of a clip space, inside for |x| <= w and |y| <= w.
+void set_side_planes(GpuCullView& view, const float* view_proj) {
+    set_plane(view.planes[0], view_proj, 0, 1.0f);
+    set_plane(view.planes[1], view_proj, 0, -1.0f);
+    set_plane(view.planes[2], view_proj, 1, 1.0f);
+    set_plane(view.planes[3], view_proj, 1, -1.0f);
+}
 
 } // namespace
 
@@ -276,13 +341,13 @@ struct SceneRendererState {
     shader::ProgramHandle fog_program;
     shader::ProgramHandle fog_inject;
     shader::ProgramHandle fog_integrate;
-    // This frame's mesh parts by kind, for the shadow and G-buffer passes: opaque first, so masked
-    // pixels behind them fail early depth; each kind one pipeline state. Capacity kept between frames.
-    core::Array<PartDraw> draws[kDrawKindCount] = {
-        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
-        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
-        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
-        core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render))};
+    shader::ProgramHandle cull;
+    // What each frame slot's cull kept, to read once that slot comes round again and its frame is done.
+    rhi::BufferHandle cull_readback[rhi::kFramesInFlight];
+    CullPlan cull_readback_plan[rhi::kFramesInFlight];
+    bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
+    bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
+    bool warned_draw_limit = false;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -316,10 +381,13 @@ struct SceneRendererState {
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program, fog_inject, fog_integrate, taa_program}) {
+              shadow_mask, fog_program, fog_inject, fog_integrate, cull, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
+            device->destroy(buffer);
+        }
+        for (const rhi::BufferHandle buffer : cull_readback) {
             device->destroy(buffer);
         }
         destroy_temporal();
@@ -440,6 +508,9 @@ struct SceneRendererState {
         const core::Result<shader::ProgramHandle> inject =
             shaders->create_compute({.module = "scene.fog_inject", .debug_name = "fog inject"});
         fog_inject = inject ? *inject : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> cull_program =
+            shaders->create_compute({.module = "scene.cull", .debug_name = "gpu cull"});
+        cull = cull_program ? *cull_program : shader::ProgramHandle{};
         const core::Result<shader::ProgramHandle> integrate =
             shaders->create_compute({.module = "scene.fog_integrate", .debug_name = "fog integrate"});
         fog_integrate = integrate ? *integrate : shader::ProgramHandle{};
@@ -458,31 +529,6 @@ struct SceneRendererState {
         shadow_mask = make("scene.shadow_mask", mask);
     }
 
-    // The frame's parts whose meshes are on the GPU, by kind; one material lookup each. Returns the
-    // instances they belong to.
-    uint32_t sort_draws(const world::RenderFrame& frame) {
-        for (core::Array<PartDraw>& list : draws) {
-            list.clear();
-        }
-        uint32_t drawn = 0;
-        for (size_t i = 0; i < frame.instances.size(); ++i) {
-            const GpuMesh* mesh = gpu_assets->mesh(frame.instances[i].mesh);
-            if (mesh == nullptr) {
-                continue;
-            }
-            ++drawn;
-            for (const GpuMeshPart& part : mesh->lod_parts(0)) {
-                draws[draw_kind(gpu_assets->material_flags(part.material))].push(
-                    {.instance = static_cast<uint32_t>(i),
-                     .material = part.material,
-                     .first_index = part.first_index,
-                     .index_count = part.index_count,
-                     .vertex_offset = mesh->vertex_offset});
-            }
-        }
-        return drawn;
-    }
-
     // The tonemap writes the caller's target: made again when its format changes.
     void make_tonemap(rhi::Format target_format) {
         if (target_format == programs_format) {
@@ -495,38 +541,30 @@ struct SceneRendererState {
         programs_format = target_format;
     }
 
-    // Draws of the kinds [first_kind, end_kind), whose arguments are side by side, with the bound pipeline and the
-    // geometry pool's index buffer. Returns the draws.
-    uint32_t draw_kinds(rhi::CommandList& list, rhi::BufferHandle buffer, const FrameLayout& layout,
-                        uint32_t first_kind, uint32_t end_kind) {
-        const uint32_t first = layout.draw_first[first_kind];
-        const uint32_t count = layout.draw_first[end_kind] - first;
-        const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
-        for (uint32_t done = 0; done < count;) {
-            const uint32_t call = std::min(count - done, call_limit);
-            list.draw_indexed_indirect(
-                buffer, layout.draw_args_offset + uint64_t{first + done} * sizeof(rhi::DrawIndexedIndirectArgs), call);
-            ++stats.indirect_calls;
-            done += call;
+    // The stats from what this slot's last frame culled. Its frame is done: begin_frame waited for it.
+    void read_cull_stats() {
+        const auto slot = static_cast<uint32_t>(device->frame_index() % rhi::kFramesInFlight);
+        if (!cull_readback_written[slot]) {
+            return;
         }
-        return count;
+        cull_readback_written[slot] = false;
+        device->invalidate_mapped(cull_readback[slot]);
+        const std::span<const std::byte> mapped = device->mapped(cull_readback[slot]);
+        uint32_t counts[kDrawListCount];
+        std::memcpy(counts, mapped.data(), sizeof(counts));
+        for (uint32_t list = 0; list < kDrawListCount; ++list) {
+            const uint32_t kept = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
+            (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
+        }
     }
 
-    // The layout of this frame's buffer, for its instances and the draws sort_draws found.
-    FrameLayout frame_layout(size_t instance_count) const {
-        FrameLayout layout;
-        uint32_t draw_count = 0;
-        for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
-            layout.draw_first[kind] = draw_count;
-            draw_count += static_cast<uint32_t>(draws[kind].size());
-        }
-        layout.draw_first[kDrawKindCount] = draw_count;
-        layout.draw_records_offset = kInstancesOffset + instance_count * kInstanceBytes;
-        layout.draw_args_offset = layout.draw_records_offset + uint64_t{draw_count} * sizeof(GpuDraw);
-        layout.bytes =
-            std::max<uint64_t>(layout.draw_args_offset + uint64_t{draw_count} * sizeof(rhi::DrawIndexedIndirectArgs),
-                               kInstancesOffset + kInstanceBytes);
-        return layout;
+    // A list the cull filled, with the bound pipeline and the geometry pool's index buffer.
+    void draw_list(rhi::CommandList& list, rhi::BufferHandle args, rhi::BufferHandle counts, const CullPlan& plan,
+                   uint32_t index) {
+        const GpuDrawList& draws = plan.lists[index];
+        list.draw_indexed_indirect_count(args, uint64_t{draws.first_slot} * sizeof(rhi::DrawIndexedIndirectArgs),
+                                         counts, uint64_t{index} * sizeof(uint32_t), draws.capacity);
+        ++stats.indirect_calls;
     }
 
     // This frame slot's buffer, at least this big: written by the CPU now, read by this frame's GPU
@@ -536,11 +574,10 @@ struct SceneRendererState {
         if (frame_capacity[slot] < needed) {
             device->destroy(frame_buffers[slot]);
             const uint64_t capacity = std::max<uint64_t>(needed + needed / 2, uint64_t{64} * 1024);
-            const core::Result<rhi::BufferHandle> buffer =
-                device->create_buffer({.size = capacity,
-                                       .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
-                                       .memory = rhi::MemoryLocation::Upload,
-                                       .debug_name = "scene frame"});
+            const core::Result<rhi::BufferHandle> buffer = device->create_buffer({.size = capacity,
+                                                                                  .usage = rhi::BufferUsage::Storage,
+                                                                                  .memory = rhi::MemoryLocation::Upload,
+                                                                                  .debug_name = "scene frame"});
             frame_buffers[slot] = buffer ? *buffer : rhi::BufferHandle{};
             frame_capacity[slot] = buffer ? capacity : 0;
         }
@@ -669,8 +706,78 @@ struct SceneRendererState {
         stats.fog_volumes_dropped = dropped;
     }
 
-    // Writes the frame's constants, instance transforms and draws; false without a buffer.
-    bool write_frame(rhi::BufferHandle buffer, const FrameLayout& layout, const world::RenderFrame& frame,
+    // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
+    void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
+                         CullPlan& plan) {
+        // Made here and copied: this memory is fast to write and very slow to read.
+        GpuCullView views[kCullViewCount];
+        // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
+        // plane.
+        views[0] = {.plane_count = 4, .first_list = 0, .lists_by_kind = 1};
+        set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
+        // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
+        // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
+        for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+            GpuCullView& view = views[1 + c];
+            view = {.plane_count = 6, .first_list = cascade_list(c, false), .lists_by_kind = 0};
+            const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
+            set_side_planes(view, view_proj);
+            std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
+            normalize_plane(view.planes[4]);
+            set_plane(view.planes[5], view_proj, 2, -1.0f);
+        }
+        std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
+
+        auto* const instance_meshes =
+            reinterpret_cast<uint32_t*>(mapped.data() + instance_meshes_offset(frame.instances.size()));
+        uint32_t kind_parts[kDrawKindCount] = {};
+        plan = {};
+        plan.instances = static_cast<uint32_t>(frame.instances.size());
+        for (size_t i = 0; i < frame.instances.size(); ++i) {
+            const GpuMesh* mesh = gpu_assets->mesh(frame.instances[i].mesh);
+            instance_meshes[i] = mesh != nullptr ? mesh->table_slot : kNoMesh;
+            if (mesh != nullptr) {
+                ++plan.drawn;
+                for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+                    kind_parts[kind] += mesh->kind_parts[kind];
+                }
+            }
+        }
+        // Each list holds all that could land in it, so the cull needs no first pass to count them.
+        uint32_t slot = 0;
+        const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
+        const auto add_list = [&](uint32_t index, uint32_t capacity) {
+            // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
+            // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
+            if (capacity > call_limit && !warned_draw_limit) {
+                DE_LOG_WARN("render",
+                            "a draw list holds %u draws, and this device draws %u in a call: the rest are lost",
+                            capacity, call_limit);
+                warned_draw_limit = true;
+            }
+            const uint32_t kept = std::min(capacity, call_limit);
+            plan.lists[index] = {.first_slot = slot, .capacity = kept};
+            slot += kept;
+        };
+        for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+            add_list(kind, kind_parts[kind]);
+            plan.draws += kind_parts[kind];
+        }
+        for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
+            add_list(cascade_list(c, false), kind_parts[0] + kind_parts[1]);
+            add_list(cascade_list(c, true), kind_parts[2] + kind_parts[3]);
+            plan.shadow_draws += kind_parts[0] + kind_parts[1] + kind_parts[2] + kind_parts[3];
+        }
+        std::memcpy(mapped.data() + kDrawListsOffset, plan.lists, sizeof(plan.lists));
+        // A power of two, so a graph buffer lasts while the counts move around.
+        plan.slot_capacity = 1024;
+        while (plan.slot_capacity < slot) {
+            plan.slot_capacity *= 2;
+        }
+    }
+
+    // Writes the frame's constants, instance transforms and what the cull reads; false without a buffer.
+    bool write_frame(rhi::BufferHandle buffer, CullPlan& plan, const world::RenderFrame& frame,
                      const SceneLighting& lighting, float froxel_reach, uint32_t taa_sample_now, uint32_t width,
                      uint32_t height) {
         const std::span<std::byte> mapped = device->mapped(buffer);
@@ -764,21 +871,8 @@ struct SceneRendererState {
             std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
-        // The sorted draws: a record each, and arguments that find it through their first instance.
-        auto* const records = reinterpret_cast<GpuDraw*>(mapped.data() + layout.draw_records_offset);
-        auto* const args = reinterpret_cast<rhi::DrawIndexedIndirectArgs*>(mapped.data() + layout.draw_args_offset);
-        uint32_t written = 0;
-        for (const core::Array<PartDraw>& list : draws) {
-            for (const PartDraw& part : list) {
-                records[written] = {.instance = part.instance, .material = part.material};
-                args[written] = {.index_count = part.index_count,
-                                 .first_index = part.first_index,
-                                 .vertex_offset = static_cast<int32_t>(part.vertex_offset),
-                                 .first_instance = written};
-                ++written;
-            }
-        }
-        device->flush_mapped(buffer, 0, layout.bytes);
+        write_cull_data(mapped, frame, scene, plan);
+        device->flush_mapped(buffer, 0, frame_bytes(frame.instances.size()));
         return true;
     }
 };
@@ -1002,6 +1096,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         std::clamp(state.shadows.max_penumbra_texels, Limits::kMinPenumbraTexels, Limits::kMaxPenumbraTexels);
     state.make_tonemap(target_format);
     state.stats = {.instances = static_cast<uint32_t>(frame.instances.size())};
+    state.read_cull_stats();
     const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
     const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
@@ -1010,6 +1105,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle caster_masked = state.shaders->pipeline(state.shadow_caster_masked);
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
+    const rhi::PipelineHandle cull = state.shaders->pipeline(state.cull);
     const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
     const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
     // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
@@ -1046,14 +1142,14 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         state.taa_sample = state.taa_sample % kTaaSamples + 1;
     }
     // This frame's constants and draws, now: every pass below draws only if they're in.
-    const uint32_t drawn = frame.camera.valid ? state.sort_draws(frame) : 0;
-    const FrameLayout layout = state.frame_layout(frame.instances.size());
-    const rhi::BufferHandle frame_buffer = frame.camera.valid ? state.frame_buffer(layout.bytes) : rhi::BufferHandle{};
-    const bool written =
-        frame_buffer.is_valid() && state.write_frame(frame_buffer, layout, frame, lighting, froxel_reach,
-                                                     taa_on ? state.taa_sample : 0, width, height);
+    const rhi::BufferHandle frame_buffer =
+        frame.camera.valid ? state.frame_buffer(frame_bytes(frame.instances.size())) : rhi::BufferHandle{};
+    CullPlan plan;
+    const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, plan, frame, lighting, froxel_reach,
+                                                                      taa_on ? state.taa_sample : 0, width, height);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
-                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid();
+                       tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
+                       cull.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared.
         graph.add_pass(
@@ -1067,9 +1163,73 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
-    state.stats.drawn = drawn;
-    // The CPU writes it, so no barrier does anything yet; the graph knows who reads the draw arguments.
-    const GraphBuffer draw_args = graph.import_buffer({.buffer = frame_buffer, .name = "scene frame"});
+    state.stats.drawn = plan.drawn;
+    state.stats.draws = plan.draws;
+    state.stats.shadow_draws = plan.shadow_draws;
+
+    // The GPU cull: what's in each view, into the draw lists the G-buffer and shadow passes draw.
+    struct CullClearPass {
+        GraphBuffer counts;
+    };
+    const auto& cull_clear = graph.add_pass<CullClearPass>(
+        "cull clear",
+        [&](PassBuilder& pass, CullClearPass& data) {
+            data.counts = pass.create_buffer({.size = kDrawListCount * sizeof(uint32_t),
+                                              .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect |
+                                                       rhi::BufferUsage::CopyDst | rhi::BufferUsage::CopySrc,
+                                              .debug_name = "draw counts"});
+            pass.use(data.counts, rhi::ResourceState::CopyDst);
+        },
+        [](const CullClearPass& data, PassContext& context) {
+            context.list.fill_buffer(context.buffer(data.counts), 0, kDrawListCount * sizeof(uint32_t), 0);
+        });
+    const GraphBuffer draw_counts = cull_clear.counts;
+    struct CullPass {
+        SceneRendererState* state = nullptr;
+        GraphBuffer counts;
+        GraphBuffer draws;
+        rhi::PipelineHandle pipeline;
+        uint64_t frame_address = 0;
+        CullPlan plan;
+    };
+    const auto& cull_pass = graph.add_pass<CullPass>(
+        "gpu cull",
+        [&](PassBuilder& pass, CullPass& data) {
+            data = {.state = &state,
+                    .counts = draw_counts,
+                    .draws = {},
+                    .pipeline = cull,
+                    .frame_address = frame_address,
+                    .plan = plan};
+            data.draws = pass.create_buffer({.size = plan.buffer_bytes(),
+                                             .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
+                                             .debug_name = "draw lists"});
+            pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(data.counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+        },
+        [](const CullPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("gpu cull pass");
+            const SceneRendererState& renderer = *data.state;
+            if (data.plan.instances == 0) {
+                return;
+            }
+            const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));
+            const CullPush push{.instances = data.frame_address + kInstancesOffset,
+                                .instance_meshes = data.frame_address + instance_meshes_offset(data.plan.instances),
+                                .meshes = renderer.gpu_assets->mesh_table_address(),
+                                .parts = renderer.gpu_assets->part_table_address(),
+                                .materials = renderer.gpu_assets->material_table_address(),
+                                .views = data.frame_address + kCullViewsOffset,
+                                .lists = data.frame_address + kDrawListsOffset,
+                                .args = draws,
+                                .records = draws + data.plan.records_offset(),
+                                .counts = renderer.device->buffer_address(context.buffer(data.counts)),
+                                .instance_count = data.plan.instances};
+            context.list.bind_pipeline(data.pipeline);
+            context.list.push_constants(push);
+            context.list.dispatch((data.plan.instances + 63) / 64);
+        });
+    const GraphBuffer draw_lists = cull_pass.draws;
 
     // TAA's textures this frame: this frame's depth, object motion and result are kept for the next; last
     // frame's are read. History needs last frame to have been drawn here, and no camera cut.
@@ -1117,8 +1277,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         rhi::PipelineHandle opaque;
         rhi::PipelineHandle masked;
         uint64_t frame_address = 0;
-        rhi::BufferHandle frame_buffer;
-        FrameLayout layout;
+        GraphBuffer draws;
+        GraphBuffer counts;
+        CullPlan plan;
         uint32_t cascade_size = 0;
     };
     const auto& shadow = graph.add_pass<ShadowPass>(
@@ -1129,10 +1290,13 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .opaque = caster_opaque,
                     .masked = caster_masked,
                     .frame_address = frame_address,
-                    .frame_buffer = frame_buffer,
-                    .layout = layout,
+                    .draws = draw_lists,
+                    .counts = draw_counts,
+                    .plan = plan,
                     .cascade_size = cascade_size};
-            pass.use(draw_args, rhi::ResourceState::IndirectArgument);
+            pass.use(draw_lists, rhi::ResourceState::IndirectArgument | rhi::ResourceState::ShaderRead,
+                     rhi::ShaderStages::Vertex);
+            pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
             data.atlas = pass.create_texture(
                 {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
             pass.use(data.atlas, rhi::ResourceState::DepthWrite);
@@ -1140,11 +1304,14 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [](const ShadowPass& data, PassContext& context) {
             DE_PROFILE_ZONE("shadow pass");
             SceneRendererState& renderer = *data.state;
+            const rhi::BufferHandle args = context.buffer(data.draws);
+            const rhi::BufferHandle counts = context.buffer(data.counts);
             ShadowCasterPush push{.frame = data.frame_address,
                                   .instances = data.frame_address + kInstancesOffset,
                                   .vertices = renderer.gpu_assets->pool_vertex_address(),
                                   .materials = renderer.gpu_assets->material_table_address(),
-                                  .draws = data.frame_address + data.layout.draw_records_offset,
+                                  .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
+                                           data.plan.records_offset(),
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
                 const rhi::DepthAttachment depth{.texture = context.texture(data.atlas)};
@@ -1156,22 +1323,20 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
                 push.cascade = cascade;
                 context.list.push_constants(push);
-                // Casters cull nothing (thin geometry casts from both sides): the kinds differ only
-                // by the alpha test.
-                if (data.layout.draw_first[kFirstMaskedKind] > 0) {
-                    context.list.bind_pipeline(data.opaque);
-                    renderer.stats.shadow_draws +=
-                        renderer.draw_kinds(context.list, data.frame_buffer, data.layout, 0, kFirstMaskedKind);
-                }
-                if (data.layout.draw_first[kDrawKindCount] > data.layout.draw_first[kFirstMaskedKind]) {
-                    context.list.bind_pipeline(data.masked);
-                    renderer.stats.shadow_draws += renderer.draw_kinds(context.list, data.frame_buffer, data.layout,
-                                                                       kFirstMaskedKind, kDrawKindCount);
+                // Casters don't cull back faces (thin geometry casts from both sides): the kinds differ
+                // only by the alpha test.
+                for (const bool masked : {false, true}) {
+                    const uint32_t index = cascade_list(cascade, masked);
+                    if (data.plan.lists[index].capacity > 0) {
+                        context.list.bind_pipeline(masked ? data.masked : data.opaque);
+                        renderer.draw_list(context.list, args, counts, data.plan, index);
+                    }
                 }
                 context.list.end_rendering();
             }
         });
     const GraphTexture atlas = shadow.atlas;
+    const auto cull_slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
 
     struct Targets {
         GraphTexture gb[3];
@@ -1185,8 +1350,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         rhi::PipelineHandle opaque;
         rhi::PipelineHandle masked;
         uint64_t frame_address = 0;
-        rhi::BufferHandle frame_buffer;
-        FrameLayout layout;
+        GraphBuffer draws;
+        GraphBuffer counts;
+        CullPlan plan;
     };
     const auto& gbuffer = graph.add_pass<GBufferPass>(
         "gbuffer",
@@ -1196,9 +1362,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .opaque = gbuffer_opaque,
                     .masked = gbuffer_masked,
                     .frame_address = frame_address,
-                    .frame_buffer = frame_buffer,
-                    .layout = layout};
-            pass.use(draw_args, rhi::ResourceState::IndirectArgument);
+                    .draws = draw_lists,
+                    .counts = draw_counts,
+                    .plan = plan};
+            pass.use(draw_lists, rhi::ResourceState::IndirectArgument | rhi::ResourceState::ShaderRead,
+                     rhi::ShaderStages::Vertex);
+            pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
             for (uint32_t i = 0; i < 3; ++i) {
                 data.targets.gb[i] =
                     pass.create_texture({.desc = {.format = kGBufferFormats[i]}, .reference_scale = 1.0f});
@@ -1228,23 +1397,55 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                    .instances = data.frame_address + kInstancesOffset,
                                    .vertices = renderer.gpu_assets->pool_vertex_address(),
                                    .materials = renderer.gpu_assets->material_table_address(),
-                                   .draws = data.frame_address + data.layout.draw_records_offset,
+                                   .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
+                                            data.plan.records_offset(),
                                    .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             context.list.push_constants(push);
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
-                if (data.layout.draw_first[kind] == data.layout.draw_first[kind + 1]) {
+                if (data.plan.lists[kind].capacity == 0) {
                     continue;
                 }
                 context.list.bind_pipeline(is_masked(kind) ? data.masked : data.opaque); // culls back faces
                 if (is_double_sided(kind)) {
                     context.list.set_cull_mode(rhi::CullMode::None);
                 }
-                renderer.stats.draws +=
-                    renderer.draw_kinds(context.list, data.frame_buffer, data.layout, kind, kind + 1);
+                renderer.draw_list(context.list, context.buffer(data.draws), context.buffer(data.counts), data.plan,
+                                   kind);
             }
             context.list.end_rendering();
         });
     const Targets targets = gbuffer.targets;
+
+    // The cull's counts, for the stats. Made once: without it the frame goes on, and they stay 0.
+    if (!state.cull_readback[cull_slot].is_valid()) {
+        const core::Result<rhi::BufferHandle> readback =
+            state.device->create_buffer({.size = kDrawListCount * sizeof(uint32_t),
+                                         .usage = rhi::BufferUsage::CopyDst,
+                                         .memory = rhi::MemoryLocation::Readback,
+                                         .debug_name = "draw counts readback"});
+        state.cull_readback[cull_slot] = readback ? *readback : rhi::BufferHandle{};
+    }
+    if (state.cull_readback[cull_slot].is_valid()) {
+        state.cull_readback_plan[cull_slot] = plan;
+        const GraphBuffer readback =
+            graph.import_buffer({.buffer = state.cull_readback[cull_slot],
+                                 .name = "draw counts readback",
+                                 .state = state.cull_readback_used[cull_slot] ? rhi::ResourceState::HostRead
+                                                                              : rhi::ResourceState::Undefined,
+                                 .final_state = rhi::ResourceState::HostRead});
+        state.cull_readback_used[cull_slot] = true;
+        graph.add_pass(
+            "cull stats",
+            [&](PassBuilder& pass) {
+                pass.use(draw_counts, rhi::ResourceState::CopySrc);
+                pass.use(readback, rhi::ResourceState::CopyDst);
+            },
+            [draw_counts, readback, written = &state.cull_readback_written[cull_slot]](PassContext& context) {
+                context.list.copy_buffer(context.buffer(draw_counts), 0, context.buffer(readback), 0,
+                                         kDrawListCount * sizeof(uint32_t));
+                *written = true;
+            });
+    }
 
     // The shadow mask: how much sun each pixel sees.
     struct MaskPass {
