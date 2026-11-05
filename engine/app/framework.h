@@ -47,8 +47,11 @@ struct FrameworkArgs {
     char** argv = nullptr;
     uint64_t frames = 0; // 0: until the window closes
     const char* game_dir = "cooked";
-    const char* src_dir = nullptr; // null: this repository, in dev builds
-    float deadzone = -1.0f;        // below 0: the default
+    const char* src_dir = nullptr;       // null: this repository, in dev builds
+    float deadzone = -1.0f;              // below 0: the default
+    uint32_t window_width_points = 1600; // --window 2560x1440
+    uint32_t window_height_points = 900;
+    bool fullscreen = false; // --fullscreen: the display's own size, whatever the window's
     bool vsync = true;
     bool validation = true;
     bool show_sticks = false;

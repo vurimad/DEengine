@@ -30,6 +30,7 @@
 #include "world/transform.h"
 #include "world/world.h"
 
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -119,6 +120,27 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.vsync = !has_flag(out, "--no-vsync");
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
+    out.fullscreen = has_flag(out, "--fullscreen");
+    if (has_flag(out, "--window")) {
+        const char* const window = flag_value(out, "--window");
+        const std::string_view size = window != nullptr ? std::string_view(window) : std::string_view();
+        const size_t split = size.find('x');
+        uint32_t width = 0;
+        uint32_t height = 0;
+        // from_chars: digits only, and it takes neither signs nor spaces.
+        const auto whole = [](std::string_view text, uint32_t& value) {
+            const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+            return error == std::errc{} && end == text.data() + text.size();
+        };
+        if (split == std::string_view::npos || !whole(size.substr(0, split), width) ||
+            !whole(size.substr(split + 1), height) || width == 0 || height == 0 || width > 16384 || height > 16384) {
+            DE_LOG_ERROR("engine", "--window needs a size like 2560x1440: '%.*s'", static_cast<int>(size.size()),
+                         size.data());
+            return false;
+        }
+        out.window_width_points = width;
+        out.window_height_points = height;
+    }
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -179,7 +201,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     if (!vfs) {
         return EXIT_FAILURE;
     }
-    auto window = platform::Window::create({.title = "DEengine"});
+    auto window = platform::Window::create({.title = "DEengine",
+                                            .width_points = args.window_width_points,
+                                            .height_points = args.window_height_points,
+                                            .fullscreen = args.fullscreen});
     if (!window) {
         return EXIT_FAILURE;
     }
@@ -384,6 +409,12 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             debug_ui.add_pass(*graph, back, device->swapchain_format());
 #endif
             graph->execute();
+            if (scene_renderer) { // a frame that drew: minimized, these would repeat the last one's
+                const render::SceneRendererStats drawn = scene_renderer->stats();
+                DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
+                DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
+                static_cast<void>(drawn);
+            }
         }
         device->end_frame();
         if (!backbuffer.is_valid()) {
