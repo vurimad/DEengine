@@ -539,6 +539,28 @@ struct ComputePipelineDesc {
     const char* debug_name = nullptr;
 };
 
+// What indirect draws and dispatches read from a buffer, as the GPU lays them out.
+struct DrawIndirectArgs {
+    uint32_t vertex_count = 0;
+    uint32_t instance_count = 0;
+    uint32_t first_vertex = 0;
+    uint32_t first_instance = 0;
+};
+
+struct DrawIndexedIndirectArgs {
+    uint32_t index_count = 0;
+    uint32_t instance_count = 0;
+    uint32_t first_index = 0;
+    int32_t vertex_offset = 0;
+    uint32_t first_instance = 0;
+};
+
+struct DispatchIndirectArgs {
+    uint32_t groups_x = 0;
+    uint32_t groups_y = 0;
+    uint32_t groups_z = 0;
+};
+
 enum class IndexType : uint8_t {
     Uint16,
     Uint32,

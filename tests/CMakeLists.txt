@@ -39,6 +39,7 @@ add_executable(de_tests
     render/bindless_test.cpp
     render/graph_test.cpp
     render/imgui_test.cpp
+    render/indirect_test.cpp
     render/memory_test.cpp
     render/mips_test.cpp
     render/rhi_test.cpp
