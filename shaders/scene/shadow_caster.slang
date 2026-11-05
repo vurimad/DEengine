@@ -10,8 +10,7 @@ struct ShadowCasterPush
     float4* instances; // 3 rows per instance: object to render-origin space
     MeshVertex* vertices;
     GpuMaterial* materials;
-    uint instance;
-    uint material;
+    GpuDraw* draws;
     uint sampler;
     uint cascade;
 };
@@ -23,19 +22,22 @@ struct VertexOutput
 {
     float4 position : SV_Position;
     float2 uv : TEXCOORD;
+    nointerpolation uint material : MATERIAL;
 };
 
 [shader("vertex")]
-VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID)
+VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_VulkanInstanceID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
+    const GpuDraw draw = push.draws[draw_id];
     const float4 local = float4(vertex.position, 1.0);
-    const float3 world = float3(dot(push.instances[push.instance * kInstanceRows + 0], local),
-                                dot(push.instances[push.instance * kInstanceRows + 1], local),
-                                dot(push.instances[push.instance * kInstanceRows + 2], local));
+    const float3 world = float3(dot(push.instances[draw.instance * kInstanceRows + 0], local),
+                                dot(push.instances[draw.instance * kInstanceRows + 1], local),
+                                dot(push.instances[draw.instance * kInstanceRows + 2], local));
     VertexOutput output;
     output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;
+    output.material = draw.material;
     return output;
 }
 
@@ -49,7 +51,7 @@ void fragment_opaque(VertexOutput input)
 [shader("fragment")]
 void fragment_masked(VertexOutput input)
 {
-    const GpuMaterial material = push.materials[push.material];
+    const GpuMaterial material = push.materials[input.material];
     const float alpha = sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
     if (alpha < material.alpha_cutoff)
     {

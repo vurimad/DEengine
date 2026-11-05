@@ -11,8 +11,7 @@ struct GBufferPush
     float4* instances; // kInstanceRows per instance: object to render-origin space, now and last frame
     MeshVertex* vertices;
     GpuMaterial* materials;
-    uint instance;
-    uint material;
+    GpuDraw* draws;
     uint sampler;
 };
 
@@ -27,6 +26,7 @@ struct VertexOutput
     float2 uv : TEXCOORD;
     float4 clip : CLIP;                   // where the vertex is, and was last frame: the motion vector
     float4 previous_clip : PREVIOUS_CLIP;
+    nointerpolation uint material : MATERIAL;
 };
 
 struct GBufferOutput
@@ -39,12 +39,13 @@ struct GBufferOutput
 };
 
 [shader("vertex")]
-VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID)
+VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_VulkanInstanceID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
-    const float4 row0 = push.instances[push.instance * kInstanceRows + 0];
-    const float4 row1 = push.instances[push.instance * kInstanceRows + 1];
-    const float4 row2 = push.instances[push.instance * kInstanceRows + 2];
+    const GpuDraw draw = push.draws[draw_id];
+    const float4 row0 = push.instances[draw.instance * kInstanceRows + 0];
+    const float4 row1 = push.instances[draw.instance * kInstanceRows + 1];
+    const float4 row2 = push.instances[draw.instance * kInstanceRows + 2];
     const float4 local = float4(vertex.position, 1.0);
     const float4 world = float4(dot(row0, local), dot(row1, local), dot(row2, local), 1.0);
     // The inverse transpose would be exact under non-uniform scale; renormalized in the pixel
@@ -54,14 +55,15 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID)
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
     output.clip = mul_rows(push.frame.unjittered_view_proj, world); // TAA's offset is no motion
-    const float4 previous_world = float4(dot(push.instances[push.instance * kInstanceRows + 3], local),
-                                         dot(push.instances[push.instance * kInstanceRows + 4], local),
-                                         dot(push.instances[push.instance * kInstanceRows + 5], local), 1.0);
+    const float4 previous_world = float4(dot(push.instances[draw.instance * kInstanceRows + 3], local),
+                                         dot(push.instances[draw.instance * kInstanceRows + 4], local),
+                                         dot(push.instances[draw.instance * kInstanceRows + 5], local), 1.0);
     output.previous_clip = mul_rows(push.frame.previous_view_proj, previous_world);
     output.normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
     const float4 tangent = snorm8x4(vertex.tangent);
     output.tangent = float4(mul(linear, tangent.xyz), tangent.w);
     output.uv = vertex.uv;
+    output.material = draw.material;
     return output;
 }
 
@@ -100,7 +102,7 @@ GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial mat
 [shader("fragment")]
 GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFace)
 {
-    const GpuMaterial material = push.materials[push.material];
+    const GpuMaterial material = push.materials[input.material];
     const float3 base = sample_texture(material.base_color_texture, push.sampler, input.uv).rgb * material.base_color.rgb;
     return write_surface(input, front_face, material, base);
 }
@@ -109,7 +111,7 @@ GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFac
 [shader("fragment")]
 GBufferOutput fragment_masked(VertexOutput input, bool front_face: SV_IsFrontFace)
 {
-    const GpuMaterial material = push.materials[push.material];
+    const GpuMaterial material = push.materials[input.material];
     const float4 base = sample_texture(material.base_color_texture, push.sampler, input.uv) * material.base_color;
     if (base.a < material.alpha_cutoff)
     {

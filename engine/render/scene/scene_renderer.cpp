@@ -60,8 +60,7 @@ struct GBufferPush {
     uint64_t instances = 0;
     uint64_t vertices = 0;
     uint64_t materials = 0;
-    uint32_t instance = 0;
-    uint32_t material = 0;
+    uint64_t draws = 0;
     uint32_t sampler = 0;
 };
 
@@ -71,10 +70,15 @@ struct ShadowCasterPush {
     uint64_t instances = 0;
     uint64_t vertices = 0;
     uint64_t materials = 0;
-    uint32_t instance = 0;
-    uint32_t material = 0;
+    uint64_t draws = 0;
     uint32_t sampler = 0;
     uint32_t cascade = 0;
+};
+
+// shaders/scene/scene_common.slang: found through a draw's first instance.
+struct GpuDraw {
+    uint32_t instance = 0;
+    uint32_t material = 0;
 };
 
 // Matches ShadowMaskPush in shaders/scene/shadow_mask.slang.
@@ -241,18 +245,6 @@ constexpr bool is_double_sided(uint32_t kind) {
     return (kind & 1U) != 0;
 }
 
-// Draws parts with the bound pipeline and the geometry pool's index buffer. Returns the draws.
-template <typename Push>
-uint32_t draw_parts(rhi::CommandList& list, std::span<const PartDraw> parts, Push push) {
-    for (const PartDraw& part : parts) {
-        push.instance = part.instance;
-        push.material = part.material;
-        list.push_constants(push);
-        list.draw_indexed(part.index_count, 1, part.first_index, static_cast<int32_t>(part.vertex_offset));
-    }
-    return static_cast<uint32_t>(parts.size());
-}
-
 } // namespace
 
 struct SceneRendererState {
@@ -278,6 +270,11 @@ struct SceneRendererState {
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render)),
         core::Array<PartDraw>(core::heap_allocator(core::MemoryTag::Render))};
+    // Where they are in this frame's buffer: a record and arguments per draw, each kind's together.
+    uint32_t draw_first[kDrawKindCount] = {};
+    uint64_t draw_records_offset = 0;
+    uint64_t draw_args_offset = 0;
+    rhi::BufferHandle frame_buffer_now;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -453,17 +450,19 @@ struct SceneRendererState {
         shadow_mask = make("scene.shadow_mask", mask);
     }
 
-    // The frame's parts whose meshes are on the GPU, by kind; one material lookup each.
-    void sort_draws(const world::RenderFrame& frame) {
+    // The frame's parts whose meshes are on the GPU, by kind; one material lookup each. Returns the
+    // instances they belong to.
+    uint32_t sort_draws(const world::RenderFrame& frame) {
         for (core::Array<PartDraw>& list : draws) {
             list.clear();
         }
+        uint32_t drawn = 0;
         for (size_t i = 0; i < frame.instances.size(); ++i) {
             const GpuMesh* mesh = gpu_assets->mesh(frame.instances[i].mesh);
             if (mesh == nullptr) {
                 continue;
             }
-            ++stats.drawn;
+            ++drawn;
             for (const GpuMeshPart& part : mesh->lod_parts(0)) {
                 draws[draw_kind(gpu_assets->material_flags(part.material))].push(
                     {.instance = static_cast<uint32_t>(i),
@@ -473,6 +472,7 @@ struct SceneRendererState {
                      .vertex_offset = mesh->vertex_offset});
             }
         }
+        return drawn;
     }
 
     // The tonemap writes the caller's target: made again when its format changes.
@@ -487,18 +487,42 @@ struct SceneRendererState {
         programs_format = target_format;
     }
 
-    // This frame slot's buffer, big enough for count instances: written by the CPU now, read by
-    // this frame's GPU work (the slot's last frame is done: begin_frame waited for it).
-    rhi::BufferHandle frame_buffer(size_t count) {
+    // This frame's draws of a kind, with the bound pipeline and the geometry pool's index buffer. Returns the draws.
+    uint32_t draw_kind_parts(rhi::CommandList& list, uint32_t kind) const {
+        const auto count = static_cast<uint32_t>(draws[kind].size());
+        const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
+        for (uint32_t done = 0; done < count;) {
+            const uint32_t call = std::min(count - done, call_limit);
+            list.draw_indexed_indirect(
+                frame_buffer_now,
+                draw_args_offset + uint64_t{draw_first[kind] + done} * sizeof(rhi::DrawIndexedIndirectArgs), call);
+            done += call;
+        }
+        return count;
+    }
+
+    // This frame slot's buffer, big enough for its instances and the sorted draws: written by the CPU
+    // now, read by this frame's GPU work (the slot's last frame is done: begin_frame waited for it).
+    rhi::BufferHandle frame_buffer(size_t instance_count) {
         const auto slot = static_cast<uint32_t>(device->frame_index() % rhi::kFramesInFlight);
-        const uint64_t needed = kInstancesOffset + std::max<uint64_t>(count, 1) * kInstanceBytes;
+        uint32_t draw_count = 0;
+        for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+            draw_first[kind] = draw_count;
+            draw_count += static_cast<uint32_t>(draws[kind].size());
+        }
+        draw_records_offset = kInstancesOffset + instance_count * kInstanceBytes;
+        draw_args_offset = draw_records_offset + uint64_t{draw_count} * sizeof(GpuDraw);
+        const uint64_t needed =
+            std::max<uint64_t>(draw_args_offset + uint64_t{draw_count} * sizeof(rhi::DrawIndexedIndirectArgs),
+                               kInstancesOffset + kInstanceBytes);
         if (frame_capacity[slot] < needed) {
             device->destroy(frame_buffers[slot]);
             const uint64_t capacity = std::max<uint64_t>(needed + needed / 2, uint64_t{64} * 1024);
-            const core::Result<rhi::BufferHandle> buffer = device->create_buffer({.size = capacity,
-                                                                                  .usage = rhi::BufferUsage::Storage,
-                                                                                  .memory = rhi::MemoryLocation::Upload,
-                                                                                  .debug_name = "scene frame"});
+            const core::Result<rhi::BufferHandle> buffer =
+                device->create_buffer({.size = capacity,
+                                       .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
+                                       .memory = rhi::MemoryLocation::Upload,
+                                       .debug_name = "scene frame"});
             frame_buffers[slot] = buffer ? *buffer : rhi::BufferHandle{};
             frame_capacity[slot] = buffer ? capacity : 0;
         }
@@ -721,7 +745,22 @@ struct SceneRendererState {
             std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
-        device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
+        // The sorted draws: a record each, and arguments that find it through their first instance.
+        auto* const records = reinterpret_cast<GpuDraw*>(mapped.data() + draw_records_offset);
+        auto* const args = reinterpret_cast<rhi::DrawIndexedIndirectArgs*>(mapped.data() + draw_args_offset);
+        uint32_t written = 0;
+        for (const core::Array<PartDraw>& list : draws) {
+            for (const PartDraw& part : list) {
+                records[written] = {.instance = part.instance, .material = part.material};
+                args[written] = {.index_count = part.index_count,
+                                 .first_index = part.first_index,
+                                 .vertex_offset = static_cast<int32_t>(part.vertex_offset),
+                                 .first_instance = written};
+                ++written;
+            }
+        }
+        device->flush_mapped(buffer, 0, draw_args_offset + uint64_t{written} * sizeof(rhi::DrawIndexedIndirectArgs));
+        frame_buffer_now = buffer;
         return true;
     }
 };
@@ -988,7 +1027,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     if (taa_on) {
         state.taa_sample = state.taa_sample % kTaaSamples + 1;
     }
-    // This frame's constants, now: every pass below draws only if they're in.
+    // This frame's constants and draws, now: every pass below draws only if they're in.
+    const uint32_t drawn = frame.camera.valid ? state.sort_draws(frame) : 0;
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame.instances.size()) : rhi::BufferHandle{};
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, frame, lighting, froxel_reach,
@@ -1008,7 +1048,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
-    state.sort_draws(frame);
+    state.stats.drawn = drawn;
 
     // TAA's textures this frame: this frame's depth, object motion and result are kept for the next; last
     // frame's are read. History needs last frame to have been drawn here, and no camera cut.
@@ -1078,6 +1118,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                   .instances = data.frame_address + kInstancesOffset,
                                   .vertices = renderer.gpu_assets->pool_vertex_address(),
                                   .materials = renderer.gpu_assets->material_table_address(),
+                                  .draws = data.frame_address + renderer.draw_records_offset,
                                   .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade) {
                 const rhi::DepthAttachment depth{.texture = context.texture(data.atlas)};
@@ -1093,7 +1134,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
                     if (!renderer.draws[kind].empty()) {
                         context.list.bind_pipeline(is_masked(kind) ? data.masked : data.opaque);
-                        renderer.stats.shadow_draws += draw_parts(context.list, renderer.draws[kind].span(), push);
+                        context.list.push_constants(push);
+                        renderer.stats.shadow_draws += renderer.draw_kind_parts(context.list, kind);
                     }
                 }
                 context.list.end_rendering();
@@ -1151,6 +1193,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                    .instances = data.frame_address + kInstancesOffset,
                                    .vertices = renderer.gpu_assets->pool_vertex_address(),
                                    .materials = renderer.gpu_assets->material_table_address(),
+                                   .draws = data.frame_address + renderer.draw_records_offset,
                                    .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
                 if (renderer.draws[kind].empty()) {
@@ -1160,7 +1203,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 if (is_double_sided(kind)) {
                     context.list.set_cull_mode(rhi::CullMode::None);
                 }
-                renderer.stats.draws += draw_parts(context.list, renderer.draws[kind].span(), push);
+                context.list.push_constants(push);
+                renderer.stats.draws += renderer.draw_kind_parts(context.list, kind);
             }
             context.list.end_rendering();
         });

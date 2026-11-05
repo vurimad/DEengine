@@ -108,8 +108,8 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     REQUIRE(field(vertex.reflection, "frame") != nullptr);
     CHECK(field(vertex.reflection, "frame")->offset == 0);
     CHECK(field(vertex.reflection, "frame")->size == 8); // a pointer
-    REQUIRE(field(vertex.reflection, "instance") != nullptr);
-    CHECK(field(vertex.reflection, "instance")->offset == 32);
+    REQUIRE(field(vertex.reflection, "draws") != nullptr);
+    CHECK(field(vertex.reflection, "draws")->offset == 32);
     CHECK(basic_lit->stages[1].code[0] == kSpirvMagic);
     CHECK(basic_lit->stages[1].reflection.stage == ShaderStage::Fragment);
     CHECK(has_dependency(report, "src:/shaders/scene/gbuffer.slang"));

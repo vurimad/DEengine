@@ -148,16 +148,23 @@ struct PoolScene {
         device.end_frame();
     }
 
-    // The engine's frame, drawing these meshes at the origin, left in flight.
-    void submit(std::initializer_list<AssetHandle> meshes) const {
-        assets.update();
-        assets.wait_all();
-        gpu_assets.update();
+    // A frame of these meshes at the origin.
+    static de::world::RenderFrame frame_of(std::initializer_list<AssetHandle> meshes) {
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         for (const AssetHandle mesh : meshes) {
             frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
         }
+        return frame;
+    }
+
+    // The engine's frame, drawing these meshes at the origin, left in flight.
+    void submit(std::initializer_list<AssetHandle> meshes) const { submit(frame_of(meshes)); }
+
+    void submit(const de::world::RenderFrame& frame) const {
+        assets.update();
+        assets.wait_all();
+        gpu_assets.update();
         device.begin_frame();
         uploader.record();
         graph.begin(kSize, kSize);
@@ -295,6 +302,85 @@ TEST_CASE("meshes in the pool draw from their own vertices and indices") {
         CHECK(is_red(both, kMiddle));
         CHECK(is_green(both, kLeft));
         CHECK(is_green(both, kRight));
+    });
+}
+
+TEST_CASE("every draw in one indirect call reads its own instance and material") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        // Each somewhere else, in one pipeline state: three draws in one call.
+        de::world::RenderFrame frame = PoolScene::frame_of({red, green, red});
+        frame.instances[0].transform[3] = -1.0f;
+        frame.instances[1].transform[3] = 0.0f;
+        frame.instances[2].transform[3] = 1.0f;
+        scene.submit(frame);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        CHECK(is_red(pixels, kLeft));
+        CHECK(is_green(pixels, kMiddle));
+        CHECK(is_red(pixels, kRight));
+        CHECK(scene.renderer.stats().draws == 3);
+    });
+}
+
+TEST_CASE("draws of every pipeline state in one frame read their own records") {
+    with_pool({}, [](const PoolScene& scene) {
+        using de::asset::AlphaMode;
+        using de::asset::MaterialFlags;
+        struct Kind {
+            AlphaMode mode;
+            MaterialFlags flags;
+            float color[3];
+            float x_m; // 1 m wide, side by side
+            uint32_t pixel;
+        };
+        // Listed backward: the renderer sorts them by kind, and each kind's draws start somewhere else.
+        const Kind kinds[] = {
+            {.mode = AlphaMode::Masked,
+             .flags = MaterialFlags::DoubleSided,
+             .color = {1, 1, 0},
+             .x_m = 1.5f,
+             .pixel = 61},
+            {.mode = AlphaMode::Masked, .flags = MaterialFlags::None, .color = {0, 0, 1}, .x_m = 0.5f, .pixel = 42},
+            {.mode = AlphaMode::Opaque,
+             .flags = MaterialFlags::DoubleSided,
+             .color = {0, 1, 0},
+             .x_m = -0.5f,
+             .pixel = 22},
+            {.mode = AlphaMode::Opaque, .flags = MaterialFlags::None, .color = {1, 0, 0}, .x_m = -1.5f, .pixel = 3},
+        };
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        uint32_t id = 0;
+        for (const Kind& kind : kinds) {
+            const AssetId material_id = AssetId::from_value(0x800 + id);
+            const AssetId mesh_id = AssetId::from_value(0x900 + id);
+            de::cooker::MaterialBuild build;
+            build.alpha_mode = kind.mode;
+            build.flags = kind.flags;
+            build.set_param(de::asset::material::kBaseColor, kind.color[0], kind.color[1], kind.color[2], 1.0f);
+            const auto material = de::cooker::cook_material(build, material_id);
+            REQUIRE(
+                scene.vfs.write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span())
+                    .ok());
+            put_squares(scene.vfs, mesh_id, material_id, {kind.x_m});
+            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = scene.load(mesh_id)});
+            ++id;
+        }
+        scene.uploader.flush_and_wait();
+        scene.submit(frame);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        for (const Kind& kind : kinds) {
+            const uint8_t* pixel = texel(pixels, kind.pixel, kMiddle);
+            for (int channel = 0; channel < 3; ++channel) {
+                CHECK((pixel[channel] > 200) == (kind.color[channel] > 0.5f));
+            }
+        }
+        CHECK(scene.renderer.stats().drawn == 4);
+        CHECK(scene.renderer.stats().draws == 4);
+        CHECK(scene.renderer.stats().shadow_draws == 16);
     });
 }
 
