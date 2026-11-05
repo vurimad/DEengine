@@ -8,6 +8,7 @@
 #include "render/graph/render_graph.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
+#include "render/scene/fog_noise.h"
 #include "render/scene/gpu_assets.h"
 #include "render/scene/scene_renderer.h"
 #include "render/shader/shader_compiler.h"
@@ -799,6 +800,57 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
     de::test::check_clean(*device);
 }
 
+TEST_CASE("fog noise tiles, covers the whole range, and each mip is the mean of the one above") {
+    using de::render::kFogNoiseBytes;
+    using de::render::kFogNoiseSize;
+    de::core::Array<uint8_t> noise(de::core::heap_allocator(de::core::MemoryTag::Render));
+    noise.resize(kFogNoiseBytes);
+    de::render::make_fog_noise(noise.span());
+    const auto at = [&](uint32_t x, uint32_t y, uint32_t z) {
+        return static_cast<int>(noise[size_t{z % kFogNoiseSize} * kFogNoiseSize * kFogNoiseSize +
+                                      size_t{y % kFogNoiseSize} * kFogNoiseSize + x % kFogNoiseSize]);
+    };
+    // Across the seam it changes no more than anywhere else, on each axis.
+    const size_t top_bytes = size_t{kFogNoiseSize} * kFogNoiseSize * kFogNoiseSize;
+    int inside_step = 0;
+    int seam_step = 0;
+    int lowest = 255;
+    int highest = 0;
+    for (uint32_t b = 0; b < kFogNoiseSize; ++b) {
+        for (uint32_t a = 0; a < kFogNoiseSize; ++a) {
+            for (uint32_t c = 0; c < kFogNoiseSize; ++c) {
+                const int here = at(c, a, b);
+                lowest = std::min(lowest, here);
+                highest = std::max(highest, here);
+                const int across = std::max({std::abs(here - at(c + 1, a, b)), std::abs(here - at(c, a + 1, b)),
+                                             std::abs(here - at(c, a, b + 1))});
+                if (c == kFogNoiseSize - 1 || a == kFogNoiseSize - 1 || b == kFogNoiseSize - 1) {
+                    seam_step = std::max(seam_step, across);
+                } else {
+                    inside_step = std::max(inside_step, across);
+                }
+            }
+        }
+    }
+    CHECK(lowest == 0);
+    CHECK(highest == 255);
+    CHECK(seam_step <= inside_step + 8);
+    // The last mip is one texel, the mean of it all.
+    int64_t total = 0;
+    for (size_t i = 0; i < top_bytes; ++i) {
+        total += noise[i];
+    }
+    const int mean = static_cast<int>(total / static_cast<int64_t>(top_bytes));
+    CHECK(std::abs(static_cast<int>(noise[kFogNoiseBytes - 1]) - mean) <= 4);
+    CHECK(mean > 60);
+    CHECK(mean < 190);
+    // The same every time.
+    de::core::Array<uint8_t> again(de::core::heap_allocator(de::core::MemoryTag::Render));
+    again.resize(kFogNoiseBytes);
+    de::render::make_fog_noise(again.span());
+    CHECK(std::memcmp(noise.data(), again.data(), kFogNoiseBytes) == 0);
+}
+
 TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shadows to the fog") {
     auto device = de::test::make_device();
     if (!device) {
@@ -823,6 +875,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         auto gpu_assets =
             de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
         REQUIRE(gpu_assets.ok());
+        CHECK(gpu_assets->fog_noise_index() == 0); // not on the GPU yet: volumes go without
         auto renderer =
             de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         REQUIRE(renderer.ok());
@@ -832,6 +885,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         uploader->flush_and_wait();
         gpu_assets->update();
         REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+        CHECK(gpu_assets->fog_noise_index() != 0);
         const auto target =
             device->create_texture({.width = kSize,
                                     .height = kSize,
@@ -1709,6 +1763,149 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const de::core::Array<std::byte> crowded_around = render(clear_air);
         CHECK(renderer->stats().fog_volumes == 64);
         CHECK(std::abs(at_pixel(crowded_around, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 15);
+        frame.fog_volumes.clear();
+        restart();
+
+        // Noise: none asked for, the shape alone, whatever else is set.
+        const auto mist_ahead = [&](float depth, float half_depth) {
+            de::world::RenderFogVolume volume = volume_at(0.0f, 0.0f, -depth, 15.0f, 0.2f, 1.0f);
+            volume.half_extents[2] = half_depth;
+            volume.noise_tiles_per_m = 0.05f;
+            return volume;
+        };
+        const auto green_change = [](const de::core::Array<std::byte>& from, const de::core::Array<std::byte>& to) {
+            int most = 0;
+            for (size_t at = 1; at < from.size(); at += 4) {
+                most = std::max(most, std::abs(static_cast<int>(static_cast<uint8_t>(from[at])) -
+                                               static_cast<int>(static_cast<uint8_t>(to[at]))));
+            }
+            return most;
+        };
+        // How much a row and a column change from pixel to pixel: how much shape there is.
+        const auto shape_in = [&](const de::core::Array<std::byte>& image) {
+            int total = 0;
+            for (uint32_t at = 1; at < kSize; ++at) {
+                total += std::abs(at_pixel(image, at, heart, 1) - at_pixel(image, at - 1, heart, 1));
+                total += std::abs(at_pixel(image, heart, at, 1) - at_pixel(image, heart, at - 1, 1));
+            }
+            return total;
+        };
+        frame.fog_volumes.push(mist_ahead(20.0f, 8.0f));
+        frame.fog_volumes[0].noise_tiles_per_m = 0.0f;
+        const de::core::Array<std::byte> shape_only = render(clear_air);
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        const de::core::Array<std::byte> amount_zero = render(clear_air);
+        CHECK(green_change(shape_only, amount_zero) <= 1);
+        // Asked for, it eats into the fog, unevenly.
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        const de::core::Array<std::byte> noisy = render(clear_air);
+        CHECK(shape_in(noisy) > shape_in(shape_only) + 20);
+        // Moved, the pattern moves; by whole tiles in all its sizes, it's the same.
+        frame.fog_volumes[0].noise_offset_tiles[0] = 0.5f;
+        const de::core::Array<std::byte> drifted = render(clear_air);
+        CHECK(green_change(noisy, drifted) > 6);
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f;
+        const de::core::Array<std::byte> wrapped_offset = render(clear_air);
+        CHECK(green_change(noisy, wrapped_offset) <= 1);
+        // The noise is the world's: moving a volume, or turning it, moves its shape and leaves the noise where it is.
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 0.0f;
+        const de::core::Array<std::byte> before_moving = render(clear_air);
+        const de::world::RenderFogVolume unmoved = frame.fog_volumes[0];
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].to_local[3] = -1.5f; // 1.5 m along x
+        frame.fog_volumes[0].center[0] = 1.5f;
+        const de::core::Array<std::byte> moved_volume = render(clear_air);
+        CHECK(green_change(moved_volume, before_moving) <= 3);
+        const float turned_axes[12] = {0, 0, 1, 20, 0, 1, 0, 0, -1, 0, 0, 0};
+        frame.fog_volumes[0] = unmoved;
+        std::memcpy(frame.fog_volumes[0].to_local, turned_axes, sizeof(turned_axes));
+        frame.fog_volumes[0].half_extents[0] = 8.0f;
+        frame.fog_volumes[0].half_extents[2] = 15.0f;
+        const de::core::Array<std::byte> turned_volume = render(clear_air);
+        CHECK(green_change(turned_volume, before_moving) <= 3);
+        // Nor does the render origin moving change anything: the same world, with everything relative to another
+        // origin, and the offset taking up the difference. 1024 m at this size of tile isn't a whole number of them.
+        frame.fog_volumes[0] = mist_ahead(14.0f, 3.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.05f;
+        const de::core::Array<std::byte> origin_here = render(clear_air);
+        frame.camera.transform[3] = -1024.0f;
+        frame.fog_volumes[0].to_local[3] = 1024.0f;
+        frame.fog_volumes[0].center[0] = -1024.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f - 3.2f; // 1024 * 0.05 = 51.2, wrapped: -(-51.2) mod 4 = 3.2
+        const de::core::Array<std::byte> origin_there = render(clear_air);
+        frame.camera.transform[3] = 0.0f;
+        CHECK(green_change(origin_here, origin_there) <= 2);
+        // With noise far finer than the grid can hold, it's flat, and eats nothing: the shape alone.
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 200.0f;
+        const de::core::Array<std::byte> too_fine = render(clear_air);
+        CHECK(green_change(too_fine, shape_only) <= 2);
+        // noise_amount limits how much a heart can lose: a half leaves no gaps through it.
+        frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -14.0f, 8.0f, 1.0f, 0.1f);
+        const de::core::Array<std::byte> solid_heart = render(clear_air);
+        frame.fog_volumes[0].noise_amount = 0.5f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.25f;
+        const de::core::Array<std::byte> noisy_heart = render(clear_air);
+        int emptiest_heart = 255;
+        for (uint32_t at = 8; at < kSize - 8; ++at) {
+            emptiest_heart = std::min(
+                emptiest_heart, std::abs(at_pixel(noisy_heart, at, heart, 1) - at_pixel(no_volume, at, heart, 1)));
+        }
+        CHECK(emptiest_heart > 15);
+        // With a tile large enough to show every size: 4 tiles is a whole number of tiles for each.
+        frame.fog_volumes[0] = mist_ahead(14.0f, 3.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.05f;
+        const de::core::Array<std::byte> large_tile = render(clear_air);
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f;
+        const de::core::Array<std::byte> large_tile_wrapped = render(clear_air);
+        CHECK(green_change(large_tile, large_tile_wrapped) <= 1);
+        // A height fade thins it toward its top, not its bottom.
+        const de::world::RenderFogVolume fading = volume_at(0.0f, 0.0f, -12.0f, 3.0f, 0.5f, 0.2f);
+        frame.fog_volumes[0] = fading;
+        const de::core::Array<std::byte> not_fading = render(clear_air);
+        frame.fog_volumes[0].height_fade_m = 3.0f;
+        const de::core::Array<std::byte> faded = render(clear_air);
+        const auto toward_top = static_cast<uint32_t>(kSize * 0.5f * (1.0f - 2.0f / (12.0f * std::tan(0.5f))));
+        const auto toward_bottom = static_cast<uint32_t>(kSize * 0.5f * (1.0f + 2.0f / (12.0f * std::tan(0.5f))));
+        CHECK(std::abs(at_pixel(faded, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) <
+              std::abs(at_pixel(not_fading, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) - 8);
+        CHECK(std::abs(at_pixel(faded, heart, toward_bottom, 1) - at_pixel(not_fading, heart, toward_bottom, 1)) <= 3);
+        // Whichever way it's turned, the fade is toward the world's top. Flipped over, it's the same.
+        const float flipped_axes[12] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, -12};
+        std::memcpy(frame.fog_volumes[0].to_local, flipped_axes, sizeof(flipped_axes));
+        const de::core::Array<std::byte> flipped_fade = render(clear_air);
+        CHECK(green_change(flipped_fade, faded) <= 3);
+        // Slices sliding through still noise finer than they can hold: moving the camera, little changes from step
+        // to step, as each size reads a coarse enough mip. A thin volume too: its short span in a slice doesn't make
+        // finer points of it. And sideways, past columns wider than the slices are deep at this size of image.
+        wall_at(58.0f);
+        const auto noise_crawl = [&](float half_depth, float density, int axis) {
+            frame.fog_volumes.clear();
+            frame.fog_volumes.push(mist_ahead(44.0f, half_depth));
+            frame.fog_volumes[0].density_per_m = density;
+            frame.fog_volumes[0].noise_amount = 1.0f;
+            frame.fog_volumes[0].noise_tiles_per_m = 1.0f;
+            const auto camera_at = [&](int step) {
+                frame.camera.transform[axis] = static_cast<float>(step) * 0.3f;
+                return render(clear_air);
+            };
+            int most = 0;
+            for (int i = 0; i < 12; i += 2) {
+                most = std::max(most, green_change(camera_at(i), camera_at(i + 1)));
+            }
+            frame.camera.transform[axis] = 0.0f;
+            return most;
+        };
+        CHECK(noise_crawl(6.0f, 0.2f, 11) <= 20); // 11 here; 33 at the finest mip
+        CHECK(noise_crawl(0.6f, 2.0f, 11) <= 20); // 8 here; 49
+        CHECK(noise_crawl(6.0f, 0.2f, 3) <= 30);  // 24 here; 39
+        frame.instances.clear();
         frame.fog_volumes.clear();
         restart();
 

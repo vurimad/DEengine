@@ -27,6 +27,10 @@ struct FogVolume {
     float edge_m = 1.0f;                // how far in from its surface it takes to reach that
     float tint[3] = {1.0f, 1.0f, 1.0f}; // of the light it scatters
     bool ellipsoid = false;
+    float noise_size_m = 8.0f;               // how big its noise's largest shapes are
+    float noise_amount = 0.0f;               // 0: smooth, to 1: as much as noise can eat away
+    float drift_mps[3] = {0.0f, 0.0f, 0.0f}; // how its noise moves through it: wind, in the world's axes
+    float height_fade_m = 0.0f;              // how far down from its top it thins from nothing; 0: not at all
 };
 
 // A point of view. The active one (ActiveCamera) is what render extraction looks through.
@@ -74,6 +78,10 @@ struct RenderFogVolume {
     float edge_m = 1.0f;
     float tint[3] = {1.0f, 1.0f, 1.0f};
     bool ellipsoid = false;
+    float noise_tiles_per_m = 0.0f;
+    float noise_amount = 0.0f;
+    float noise_offset_tiles[3] = {}; // past the render origin, in the world's axes, wrapped to [0, 4)
+    float height_fade_m = 0.0f;
 };
 
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
@@ -112,6 +120,7 @@ struct RenderExtractDesc {
     RenderExtractScratch* scratch = nullptr; // must outlive the world
     const float* alpha = nullptr;            // this frame's interpolation point, set before RenderExtract
     const float* alpha_step = nullptr;       // how much of a tick this frame took, set likewise
+    const double* time_s = nullptr;          // the world's time at this frame's interpolation point, likewise
     core::JobSystem* jobs = nullptr;         // null: one thread
 };
 

@@ -105,7 +105,11 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
             member.set(FogVolume{.density_per_m = fog.density_per_m,
                                  .edge_m = fog.edge_m,
                                  .tint = {fog.tint[0], fog.tint[1], fog.tint[2]},
-                                 .ellipsoid = fog.shape == asset::CellFogShape::Ellipsoid});
+                                 .ellipsoid = fog.shape == asset::CellFogShape::Ellipsoid,
+                                 .noise_size_m = fog.noise_size_m,
+                                 .noise_amount = fog.noise_amount,
+                                 .drift_mps = {fog.drift_mps[0], fog.drift_mps[1], fog.drift_mps[2]},
+                                 .height_fade_m = fog.height_fade_m});
         }
         const Transform placed =
             attached ? local : Transform{.position = world.position, .rotation = world.rotation, .scale = world.scale};

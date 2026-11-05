@@ -33,7 +33,8 @@ struct VertexOutput
 // and at distance a slice is as thick as a whole volume: taking a share by depth alone puts the volume's
 // fog in front of ground it's really behind, and the other way round, and the error sweeps across the
 // volume as slices slide over the ground with the camera. So the volumes' share is what's really in front.
-// The world's fog in the slice stays by depth: it's nearly even across one.
+// The world's fog in the slice stays by depth: it's nearly even across one. The volumes' shapes alone are
+// enough to place them, without their noise.
 float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray, uint slice, float by_depth, float view_depth)
 {
     const uint2 mask = push.fog_slice_masks[slice];
@@ -47,12 +48,12 @@ float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray
     const float far_distance = froxel_depth(frame.fog, float(slice + 1) / slices) / view_per_ray;
     const float3 camera = frame.camera_position.xyz;
     float2 span;
-    const float through = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, far_distance, span).a;
+    const float through = fog_volumes_along(push.fog_volumes, mask, 0, 0.0, camera, direction, view_per_ray, reach, near_distance, far_distance, span).a;
     if (through <= 0.0)
     {
         return by_depth;
     }
-    const float in_front = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, view_depth / view_per_ray, span).a;
+    const float in_front = fog_volumes_along(push.fog_volumes, mask, 0, 0.0, camera, direction, view_per_ray, reach, near_distance, view_depth / view_per_ray, span).a;
     // As the slice stored it: within where the world's fog starts and ends.
     const float fog_near = clamp(frame.fog.ambient.w, near_distance, far_distance);
     const float fog_far = clamp(frame.fog.range.x, near_distance, far_distance);

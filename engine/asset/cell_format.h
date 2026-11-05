@@ -27,8 +27,12 @@ struct CellFogVolume {
     float edge_m = 1.0f;        // how far in from its surface it takes to reach that
     float tint[3] = {1, 1, 1};  // of the light it scatters
     CellFogShape shape = CellFogShape::Box;
+    float noise_size_m = 8.0f;      // how big its noise's largest shapes are
+    float noise_amount = 0.0f;      // 0: smooth, to 1: as much as noise can eat away
+    float drift_mps[3] = {0, 0, 0}; // how its noise moves through it: wind, in the world's axes
+    float height_fade_m = 0.0f;     // how far down from its top it thins from nothing; 0: not at all
 };
-static_assert(sizeof(CellFogVolume) == 24);
+static_assert(sizeof(CellFogVolume) == 48);
 
 // One entity placed in a cell. Its transform is relative to its parent, or the world without one.
 struct CellEntity {
@@ -53,7 +57,7 @@ static_assert(sizeof(CellEntity) == 72);
 // Entities are in an order where every parent comes before its children.
 struct CellAsset {
     static constexpr AssetType kType = AssetType::Cell;
-    static constexpr uint16_t kFormatVersion = 2;
+    static constexpr uint16_t kFormatVersion = 3;
 
     AssetHeader header;
     int32_t coord_x = 0; // the cell's place in the grid (world::CellCoord)

@@ -111,6 +111,8 @@ public:
     // how it draws: alpha-tested (Masked) and without back-face culling (DoubleSided). None for an
     // index past the table.
     GpuMaterialFlags material_flags(uint32_t material) const;
+    // The fog noise's bindless index (3D, fog_noise.h), or 0 until it's uploaded.
+    uint32_t fog_noise_index() const;
 
     GpuAssetsStats stats() const;
 

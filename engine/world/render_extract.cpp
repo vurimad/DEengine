@@ -125,12 +125,21 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                     const WorldTransform& current = currents[entity_row];
                     const PreviousWorldTransform& previous = previouses[entity_row];
                     const FogVolume& volume = volumes[entity_row];
-                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f); // cooked ones are checked at load
+                    // Cooked ones are checked at load; one set from code, here.
+                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f && volume.noise_size_m > 0.0f &&
+                              volume.noise_amount >= 0.0f && volume.noise_amount <= 1.0f &&
+                              volume.height_fade_m >= 0.0f && std::isfinite(volume.drift_mps[0]) &&
+                              std::isfinite(volume.drift_mps[1]) && std::isfinite(volume.drift_mps[2]));
                     const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
                     const Vec3 center(seen.position - desc.frame->origin);
                     const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
-                    RenderFogVolume out{
-                        .density_per_m = volume.density_per_m, .edge_m = volume.edge_m, .ellipsoid = volume.ellipsoid};
+                    const float noise_tiles_per_m = 1.0f / std::max(volume.noise_size_m, 1e-3f);
+                    RenderFogVolume out{.density_per_m = volume.density_per_m,
+                                        .edge_m = volume.edge_m,
+                                        .ellipsoid = volume.ellipsoid,
+                                        .noise_tiles_per_m = noise_tiles_per_m,
+                                        .noise_amount = volume.noise_amount,
+                                        .height_fade_m = volume.height_fade_m};
                     for (int row = 0; row < 3; ++row) {
                         const Vec3 axis(to_axes[0][row], to_axes[1][row], to_axes[2][row]);
                         out.to_local[static_cast<size_t>(row) * 4 + 0] = axis.x;
@@ -140,6 +149,13 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                         out.center[row] = center[row];
                         out.half_extents[row] = std::abs(seen.scale[row]);
                         out.tint[row] = volume.tint[row];
+                        // In double, however long the world has run and wherever the origin is; wrapped, so a
+                        // float holds it. The render origin's part keeps the noise still in the world as it moves.
+                        const double moved =
+                            (static_cast<double>(volume.drift_mps[row]) * *desc.time_s - desc.frame->origin[row]) *
+                            static_cast<double>(noise_tiles_per_m);
+                        const auto wrapped = static_cast<float>(moved - 4.0 * std::floor(moved * 0.25));
+                        out.noise_offset_tiles[row] = wrapped < 4.0f ? wrapped : 0.0f; // it can round up to 4
                     }
                     desc.frame->fog_volumes.push(out);
                 }
