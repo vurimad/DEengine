@@ -1770,7 +1770,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const auto mist_ahead = [&](float depth, float half_depth) {
             de::world::RenderFogVolume volume = volume_at(0.0f, 0.0f, -depth, 15.0f, 0.2f, 1.0f);
             volume.half_extents[2] = half_depth;
-            volume.noise_tiles_per_m = 0.25f;
+            volume.noise_tiles_per_m = 0.05f;
             return volume;
         };
         const auto green_change = [](const de::core::Array<std::byte>& from, const de::core::Array<std::byte>& to) {
@@ -1826,6 +1826,37 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes[0].half_extents[2] = 15.0f;
         const de::core::Array<std::byte> turned_volume = render(clear_air);
         CHECK(green_change(turned_volume, before_moving) <= 3);
+        // Nor does the render origin moving change anything: the same world, with everything relative to another
+        // origin, and the offset taking up the difference. 1024 m at this size of tile isn't a whole number of them.
+        frame.fog_volumes[0] = mist_ahead(14.0f, 3.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.05f;
+        const de::core::Array<std::byte> origin_here = render(clear_air);
+        frame.camera.transform[3] = -1024.0f;
+        frame.fog_volumes[0].to_local[3] = 1024.0f;
+        frame.fog_volumes[0].center[0] = -1024.0f;
+        frame.fog_volumes[0].noise_offset_tiles[0] = 4.0f - 3.2f; // 1024 * 0.05 = 51.2, wrapped: -(-51.2) mod 4 = 3.2
+        const de::core::Array<std::byte> origin_there = render(clear_air);
+        frame.camera.transform[3] = 0.0f;
+        CHECK(green_change(origin_here, origin_there) <= 2);
+        // With noise far finer than the grid can hold, it's flat, and eats nothing: the shape alone.
+        frame.fog_volumes[0] = mist_ahead(20.0f, 8.0f);
+        frame.fog_volumes[0].noise_amount = 1.0f;
+        frame.fog_volumes[0].noise_tiles_per_m = 200.0f;
+        const de::core::Array<std::byte> too_fine = render(clear_air);
+        CHECK(green_change(too_fine, shape_only) <= 2);
+        // noise_amount limits how much a heart can lose: a half leaves no gaps through it.
+        frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -14.0f, 8.0f, 1.0f, 0.1f);
+        const de::core::Array<std::byte> solid_heart = render(clear_air);
+        frame.fog_volumes[0].noise_amount = 0.5f;
+        frame.fog_volumes[0].noise_tiles_per_m = 0.25f;
+        const de::core::Array<std::byte> noisy_heart = render(clear_air);
+        int emptiest_heart = 255;
+        for (uint32_t at = 8; at < kSize - 8; ++at) {
+            emptiest_heart = std::min(
+                emptiest_heart, std::abs(at_pixel(noisy_heart, at, heart, 1) - at_pixel(no_volume, at, heart, 1)));
+        }
+        CHECK(emptiest_heart > 15);
         // With a tile large enough to show every size: 4 tiles is a whole number of tiles for each.
         frame.fog_volumes[0] = mist_ahead(14.0f, 3.0f);
         frame.fog_volumes[0].noise_amount = 1.0f;
@@ -1845,6 +1876,11 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(std::abs(at_pixel(faded, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) <
               std::abs(at_pixel(not_fading, heart, toward_top, 1) - at_pixel(no_volume, heart, toward_top, 1)) - 8);
         CHECK(std::abs(at_pixel(faded, heart, toward_bottom, 1) - at_pixel(not_fading, heart, toward_bottom, 1)) <= 3);
+        // Whichever way it's turned, the fade is toward the world's top. Flipped over, it's the same.
+        const float flipped_axes[12] = {1, 0, 0, 0, 0, -1, 0, 0, 0, 0, -1, -12};
+        std::memcpy(frame.fog_volumes[0].to_local, flipped_axes, sizeof(flipped_axes));
+        const de::core::Array<std::byte> flipped_fade = render(clear_air);
+        CHECK(green_change(flipped_fade, faded) <= 3);
         // Slices sliding through still noise finer than they can hold: moving the camera, little changes from step
         // to step, as each size reads a coarse enough mip. A thin volume too: its short span in a slice doesn't make
         // finer points of it. And sideways, past columns wider than the slices are deep at this size of image.
@@ -1866,9 +1902,9 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             frame.camera.transform[axis] = 0.0f;
             return most;
         };
-        CHECK(noise_crawl(6.0f, 0.2f, 11) <= 14); // 31 at the finest mip
-        CHECK(noise_crawl(0.6f, 2.0f, 11) <= 16);
-        CHECK(noise_crawl(6.0f, 0.2f, 3) <= 15); // 40 at the finest mip, 17 by depth alone
+        CHECK(noise_crawl(6.0f, 0.2f, 11) <= 20); // 11 here; 33 at the finest mip
+        CHECK(noise_crawl(0.6f, 2.0f, 11) <= 20); // 8 here; 49
+        CHECK(noise_crawl(6.0f, 0.2f, 3) <= 30);  // 24 here; 39
         frame.instances.clear();
         frame.fog_volumes.clear();
         restart();

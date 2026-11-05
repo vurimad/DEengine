@@ -125,7 +125,11 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                     const WorldTransform& current = currents[entity_row];
                     const PreviousWorldTransform& previous = previouses[entity_row];
                     const FogVolume& volume = volumes[entity_row];
-                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f); // cooked ones are checked at load
+                    // Cooked ones are checked at load; one set from code, here.
+                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f && volume.noise_size_m > 0.0f &&
+                              volume.noise_amount >= 0.0f && volume.noise_amount <= 1.0f &&
+                              volume.height_fade_m >= 0.0f && std::isfinite(volume.drift_mps[0]) &&
+                              std::isfinite(volume.drift_mps[1]) && std::isfinite(volume.drift_mps[2]));
                     const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
                     const Vec3 center(seen.position - desc.frame->origin);
                     const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
@@ -150,7 +154,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                         const double moved =
                             (static_cast<double>(volume.drift_mps[row]) * *desc.time_s - desc.frame->origin[row]) *
                             static_cast<double>(noise_tiles_per_m);
-                        out.noise_offset_tiles[row] = static_cast<float>(moved - 4.0 * std::floor(moved * 0.25));
+                        const auto wrapped = static_cast<float>(moved - 4.0 * std::floor(moved * 0.25));
+                        out.noise_offset_tiles[row] = wrapped < 4.0f ? wrapped : 0.0f; // it can round up to 4
                     }
                     desc.frame->fog_volumes.push(out);
                 }

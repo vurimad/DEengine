@@ -32,7 +32,7 @@ struct CellBuild {
 //             "density_per_m": 0.2,               //   extinction per meter at its heart, on top of the world's
 //             "edge_m": 2,                        //   how far in from its surface it takes to reach that
 //             "tint": [1, 1, 1],                  //   of the light it scatters
-//             "noise_amount": 0.8,                //   0 (default): smooth, to 1: as much as noise can eat away
+//             "noise_amount": 0.8,                //   0 (default): smooth, to 1: noise can eat all of it, leaving gaps
 //             "noise_size_m": 8,                  //   how big its noise's largest shapes are
 //             "drift_mps": [0.5, 0, 0.2],         //   how its noise moves through it: wind, in the world's axes
 //             "height_fade_m": 2                  //   how far down from its top it thins from nothing

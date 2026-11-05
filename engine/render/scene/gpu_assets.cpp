@@ -120,9 +120,7 @@ struct GpuAssetsState {
             device->destroy(mesh.gpu.vertices);
             device->destroy(mesh.gpu.indices);
         }
-        if (fog_noise.is_valid()) {
-            device->destroy(fog_noise);
-        }
+        device->destroy(fog_noise);
         for (const rhi::TextureHandle texture : defaults) {
             device->destroy(texture);
         }
@@ -495,7 +493,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
         return core::fail(noise_texture.error());
     }
     state->fog_noise = *noise_texture;
-    core::Array<uint8_t> noise_texels(core::heap_allocator(core::MemoryTag::Render));
+    core::Array<uint8_t> noise_texels(render_heap());
     noise_texels.resize(kFogNoiseBytes);
     make_fog_noise(noise_texels.span());
     if (const core::Result<void> queued =
