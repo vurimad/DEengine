@@ -193,7 +193,7 @@ private:
             diagnostics_.error(path_, "%s: fog_volume should be an object", label.c_str());
             return;
         }
-        static constexpr const char* kKeys[] = {"shape", "density", "edge_m", "tint"};
+        static constexpr const char* kKeys[] = {"shape", "density_per_m", "edge_m", "tint"};
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
         reader.check_keys(kKeys, "fog volume");
         asset::CellFogVolume volume;
@@ -203,11 +203,11 @@ private:
         } else if (shape != "box") {
             diagnostics_.error(path_, "%s: fog_volume shape should be box or ellipsoid", label.c_str());
         }
-        const double density = reader.number("density", 0.0);
+        const double density = reader.number("density_per_m", 0.0);
         const double edge = reader.number("edge_m", 1.0);
         if (density <= 0.0 || density > static_cast<double>(asset::kMaxFogVolumeDensityPerM) ||
             !to_float(density, volume.density_per_m)) {
-            diagnostics_.error(path_, "%s: fog_volume needs a density above 0, up to 4", label.c_str());
+            diagnostics_.error(path_, "%s: fog_volume needs a density_per_m above 0, up to 4", label.c_str());
         }
         if (!to_float(edge, volume.edge_m) || edge < 0.0) {
             diagnostics_.error(path_, "%s: fog_volume edge_m should be 0 or more", label.c_str());

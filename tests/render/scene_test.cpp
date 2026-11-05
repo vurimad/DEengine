@@ -1357,6 +1357,15 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(std::abs(at_pixel(soft, near_surface, heart, 1) - at_pixel(no_volume, near_surface, heart, 1)) <
               std::abs(at_pixel(box, near_surface, heart, 1) - at_pixel(no_volume, near_surface, heart, 1)) - 2);
 
+        // An edge wider than the volume ends at its middle, so its heart keeps its density.
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 2.0f, 0.5f, 2.0f));
+        const de::core::Array<std::byte> edge_to_middle = render(clear_air);
+        frame.fog_volumes[0].edge_m = 8.0f;
+        const de::core::Array<std::byte> edge_past_middle = render(clear_air);
+        CHECK(std::abs(at_pixel(edge_past_middle, heart, heart, 1) - at_pixel(edge_to_middle, heart, heart, 1)) <= 1);
+        CHECK(std::abs(at_pixel(edge_past_middle, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 5);
+
         // An ellipsoid has no corners. A box, looked at toward one, has fog there.
         frame.fog_volumes.clear();
         frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
@@ -1404,6 +1413,38 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         late_sun.sun_start_m = 30.0f;
         const de::core::Array<std::byte> late_sun_box = render(late_sun);
         CHECK(std::abs(at_pixel(late_sun_box, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        // Nor does the world's fog take its light where there is none of it: it starts past the grid here.
+        de::render::SceneFog late_start_fog = clear_air;
+        late_start_fog.density_per_m = 0.3f;
+        late_start_fog.start_m = 500.0f;
+        late_start_fog.sun_start_m = 500.0f;
+        frame.instances.push(
+            {.transform = {100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -40}, .mesh = mesh}); // nothing past it
+        const de::core::Array<std::byte> walled_clear = render(clear_air);
+        const de::core::Array<std::byte> walled_late_start_fog = render(late_start_fog);
+        frame.instances.clear();
+        CHECK(std::abs(at_pixel(walled_late_start_fog, heart, heart, 1) - at_pixel(walled_clear, heart, heart, 1)) <=
+              3);
+        CHECK(at_pixel(walled_clear, heart, heart, 1) > 15);
+
+        // A camera carrying a scale (a child of something scaled) sees it at its true depth.
+        frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -40.0f, 3.0f, 0.5f, 0.5f);
+        const de::core::Array<std::byte> unscaled_view = render(clear_air);
+        for (const int column : {0, 1, 2}) {
+            frame.camera.transform[column] *= 2.0f;
+            frame.camera.transform[4 + column] *= 2.0f;
+            frame.camera.transform[8 + column] *= 2.0f;
+        }
+        const de::core::Array<std::byte> scaled_view = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 1);
+        for (const int column : {0, 1, 2}) {
+            frame.camera.transform[column] *= 0.5f;
+            frame.camera.transform[4 + column] *= 0.5f;
+            frame.camera.transform[8 + column] *= 0.5f;
+        }
+        CHECK(std::abs(at_pixel(scaled_view, heart, heart, 1) - at_pixel(unscaled_view, heart, heart, 1)) <= 3);
+        CHECK(std::abs(at_pixel(scaled_view, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 8);
+        frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
 
         // Over frames it holds, like the rest of the grid, and goes when it goes.
         settle(clear_air);
@@ -1431,6 +1472,20 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes.clear();
         static_cast<void>(render(clear_air));
         CHECK(graph->stats().passes == out_of_view_passes);
+        // Panning one in and out of view doesn't make and free the kept 3D textures each time; with none left,
+        // they go.
+        frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+        static_cast<void>(render(clear_air));
+        static_cast<void>(render(clear_air));
+        const uint32_t textures_in_view = device->stats().live_textures;
+        const uint32_t destroys_in_view = device->stats().pending_destroys;
+        frame.fog_volumes[0] = volume_at(40.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
+        static_cast<void>(render(clear_air));
+        CHECK(device->stats().live_textures == textures_in_view);
+        CHECK(device->stats().pending_destroys <= destroys_in_view);
+        frame.fog_volumes.clear();
+        static_cast<void>(render(clear_air));
+        CHECK(device->stats().live_textures <= textures_in_view - 2);
         frame.fog_volumes.push(volume_at(7.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f)); // 4 m aside, and the view reaches 5.5
         const de::core::Array<std::byte> reaching_in = render(clear_air);
         CHECK(renderer->stats().fog_volumes == 1);
@@ -1444,6 +1499,22 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes.push(volume_at(30.0f, 0.0f, -59.0f, 1.5f, 0.5f, 0.5f));
         static_cast<void>(render(clear_air));
         CHECK(renderer->stats().fog_volumes == 1);
+        frame.fog_volumes.clear();
+
+        // In the last tenth of the grid's reach it fades out, where it couldn't be held much farther.
+        de::world::RenderFogVolume far_slab = volume_at(0.0f, 0.0f, -45.0f, 6.0f, 0.3f, 0.2f);
+        far_slab.half_extents[2] = 1.0f;
+        frame.fog_volumes.push(far_slab);
+        const de::core::Array<std::byte> before_fade = render(clear_air);
+        far_slab = volume_at(0.0f, 0.0f, -58.5f, 6.0f, 0.3f, 0.2f);
+        far_slab.half_extents[2] = 1.0f;
+        frame.fog_volumes[0] = far_slab;
+        const de::core::Array<std::byte> in_fade = render(clear_air);
+        const int seen_before_fade =
+            std::abs(at_pixel(before_fade, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1));
+        CHECK(seen_before_fade > 8);
+        CHECK(std::abs(at_pixel(in_fade, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) <
+              seen_before_fade / 2);
         frame.fog_volumes.clear();
 
         // Long along the view: it reaches across many slices, and it's in them all.
@@ -1489,49 +1560,60 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             slab_ahead.half_extents[2] = half_depth;
             return slab_ahead;
         };
-        const auto mist_in_slice = [&] {
+        const auto mist_in_slice = [&](const de::render::SceneFog& slice_fog) {
             wall_at(48.3f); // in front of the mist, in the same slice
-            const de::core::Array<std::byte> before_bare = render(clear_air);
+            const de::core::Array<std::byte> before_bare = render(slice_fog);
             frame.fog_volumes.push(mist_slab(49.8f, 0.9f));
-            const de::core::Array<std::byte> before_mist = render(clear_air);
+            const de::core::Array<std::byte> before_mist = render(slice_fog);
             frame.fog_volumes.pop();
             CHECK(std::abs(at_pixel(before_mist, heart, heart, 1) - at_pixel(before_bare, heart, heart, 1)) <= 3);
 
             wall_at(49.6f); // behind the mist, in the same slice
             frame.fog_volumes.push(mist_slab(48.7f, 0.6f));
-            const de::core::Array<std::byte> behind_mist = render(clear_air);
+            const de::core::Array<std::byte> behind_mist = render(slice_fog);
             wall_at(53.0f); // and well past it
-            const de::core::Array<std::byte> far_past_mist = render(clear_air);
+            const de::core::Array<std::byte> far_past_mist = render(slice_fog);
             frame.fog_volumes.pop();
-            const de::core::Array<std::byte> far_past_bare = render(clear_air);
+            const de::core::Array<std::byte> far_past_bare = render(slice_fog);
             const int all_of_it = at_pixel(far_past_mist, heart, heart, 1) - at_pixel(far_past_bare, heart, heart, 1);
             CHECK(all_of_it > 20);
             CHECK(std::abs(at_pixel(behind_mist, heart, heart, 1) - at_pixel(far_past_mist, heart, heart, 1)) <
                   all_of_it / 4);
             frame.instances.clear();
         };
-        mist_in_slice();
+        mist_in_slice(clear_air);
+        // Fog that starts past the grid isn't in the slice: it doesn't weigh on the mist's share.
+        de::render::SceneFog fog_past_grid = clear_air;
+        fog_past_grid.density_per_m = 3.0f;
+        fog_past_grid.start_m = 500.0f;
+        fog_past_grid.sun_start_m = 500.0f;
+        mist_in_slice(fog_past_grid);
         // The same for a volume in the mask's second half (the others are above the view's middle).
         for (int i = 0; i < 40; ++i) {
             frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 2.0f, 20.0f, -49.0f, 3.0f, 0.5f, 0.5f));
         }
-        mist_in_slice();
+        mist_in_slice(clear_air);
         frame.fog_volumes.clear();
 
-        // Slid along the view, through thick far slices, the mist doesn't come and go: its fog is that of
-        // several points through a slice's depth.
-        int least_seen = 255;
-        int most_seen = 0;
+        // Slid along the view, through thick far slices, mist doesn't come and go: its points are its own. That
+        // goes for a thin wall, thinner than the space between points in a slice, too.
         wall_at(55.0f);
-        for (int i = 0; i < 16; ++i) {
-            frame.fog_volumes.clear();
-            frame.fog_volumes.push(mist_slab(40.0f + static_cast<float>(i) * 0.35f, 1.5f));
-            frame.fog_volumes[0].density_per_m = 0.4f;
-            const de::core::Array<std::byte> slid = render(clear_air);
-            least_seen = std::min(least_seen, at_pixel(slid, heart, heart, 1));
-            most_seen = std::max(most_seen, at_pixel(slid, heart, heart, 1));
+        for (const float half_depth : {1.5f, 0.3f, -0.3f}) { // the last: an ellipsoid
+            int least_seen = 255;
+            int most_seen = 0;
+            for (int i = 0; i < 16; ++i) {
+                frame.fog_volumes.clear();
+                frame.fog_volumes.push(mist_slab(40.0f + static_cast<float>(i) * 0.35f, std::abs(half_depth)));
+                frame.fog_volumes[0].density_per_m = 0.6f / std::abs(half_depth);
+                frame.fog_volumes[0].ellipsoid = half_depth < 0.0f;
+                const de::core::Array<std::byte> slid = render(clear_air);
+                least_seen = std::min(least_seen, at_pixel(slid, heart, heart, 1));
+                most_seen = std::max(most_seen, at_pixel(slid, heart, heart, 1));
+            }
+            // A thin ellipsoid does change along one ray as it slides: it's thinner away from its middle.
+            CHECK(most_seen - least_seen <= (half_depth < 0.0f ? 25 : 8));
+            CHECK(least_seen > 40);
         }
-        CHECK(most_seen - least_seen <= 20);
         frame.instances.clear();
         frame.fog_volumes.clear();
 
@@ -1550,9 +1632,24 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         CHECK(renderer->stats().fog_volumes == 64);
         CHECK(renderer->stats().fog_volumes_dropped == 7);
         CHECK(std::abs(at_pixel(crowded, heart, heart, 1) - at_pixel(box, heart, heart, 1)) <= 3);
+        // What's replaced is the farthest kept, wherever it is among them, not the first found.
+        frame.fog_volumes.clear();
+        frame.fog_volumes.push(volume_at(0.0f, 10.0f, -12.0f, 3.0f, 0.5f, 0.5f)); // above the view's middle, nearest
+        for (int i = 0; i < 63; ++i) {
+            frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 3.0f, 10.0f, -30.0f, 3.0f, 0.5f, 0.5f));
+        }
+        frame.fog_volumes.push(
+            volume_at(0.0f, 0.0f, -20.0f, 3.0f, 0.5f, 0.5f)); // nearer than those, not than the first
+        const de::core::Array<std::byte> replaced_farthest = render(clear_air);
+        CHECK(renderer->stats().fog_volumes == 64);
+        CHECK(renderer->stats().fog_volumes_dropped == 1);
+        CHECK(std::abs(at_pixel(replaced_farthest, heart, heart, 1) - at_pixel(no_volume, heart, heart, 1)) > 8);
+        frame.fog_volumes.clear();
+        for (int i = 0; i < 70; ++i) {
+            frame.fog_volumes.push(volume_at(static_cast<float>(i) * 0.1f - 3.5f, 10.0f, -30.0f, 3.0f, 0.5f, 0.5f));
+        }
         // Nearest by its surface, not its middle: one the camera is inside stays, though its middle is farther
         // than all of those.
-        frame.fog_volumes.pop();
         frame.fog_volumes.push(volume_at(0.0f, 0.0f, -45.0f, 50.0f, 0.1f, 0.5f));
         const de::core::Array<std::byte> crowded_around = render(clear_air);
         CHECK(renderer->stats().fog_volumes == 64);

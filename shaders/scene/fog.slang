@@ -29,14 +29,11 @@ struct VertexOutput
     float2 ndc : TEXCOORD;
 };
 
-// Points tested along a pixel's ray, in front of its surface and through its slice.
-static const uint kVolumeFrontSamples = 4;
-
 // How much of a pixel's slice's fog to count, when its surface is inside the slice. A slice holds one mean,
 // and at distance a slice is as thick as a whole volume: taking a share by depth alone puts the volume's
 // fog in front of ground it's really behind, and the other way round, and the error sweeps across the
 // volume as slices slide over the ground with the camera. So the volumes' share is what's really in front.
-// The fog in the slice stays where it was: it's nearly even across one.
+// The world's fog in the slice stays by depth: it's nearly even across one.
 float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray, uint slice, float by_depth, float view_depth)
 {
     const uint2 mask = push.fog_slice_masks[slice];
@@ -45,31 +42,16 @@ float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray
         return by_depth;
     }
     const float slices = frame.fog.range.w;
-    const float near_depth = froxel_depth(frame.fog, float(slice) / slices);
-    const float far_depth = froxel_depth(frame.fog, float(slice + 1) / slices);
+    const float reach = frame.fog.range.y;
+    const float near_distance = froxel_depth(frame.fog, float(slice) / slices) / view_per_ray;
+    const float far_distance = froxel_depth(frame.fog, float(slice + 1) / slices) / view_per_ray;
     const float3 camera = frame.camera_position.xyz;
-    float in_front = 0.0;
-    float through = 0.0;
-    for (uint i = 0; i < kVolumeFrontSamples; ++i)
-    {
-        const float place = (float(i) + 0.5) / float(kVolumeFrontSamples);
-        const float3 front_point = camera + direction * (lerp(near_depth, view_depth, place) / view_per_ray);
-        const float3 slice_point = camera + direction * (lerp(near_depth, far_depth, place) / view_per_ray);
-        for (uint word = 0; word < 2; ++word)
-        {
-            for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
-            {
-                const FogVolumeData volume = push.fog_volumes[word * 32 + firstbitlow(bits)];
-                in_front += volume.tint_density.w * fog_volume_share(volume, front_point);
-                through += volume.tint_density.w * fog_volume_share(volume, slice_point);
-            }
-        }
-    }
-    const float span = far_depth - near_depth;
-    in_front *= (view_depth - near_depth) / float(kVolumeFrontSamples);
-    through *= span / float(kVolumeFrontSamples);
-    const float3 middle = camera + direction * (lerp(near_depth, far_depth, 0.5) / view_per_ray);
-    const float world_fog = fog_density(frame.fog, middle.y - frame.fog.density.w) * span;
+    const float in_front = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, view_depth / view_per_ray).a;
+    const float through = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, far_distance).a;
+    // As the slice stored it: within where the world's fog starts and ends.
+    const float fog_near = clamp(frame.fog.ambient.w, near_distance, far_distance);
+    const float fog_far = clamp(frame.fog.range.x, near_distance, far_distance);
+    const float world_fog = fog_far > fog_near ? optical_depth(frame.fog, camera.y, direction.y, fog_near, fog_far) : 0.0;
     const float all_fog = through + world_fog;
     return all_fog > 0.0 ? saturate((in_front + world_fog * by_depth) / all_fog) : by_depth;
 }

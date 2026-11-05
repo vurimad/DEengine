@@ -29,7 +29,7 @@ struct CellBuild {
 //           "name": "statue",                     // optional; unique in the cell
 //           "fog_volume": {                       // optional: fog here, sized by its scale (half extents);
 //             "shape": "box",                     //   "box" (default) or "ellipsoid"
-//             "density": 0.2,                     //   extinction per meter at its heart, on top of the world's
+//             "density_per_m": 0.2,               //   extinction per meter at its heart, on top of the world's
 //             "edge_m": 2,                        //   how far in from its surface it takes to reach that
 //             "tint": [1, 1, 1]                   //   of the light it scatters
 //           },

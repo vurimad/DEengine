@@ -32,8 +32,6 @@ struct FogInjectPush
 ConstantBuffer<FogInjectPush> push;
 
 static const uint kSamples = 4;
-// Points tested through a froxel's depth for fog volumes.
-static const uint kVolumeSamples = 3;
 // All the volumes in a froxel, in extinction per meter: past this, a half float couldn't hold it.
 static const float kMostVolumeDensity = 12.0;
 // How much of last frame's light a froxel keeps.
@@ -104,35 +102,17 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
                                                         (far_distance - near_distance)
                                                   : 0.0;
 
-    // The fog volumes through its depth, at fixed points: extinction stays steady from frame to frame, and
-    // the camera's motion doesn't slide one point through a volume's edge. They fade out at the grid's
-    // reach, where the fog past it, which can't hold them, takes over.
+    // The fog volumes through its depth, each at fixed points of its own: extinction stays steady from frame
+    // to frame. However many overlap, it fits what the froxels store.
     float volume_density = 0.0;
     float3 volume_tinted = float3(0.0);
     if (push.fog_volume_count > 0)
     {
-        const uint2 mask = push.fog_slice_masks[froxel.z];
-        const float reach = frame.fog.range.y;
-        for (uint i = 0; i < kVolumeSamples; ++i)
-        {
-            const float depth = lerp(near_depth, far_depth, (float(i) + 0.5) / float(kVolumeSamples));
-            const float3 point = camera + ray.direction * (depth / ray.view_per_ray);
-            const float reach_fade = saturate((reach - depth) / (reach * 0.1));
-            for (uint word = 0; word < 2; ++word)
-            {
-                for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
-                {
-                    const FogVolumeData volume = push.fog_volumes[word * 32 + firstbitlow(bits)];
-                    const float density = volume.tint_density.w * fog_volume_share(volume, point) * reach_fade;
-                    volume_density += density;
-                    volume_tinted += density * volume.tint_density.rgb;
-                }
-            }
-        }
-        // However many overlap, it fits what the froxels store.
-        const float scale = min(1.0 / float(kVolumeSamples), kMostVolumeDensity / max(volume_density, 1e-6));
-        volume_density *= scale;
-        volume_tinted *= scale;
+        const float4 along = fog_volumes_along(push.fog_volumes, push.fog_slice_masks[froxel.z], camera, ray.direction, ray.view_per_ray,
+                                               frame.fog.range.y, near_distance, far_distance);
+        const float scale = min(1.0 / (far_distance - near_distance), kMostVolumeDensity / max(along.a, 1e-6));
+        volume_density = along.a * scale;
+        volume_tinted = along.rgb * scale;
     }
     const float all_density = mean_density + volume_density;
     const float extinction = all_density * kFroxelDensityScale;
@@ -175,7 +155,9 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         const float view_depth = distance * sample_ray.view_per_ray;
         const float3 position = camera + sample_ray.direction * distance;
         const float height = position.y - frame.fog.density.w;
-        const float weight = fog_density(frame.fog, height) + volume_density;
+        // The world's fog only within its span: outside it, there's none to share the light with a volume.
+        const float world_density = mean_density > 0.0 ? fog_density(frame.fog, height) : 0.0;
+        const float weight = world_density + volume_density;
         float3 light = fog_ambient_light(frame.fog, height);
         // Where the sun's haze starts is about the world's fog; a volume is lit from the first meter.
         const float sun_share = distance >= frame.fog.sun_back.w ? 1.0 : volume_density / max(weight, 1e-6);

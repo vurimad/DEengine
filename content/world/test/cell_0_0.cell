@@ -6,7 +6,7 @@
     {"name": "camp", "position": [64, 0, 64]},
     {"name": "ground", "mesh": "../../props/forest_ground/forest_ground.gltf", "position": [64, 0, 64]},
     {"name": "mist_bank", "position": [64, 1.5, 58], "scale": [9, 2.5, 4],
-     "fog_volume": {"shape": "ellipsoid", "density": 0.35, "edge_m": 2}},
+     "fog_volume": {"shape": "ellipsoid", "density_per_m": 0.35, "edge_m": 2}},
     {"name": "fire_pit", "parent": "camp", "mesh": "../../props/stone_fire_pit/stone_fire_pit.gltf", "position": [0, 0.19, 0]},
     {"name": "log_north", "parent": "camp", "mesh": "../../props/dead_tree_trunk/dead_tree_trunk.gltf", "position": [0, 0.03, -2.2], "rotation_deg": [0, 8, 0]},
     {"name": "log_east", "parent": "camp", "mesh": "../../props/dead_tree_trunk/dead_tree_trunk.gltf", "position": [2.3, 0.03, 0.4], "rotation_deg": [0, 97, 0]},

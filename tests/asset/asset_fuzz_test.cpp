@@ -19,6 +19,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <string_view>
 #include <vector>
 
@@ -287,7 +288,7 @@ std::vector<std::byte> sample_material() {
 }
 
 // A cell with a parent, two meshes, and names.
-std::vector<std::byte> sample_cell(float fog_density_per_m = 0.2f) {
+std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = {.density_per_m = 0.2f}) {
     de::cooker::CellBuild build;
     build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
     build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
@@ -297,7 +298,7 @@ std::vector<std::byte> sample_cell(float fog_density_per_m = 0.2f) {
     }
     build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
-    build.fog_volumes.push({.density_per_m = fog_density_per_m});
+    build.fog_volumes.push(fog_volume);
     build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
 }
@@ -342,9 +343,34 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     REQUIRE(load_in_place<ShaderAsset>(shader_file.bytes()).ok());
     Buffer cell_file(cell);
     REQUIRE(load_in_place<CellAsset>(cell_file.bytes()).ok());
-    // Denser than the froxels can hold: the cooker won't write one, and a file that has it is refused.
-    Buffer too_dense_file(sample_cell(5.0f));
-    CHECK_FALSE(load_in_place<CellAsset>(too_dense_file.bytes()).ok());
+    // Fog volumes the cooker wouldn't write, and shaders can't take: refused.
+    const float not_a_number = std::numeric_limits<float>::quiet_NaN();
+    const de::asset::CellFogVolume good_volume{.density_per_m = 0.2f};
+    const auto refused = [](const de::asset::CellFogVolume& volume) {
+        Buffer file(sample_cell(volume));
+        return !load_in_place<CellAsset>(file.bytes()).ok();
+    };
+    CHECK_FALSE(refused(good_volume));
+    de::asset::CellFogVolume bad_volume = good_volume;
+    bad_volume.density_per_m = 5.0f; // more than the froxels can hold
+    CHECK(refused(bad_volume));
+    bad_volume.density_per_m = -1.0f;
+    CHECK(refused(bad_volume));
+    bad_volume.density_per_m = not_a_number;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.edge_m = -1.0f;
+    CHECK(refused(bad_volume));
+    bad_volume.edge_m = not_a_number;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.tint[1] = -1.0f;
+    CHECK(refused(bad_volume));
+    bad_volume.tint[1] = not_a_number;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.shape = static_cast<de::asset::CellFogShape>(7);
+    CHECK(refused(bad_volume));
 
     constexpr int kRounds = 4000;
     fuzz<MeshAsset>(mesh, 1, kRounds);

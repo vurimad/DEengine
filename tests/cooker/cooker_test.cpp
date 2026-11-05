@@ -1218,19 +1218,19 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "cart", "static": false},
     {"name": "wheel", "parent": "cart", "static": true},
     {"name": "mist_a", "fog_volume": 1},
-    {"name": "mist_b", "fog_volume": {"shape": "cube", "density": 0.2}},
+    {"name": "mist_b", "fog_volume": {"shape": "cube", "density_per_m": 0.2}},
     {"name": "mist_c", "fog_volume": {"edge_m": 2}},
-    {"name": "mist_d", "fog_volume": {"density": 0.2, "edge_m": -1, "tint": [1, 1], "paint": 1}},
-    {"name": "mist_e", "fog_volume": {"density": 5}},
-    {"name": "mist_f", "fog_volume": {"density": 0.2, "edge_m": "wide"}},
+    {"name": "mist_d", "fog_volume": {"density_per_m": 0.2, "edge_m": -1, "tint": [1, 1], "paint": 1}},
+    {"name": "mist_e", "fog_volume": {"density_per_m": 5}},
+    {"name": "mist_f", "fog_volume": {"density_per_m": 0.2, "edge_m": "wide"}},
   ],
 })");
     write_src(sandbox, "content/world/cell_5_5.cell", R"({
   "coord": [5, 5],
   "entities": [
     {"name": "mist", "position": [700, 0, 700], "scale": [8, 3, 8],
-     "fog_volume": {"shape": "ellipsoid", "density": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7]}},
-    {"name": "fog wall", "position": [710, 0, 700], "fog_volume": {"density": 0.1}},
+     "fog_volume": {"shape": "ellipsoid", "density_per_m": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7]}},
+    {"name": "fog wall", "position": [710, 0, 700], "fog_volume": {"density_per_m": 0.1}},
     {"name": "plain", "position": [720, 0, 700]},
   ],
 })");
@@ -1251,11 +1251,11 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "unknown cell entity setting 'colour'"));
     CHECK(has_message(report, broken, "mist_a: fog_volume should be an object"));
     CHECK(has_message(report, broken, "mist_b: fog_volume shape should be box or ellipsoid"));
-    CHECK(has_message(report, broken, "mist_c: fog_volume needs a density above 0"));
+    CHECK(has_message(report, broken, "mist_c: fog_volume needs a density_per_m above 0"));
     CHECK(has_message(report, broken, "mist_d: fog_volume edge_m should be 0 or more"));
     CHECK(has_message(report, broken, "mist_d: fog_volume tint should be 3 numbers"));
     CHECK(has_message(report, broken, "unknown fog volume setting 'paint'"));
-    CHECK(has_message(report, broken, "mist_e: fog_volume needs a density above 0, up to 4"));
+    CHECK(has_message(report, broken, "mist_e: fog_volume needs a density_per_m above 0, up to 4"));
     CHECK(has_message(report, broken, "'edge_m' should be a number"));
     CHECK_FALSE(has_message(report, "content/world/cell_5_5.cell", ""));
     CHECK(report.stats.failed == 1);

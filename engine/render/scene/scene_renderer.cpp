@@ -508,6 +508,36 @@ struct SceneRendererState {
         return frame_buffers[slot];
     }
 
+    // What sets a fog volume's place in the view, worked out once a frame. The camera's axes without any
+    // scale it may carry, as the view itself.
+    struct FogVolumeCamera {
+        float position[3] = {};
+        float right[3] = {};
+        float up[3] = {};
+        float forward[3] = {};
+        float tan_x = 0.0f;
+        float tan_y = 0.0f;
+    };
+    static FogVolumeCamera fog_volume_camera(const world::RenderFrame& frame, float aspect) {
+        const float* camera = frame.camera.transform;
+        const auto unit = [](float x, float y, float z, float (&out)[3]) {
+            const float scale = 1.0f / std::max(std::sqrt(x * x + y * y + z * z), 1e-6f);
+            out[0] = x * scale;
+            out[1] = y * scale;
+            out[2] = z * scale;
+        };
+        FogVolumeCamera seen;
+        seen.position[0] = camera[3];
+        seen.position[1] = camera[7];
+        seen.position[2] = camera[11];
+        unit(camera[0], camera[4], camera[8], seen.right);
+        unit(camera[1], camera[5], camera[9], seen.up);
+        unit(-camera[2], -camera[6], -camera[10], seen.forward);
+        seen.tan_y = std::tan(frame.camera.vertical_fov_rad * 0.5f);
+        seen.tan_x = seen.tan_y * aspect;
+        return seen;
+    }
+
     // Where a fog volume is from the camera, by its bounding sphere, and whether it reaches what the froxel
     // grid sees: in the view and within its reach, which is in view depth. What that lets through costs a
     // little and adds nothing.
@@ -517,23 +547,21 @@ struct SceneRendererState {
         float nearest = 0.0f; // of its sphere from the camera: 0 around the camera
         bool visible = false;
     };
-    static FogVolumeView fog_volume_view(const world::RenderFrame& frame, const world::RenderFogVolume& volume,
-                                         float froxel_reach, float aspect) {
-        const float* camera = frame.camera.transform;
-        const float to[3] = {volume.center[0] - camera[3], volume.center[1] - camera[7], volume.center[2] - camera[11]};
-        const float forward[3] = {-camera[2], -camera[6], -camera[10]};
-        const float tan_y = std::tan(frame.camera.vertical_fov_rad * 0.5f);
-        const float tan_x = tan_y * aspect;
-        const float ahead = to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2];
-        const float aside = std::abs(to[0] * camera[0] + to[1] * camera[4] + to[2] * camera[8]);
-        const float above = std::abs(to[0] * camera[1] + to[1] * camera[5] + to[2] * camera[9]);
+    static FogVolumeView fog_volume_view(const FogVolumeCamera& camera, const world::RenderFogVolume& volume,
+                                         float froxel_reach) {
+        const float to[3] = {volume.center[0] - camera.position[0], volume.center[1] - camera.position[1],
+                             volume.center[2] - camera.position[2]};
+        const auto along = [&](const float (&axis)[3]) { return to[0] * axis[0] + to[1] * axis[1] + to[2] * axis[2]; };
+        const float ahead = along(camera.forward);
+        const float aside = std::abs(along(camera.right));
+        const float above = std::abs(along(camera.up));
         const float radius = std::sqrt(volume.half_extents[0] * volume.half_extents[0] +
                                        volume.half_extents[1] * volume.half_extents[1] +
                                        volume.half_extents[2] * volume.half_extents[2]);
         const float distance = std::sqrt(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
         const bool visible = ahead - radius <= froxel_reach && ahead >= -radius &&
-                             (aside - ahead * tan_x) / std::sqrt(1.0f + tan_x * tan_x) <= radius &&
-                             (above - ahead * tan_y) / std::sqrt(1.0f + tan_y * tan_y) <= radius;
+                             (aside - ahead * camera.tan_x) / std::sqrt(1.0f + camera.tan_x * camera.tan_x) <= radius &&
+                             (above - ahead * camera.tan_y) / std::sqrt(1.0f + camera.tan_y * camera.tan_y) <= radius;
         return {.ahead = ahead, .radius = radius, .nearest = std::max(distance - radius, 0.0f), .visible = visible};
     }
 
@@ -547,29 +575,33 @@ struct SceneRendererState {
         if (froxel_reach <= 0.0f || frame.fog_volumes.empty()) {
             return;
         }
-        uint32_t kept[kMaxFogVolumes];
-        float kept_distance[kMaxFogVolumes];
+        struct KeptVolume {
+            uint32_t index = 0;
+            FogVolumeView seen;
+        };
+        // Once full, a heap with the farthest first: anything nearer takes its place.
+        const auto nearer = [](const KeptVolume& a, const KeptVolume& b) { return a.seen.nearest < b.seen.nearest; };
+        const FogVolumeCamera camera = fog_volume_camera(frame, aspect);
+        KeptVolume kept[kMaxFogVolumes];
         uint32_t dropped = 0;
         for (uint32_t i = 0; i < frame.fog_volumes.size(); ++i) {
-            const FogVolumeView seen = fog_volume_view(frame, frame.fog_volumes[i], froxel_reach, aspect);
+            const FogVolumeView seen = fog_volume_view(camera, frame.fog_volumes[i], froxel_reach);
             if (!seen.visible) {
                 continue;
             }
-            uint32_t at = fog_volumes_now;
-            if (fog_volumes_now == kMaxFogVolumes) {
-                ++dropped;
-                at = 0;
-                for (uint32_t k = 1; k < kMaxFogVolumes; ++k) {
-                    at = kept_distance[k] > kept_distance[at] ? k : at;
+            if (fog_volumes_now < kMaxFogVolumes) {
+                kept[fog_volumes_now++] = {.index = i, .seen = seen};
+                if (fog_volumes_now == kMaxFogVolumes) {
+                    std::make_heap(kept, kept + kMaxFogVolumes, nearer);
                 }
-                if (kept_distance[at] <= seen.nearest) {
-                    continue;
-                }
-            } else {
-                ++fog_volumes_now;
+                continue;
             }
-            kept[at] = i;
-            kept_distance[at] = seen.nearest;
+            ++dropped;
+            if (seen.nearest < kept[0].seen.nearest) {
+                std::pop_heap(kept, kept + kMaxFogVolumes, nearer);
+                kept[kMaxFogVolumes - 1] = {.index = i, .seen = seen};
+                std::push_heap(kept, kept + kMaxFogVolumes, nearer);
+            }
         }
         uint64_t slice_masks[kFroxelSlices] = {};
         const auto slice_of = [&](float depth) {
@@ -579,8 +611,8 @@ struct SceneRendererState {
                 std::clamp(t * static_cast<float>(kFroxelSlices), 0.0f, static_cast<float>(kFroxelSlices - 1)));
         };
         for (uint32_t k = 0; k < fog_volumes_now; ++k) {
-            const world::RenderFogVolume& volume = frame.fog_volumes[kept[k]];
-            const FogVolumeView seen = fog_volume_view(frame, volume, froxel_reach, aspect);
+            const world::RenderFogVolume& volume = frame.fog_volumes[kept[k].index];
+            const FogVolumeView& seen = kept[k].seen;
             const uint32_t last_slice = slice_of(seen.ahead + seen.radius);
             for (uint32_t slice = slice_of(seen.ahead - seen.radius); slice <= last_slice; ++slice) {
                 slice_masks[slice] |= uint64_t{1} << k;
@@ -940,9 +972,13 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         const float reach = std::min(lighting.fog.volume_distance_m, state.shadows.distance_m);
         const float view_aspect =
             static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
+        const SceneRendererState::FogVolumeCamera volume_camera =
+            SceneRendererState::fog_volume_camera(frame, view_aspect);
         for (const world::RenderFogVolume& volume : frame.fog_volumes) {
-            volume_in_view =
-                volume_in_view || SceneRendererState::fog_volume_view(frame, volume, reach, view_aspect).visible;
+            if (SceneRendererState::fog_volume_view(volume_camera, volume, reach).visible) {
+                volume_in_view = true;
+                break;
+            }
         }
     }
     const bool foggy =
@@ -1196,7 +1232,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // back (so the composite reads the fog from the camera to any depth with one sample).
     GraphTexture integrated;
     if (!froxels_on) {
-        state.destroy_froxels(); // a grid no one's using holds no memory
+        // A grid no one's using holds no memory; fog volumes just out of view may well be back next frame.
+        const bool volumes_may_return =
+            view == SceneView::Lit && lighting.fog.volume_distance_m > 0.0f && !frame.fog_volumes.empty();
+        if (!volumes_may_return) {
+            state.destroy_froxels();
+        }
     } else {
         const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
         const uint32_t grid_height =
