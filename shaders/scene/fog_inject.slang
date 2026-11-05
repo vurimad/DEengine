@@ -164,7 +164,7 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         const float3 position = camera + sample_ray.direction * distance;
         const float height = position.y - frame.fog.density.w;
         // The world's fog only within its span: outside it, there's none to share the light with a volume.
-        const float world_density = mean_density > 0.0 ? fog_density(frame.fog, height) : 0.0;
+        const float world_density = distance >= fog_near && distance <= fog_far ? fog_density(frame.fog, height) : 0.0;
         const float weight = world_density + volume_density;
         float3 light = fog_ambient_light(frame.fog, height);
         // Where the sun's haze starts is about the world's fog; a volume is lit from the first meter.
