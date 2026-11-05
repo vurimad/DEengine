@@ -28,10 +28,7 @@ uint64_t RangeAllocator::allocate(uint64_t count) {
             return offset;
         }
         // Used up: the rest stay in order.
-        for (size_t k = i + 1; k < free_.size(); ++k) {
-            free_[k - 1] = free_[k];
-        }
-        free_.resize(free_.size() - 1);
+        free_.remove_ordered(i);
         return offset;
     }
     return kNone;
@@ -50,10 +47,7 @@ void RangeAllocator::free(uint64_t offset, uint64_t count) {
     const bool joins_after = at < free_.size() && offset + count == free_[at].offset;
     if (joins_before && joins_after) {
         free_[at - 1].size += count + free_[at].size;
-        for (size_t k = at + 1; k < free_.size(); ++k) {
-            free_[k - 1] = free_[k];
-        }
-        free_.resize(free_.size() - 1);
+        free_.remove_ordered(at);
     } else if (joins_before) {
         free_[at - 1].size += count;
     } else if (joins_after) {

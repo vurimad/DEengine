@@ -65,16 +65,21 @@ struct MaterialEntry {
     bool missing = false; // a texture it names failed: written again when a texture loads
 };
 
-struct MeshEntry {
-    asset::AssetHandle handle;
-    GpuMesh gpu;
-    core::Array<GpuMeshPart> parts{render_heap()};
-    core::Array<GpuMeshLod> lods{render_heap()};
-    uint64_t bytes = 0;
+// Where a mesh is in the geometry pool, in vertices and indices.
+struct PoolPlace {
     uint64_t first_vertex = 0;
     uint64_t vertex_count = 0;
     uint64_t first_index = 0;
     uint64_t index_count = 0;
+};
+
+struct MeshEntry {
+    asset::AssetHandle handle;
+    PoolPlace place;
+    GpuMesh gpu;
+    core::Array<GpuMeshPart> parts{render_heap()};
+    core::Array<GpuMeshLod> lods{render_heap()};
+    uint64_t bytes = 0;
     uint64_t upload_ticket = 0;        // the uploader's, when both its uploads are recorded
     uint64_t needs_table = UINT64_MAX; // the table upload its parts' materials are in (set in update)
     bool ready = false;
@@ -102,16 +107,14 @@ struct GpuAssetsState {
     uint64_t pool_vertex_address = 0;
     core::RangeAllocator vertex_ranges;
     core::RangeAllocator index_ranges;
-    // A mesh's old place, freed once the frames that may still draw from it are done.
-    struct RetiredRange {
-        uint64_t first_vertex = 0;
-        uint64_t vertex_count = 0;
-        uint64_t first_index = 0;
-        uint64_t index_count = 0;
-        uint64_t free_at_frame = 0;
+    // A mesh's old place, freed once the last frame that may have drawn from it is done.
+    struct RetiredPlace {
+        PoolPlace place;
+        uint64_t last_frame = 0;
     };
-    core::Array<RetiredRange> retired_ranges{render_heap()};
-    uint32_t meshes_dropped = 0;
+    core::Array<RetiredPlace> retired_places{render_heap()};
+    // Meshes that didn't fit: tried again as places come back. A full pool may be full for only a few frames.
+    core::Array<asset::AssetHandle> dropped_meshes{render_heap()};
 
     GpuAssetsState(uint32_t vertices, uint32_t indices)
         : vertex_ranges(render_heap(), vertices), index_ranges(render_heap(), indices) {}
@@ -121,12 +124,13 @@ struct GpuAssetsState {
     uint32_t default_index[DefaultCount] = {};
     uint64_t bytes = 0;
     // The table as last written, and the slots changed since it was last uploaded: one upload per
-    // update() (the uploader takes one upload per resource per frame).
+    // update(), of the span that changed.
     core::Array<GpuMaterial> table{render_heap()};
     uint32_t dirty_first = UINT32_MAX;
     uint32_t dirty_end = 0;
-    uint64_t table_uploads = 0;  // queued so far
-    uint64_t table_recorded = 0; // of those, recorded: the GPU sees the table as of that upload
+    uint64_t table_uploads = 0;                         // queued so far
+    uint64_t table_recorded = 0;                        // of those, recorded: the GPU sees the table as of that upload
+    core::Array<uint64_t> table_tickets{render_heap()}; // the uploader's, for those not yet recorded, oldest first
     // Textures replaced by a reload, kept until the table no longer points at them: once a table
     // upload queued after the replacement is recorded.
     struct Retired {
@@ -290,8 +294,7 @@ struct GpuAssetsState {
             // A material that failed before may be this one, back: meshes that fell back resolve
             // their parts again (and wait for the table again).
             for (auto [mesh_key, mesh] : meshes) {
-                if (mesh.missing) {
-                    resolve_parts(mesh);
+                if (mesh.missing && resolve_parts(mesh)) {
                     mesh.ready = false;
                     mesh.needs_table = UINT64_MAX;
                     pending_meshes.push(mesh_key);
@@ -385,6 +388,7 @@ struct GpuAssetsState {
             return; // still dirty: tried again next update
         }
         ++table_uploads;
+        table_tickets.push(uploader->buffer_upload_ticket());
         dirty_first = UINT32_MAX;
         dirty_end = 0;
     }
@@ -403,7 +407,7 @@ struct GpuAssetsState {
             return;
         }
         const uint64_t key = key_of(handle);
-        unload_mesh(handle); // reloaded: its old place is freed (after the frames using it)
+        unload_mesh(handle); // reloaded: its old place is freed once the frames using it are done
         const auto vertices = asset->vertices.get(asset);
         const auto indices = asset->indices.get(asset);
         const uint64_t first_vertex = vertex_ranges.allocate(vertices.size());
@@ -420,15 +424,16 @@ struct GpuAssetsState {
                 asset::format_asset_id(asset->header.id).c_str(), vertices.size(), indices.size(),
                 static_cast<unsigned long long>(vertex_ranges.largest_free()),
                 static_cast<unsigned long long>(index_ranges.largest_free()));
-            ++meshes_dropped;
+            dropped_meshes.push(handle);
             return;
         }
         const core::Result<void> queued_vertices =
             uploader->upload_buffer(pool_vertices, first_vertex * sizeof(asset::MeshVertex), std::as_bytes(vertices),
-                                    rhi::ResourceState::ShaderRead);
+                                    rhi::ResourceState::ShaderRead, rhi::ShaderStages::All, rhi::BufferRange::Unread);
         const core::Result<void> queued_indices =
             queued_vertices ? uploader->upload_buffer(pool_indices, first_index * sizeof(uint32_t),
-                                                      std::as_bytes(indices), rhi::ResourceState::IndexBuffer)
+                                                      std::as_bytes(indices), rhi::ResourceState::IndexBuffer,
+                                                      rhi::ShaderStages::All, rhi::BufferRange::Unread)
                             : queued_vertices;
         if (!queued_indices) {
             // Not drawn, with its place free again. Vertices already queued still land there, before anything queued
@@ -440,10 +445,10 @@ struct GpuAssetsState {
         }
         MeshEntry& entry = meshes.find_or_insert(key);
         entry.handle = handle;
-        entry.first_vertex = first_vertex;
-        entry.vertex_count = vertices.size();
-        entry.first_index = first_index;
-        entry.index_count = indices.size();
+        entry.place = {.first_vertex = first_vertex,
+                       .vertex_count = vertices.size(),
+                       .first_index = first_index,
+                       .index_count = indices.size()};
         entry.upload_ticket = uploader->buffer_upload_ticket();
         entry.gpu.vertex_offset = static_cast<uint32_t>(first_vertex);
         std::memcpy(entry.gpu.bounds_min, asset->bounds.min, sizeof(entry.gpu.bounds_min));
@@ -458,9 +463,11 @@ struct GpuAssetsState {
     }
 
     // The mesh's parts, of every LOD, and the table slots of their materials (the default for one that's
-    // missing, remembered so they're resolved again when it loads).
-    void resolve_parts(MeshEntry& entry) {
-        entry.parts.clear();
+    // missing, remembered so they're resolved again when it loads). Returns whether a part changed.
+    bool resolve_parts(MeshEntry& entry) {
+        const size_t resolved_before = entry.parts.size();
+        size_t count = 0;
+        bool changed = false;
         entry.lods.clear();
         entry.missing = false;
         const auto* asset = assets->get<asset::MeshAsset>(entry.handle);
@@ -468,33 +475,79 @@ struct GpuAssetsState {
             const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
             const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
             for (const asset::MeshLod& lod : asset->lods.get(asset)) {
-                entry.lods.push({.error_m = lod.error,
-                                 .first_part = static_cast<uint32_t>(entry.parts.size()),
-                                 .part_count = lod.part_count});
+                entry.lods.push(
+                    {.error_m = lod.error, .first_part = static_cast<uint32_t>(count), .part_count = lod.part_count});
                 for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
                     const asset::MeshPart& part = parts[p];
                     const asset::AssetId material = slots[part.material_slot].material;
                     const uint32_t slot = material_slot(material);
                     entry.missing = entry.missing || (slot == 0 && material.is_valid());
-                    entry.parts.push({.first_index = static_cast<uint32_t>(entry.first_index) + part.first_index,
-                                      .index_count = part.index_count,
-                                      .material = slot});
+                    const GpuMeshPart resolved{.first_index =
+                                                   static_cast<uint32_t>(entry.place.first_index) + part.first_index,
+                                               .index_count = part.index_count,
+                                               .material = slot};
+                    if (count < resolved_before) {
+                        changed = changed || entry.parts[count].material != slot;
+                        entry.parts[count] = resolved;
+                    } else {
+                        changed = true;
+                        entry.parts.push(resolved);
+                    }
+                    ++count;
                 }
             }
         }
         entry.gpu.parts = entry.parts.span();
         entry.gpu.lods = entry.lods.span();
+        return changed;
     }
 
     void unload_mesh(asset::AssetHandle handle) {
         if (const MeshEntry* entry = meshes.find(key_of(handle)); entry != nullptr) {
-            retired_ranges.push({.first_vertex = entry->first_vertex,
-                                 .vertex_count = entry->vertex_count,
-                                 .first_index = entry->first_index,
-                                 .index_count = entry->index_count,
-                                 .free_at_frame = device->frame_index() + rhi::kFramesInFlight + 1});
+            retired_places.push({.place = entry->place, .last_frame = device->frame_index()});
             bytes -= entry->bytes;
             meshes.remove(key_of(handle)); // a pending key that's gone is skipped
+        }
+        for (size_t i = 0; i < dropped_meshes.size(); ++i) {
+            if (key_of(dropped_meshes[i]) == key_of(handle)) {
+                dropped_meshes.remove_ordered(i);
+                break;
+            }
+        }
+    }
+
+    // Frees the places of meshes that are gone once no frame in flight can draw from them, and gives meshes that
+    // didn't fit another try.
+    void free_retired_places() {
+        if (retired_places.empty()) {
+            return;
+        }
+        const uint64_t completed = device->completed_frame();
+        size_t kept = 0;
+        for (const RetiredPlace& gone : retired_places) {
+            if (completed >= gone.last_frame) {
+                vertex_ranges.free(gone.place.first_vertex, gone.place.vertex_count);
+                index_ranges.free(gone.place.first_index, gone.place.index_count);
+            } else {
+                retired_places[kept++] = gone;
+            }
+        }
+        const bool freed = kept < retired_places.size();
+        retired_places.resize(kept);
+        if (!freed) {
+            return;
+        }
+        // Each is either still too big, and stays, or leaves the list in load_mesh.
+        for (size_t i = 0; i < dropped_meshes.size();) {
+            const auto* asset = assets->get<asset::MeshAsset>(dropped_meshes[i]);
+            if (asset == nullptr) {
+                dropped_meshes.remove_ordered(i);
+            } else if (asset->vertices.count <= vertex_ranges.largest_free() &&
+                       asset->indices.count <= index_ranges.largest_free()) {
+                load_mesh(dropped_meshes[i]);
+            } else {
+                ++i;
+            }
         }
     }
 };
@@ -625,10 +678,18 @@ uint32_t GpuAssets::fog_noise_index() const {
 void GpuAssets::update() {
     DE_PROFILE_ZONE("gpu assets");
     GpuAssetsState& state = *state_;
-    // Every table upload queued before this one is recorded once nothing is waiting: read before
-    // this frame's upload is queued, so steady streaming (an upload every frame) still moves on.
-    if (state.uploader->ready(state.material_table)) {
-        state.table_recorded = state.table_uploads;
+    // By ticket: a burst of other uploads, or a table upload every frame, doesn't hold this back.
+    size_t recorded_tickets = 0;
+    while (recorded_tickets < state.table_tickets.size() &&
+           state.uploader->recorded(state.table_tickets[recorded_tickets])) {
+        ++recorded_tickets;
+    }
+    if (recorded_tickets > 0) {
+        for (size_t i = recorded_tickets; i < state.table_tickets.size(); ++i) {
+            state.table_tickets[i - recorded_tickets] = state.table_tickets[i];
+        }
+        state.table_tickets.resize(state.table_tickets.size() - recorded_tickets);
+        state.table_recorded += recorded_tickets;
     }
     // Materials whose textures were uploading: written again; kept while any still is.
     size_t kept = 0;
@@ -656,7 +717,7 @@ void GpuAssets::update() {
         }
     }
     state.retired.resize(kept);
-    // Meshes become drawable once their buffers and the table upload with their materials are in.
+    // Meshes become drawable once their uploads and the table upload with their materials are in.
     kept = 0;
     for (size_t i = 0; i < state.pending_meshes.size(); ++i) {
         const uint64_t key = state.pending_meshes[i];
@@ -674,18 +735,7 @@ void GpuAssets::update() {
         }
     }
     state.pending_meshes.resize(kept);
-    // The places of meshes that are gone, once no frame still in flight can draw from them.
-    kept = 0;
-    for (size_t i = 0; i < state.retired_ranges.size(); ++i) {
-        const GpuAssetsState::RetiredRange& range = state.retired_ranges[i];
-        if (state.device->frame_index() >= range.free_at_frame) {
-            state.vertex_ranges.free(range.first_vertex, range.vertex_count);
-            state.index_ranges.free(range.first_index, range.index_count);
-        } else {
-            state.retired_ranges[kept++] = range;
-        }
-    }
-    state.retired_ranges.resize(kept);
+    state.free_retired_places();
 }
 
 uint64_t GpuAssets::pool_vertex_address() const {
@@ -721,7 +771,7 @@ GpuAssetsStats GpuAssets::stats() const {
             .materials = static_cast<uint32_t>(state.materials.size()),
             .pending = static_cast<uint32_t>(state.dirty_materials.size() + state.pending_meshes.size()),
             .bytes = state.bytes,
-            .meshes_dropped = state.meshes_dropped,
+            .meshes_dropped = static_cast<uint32_t>(state.dropped_meshes.size()),
             .pool_vertices_free = state.vertex_ranges.free_total(),
             .pool_indices_free = state.index_ranges.free_total()};
 }

@@ -478,6 +478,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         "gpu assets: %u meshes, %u textures, %u materials, %llu bytes; last frame drew %u of %u instances in %u draws",
         gpu_stats.meshes, gpu_stats.textures, gpu_stats.materials, static_cast<unsigned long long>(gpu_stats.bytes),
         scene_stats.drawn, scene_stats.instances, scene_stats.draws);
+    if (gpu_stats.meshes_dropped > 0) {
+        DE_LOG_WARN("render", "%u meshes didn't fit in the geometry pool", gpu_stats.meshes_dropped);
+    }
     const rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),

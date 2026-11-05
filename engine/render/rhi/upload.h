@@ -26,6 +26,13 @@ struct UploaderDesc {
     bool use_transfer_queue = true;
 };
 
+// Whether the GPU may be reading the part of a buffer an upload fills.
+enum class BufferRange : uint8_t {
+    MayBeRead, // the copy waits for the previous frame, and on the transfer queue the frame waits for the copy
+    Unread,    // nothing in flight reads it, and nothing will until the upload is recorded, as the caller guarantees:
+               // like a new resource, it costs the graphics queue nothing
+};
+
 // Which mips of a texture an upload fills, and the state it leaves them in.
 struct TextureUpload {
     uint32_t first_mip = 0;
@@ -48,7 +55,9 @@ struct UploaderStats {
     uint64_t queued_bytes = 0;
     uint64_t staging_bytes_in_use = 0; // ring bytes the GPU may still read
     uint64_t staging_bytes = 0;
-    uint64_t uploaded_bytes = 0;    // copied to the GPU so far, in total
+    uint64_t uploaded_bytes = 0; // copied to the GPU so far, in total
+    uint32_t overwrites =
+        0; // recorded so far that may overwrite what the GPU reads: on the transfer queue the frame waits for these
     uint32_t dedicated_staging = 0; // uploads that didn't fit the ring and got their own buffer
     uint32_t dropped_uploads = 0;   // uploads whose texture or buffer was destroyed before they were recorded
     bool transfer_queue = false;    // copies run on the transfer queue
@@ -81,8 +90,8 @@ struct UploaderStats {
 //
 // Uploads are copied into staging at once, so the caller's memory is free on return; they reach the
 // GPU in the order they were queued, one batch a frame, where a batch holds as many as the budget allows
-// but only one to a texture, or to any one place in a buffer. Destroying a texture or buffer with uploads still queued
-// is fine: they are dropped. Single-threaded, like the device. Move-only; the device must outlive it.
+// but only one to a texture, and none that overlap in a buffer. Destroying a texture or buffer with uploads still
+// queued is fine: they are dropped. Single-threaded, like the device. Move-only; the device must outlive it.
 class Uploader {
 public:
     static core::Result<Uploader> create(Device& device, const UploaderDesc& desc = {});
@@ -103,7 +112,8 @@ public:
     // the upload are in after state, for after_stages. A buffer's state is tracked as a whole: read
     // states left by uploads to different ranges add up, and the next upload waits for all of them.
     core::Result<void> upload_buffer(BufferHandle buffer, uint64_t offset, std::span<const std::byte> data,
-                                     ResourceState after, ShaderStages after_stages = ShaderStages::All);
+                                     ResourceState after, ShaderStages after_stages = ShaderStages::All,
+                                     BufferRange range = BufferRange::MayBeRead);
 
     // Once per frame, between begin_frame and end_frame: records the queued copies, within the
     // frame budget, and the barriers around them, on lists of its own. Records nothing when idle().

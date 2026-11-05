@@ -389,7 +389,7 @@ TEST_CASE("uploads to one resource are recorded in order, a batch apart") {
     check_clean(*device);
 }
 
-TEST_CASE("uploads to separate places in one buffer go in one batch, and a later one to the same place waits") {
+TEST_CASE("uploads to separate places in one buffer go in one batch, and one that overlaps waits") {
     auto device = make_device();
     if (!device) {
         return;
@@ -401,16 +401,18 @@ TEST_CASE("uploads to separate places in one buffer go in one batch, and a later
     const auto low = pattern(16, 2);
     const auto high = pattern(16, 3);
     const auto below = pattern(8, 4);
-    const auto inside = pattern(8, 5);
+    const auto between = pattern(8, 5);
+    const auto clash = pattern(8, 6);
     REQUIRE(uploader->upload_buffer(buffer, 0, as_span(base), ResourceState::CopySrc).ok());
     uploader->flush_and_wait();
 
-    // Upward, then below all of them: none touch.
+    // Upward, below them all, and in a gap between them: none overlap.
     REQUIRE(uploader->upload_buffer(buffer, 16, as_span(low), ResourceState::CopySrc).ok());
     REQUIRE(uploader->upload_buffer(buffer, 48, as_span(high), ResourceState::CopySrc).ok());
     REQUIRE(uploader->upload_buffer(buffer, 8, as_span(below), ResourceState::CopySrc).ok());
-    // Inside the span so far, though it touches none of them: that's kept simple, and it waits.
-    REQUIRE(uploader->upload_buffer(buffer, 36, as_span(inside), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 36, as_span(between), ResourceState::CopySrc).ok());
+    // Over `high`, and it lands after it.
+    REQUIRE(uploader->upload_buffer(buffer, 52, as_span(clash), ResourceState::CopySrc).ok());
     record_frame(*device, *uploader);
     CHECK(uploader->stats().queued_uploads == 1);
     uploader->flush_and_wait();
@@ -420,9 +422,50 @@ TEST_CASE("uploads to separate places in one buffer go in one batch, and a later
     CHECK(same_bytes(as_span(bytes).subspan(8, 8), as_span(below)));
     CHECK(same_bytes(as_span(bytes).subspan(16, 16), as_span(low)));
     CHECK(same_bytes(as_span(bytes).subspan(32, 4), as_span(base).subspan(32, 4)));
-    CHECK(same_bytes(as_span(bytes).subspan(36, 8), as_span(inside)));
+    CHECK(same_bytes(as_span(bytes).subspan(36, 8), as_span(between)));
     CHECK(same_bytes(as_span(bytes).subspan(44, 4), as_span(base).subspan(44, 4)));
-    CHECK(same_bytes(as_span(bytes).subspan(48, 16), as_span(high)));
+    CHECK(same_bytes(as_span(bytes).subspan(48, 4), as_span(high).first(4)));
+    CHECK(same_bytes(as_span(bytes).subspan(52, 8), as_span(clash)));
+    CHECK(same_bytes(as_span(bytes).subspan(60, 4), as_span(high).subspan(12, 4)));
+
+    // Downward, then over the lower one: the search has to look down there too.
+    REQUIRE(uploader->upload_buffer(buffer, 48, as_span(below), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 16, as_span(below), ResourceState::CopySrc).ok());
+    REQUIRE(uploader->upload_buffer(buffer, 18, as_span(below), ResourceState::CopySrc).ok());
+    record_frame(*device, *uploader);
+    CHECK(uploader->stats().queued_uploads == 1);
+    uploader->flush_and_wait();
+    device->destroy(buffer);
+    device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("an upload to an unread range of a buffer in use isn't an overwrite") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto uploader = Uploader::create(*device, {.use_transfer_queue = transfer_path(*device)});
+    REQUIRE(uploader.ok());
+    const auto buffer = *device->create_buffer({.size = 64, .usage = kBufferCopyBoth});
+    const auto data = pattern(16, 1);
+    REQUIRE(uploader->upload_buffer(buffer, 0, as_span(data), ResourceState::CopySrc).ok());
+    uploader->flush_and_wait();
+    CHECK(uploader->stats().overwrites == 0); // nothing there yet
+
+    REQUIRE(uploader
+                ->upload_buffer(buffer, 16, as_span(data), ResourceState::CopySrc, de::rhi::ShaderStages::All,
+                                de::rhi::BufferRange::Unread)
+                .ok());
+    uploader->flush_and_wait();
+    CHECK(uploader->stats().overwrites == 0);
+
+    REQUIRE(uploader->upload_buffer(buffer, 32, as_span(data), ResourceState::CopySrc).ok());
+    uploader->flush_and_wait();
+    CHECK(uploader->stats().overwrites == 1);
+    const auto bytes = read_buffer(*device, buffer);
+    CHECK(same_bytes(as_span(bytes).subspan(16, 16), as_span(data)));
+    CHECK(same_bytes(as_span(bytes).subspan(32, 16), as_span(data)));
     device->destroy(buffer);
     device->wait_idle();
     check_clean(*device);

@@ -148,8 +148,8 @@ struct PoolScene {
         device.end_frame();
     }
 
-    // The engine's frame, drawing these meshes at the origin, and what it drew.
-    de::core::Array<std::byte> draw(std::initializer_list<AssetHandle> meshes) const {
+    // The engine's frame, drawing these meshes at the origin, left in flight.
+    void submit(std::initializer_list<AssetHandle> meshes) const {
         assets.update();
         assets.wait_all();
         gpu_assets.update();
@@ -166,7 +166,20 @@ struct PoolScene {
         renderer.add_passes(graph, color, de::rhi::Format::RGBA8Unorm, frame, {}, de::render::SceneView::BaseColor);
         graph.execute();
         device.end_frame();
+    }
+
+    // The same, and what it drew.
+    de::core::Array<std::byte> draw(std::initializer_list<AssetHandle> meshes) const {
+        submit(meshes);
         return de::test::read_texture(device, target);
+    }
+
+    // Frames until nothing in flight can hold a place back, and the update that frees them.
+    void settle() const {
+        device.wait_idle();
+        empty_frame();
+        device.wait_idle();
+        gpu_assets.update();
     }
 };
 
@@ -331,20 +344,22 @@ TEST_CASE("a mesh's place in the pool waits for the frames that may still draw f
         CHECK(is_red(scene.draw({center}), kMiddle));
         CHECK(scene.gpu_assets.stats().pool_vertices_free == 8 - kSquareVertices);
 
-        // Gone, but the frames in flight may still be drawing it.
+        // Gone, with a frame that draws it possibly still running: it's free only when that's done.
+        scene.submit({center});
+        const uint64_t last_draw = scene.device.frame_index();
         scene.assets.release(center);
         scene.assets.update();
         CHECK(scene.gpu_assets.mesh(center) == nullptr);
-        CHECK(scene.gpu_assets.stats().pool_vertices_free == 8 - kSquareVertices);
-        CHECK(scene.gpu_assets.stats().pool_indices_free == 12 - kSquareIndices);
-        for (uint32_t frame = 0; frame < de::rhi::kFramesInFlight + 1; ++frame) {
-            scene.empty_frame();
-            CHECK(scene.gpu_assets.stats().pool_vertices_free == 8 - kSquareVertices);
+        for (int update = 0; update < 3; ++update) {
+            scene.gpu_assets.update();
+            if (scene.gpu_assets.stats().pool_vertices_free == 8) {
+                CHECK(scene.device.completed_frame() >= last_draw);
+            }
         }
-        // Done: all of it is free again, for a mesh that only fits in the same place.
-        scene.empty_frame();
+        scene.settle();
         CHECK(scene.gpu_assets.stats().pool_vertices_free == 8);
         CHECK(scene.gpu_assets.stats().pool_indices_free == 12);
+        // All of it, for a mesh that only fits in the same place.
         const AssetHandle sides = scene.load(kSides);
         scene.uploader.flush_and_wait();
         scene.gpu_assets.update();
@@ -356,6 +371,31 @@ TEST_CASE("a mesh's place in the pool waits for the frames that may still draw f
         CHECK(is_green(pixels, kLeft));
         CHECK(is_green(pixels, kRight));
         CHECK_FALSE(is_green(pixels, kMiddle));
+    });
+}
+
+TEST_CASE("meshes stream into the pool while others are drawn") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle center = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const uint32_t overwrites = scene.uploader.stats().overwrites;
+        // A new mesh every frame, with frames in flight: sync validation watches the pool's ranges.
+        constexpr int kCount = 16;
+        AssetHandle streamed[kCount];
+        for (int i = 0; i < kCount; ++i) {
+            const AssetId id = AssetId::from_value(0x500 + i);
+            put_squares(scene.vfs, id, kRed, {-1.0f, 1.0f});
+            streamed[i] = scene.load(id);
+            scene.submit({center});
+        }
+        CHECK(scene.uploader.stats().overwrites == overwrites); // the frame never waited for them
+        scene.uploader.flush_and_wait();
+        const auto pixels = scene.draw({center, streamed[kCount - 1]});
+        CHECK(is_red(pixels, kMiddle));
+        CHECK(is_red(pixels, kLeft));
+        CHECK(is_red(pixels, kRight));
     });
 }
 
@@ -385,10 +425,7 @@ TEST_CASE("a reloaded mesh moves in the pool, and its old place comes back") {
         CHECK(is_red(pixels, kLeft));
         CHECK(is_red(pixels, kRight));
         CHECK_FALSE(is_red(pixels, kMiddle));
-        for (uint32_t frame = 0; frame < de::rhi::kFramesInFlight + 2; ++frame) {
-            scene.empty_frame();
-        }
-        scene.gpu_assets.update();
+        scene.settle();
         CHECK(scene.gpu_assets.stats().pool_vertices_free == 1024 - (2 * kSquareVertices));
         CHECK(scene.gpu_assets.stats().pool_indices_free == 1024 - (2 * kSquareIndices));
     });
@@ -421,6 +458,111 @@ TEST_CASE("a mesh that doesn't fit in the pool is left out, whichever buffer is 
               [&](const PoolScene& scene) { left_out(scene, 6 - kSquareVertices, 1024 - kSquareIndices); });
     with_pool({.pool_vertices = 1024, .pool_indices = 8},
               [&](const PoolScene& scene) { left_out(scene, 1024 - kSquareVertices, 8 - kSquareIndices); });
+}
+
+TEST_CASE("a mesh that didn't fit gets in when space comes back") {
+    with_pool({.pool_vertices = 8, .pool_indices = 12}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        const AssetHandle center = scene.load(kCenter);
+        const AssetHandle sides = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
+        CHECK(scene.gpu_assets.mesh(sides) == nullptr);
+
+        scene.assets.release(center);
+        scene.assets.update();
+        scene.settle();
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 0);
+        REQUIRE(scene.gpu_assets.mesh(sides) != nullptr);
+        CHECK(is_green(scene.draw({sides}), kLeft));
+    });
+}
+
+TEST_CASE("a mesh that didn't fit stops waiting when it's released") {
+    with_pool({.pool_vertices = 4, .pool_indices = 6}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        const AssetHandle center = scene.load(kCenter);
+        const AssetHandle sides = scene.load(kSides);
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
+        scene.assets.release(sides);
+        scene.assets.update();
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 0);
+        // Space coming back doesn't bring it back.
+        scene.assets.release(center);
+        scene.assets.update();
+        scene.settle();
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.stats().meshes == 0);
+        CHECK(scene.gpu_assets.stats().pool_vertices_free == 4);
+    });
+}
+
+TEST_CASE("a mesh reloaded in a full pool comes back once its old place is free") {
+    with_pool({.pool_vertices = 8, .pool_indices = 12, .hot_reload = true}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        const AssetHandle mesh = scene.load(kSides); // all of the pool
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        REQUIRE(scene.gpu_assets.mesh(mesh) != nullptr);
+
+        // As big again, so there's no room until its old place is free.
+        put_squares(scene.vfs, kSides, kRed, {-1.5f, 1.5f});
+        const uint32_t reloads = scene.assets.stats().reloads;
+        for (int i = 0; i < 100 && scene.assets.stats().reloads == reloads; ++i) {
+            scene.empty_frame();
+        }
+        REQUIRE(scene.assets.stats().reloads > reloads);
+        scene.settle();
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 0);
+        REQUIRE(scene.gpu_assets.mesh(mesh) != nullptr);
+        CHECK(is_red(scene.draw({mesh}), kLeft - 10));
+    });
+}
+
+TEST_CASE("a mesh with a missing material stays drawn as other materials load") {
+    with_pool({}, [](const PoolScene& scene) {
+        constexpr AssetId kNoSuchMaterial = AssetId::from_value(0x77);
+        put_squares(scene.vfs, kCenter, kNoSuchMaterial, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        const AssetHandle center = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        REQUIRE(scene.gpu_assets.mesh(center) != nullptr);
+        static_cast<void>(scene.load(kSides)); // its material loads: nothing about this mesh changes
+        CHECK(scene.gpu_assets.mesh(center) != nullptr);
+    });
+}
+
+TEST_CASE("a mesh waits for its own material's table upload, not for the ones queued after it") {
+    with_pool({.frame_budget_bytes = 1}, [](const PoolScene& scene) { // one upload a frame: the queue backs up
+        // A new mesh and a new material every frame, so a table upload is always queued.
+        const auto add_mesh = [&](int i) {
+            const AssetId mesh_id = AssetId::from_value(0x600 + i);
+            const AssetId material_id = AssetId::from_value(0x700 + i);
+            put_material(scene.vfs, material_id, 1.0f, 0.0f);
+            put_squares(scene.vfs, mesh_id, material_id, {0.0f});
+            return scene.load(mesh_id);
+        };
+        const AssetHandle first = add_mesh(0);
+        bool ready = false;
+        for (int i = 1; i < 12 && !ready; ++i) {
+            scene.empty_frame();
+            static_cast<void>(add_mesh(i));
+            ready = scene.gpu_assets.mesh(first) != nullptr;
+        }
+        CHECK(ready);
+        CHECK_FALSE(scene.uploader.idle());
+        scene.uploader.flush_and_wait();
+    });
 }
 
 TEST_CASE("a mesh's bounds and every LOD are kept, and only LOD 0 is drawn") {

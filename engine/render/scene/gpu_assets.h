@@ -85,7 +85,7 @@ struct GpuAssetsStats {
     uint32_t materials = 0;      // in the table
     uint32_t pending = 0;        // waiting for their uploads (meshes) or textures (materials)
     uint64_t bytes = 0;          // of vertices, indices and texels
-    uint32_t meshes_dropped = 0; // didn't fit in the geometry pool, so aren't drawn (logged)
+    uint32_t meshes_dropped = 0; // don't fit in the geometry pool now, so aren't drawn: tried again as space comes back
     uint64_t pool_vertices_free = 0;
     uint64_t pool_indices_free = 0;
 };
