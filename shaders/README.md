@@ -16,7 +16,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | `scene/taa.slang` | Temporal anti-aliasing: history reprojected by motion, clipped to the neighbourhood, dropped where object motion or depth says it was about something else; writes the object motion the next frame compares |
 | `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel, the shadow mask or the cascades (debug views) |
 | `imgui.slang` | Dear ImGui's draw lists (the debug UI) |
-| `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color`, `common.fog` (the fog medium, its light, its integral along a ray, the froxel slices, fog volumes' density) |
+| `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color`, `common.fog` (the fog medium, its light, its integral along a ray, the froxel slices, fog volumes' density and noise) |
 | `tests/` | Shaders the unit tests run: a solid triangle, buffers through pointers, textures by bindless index, storage writes, a shader that binds a slot of its own (refused) |
 
 A module's name is its path with dots: `common.color` is `common/color.slang`. Declarations other modules import are `public`.

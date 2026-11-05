@@ -78,7 +78,7 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | Texture | a `.detex` |
 | glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
-| `.cell` | a `.decell`: its entities, parents first, and their fog volumes, with the meshes of the models they name (relative paths) as its dependencies |
+| `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies |
 | `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment as its dependency; cooked again when a cell it lists changes (its coordinate may have), not when the environment does |
 | `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth, the shadow and fog settings within their limits |
 | `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings and engine settings: what ship builds read) |

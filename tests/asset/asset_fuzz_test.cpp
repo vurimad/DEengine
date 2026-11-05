@@ -371,6 +371,20 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     bad_volume = good_volume;
     bad_volume.shape = static_cast<de::asset::CellFogShape>(7);
     CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.noise_size_m = 0.0f;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.noise_amount = 1.5f;
+    CHECK(refused(bad_volume));
+    bad_volume.noise_amount = -0.5f;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.drift_mps[2] = not_a_number;
+    CHECK(refused(bad_volume));
+    bad_volume = good_volume;
+    bad_volume.height_fade_m = -1.0f;
+    CHECK(refused(bad_volume));
 
     constexpr int kRounds = 4000;
     fuzz<MeshAsset>(mesh, 1, kRounds);

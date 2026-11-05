@@ -1223,13 +1223,15 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "mist_d", "fog_volume": {"density_per_m": 0.2, "edge_m": -1, "tint": [1, 1], "paint": 1}},
     {"name": "mist_e", "fog_volume": {"density_per_m": 5}},
     {"name": "mist_f", "fog_volume": {"density_per_m": 0.2, "edge_m": "wide"}},
+    {"name": "mist_g", "fog_volume": {"density_per_m": 0.2, "noise_amount": 2, "noise_size_m": 0, "drift_mps": [1, 2], "height_fade_m": -1}},
   ],
 })");
     write_src(sandbox, "content/world/cell_5_5.cell", R"({
   "coord": [5, 5],
   "entities": [
     {"name": "mist", "position": [700, 0, 700], "scale": [8, 3, 8],
-     "fog_volume": {"shape": "ellipsoid", "density_per_m": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7]}},
+     "fog_volume": {"shape": "ellipsoid", "density_per_m": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7],
+                    "noise_amount": 0.75, "noise_size_m": 5, "drift_mps": [0.5, 0.25, 1.5], "height_fade_m": 3}},
     {"name": "fog wall", "position": [710, 0, 700], "fog_volume": {"density_per_m": 0.1}},
     {"name": "plain", "position": [720, 0, 700]},
   ],
@@ -1257,6 +1259,10 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "unknown fog volume setting 'paint'"));
     CHECK(has_message(report, broken, "mist_e: fog_volume needs a density_per_m above 0, up to 4"));
     CHECK(has_message(report, broken, "'edge_m' should be a number"));
+    CHECK(has_message(report, broken, "mist_g: fog_volume noise_size_m should be above 0"));
+    CHECK(has_message(report, broken, "mist_g: fog_volume noise_amount should be from 0 to 1"));
+    CHECK(has_message(report, broken, "mist_g: fog_volume drift_mps should be 3 numbers"));
+    CHECK(has_message(report, broken, "mist_g: fog_volume height_fade_m should be 0 or more"));
     CHECK_FALSE(has_message(report, "content/world/cell_5_5.cell", ""));
     CHECK(report.stats.failed == 1);
     CHECK_FALSE(has_message(report, "content/world/cell_1_2.cell", ""));
@@ -1278,9 +1284,17 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
         CHECK(volumes[0].density_per_m == 0.2f);
         CHECK(volumes[0].edge_m == 2.0f);
         CHECK(volumes[0].tint[2] == 0.7f);
+        CHECK(volumes[0].noise_amount == 0.75f);
+        CHECK(volumes[0].noise_size_m == 5.0f);
+        CHECK(volumes[0].drift_mps[1] == 0.25f);
+        CHECK(volumes[0].height_fade_m == 3.0f);
         CHECK(volumes[1].shape == de::asset::CellFogShape::Box);
         CHECK(volumes[1].edge_m == 1.0f); // by default
         CHECK(volumes[1].tint[0] == 1.0f);
+        CHECK(volumes[1].noise_amount == 0.0f);
+        CHECK(volumes[1].noise_size_m > 0.0f);
+        CHECK(volumes[1].drift_mps[0] == 0.0f);
+        CHECK(volumes[1].height_fade_m == 0.0f);
     }
     {
         Cooked file(vfs, cell_id, AssetType::Cell);

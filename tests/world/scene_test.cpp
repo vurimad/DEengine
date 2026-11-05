@@ -197,6 +197,38 @@ TEST_CASE("render extraction: fog volumes, relative to the render origin, and th
     mist.destruct();
     world->advance(1.0 / 60.0);
     CHECK(frame.fog_volumes.empty());
+
+    // Its noise: tiles a meter, and how far it's drifted by the world's time, along the world's axes as the
+    // volume's own axes see them. Yawed, the world's x is its z.
+    const flecs::entity windy = ecs.entity().set(de::world::FogVolume{
+        .noise_size_m = 10.0f, .noise_amount = 0.5f, .drift_mps = {5.0f, 0.0f, 0.0f}, .height_fade_m = 2.0f});
+    de::world::place(windy, Transform{.position = {0.0, 0.0, 0.0}, .rotation = yaw, .scale = {4.0f, 2.0f, 1.0f}});
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.fog_volumes.size() == 1);
+    CHECK(near(frame.fog_volumes[0].noise_per_m, 0.1, 1e-6));
+    CHECK(frame.fog_volumes[0].noise_amount == 0.5f);
+    CHECK(frame.fog_volumes[0].height_fade_m == 2.0f);
+    const float offset_before = frame.fog_volumes[0].noise_offset[2];
+    for (int i = 0; i < 30; ++i) {
+        world->advance(1.0 / 60.0);
+    }
+    const float moved = frame.fog_volumes[0].noise_offset[2] - offset_before;
+    CHECK(near(moved < -1.0f ? moved + 4.0f : moved, 0.25, 1e-3)); // half a second at half a tile per second
+    CHECK(near(frame.fog_volumes[0].noise_offset[0], 0.0, 1e-3));
+    // It wraps at 4 tiles, however long the world runs, without a jump in between.
+    float last_offset = frame.fog_volumes[0].noise_offset[2];
+    bool wrapped = false;
+    for (int i = 0; i < 600; ++i) {
+        world->advance(1.0 / 60.0);
+        const float offset = frame.fog_volumes[0].noise_offset[2];
+        CHECK(offset >= 0.0f);
+        CHECK(offset < 4.0f);
+        wrapped = wrapped || offset < last_offset - 3.0f;
+        CHECK((offset > last_offset || offset < last_offset - 3.0f));
+        last_offset = offset;
+    }
+    CHECK(wrapped);
+    windy.destruct();
 }
 
 TEST_CASE("a cell owns its entities and its assets: deleting it unloads both, in any number of cells") {
@@ -473,7 +505,11 @@ void put_cell(const de::platform::Vfs& vfs, de::asset::AssetId id, de::asset::As
     build.fog_volumes.push({.density_per_m = 0.4f,
                             .edge_m = 3.0f,
                             .tint = {0.5f, 0.6f, 0.7f},
-                            .shape = de::asset::CellFogShape::Ellipsoid});
+                            .shape = de::asset::CellFogShape::Ellipsoid,
+                            .noise_size_m = 5.0f,
+                            .noise_amount = 0.75f,
+                            .drift_mps = {0.5f, 0.25f, 1.5f},
+                            .height_fade_m = 3.0f});
     build.entities[2].fog_volume = 0;
     const auto cooked = de::cooker::cook_cell(build, id);
     REQUIRE(vfs.write_file(de::asset::cooked_path(id, de::asset::AssetType::Cell).c_str(), cooked.span()).ok());
@@ -520,6 +556,10 @@ TEST_CASE("a loaded cell spawns its members once it and its meshes are in, and a
             CHECK(fog.edge_m == 3.0f);
             CHECK(fog.tint[2] == 0.7f);
             CHECK(fog.ellipsoid);
+            CHECK(fog.noise_size_m == 5.0f);
+            CHECK(fog.noise_amount == 0.75f);
+            CHECK(fog.drift_mps[2] == 1.5f);
+            CHECK(fog.height_fade_m == 3.0f);
         });
     CHECK(fog_volumes == 1);
 
