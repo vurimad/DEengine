@@ -815,6 +815,20 @@ TEST_CASE("DIAG B: slot 0 never had a mesh, slot 1 alive, no free record") {
     });
 }
 
+TEST_CASE("DIAG D: slot 0 out of view, slot 1 in view") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 2;
+        frame.instances.push(instance_at(red, 0, 50.0f));
+        frame.instances.push(instance_at(red, 1, 0.0f));
+        scene.submit(frame);
+        CHECK(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}
+
 TEST_CASE("DIAG C: slot 0 freed, nothing else alive") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});

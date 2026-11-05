@@ -86,15 +86,19 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     {
         return;
     }
+    // No mesh, or none ready to draw, is no LODs. Not an early return: llvmpipe, which runs a group's invocations as
+    // lanes of one, crashes in what follows when only the first lane has gone (a slot 0 with nothing in it).
     const uint mesh_slot = push.instance_meshes[instance];
-    if (mesh_slot == kNoMesh)
+    GpuMeshInfo mesh;
+    mesh.center = float3(0.0);
+    mesh.radius = 0.0;
+    mesh.vertex_offset = 0;
+    mesh.first_lod = 0;
+    mesh.lod_count = 0;
+    mesh.padding = 0;
+    if (mesh_slot != kNoMesh)
     {
-        return;
-    }
-    const GpuMeshInfo mesh = push.meshes[mesh_slot];
-    if (mesh.lod_count == 0) // not ready to draw
-    {
-        return;
+        mesh = push.meshes[mesh_slot];
     }
     const float4 row0 = push.instances[instance * kInstanceRows + 0];
     const float4 row1 = push.instances[instance * kInstanceRows + 1];
@@ -111,7 +115,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     for (uint v = 0; v < kCullViewCount; ++v)
     {
         GpuCullView* view = push.views + v;
-        if (!in_view(view, center, radius))
+        if (mesh.lod_count == 0 || !in_view(view, center, radius))
         {
             continue;
         }
