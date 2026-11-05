@@ -148,6 +148,7 @@ struct CommandListImpl {
     bool in_rendering = false;
     // Vulkan keeps a graphics and a compute binding side by side.
     bool graphics_bound = false;
+    bool index_buffer_bound = false;
     bool compute_bound = false;
 };
 

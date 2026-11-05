@@ -369,7 +369,7 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                                               .height = static_cast<uint32_t>(bottom - top)});
                     push.texture = bindless_of(texture);
                     // The vertex base goes through push constants, not the draw's vertex offset:
-                    // whether SV_VertexID includes that offset differs between shading languages.
+                    // SV_VertexID leaves that offset out.
                     push.vertex_base = command.VtxOffset + vertex_base;
                     context.list.push_constants(push);
                     context.list.draw_indexed(command.ElemCount, 1, command.IdxOffset + index_base, 0);

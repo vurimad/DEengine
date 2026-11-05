@@ -39,7 +39,7 @@ struct GBufferOutput
 };
 
 [shader("vertex")]
-VertexOutput vertex_main(uint vertex_id: SV_VertexID)
+VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID)
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const float4 row0 = push.instances[push.instance * kInstanceRows + 0];

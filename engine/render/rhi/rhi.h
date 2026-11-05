@@ -539,6 +539,28 @@ struct ComputePipelineDesc {
     const char* debug_name = nullptr;
 };
 
+// What indirect draws and dispatches read from a buffer, as the GPU lays them out.
+struct DrawIndirectArgs {
+    uint32_t vertex_count = 0;
+    uint32_t instance_count = 1;
+    uint32_t first_vertex = 0;
+    uint32_t first_instance = 0;
+};
+
+struct DrawIndexedIndirectArgs {
+    uint32_t index_count = 0;
+    uint32_t instance_count = 1;
+    uint32_t first_index = 0;
+    int32_t vertex_offset = 0;
+    uint32_t first_instance = 0;
+};
+
+struct DispatchIndirectArgs {
+    uint32_t groups_x = 0;
+    uint32_t groups_y = 1;
+    uint32_t groups_z = 1;
+};
+
 enum class IndexType : uint8_t {
     Uint16,
     Uint32,
@@ -594,6 +616,10 @@ struct Capabilities {
     uint32_t max_push_constant_bytes = 0;
     uint32_t max_compute_group_size[3] = {};
     uint32_t max_compute_group_invocations = 0;
+    uint32_t max_draw_indirect_count = 0; // draws in one indirect call; the spec promises only 65535
+    // Groups in one dispatch, along each axis. An indirect dispatch's arguments have to stay within it: nothing
+    // checks what a shader wrote, and past it what happens is undefined. The spec promises 65535.
+    uint32_t max_dispatch_groups[3] = {};
     uint32_t subgroup_size = 0;
     uint64_t uniform_buffer_alignment = 0; // offsets into uniform buffers are multiples of this
     uint64_t storage_buffer_alignment = 0;

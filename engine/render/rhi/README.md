@@ -60,6 +60,16 @@ device.end_frame();                                      // one submit for all l
 - GPU timestamps: `CommandList::write_timestamp()` (graphics lists, up to `kMaxTimestampsPerFrame` a frame) writes into the frame slot's query pool; when `begin_frame()` reuses the slot, the GPU has finished that frame, so its values are read without waiting (`Device::completed_timestamps()`, nanoseconds after the frame's first, safe across a narrow counter's wrap) and the queries reset on the host.
 - Object names and command-list labels reach RenderDoc and Nsight whenever `VK_EXT_debug_utils` is available, in every build.
 
+## Indirect draws
+
+`draw_indirect`, `draw_indexed_indirect`, their `_count` forms and `dispatch_indirect` read their arguments from a buffer with `Indirect` usage, in `IndirectArgument` state, laid out as `DrawIndirectArgs`, `DrawIndexedIndirectArgs` and `DispatchIndirectArgs` in `rhi.h`. Compute can write them in the same frame, as a graph pass before the draw.
+
+`SV_VertexID` and `SV_InstanceID` leave out a draw's own first vertex, vertex offset and first instance, so they don't say where in a shared buffer a draw is. `SV_VulkanVertexID` and `SV_VulkanInstanceID` include them, and `SV_DrawIndex` counts from 0 in each call, wherever its offset starts in the buffer (`tests/render/indirect_test.cpp` pins all of this on our Slang). So in a shared buffer, read vertices by `SV_VulkanVertexID`, and find a draw's data by its first instance, or by a base in the push constants added to `SV_DrawIndex`.
+
+A count buffer needs `Indirect` usage and `IndirectArgument` state too.
+
+Nothing checks what a shader writes into arguments. An indirect dispatch has to stay within `Capabilities::max_dispatch_groups`, and past it what happens is undefined.
+
 ## Not yet
 
 - Async compute submission (render graph v3), multi-threaded command recording, sampled views and render targets of single mips or layers (attachments use mip 0 and layer 0 of single-mip, single-layer textures for now), stencil copies.
