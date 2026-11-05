@@ -160,6 +160,7 @@ void fill_capabilities(DeviceImpl& impl, bool ray_query) {
         caps.max_compute_group_size[i] = limits.maxComputeWorkGroupSize[i];
     }
     caps.max_compute_group_invocations = limits.maxComputeWorkGroupInvocations;
+    caps.max_draw_indirect_count = limits.maxDrawIndirectCount;
     caps.subgroup_size = props11.subgroupSize;
     caps.uniform_buffer_alignment = limits.minUniformBufferOffsetAlignment;
     caps.storage_buffer_alignment = limits.minStorageBufferOffsetAlignment;

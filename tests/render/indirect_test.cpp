@@ -2,6 +2,7 @@
 #include "render/rhi/command_list.h"
 #include "render/rhi/device.h"
 #include "support/gpu.h"
+#include "support/readback.h"
 #include "support/shader_kit.h"
 
 #include <doctest/doctest.h>
@@ -47,45 +48,45 @@ struct Column {
     uint32_t instance = 0; // all of these + 1: 0 is a column nothing drew
     uint32_t draw = 0;
     uint32_t instance_id = 0;
-    uint32_t vertex_sixths = 0;
+    uint32_t vertex_sixths = 0;        // SV_VertexID / 6
+    uint32_t vulkan_vertex_sixths = 0; // SV_VulkanVertexID / 6
 };
 
 // A row of columns to draw into and read from, and what to draw with.
 struct Bench {
     de::rhi::Device& device;
-    ShaderKit& kit;
     RenderGraph& graph;
     PipelineHandle columns;
     TextureHandle target;
-    BufferHandle readback;
 
     std::array<Column, kWidth> read() {
-        device.invalidate_mapped(readback);
+        const de::core::Array<std::byte> texels = de::test::read_texture(device, target);
         std::array<Column, kWidth> out{};
         for (uint32_t x = 0; x < kWidth; ++x) {
-            const uint32_t texel = read_u32(device, readback, x);
-            out[x] = {.instance = texel & 0xFFU,
-                      .draw = (texel >> 8U) & 0xFFU,
-                      .instance_id = (texel >> 16U) & 0xFFU,
-                      .vertex_sixths = texel >> 24U};
+            const auto byte = [&](uint32_t channel) { return static_cast<uint32_t>(texels[size_t{x} * 4 + channel]); };
+            out[x] = {.instance = byte(0),
+                      .draw = byte(1),
+                      .instance_id = byte(2),
+                      .vertex_sixths = byte(3) & 0xFU,
+                      .vulkan_vertex_sixths = byte(3) >> 4U};
         }
         return out;
     }
 
     // One frame: draw(list) inside a cleared rendering, with the pipeline bound and its push set, after
-    // setup(pass) has declared what it reads; then the target is read back.
+    // setup(pass) has declared what it reads.
     template <typename Setup, typename Draw>
     void frame(Setup&& setup, Draw&& draw) {
+        const GraphTexture color =
+            graph.import_texture({.texture = target, .name = "target", .final_state = ResourceState::CopySrc});
         graph.add_pass(
             "columns",
             [&](PassBuilder& pass) {
                 setup(pass);
                 pass.never_cull();
-                color =
-                    graph.import_texture({.texture = target, .name = "target", .final_state = ResourceState::CopySrc});
                 pass.use(color, ResourceState::RenderTarget);
             },
-            [this, &draw](PassContext& context) {
+            [this, color, &draw](PassContext& context) {
                 const ColorAttachment attachment{.texture = context.texture(color), .load = LoadOp::Clear, .clear = {}};
                 context.list.begin_rendering({.colors = std::span(&attachment, 1)});
                 context.list.bind_pipeline(columns);
@@ -93,24 +94,10 @@ struct Bench {
                 draw(context, context.list);
                 context.list.end_rendering();
             });
-        const GraphBuffer out =
-            graph.import_buffer({.buffer = readback, .name = "readback", .final_state = ResourceState::HostRead});
-        const GraphTexture from = color;
-        graph.add_pass(
-            "read target",
-            [&](PassBuilder& pass) {
-                pass.use(from, ResourceState::CopySrc);
-                pass.use(out, ResourceState::CopyDst);
-            },
-            [from, out](PassContext& context) {
-                context.list.copy_texture_to_buffer(context.texture(from), context.buffer(out));
-            });
         graph.execute();
         device.end_frame();
         device.wait_idle();
     }
-
-    GraphTexture color;
 };
 
 } // namespace
@@ -134,17 +121,7 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
                                                           .format = Format::RGBA8Unorm,
                                                           .usage = TextureUsage::RenderTarget | TextureUsage::CopySrc,
                                                           .debug_name = "target"});
-    const BufferHandle readback = *device->create_buffer({.size = uint64_t{kWidth} * 4,
-                                                          .usage = BufferUsage::CopyDst,
-                                                          .memory = MemoryLocation::Readback,
-                                                          .debug_name = "readback"});
-    Bench bench{.device = *device,
-                .kit = kit,
-                .graph = *graph,
-                .columns = columns,
-                .target = target,
-                .readback = readback,
-                .color = {}};
+    Bench bench{.device = *device, .graph = *graph, .columns = columns, .target = target};
 
     const BufferHandle args = *device->create_buffer(
         {.size = 256, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "args"});
@@ -190,8 +167,9 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
                     [&](PassContext& context, CommandList& list) { list.draw_indirect(context.buffer(used), 0, 1); });
         const auto seen = bench.read();
         CHECK(seen[3].instance == 4);
-        CHECK(seen[3].instance_id == 1);   // SV_InstanceID: 0, for the first instance of the draw
-        CHECK(seen[3].vertex_sixths == 1); // SV_VertexID: 0 to 5, not 12 to 17
+        CHECK(seen[3].instance_id == 1);          // SV_InstanceID: 0, for the first instance of the draw
+        CHECK(seen[3].vertex_sixths == 1);        // SV_VertexID: 0 to 5, not 12 to 17
+        CHECK(seen[3].vulkan_vertex_sixths == 3); // SV_VulkanVertexID: 12 to 17, what a shared buffer needs
     }
 
     SUBCASE("indexed, from a shared index buffer: first index and vertex offset") {
@@ -214,7 +192,8 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
             });
         const auto seen = bench.read();
         CHECK(seen[4].instance == 5);
-        CHECK(seen[4].vertex_sixths == 1); // SV_VertexID leaves out the vertex offset too
+        CHECK(seen[4].vertex_sixths == 1);        // SV_VertexID leaves out the vertex offset too
+        CHECK(seen[4].vulkan_vertex_sixths == 5); // and SV_VulkanVertexID has it: 24 to 29
         CHECK(seen[0].instance == 0);
     }
 
@@ -244,6 +223,59 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
         CHECK(seen[0].instance == 1);
         CHECK(seen[2].instance == 3);
         CHECK(seen[3].instance == 0); // the count says 4; only 3 were allowed
+    }
+
+    SUBCASE("a count in a buffer of its own") {
+        const BufferHandle counts = *device->create_buffer(
+            {.size = 16, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "counts"});
+        const uint32_t count = 2;
+        std::memcpy(device->mapped(counts).data() + 8, &count, sizeof(count));
+        device->flush_mapped(counts);
+        write_args(std::array{DrawIndirectArgs{.vertex_count = 6, .first_instance = 1},
+                              DrawIndirectArgs{.vertex_count = 6, .first_instance = 2},
+                              DrawIndirectArgs{.vertex_count = 6, .first_instance = 3}});
+        begin();
+        const GraphBuffer used = import_args();
+        const GraphBuffer used_counts = graph->import_buffer({.buffer = counts, .name = "counts"});
+        bench.frame(
+            [&](PassBuilder& pass) {
+                pass.use(used, ResourceState::IndirectArgument);
+                pass.use(used_counts, ResourceState::IndirectArgument);
+            },
+            [&](PassContext& context, CommandList& list) {
+                list.draw_indirect_count(context.buffer(used), 0, context.buffer(used_counts), 8, 3);
+            });
+        const auto seen = bench.read();
+        CHECK(seen[1].instance == 2);
+        CHECK(seen[2].instance == 3);
+        CHECK(seen[3].instance == 0);
+        device->destroy(counts);
+    }
+
+    SUBCASE("SV_DrawIndex counts from 0 in each call, wherever its offset starts") {
+        write_args(std::array{DrawIndirectArgs{.vertex_count = 6, .first_instance = 1},
+                              DrawIndirectArgs{.vertex_count = 6, .first_instance = 2},
+                              DrawIndirectArgs{.vertex_count = 6, .first_instance = 3}});
+        begin();
+        const GraphBuffer used = import_args();
+        bench.frame([&](PassBuilder& pass) { pass.use(used, ResourceState::IndirectArgument); },
+                    [&](PassContext& context, CommandList& list) {
+                        list.draw_indirect(context.buffer(used), sizeof(DrawIndirectArgs), 2);
+                    });
+        const auto seen = bench.read();
+        CHECK(seen[1].instance == 0);
+        CHECK(seen[2].draw == 1); // the second in the buffer, the first in this call
+        CHECK(seen[3].draw == 2);
+    }
+
+    SUBCASE("left out, an instance count is 1, as it is for a plain draw") {
+        CHECK(device->capabilities().max_draw_indirect_count >= 1);
+        write_args(std::array{DrawIndirectArgs{.vertex_count = 6}});
+        begin();
+        const GraphBuffer used = import_args();
+        bench.frame([&](PassBuilder& pass) { pass.use(used, ResourceState::IndirectArgument); },
+                    [&](PassContext& context, CommandList& list) { list.draw_indirect(context.buffer(used), 0, 1); });
+        CHECK(bench.read()[0].instance == 1);
     }
 
     SUBCASE("arguments apart by a stride") {
@@ -307,7 +339,6 @@ TEST_CASE("indirect draws read their arguments, and the shaders see what they sa
     device->destroy(args);
     device->destroy(indices);
     device->destroy(target);
-    device->destroy(readback);
     check_clean(*device);
 }
 
@@ -392,5 +423,59 @@ TEST_CASE("an indirect dispatch runs the groups its arguments say, written by co
     CHECK(read_u32(*device, readback, 2) == 3);
     CHECK(read_u32(*device, readback, 3) == 0);
     device->destroy(readback);
+    check_clean(*device);
+}
+
+TEST_CASE("an indirect dispatch reads each field of its arguments") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    ShaderKit kit(*device);
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const auto groups_program =
+        kit.library().create_compute({.module = "tests.write_indirect", .entry = "groups_main"});
+    REQUIRE(groups_program.ok());
+    const PipelineHandle groups = kit.pipeline(*groups_program);
+    const BufferHandle args = *device->create_buffer(
+        {.size = 64, .usage = BufferUsage::Indirect, .memory = MemoryLocation::Upload, .debug_name = "args"});
+    const BufferHandle values = *device->create_buffer({.size = 64,
+                                                        .usage = BufferUsage::Storage | BufferUsage::CopyDst,
+                                                        .memory = MemoryLocation::Readback,
+                                                        .debug_name = "values"});
+    // At an offset, with the other two left out: they're 1, as they are for a plain dispatch.
+    const DispatchIndirectArgs arguments{.groups_x = 2};
+    std::memcpy(device->mapped(args).data() + 12, &arguments, sizeof(arguments));
+    device->flush_mapped(args);
+    device->begin_frame();
+    graph->begin(1, 1);
+    const GraphBuffer used = graph->import_buffer({.buffer = args, .name = "args"});
+    const GraphBuffer out =
+        graph->import_buffer({.buffer = values, .name = "values", .final_state = ResourceState::HostRead});
+    graph->add_pass(
+        "clear values", [&](PassBuilder& pass) { pass.use(out, ResourceState::CopyDst); },
+        [out](PassContext& context) { context.list.fill_buffer(context.buffer(out), 0, 64, 0); });
+    graph->add_pass(
+        "run groups",
+        [&](PassBuilder& pass) {
+            pass.use(used, ResourceState::IndirectArgument);
+            pass.use(out, ResourceState::ShaderWrite, ShaderStages::Compute);
+        },
+        [groups, used, out](PassContext& context) {
+            context.list.bind_pipeline(groups);
+            context.list.push_constants(
+                WriteIndirectPush{.output = context.device.buffer_address(context.buffer(out))});
+            context.list.dispatch_indirect(context.buffer(used), 12);
+        });
+    graph->execute();
+    device->end_frame();
+    device->wait_idle();
+    device->invalidate_mapped(values);
+    CHECK(read_u32(*device, values, 0) == 1);
+    CHECK(read_u32(*device, values, 1) == 2);
+    CHECK(read_u32(*device, values, 2) == 0);
+    device->destroy(args);
+    device->destroy(values);
     check_clean(*device);
 }

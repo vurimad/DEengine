@@ -69,10 +69,14 @@ public:
     void dispatch(uint32_t groups_x, uint32_t groups_y = 1, uint32_t groups_z = 1);
 
     // Draws and dispatches whose arguments are in a buffer (rhi.h: DrawIndirectArgs and friends), with Indirect
-    // usage and in IndirectArgument state. A shader tells draws apart by SV_DrawIndex or the first instance
-    // (SV_VulkanInstanceID, SV_StartInstanceLocation): SV_VertexID and SV_InstanceID leave out the draw's own first
-    // vertex, vertex offset and first instance. A stride of 0 means the arguments are packed. The counted forms
-    // read a uint32 from count_buffer and draw that many, up to max_draws. An offset and a stride are multiples of 4.
+    // usage and in IndirectArgument state, as a count_buffer must be too. A stride of 0 means the arguments are
+    // packed. The counted forms read a uint32 from count_buffer and draw that many, up to max_draws. Offsets and
+    // strides are multiples of 4, and a call's draws are at most Capabilities::max_draw_indirect_count.
+    //
+    // What a shader sees: SV_VertexID and SV_InstanceID leave out a draw's own first vertex, vertex offset and first
+    // instance, so in a shared buffer read vertices by SV_VulkanVertexID. SV_DrawIndex counts from 0 in each call,
+    // wherever in the buffer its offset starts: to find a draw's data, use the first instance (SV_VulkanInstanceID),
+    // or add a base from the push constants.
     void draw_indirect(BufferHandle args, uint64_t offset, uint32_t draw_count, uint32_t stride = 0);
     void draw_indexed_indirect(BufferHandle args, uint64_t offset, uint32_t draw_count, uint32_t stride = 0);
     void draw_indirect_count(BufferHandle args, uint64_t offset, BufferHandle count_buffer, uint64_t count_offset,

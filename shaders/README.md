@@ -29,6 +29,7 @@ A module's name is its path with dots: `common.color` is `common/color.slang`. D
 - No descriptor slots of their own: buffers are reached through pointers in push constants (`uint* output`), textures and samplers through `import common.bindless;` and indices in push constants. A shader that binds anything else to a slot compiles, but the library rejects it.
 - Reach textures through the accessors, never the raw tables: `texture_2d(index)`, `texture_cube(index)`, `storage_2d(index)`, `sampler_state(sampler)`..., or the shorthands (`sample_texture(push.albedo, kSamplerAnisotropicWrap, uv)`). They check the index's table in debug and dev builds (`DE_SHADER_CHECKS`) and clamp it in every build, so a wrong index draws the fallback instead of reading out of bounds.
 - A texture's index belongs to the table of its shape: `texture_2d` for 2D, `texture_cube` for cubes... Integer storage textures use `storage_2d_uint`.
+- `SV_VertexID` and `SV_InstanceID` leave out a draw's first vertex, vertex offset and first instance. To read vertices from a shared buffer, or find a draw's data by its first instance, use `SV_VulkanVertexID` and `SV_VulkanInstanceID` (rhi `README.md`, Indirect draws).
 - Clip space is +Y up, depth 0..1, reverse Z (1 near, 0 far). Front faces are counter-clockwise.
 - Matrices are column-major: `mul(matrix, vector)`, the same layout as GLM.
 - Names: `snake_case` functions and variables, `PascalCase` structs (docs/design.md, Code conventions).

@@ -64,7 +64,9 @@ device.end_frame();                                      // one submit for all l
 
 `draw_indirect`, `draw_indexed_indirect`, their `_count` forms and `dispatch_indirect` read their arguments from a buffer with `Indirect` usage, in `IndirectArgument` state, laid out as `DrawIndirectArgs`, `DrawIndexedIndirectArgs` and `DispatchIndirectArgs` in `rhi.h`. Compute can write them in the same frame, as a graph pass before the draw.
 
-`SV_VertexID` and `SV_InstanceID` leave out a draw's own first vertex, vertex offset and first instance, so they don't say where in a shared buffer a draw is (`tests/render/indirect_test.cpp` pins this on our Slang). To find a draw's data, use `SV_DrawIndex`, or `SV_VulkanInstanceID` with a first instance. To reach a vertex in a shared buffer, `SV_VulkanVertexID`.
+`SV_VertexID` and `SV_InstanceID` leave out a draw's own first vertex, vertex offset and first instance, so they don't say where in a shared buffer a draw is. `SV_VulkanVertexID` and `SV_VulkanInstanceID` include them, and `SV_DrawIndex` counts from 0 in each call, wherever its offset starts in the buffer (`tests/render/indirect_test.cpp` pins all of this on our Slang). So in a shared buffer, read vertices by `SV_VulkanVertexID`, and find a draw's data by its first instance, or by a base in the push constants added to `SV_DrawIndex`.
+
+A count buffer needs `Indirect` usage and `IndirectArgument` state too.
 
 ## Not yet
 
