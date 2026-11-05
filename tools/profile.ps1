@@ -16,8 +16,9 @@
 #   summary.csv      per zone and plot, without the start: count, median, p95, p99, min, max, mean
 #   gpu.csv          nvidia-smi's clock, power, temperature and P-state each second, where it's installed
 # and prints the top zones by total time, the same figures for each plot (e.g. "heap allocations/frame"
-# should stay at 0), and the GPU's clocks. The first -SkipSeconds of the capture aren't in those figures:
-# compiling shaders and allocating would otherwise be counted, and a median is what to compare between runs.
+# should stay at 0), and the GPU's clocks. The first -SkipSeconds from the first frame aren't in those figures:
+# the GPU ramping up and things first used would otherwise be counted, and a median is what to compare
+# between runs. A zone's self time is over the whole capture.
 #
 # Needs the Tracy 0.14.1 tools (tracy-capture, tracy-csvexport), the same version as the
 # client in vcpkg; `winget install wolfpld.tracy` provides them.
@@ -76,6 +77,7 @@ $engineStart = @{
 if ($EngineArgs.Count -gt 0) {
     $engineStart.ArgumentList = $EngineArgs # Start-Process rejects an empty list
 }
+$engineStartTime = Get-Date
 $engineProcess = Start-Process @engineStart
 
 # What the GPU was doing: a laptop's clocks can move a number more than a change being measured.
@@ -129,14 +131,16 @@ $plotValues = @{}
 $first = [double]::MaxValue
 $rows = [System.Collections.Generic.List[string[]]]::new()
 while ($null -ne ($line = $reader.ReadLine())) {
-    # A name can hold a comma only in quotes, and ours don't: a comma there is a bug to see, not to parse around.
+    # A comma in a name would move every field along and quietly lose the row: stop instead.
     $fields = $line.Split(',')
-    if ($fields.Count -le $durationColumn) { continue }
+    if ($fields.Count -ne $header.Count) { throw "events.csv: a name holds a comma, which this can't read: $line" }
     $at = [double]$fields[$timeColumn]
-    if ($at -lt $first) { $first = $at }
+    # From the first frame's numbers: anything earlier is loading, whatever it takes.
+    if ($at -lt $first -and $fields[$nameColumn].Trim('"') -eq 'gpu frame ms') { $first = $at }
     $rows.Add($fields)
 }
 $reader.Close()
+if ($first -eq [double]::MaxValue) { throw "no frame reached the GPU timers in this capture; see $out\engine.log" }
 $from = $first + $SkipSeconds * 1e9
 foreach ($fields in $rows) {
     if ([double]$fields[$timeColumn] -lt $from) { continue }
@@ -151,17 +155,23 @@ foreach ($fields in $rows) {
     }
 }
 $rows = $null
+if (-not $plotValues.ContainsKey('gpu frame ms')) {
+    throw "no frames past the first $SkipSeconds s: capture for longer than that (-Seconds $Seconds)"
+}
 
 function Get-Figures([string]$kind, [string]$name, [System.Collections.Generic.List[double]]$values) {
     $values.Sort()
-    $percentile = { param($p) $values[[math]::Min([int]($p * $values.Count), $values.Count - 1)] }
+    # The value with that share of them at or below it.
+    $percentile = { param($p) $values[[math]::Max([int][math]::Ceiling($p * $values.Count) - 1, 0)] }
+    $middle = [int][math]::Floor($values.Count / 2)
+    $median = if ($values.Count % 2 -eq 1) { $values[$middle] } else { ($values[$middle - 1] + $values[$middle]) / 2 }
     $total = 0.0
     foreach ($value in $values) { $total += $value }
     [pscustomobject]@{
         kind   = $kind
         name   = $name
         count  = $values.Count
-        median = [math]::Round((& $percentile 0.5), 3)
+        median = [math]::Round($median, 3)
         p95    = [math]::Round((& $percentile 0.95), 3)
         p99    = [math]::Round((& $percentile 0.99), 3)
         min    = [math]::Round($values[0], 3)
@@ -176,28 +186,47 @@ $plotFigures = @($plotValues.GetEnumerator() | Sort-Object Key | ForEach-Object 
     Export-Csv (Join-Path $out 'summary.csv') -NoTypeInformation
 
 Write-Host ""
-Write-Host "Top zones by total time, past the first $SkipSeconds s, in us ($out):"
+$selfTimes = @{}
+foreach ($zone in (Import-Csv (Join-Path $out 'zones_self.csv'))) { $selfTimes[$zone.name] = [double]$zone.total_ns }
+Write-Host "Top zones by total time, past the first $SkipSeconds s from the first frame, in us ($out):"
 $zoneFigures | Sort-Object total -Descending | Select-Object -First $Top |
-    Select-Object @{ n = 'zone'; e = { $_.name } }, count, median, p95, p99, max, mean |
+    Select-Object @{ n = 'zone'; e = { $_.name } }, count, @{ n = 'total_ms'; e = { [math]::Round($_.total / 1e3, 2) } },
+        @{ n = 'self_ms_all'; e = { [math]::Round($selfTimes[$_.name] / 1e6, 2) } }, median, p95, p99, max, mean |
     Format-Table -AutoSize | Out-String | Write-Host
 
-Write-Host "Plots, past the first $SkipSeconds s:"
+Write-Host "Plots, past the first $SkipSeconds s from the first frame:"
 $plotFigures | Select-Object @{ n = 'plot'; e = { $_.name } }, @{ n = 'samples'; e = { $_.count } }, median, p95, p99, min, max, mean |
     Format-Table -AutoSize | Out-String | Write-Host
 
+# The GPU log over the same span: launch and exit would otherwise set its ranges. The engine's clock starts about
+# when its process does, so this lines up to within a second or so, which is all a once-a-second log can tell.
 $gpuLog = Join-Path $out 'gpu.csv'
 if ((Test-Path $gpuLog) -and (Get-Item $gpuLog).Length -gt 0) {
     $samples = @(Import-Csv $gpuLog)
-    if ($samples.Count -gt 0) {
-        $names = $samples[0].PSObject.Properties.Name
+    $names = if ($samples.Count -gt 0) { $samples[0].PSObject.Properties.Name } else { @() }
+    $timeName = $names | Where-Object { $_ -like '*timestamp*' } | Select-Object -First 1
+    $since = $engineStartTime.AddSeconds($from / 1e9)
+    $kept = @($samples | Where-Object {
+            $when = [datetime]::MinValue
+            [datetime]::TryParse($_.$timeName, [ref]$when) -and $when -ge $since
+        })
+    if ($kept.Count -gt 0) {
+        # Some GPUs and laptops report [N/A] here, and the last line can be cut short: skip what isn't a number.
         $range = {
             param($match)
             $column = $names | Where-Object { $_ -like $match } | Select-Object -First 1
-            $values = $samples | ForEach-Object { [double]$_.$column } | Measure-Object -Minimum -Maximum
-            "$($values.Minimum) to $($values.Maximum)"
+            $numbers = foreach ($sample in $kept) {
+                $number = 0.0
+                if ([double]::TryParse([string]$sample.$column, [ref]$number)) { $number }
+            }
+            if (-not $numbers) { return 'not reported' }
+            $values = $numbers | Sort-Object
+            $all = @($values)
+            "{0} (from {1} to {2})" -f $all[[int][math]::Floor($all.Count / 2)], $all[0], $all[$all.Count - 1]
         }
-        $states = ($samples | ForEach-Object { $_.$($names | Where-Object { $_ -like '*pstate*' } | Select-Object -First 1).Trim() } | Sort-Object -Unique) -join ', '
-        Write-Host ("GPU over the run: {0}; graphics clock {1} MHz; power {2} W; {3} C; busy {4} %" -f $states,
+        $stateName = $names | Where-Object { $_ -like '*pstate*' } | Select-Object -First 1
+        $states = (@($kept | ForEach-Object { ([string]$_.$stateName).Trim() }) | Sort-Object -Unique) -join ', '
+        Write-Host ("GPU past the first {0} s, median: {1}; graphics clock {2} MHz; power {3} W; {4} C; busy {5} %" -f $SkipSeconds, $states,
             (& $range '*clocks.current.graphics*'), (& $range '*power.draw*'), (& $range '*temperature.gpu*'), (& $range '*utilization.gpu*'))
     }
 }
