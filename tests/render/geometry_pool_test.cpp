@@ -161,7 +161,8 @@ struct PoolScene {
     // The engine's frame, drawing these meshes at the origin, left in flight.
     void submit(std::initializer_list<AssetHandle> meshes) const { submit(frame_of(meshes)); }
 
-    void submit(const de::world::RenderFrame& frame) const {
+    void submit(const de::world::RenderFrame& frame, const de::render::SceneLighting& lighting = {},
+                de::render::SceneView view = de::render::SceneView::BaseColor) const {
         assets.update();
         assets.wait_all();
         gpu_assets.update();
@@ -170,7 +171,7 @@ struct PoolScene {
         graph.begin(kSize, kSize);
         const de::render::GraphTexture color =
             graph.import_texture({.texture = target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-        renderer.add_passes(graph, color, de::rhi::Format::RGBA8Unorm, frame, {}, de::render::SceneView::BaseColor);
+        renderer.add_passes(graph, color, de::rhi::Format::RGBA8Unorm, frame, lighting, view);
         graph.execute();
         device.end_frame();
     }
@@ -323,6 +324,7 @@ TEST_CASE("every draw in one indirect call reads its own instance and material")
         CHECK(is_green(pixels, kMiddle));
         CHECK(is_red(pixels, kRight));
         CHECK(scene.renderer.stats().draws == 3);
+        CHECK(scene.renderer.stats().indirect_calls == 1 + de::render::kShadowCascadeCount);
     });
 }
 
@@ -365,8 +367,9 @@ TEST_CASE("draws of every pipeline state in one frame read their own records") {
             REQUIRE(
                 scene.vfs.write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span())
                     .ok());
-            put_squares(scene.vfs, mesh_id, material_id, {kind.x_m});
-            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = scene.load(mesh_id)});
+            put_squares(scene.vfs, mesh_id, material_id, {0.0f});
+            frame.instances.push(
+                {.transform = {1, 0, 0, kind.x_m, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = scene.load(mesh_id)});
             ++id;
         }
         scene.uploader.flush_and_wait();
@@ -381,6 +384,52 @@ TEST_CASE("draws of every pipeline state in one frame read their own records") {
         CHECK(scene.renderer.stats().drawn == 4);
         CHECK(scene.renderer.stats().draws == 4);
         CHECK(scene.renderer.stats().shadow_draws == 16);
+        // A call for each of the G-buffer's pipeline states, and casters have two.
+        CHECK(scene.renderer.stats().indirect_calls == 4 + (2 * de::render::kShadowCascadeCount));
+    });
+}
+
+TEST_CASE("a shadow caster reads its own instance and material") {
+    with_pool({}, [](const PoolScene& scene) {
+        constexpr AssetId kSolidMaterial = AssetId::from_value(0xa00);
+        constexpr AssetId kThinMaterial = AssetId::from_value(0xa01);
+        constexpr AssetId kSolid = AssetId::from_value(0xa02);
+        constexpr AssetId kThin = AssetId::from_value(0xa03);
+        const auto put_masked = [&](AssetId id, float alpha) {
+            de::cooker::MaterialBuild build;
+            build.alpha_mode = de::asset::AlphaMode::Masked;
+            build.set_param(de::asset::material::kBaseColor, 1.0f, 1.0f, 1.0f, alpha);
+            const auto material = de::cooker::cook_material(build, id);
+            REQUIRE(
+                scene.vfs.write_file(de::asset::cooked_path(id, AssetType::Material).c_str(), material.span()).ok());
+        };
+        put_masked(kSolidMaterial, 0.8f); // above the cutoff: it casts
+        put_masked(kThinMaterial, 0.2f);  // below: it doesn't
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSolid, kSolidMaterial, {0.0f});
+        put_squares(scene.vfs, kThin, kThinMaterial, {0.0f});
+        const AssetHandle wall = scene.load(kCenter);
+        const AssetHandle solid = scene.load(kSolid);
+        const AssetHandle thin = scene.load(kThin);
+        scene.uploader.flush_and_wait();
+
+        // A 2 m wall at z = 0, and two 0.5 m squares 1 m in front of it, one above the other. The sun is at (1, 0, 2),
+        // so each would shadow the wall 0.5 m to its left. Both are masked, so they share a call, and their records
+        // come after the wall's.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.instances.push({.transform = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}, .mesh = wall});
+        frame.instances.push({.transform = {0.5f, 0, 0, 0.6f, 0, 0.5f, 0, 0.6f, 0, 0, 0.5f, 1}, .mesh = solid});
+        frame.instances.push({.transform = {0.5f, 0, 0, 0.6f, 0, 0.5f, 0, -0.6f, 0, 0, 0.5f, 1}, .mesh = thin});
+        de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        scene.submit(frame, light, de::render::SceneView::ShadowMask);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        // About 19.5 pixels a meter on the wall: x = 0.1 m is 2 pixels right of the middle, y = +-0.6 m 12 up or down.
+        constexpr uint32_t kShadowColumn = kMiddle + 2;
+        CHECK(texel(pixels, kShadowColumn, kMiddle - 12)[0] < 40);  // the solid one's shadow
+        CHECK(texel(pixels, kMiddle - 8, kMiddle - 12)[0] > 215);   // and only there: x = -0.4 m is past its edge
+        CHECK(texel(pixels, kShadowColumn, kMiddle + 12)[0] > 215); // the thin one casts none
+        CHECK(texel(pixels, kMiddle - 12, kMiddle)[0] > 215);       // lit
     });
 }
 

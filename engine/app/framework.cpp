@@ -413,6 +413,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 const render::SceneRendererStats drawn = scene_renderer->stats();
                 DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
                 DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
+                DE_PROFILE_PLOT("indirect calls", static_cast<int64_t>(drawn.indirect_calls));
                 static_cast<void>(drawn);
             }
         }
