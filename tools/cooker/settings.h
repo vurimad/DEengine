@@ -37,11 +37,11 @@ struct TextureSettings {
 
 // The "mesh" section.
 struct MeshSettings {
-    float scale = 1.0f;      // applied on top of the importer's conversion to meters
-    uint32_t lod_count = 4;  // LOD 0 included; the chain stops early when a mesh won't simplify
-    float lod_ratio = 0.5f;  // triangles kept from one LOD to the next
-    float lod_error = 0.02f; // largest error a LOD may add, relative to the mesh's size
-    bool optimize = true;    // vertex cache, overdraw and fetch order
+    float scale = 1.0f;     // applied on top of the importer's conversion to meters
+    uint32_t lod_count = 8; // LOD 0 included; the chain stops early when a mesh won't simplify
+    float lod_ratio = 0.5f; // triangles kept from one LOD to the next
+    float lod_error = 0.5f; // largest error a LOD may add, relative to the mesh's size
+    bool optimize = true;   // vertex cache, overdraw and fetch order
 };
 
 // The defaults a usage implies, as a "texture" section (the bottom layer of a texture's settings).

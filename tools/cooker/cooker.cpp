@@ -33,7 +33,7 @@ namespace {
 
 // Bumped when the cooker writes different files for the same inputs (a better encoder, a fixed
 // bug): every source cooks again. Format versions are hashed in too, per kind.
-constexpr uint64_t kCookerVersion = 2; // 2: cell children are as static as their parent
+constexpr uint64_t kCookerVersion = 6; // 2: cell children are as static as their parent; 6: longer LOD chains
 
 constexpr std::string_view kShaderTests = "shaders/tests/";
 

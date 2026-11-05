@@ -109,6 +109,8 @@ struct SceneRendererStats {
     // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.
     uint32_t visible_draws = 0;
     uint32_t visible_shadow_draws = 0;
+    uint32_t visible_triangles = 0;
+    uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 
@@ -159,6 +161,10 @@ public:
     void add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format, const world::RenderFrame& frame,
                     const SceneLighting& lighting, SceneView view = SceneView::Lit, bool taa = false,
                     rhi::Color empty = kEmptySceneColor);
+
+    // How far a LOD may lie from LOD 0 where it's picked: this many pixels on screen, and shadow map texels in a
+    // cascade. 0 draws LOD 0 everywhere, to compare with.
+    void set_lod_error_pixels(float pixels);
 
     SceneRendererStats stats() const;
 

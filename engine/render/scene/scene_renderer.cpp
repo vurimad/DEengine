@@ -244,9 +244,12 @@ struct GpuCullView {
     uint32_t plane_count = 0;
     uint32_t first_list = 0;
     uint32_t lists_by_kind = 0;
-    uint32_t padding = 0;
+    uint32_t lod_perspective = 0;
+    float depth_plane[4] = {};
+    float lod_scale = 0.0f;
+    float padding_end[3] = {};
 };
-static_assert(sizeof(GpuCullView) == 112);
+static_assert(sizeof(GpuCullView) == 144);
 
 struct GpuDrawList {
     uint32_t first_slot = 0;
@@ -254,6 +257,8 @@ struct GpuDrawList {
 };
 
 constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
+// The counts the cull writes: per draw list, then the triangles it kept for the camera and for the cascades.
+constexpr uint32_t kCullCounterCount = kDrawListCount + 2;
 constexpr uint32_t kNoMesh = UINT32_MAX;
 // The views and lists, then the instances: their rows, and then their slots in the mesh table.
 constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
@@ -279,6 +284,7 @@ struct CullPush {
     uint64_t instances = 0;
     uint64_t instance_meshes = 0;
     uint64_t meshes = 0;
+    uint64_t lods = 0;
     uint64_t parts = 0;
     uint64_t materials = 0;
     uint64_t views = 0;
@@ -348,6 +354,7 @@ struct SceneRendererState {
     bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
     bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
     bool warned_draw_limit = false;
+    float lod_error_pixels = 1.0f;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -550,12 +557,14 @@ struct SceneRendererState {
         cull_readback_written[slot] = false;
         device->invalidate_mapped(cull_readback[slot]);
         const std::span<const std::byte> mapped = device->mapped(cull_readback[slot]);
-        uint32_t counts[kDrawListCount];
+        uint32_t counts[kCullCounterCount];
         std::memcpy(counts, mapped.data(), sizeof(counts));
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
             const uint32_t kept = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
             (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
         }
+        stats.visible_triangles = counts[kDrawListCount];
+        stats.visible_shadow_triangles = counts[kDrawListCount + 1];
     }
 
     // A list the cull filled, with the bound pipeline and the geometry pool's index buffer.
@@ -708,18 +717,39 @@ struct SceneRendererState {
 
     // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
-                         CullPlan& plan) {
+                         uint32_t height, CullPlan& plan) {
+        // At 0, LOD 0 everywhere, however small a LOD's error.
+        const auto lod_scale_for = [this](float per_unit_of_error) {
+            return lod_error_pixels > 0.0f ? per_unit_of_error / lod_error_pixels : -1.0f;
+        };
         // Made here and copied: this memory is fast to write and very slow to read.
         GpuCullView views[kCullViewCount];
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
         // plane.
-        views[0] = {.plane_count = 4, .first_list = 0, .lists_by_kind = 1};
+        views[0] = {.plane_count = 4,
+                    .first_list = 0,
+                    .lists_by_kind = 1,
+                    .lod_perspective = 1,
+                    .lod_scale = lod_scale_for(static_cast<float>(height) /
+                                               (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f)))};
+        // Depth along where it looks, its -Z axis. A camera's transform may scale.
+        const float* const camera = frame.camera.transform;
+        const float look[3] = {-camera[2], -camera[6], -camera[10]};
+        const float look_length = std::sqrt((look[0] * look[0]) + (look[1] * look[1]) + (look[2] * look[2]));
+        for (uint32_t k = 0; k < 3; ++k) {
+            views[0].depth_plane[k] = look[k] / look_length;
+        }
+        views[0].depth_plane[3] = -((views[0].depth_plane[0] * camera[3]) + (views[0].depth_plane[1] * camera[7]) +
+                                    (views[0].depth_plane[2] * camera[11]));
         set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
         // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
         // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             GpuCullView& view = views[1 + c];
-            view = {.plane_count = 6, .first_list = cascade_list(c, false), .lists_by_kind = 0};
+            view = {.plane_count = 6,
+                    .first_list = cascade_list(c, false),
+                    .lists_by_kind = 0,
+                    .lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f))};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             set_side_planes(view, view_proj);
             std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
@@ -871,7 +901,7 @@ struct SceneRendererState {
             std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
-        write_cull_data(mapped, frame, scene, plan);
+        write_cull_data(mapped, frame, scene, height, plan);
         device->flush_mapped(buffer, 0, frame_bytes(frame.instances.size()));
         return true;
     }
@@ -1174,14 +1204,14 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const auto& cull_clear = graph.add_pass<CullClearPass>(
         "cull clear",
         [&](PassBuilder& pass, CullClearPass& data) {
-            data.counts = pass.create_buffer({.size = kDrawListCount * sizeof(uint32_t),
+            data.counts = pass.create_buffer({.size = kCullCounterCount * sizeof(uint32_t),
                                               .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect |
                                                        rhi::BufferUsage::CopyDst | rhi::BufferUsage::CopySrc,
                                               .debug_name = "draw counts"});
             pass.use(data.counts, rhi::ResourceState::CopyDst);
         },
         [](const CullClearPass& data, PassContext& context) {
-            context.list.fill_buffer(context.buffer(data.counts), 0, kDrawListCount * sizeof(uint32_t), 0);
+            context.list.fill_buffer(context.buffer(data.counts), 0, kCullCounterCount * sizeof(uint32_t), 0);
         });
     const GraphBuffer draw_counts = cull_clear.counts;
     struct CullPass {
@@ -1217,6 +1247,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             const CullPush push{.instances = data.frame_address + kInstancesOffset,
                                 .instance_meshes = data.frame_address + instance_meshes_offset(data.plan.instances),
                                 .meshes = renderer.gpu_assets->mesh_table_address(),
+                                .lods = renderer.gpu_assets->lod_table_address(),
                                 .parts = renderer.gpu_assets->part_table_address(),
                                 .materials = renderer.gpu_assets->material_table_address(),
                                 .views = data.frame_address + kCullViewsOffset,
@@ -1419,7 +1450,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // The cull's counts, for the stats. Made once: without it the frame goes on, and they stay 0.
     if (!state.cull_readback[cull_slot].is_valid()) {
         const core::Result<rhi::BufferHandle> readback =
-            state.device->create_buffer({.size = kDrawListCount * sizeof(uint32_t),
+            state.device->create_buffer({.size = kCullCounterCount * sizeof(uint32_t),
                                          .usage = rhi::BufferUsage::CopyDst,
                                          .memory = rhi::MemoryLocation::Readback,
                                          .debug_name = "draw counts readback"});
@@ -1442,7 +1473,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             },
             [draw_counts, readback, written = &state.cull_readback_written[cull_slot]](PassContext& context) {
                 context.list.copy_buffer(context.buffer(draw_counts), 0, context.buffer(readback), 0,
-                                         kDrawListCount * sizeof(uint32_t));
+                                         kCullCounterCount * sizeof(uint32_t));
                 *written = true;
             });
     }
@@ -1745,6 +1776,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.draw(3);
             context.list.end_rendering();
         });
+}
+
+void SceneRenderer::set_lod_error_pixels(float pixels) {
+    state_->lod_error_pixels = pixels;
 }
 
 SceneRendererStats SceneRenderer::stats() const {

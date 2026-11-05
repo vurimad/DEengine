@@ -41,15 +41,22 @@ public struct GpuDraw
 };
 
 // The tables and lists of the GPU cull (scene.cull). All of these match C++ structs of the same name: the first
-// two in engine/render/scene/gpu_assets.h, the rest in scene_renderer.cpp.
+// three in engine/render/scene/gpu_assets.h, the rest in scene_renderer.cpp.
 public struct GpuMeshInfo
 {
     public float3 center; // of its bounding sphere, in object space
     public float radius;
     public uint vertex_offset; // its first vertex in the geometry pool
-    public uint first_part;    // of LOD 0, in the part table
-    public uint part_count;
+    public uint first_lod;     // in the LOD table
+    public uint lod_count;
     public uint padding;
+};
+
+public struct GpuMeshLod
+{
+    public float error_m;  // object space: how far this LOD may lie from LOD 0. Rises with each LOD
+    public uint first_part; // in the part table
+    public uint part_count;
 };
 
 public struct GpuMeshPart
@@ -68,7 +75,11 @@ public struct GpuCullView
     public uint plane_count;
     public uint first_list;
     public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
-    public uint padding;
+    public uint lod_perspective; // a LOD's error shrinks with depth, or else it doesn't
+    public float4 depth_plane;   // dot(xyz, p) + w is the depth in front of the eye, in render-origin space
+    public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
+                                 // be. Below 0: LOD 0 everywhere
+    public float padding[3];
 };
 
 public struct GpuDrawList

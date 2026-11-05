@@ -746,6 +746,190 @@ TEST_CASE("a malformed embedded image is reported, not trusted") {
     CHECK(has_message(report, "content/broken/bad.gltf", "isn't valid base64"));
 }
 
+TEST_CASE("a mesh with its vertices split all over still gets a long LOD chain, with errors that only rise") {
+    const Sandbox sandbox;
+    std::vector<Vertex> welded;
+    std::vector<uint32_t> welded_indices;
+    grid(48, welded, welded_indices);
+    // Every triangle has vertices of its own, kept apart by its uvs, as in a scan with its uvs in pieces.
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    for (size_t i = 0; i < welded_indices.size(); ++i) {
+        Vertex vertex = welded[welded_indices[i]];
+        const size_t triangle = i / 3;
+        vertex.uv[0] += 0.001f * static_cast<float>(triangle);
+        indices.push_back(static_cast<uint32_t>(vertices.size()));
+        vertices.push_back(vertex);
+    }
+    write_src(sandbox, "content/split/split.gltf", gltf(vertices, indices, 0.0f, R"([{}])", "[]", "[]"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    REQUIRE(report.ok());
+    const AssetId split = asset_id(guid_of(vfs, "src:/meta/split/split.gltf.json"));
+
+    Cooked file(vfs, split, AssetType::Mesh);
+    const auto& mesh = file.load<MeshAsset>();
+    const auto lods = mesh.lods.get(file.data());
+    const auto parts = mesh.parts.get(file.data());
+    CHECK(lods.size() >= 6); // what the default setting allows, this far
+    CHECK(lods.size() <= 8);
+    for (size_t i = 1; i < lods.size(); ++i) {
+        CAPTURE(i);
+        CHECK(lods[i].error >= lods[i - 1].error);
+        CHECK(parts[lods[i].first_part].index_count < parts[lods[i - 1].first_part].index_count * 3 / 4);
+    }
+}
+
+TEST_CASE("a mesh that simplifies well keeps its uv seams in every LOD") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(48, vertices, indices);
+    // A seam down the middle: each side has its own vertices along it, with uvs far apart.
+    constexpr uint32_t kN = 48;
+    std::vector<Vertex> split_vertices;
+    std::vector<uint32_t> split_indices;
+    const auto add_side = [&](uint32_t first_x, uint32_t end_x, float uv_offset) {
+        const auto first_vertex = static_cast<uint32_t>(split_vertices.size());
+        for (uint32_t y = 0; y <= kN; ++y) {
+            for (uint32_t x = first_x; x <= end_x; ++x) {
+                Vertex vertex = vertices[(y * (kN + 1)) + x];
+                vertex.uv[0] += uv_offset;
+                split_vertices.push_back(vertex);
+            }
+        }
+        const uint32_t width = end_x - first_x + 1;
+        for (uint32_t y = 0; y < kN; ++y) {
+            for (uint32_t x = 0; x + 1 < width; ++x) {
+                const uint32_t i = first_vertex + (y * width) + x;
+                for (const uint32_t index : {i, i + width, i + 1, i + 1, i + width, i + width + 1}) {
+                    split_indices.push_back(index);
+                }
+            }
+        }
+    };
+    add_side(0, kN / 2, 0.0f);
+    add_side(kN / 2, kN, 10.0f);
+    write_src(sandbox, "content/seam/seam.gltf", gltf(split_vertices, split_indices, 0.0f, R"([{}])", "[]", "[]"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    REQUIRE(report.ok());
+    const AssetId seam = asset_id(guid_of(vfs, "src:/meta/seam/seam.gltf.json"));
+
+    Cooked file(vfs, seam, AssetType::Mesh);
+    const auto& mesh = file.load<MeshAsset>();
+    const auto lods = mesh.lods.get(file.data());
+    const auto parts = mesh.parts.get(file.data());
+    const auto mesh_vertices = mesh.vertices.get(file.data());
+    const auto mesh_indices = mesh.indices.get(file.data());
+    REQUIRE(lods.size() >= 4);
+    for (size_t l = 0; l < 4; ++l) {
+        const MeshPart& part = parts[lods[l].first_part];
+        uint32_t crossing = 0;
+        for (uint32_t i = 0; i < part.index_count; i += 3) {
+            const auto side = [&](uint32_t corner) {
+                return mesh_vertices[mesh_indices[part.first_index + i + corner]].uv[0] > 5.0f;
+            };
+            crossing += side(0) != side(1) || side(1) != side(2) ? 1 : 0;
+        }
+        CAPTURE(l);
+        CHECK(crossing == 0); // a triangle across it would smear the whole texture over itself
+    }
+}
+
+TEST_CASE("a flat mesh's LODs have an error for the colors and uvs they lose") {
+    de::cooker::ModelData model;
+    de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
+    primitive.material = 0;
+    constexpr uint32_t kCells = 32;
+    for (uint32_t y = 0; y <= kCells; ++y) {
+        for (uint32_t x = 0; x <= kCells; ++x) {
+            const float u = static_cast<float>(x) / kCells;
+            const float v = static_cast<float>(y) / kCells;
+            de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
+            vertex.position[0] = u;
+            vertex.position[2] = v; // flat, so every LOD has the same shape
+            vertex.color[0] = 0.5f + (0.5f * std::sin(u * 40.0f) * std::sin(v * 30.0f)); // painted
+        }
+    }
+    for (uint32_t y = 0; y < kCells; ++y) {
+        for (uint32_t x = 0; x < kCells; ++x) {
+            const uint32_t a = (y * (kCells + 1)) + x;
+            const uint32_t b = a + kCells + 1;
+            for (const uint32_t index : {a, b, a + 1, a + 1, b, b + 1}) {
+                primitive.indices.push(index);
+            }
+        }
+    }
+    static_cast<void>(model.materials.emplace());
+    de::cooker::Diagnostics diagnostics;
+    const AssetId materials[] = {AssetId::from_value(0x1)};
+    const auto cooked =
+        de::cooker::cook_mesh(model, materials, {.lod_count = 4}, AssetId::from_value(0x2), "test", diagnostics);
+    REQUIRE(cooked.ok());
+    const auto& mesh = *reinterpret_cast<const MeshAsset*>(cooked->data());
+    const auto lods = mesh.lods.get(cooked->data());
+    REQUIRE(lods.size() >= 2);
+    CHECK(lods[1].error > 0.0f);
+    CHECK(lods[lods.size() - 1].error > 0.01f); // a real share of its size, so it's only picked from far enough away
+}
+
+TEST_CASE("a part simplified away counts as that much error") {
+    // A big bumpy grid, and a tiny part of another material far off to its side, that simplifies to nothing.
+    de::cooker::ModelData model;
+    de::cooker::ModelPrimitive& big = model.primitives.emplace();
+    big.material = 0;
+    constexpr uint32_t kCells = 32;
+    for (uint32_t y = 0; y <= kCells; ++y) {
+        for (uint32_t x = 0; x <= kCells; ++x) {
+            const float u = static_cast<float>(x) / kCells;
+            const float v = static_cast<float>(y) / kCells;
+            de::cooker::ModelVertex& vertex = big.vertices.emplace();
+            vertex.position[0] = u * 4.0f;
+            vertex.position[1] = 0.1f * std::sin(u * 9.0f) * std::sin(v * 7.0f);
+            vertex.position[2] = v * 4.0f;
+        }
+    }
+    for (uint32_t y = 0; y < kCells; ++y) {
+        for (uint32_t x = 0; x < kCells; ++x) {
+            const uint32_t a = (y * (kCells + 1)) + x;
+            const uint32_t b = a + kCells + 1;
+            for (const uint32_t index : {a, b, a + 1, a + 1, b, b + 1}) {
+                big.indices.push(index);
+            }
+        }
+    }
+    de::cooker::ModelPrimitive& small = model.primitives.emplace();
+    small.material = 1;
+    constexpr float kSmallSize = 0.2f;
+    const float corners[4][3] = {{10, 0, 0}, {10 + kSmallSize, 0, 0}, {10, kSmallSize, 0}, {10, 0, kSmallSize}};
+    for (const auto& corner : corners) {
+        de::cooker::ModelVertex& vertex = small.vertices.emplace();
+        std::copy_n(corner, 3, vertex.position);
+    }
+    for (const uint32_t index : {0U, 2U, 1U, 0U, 1U, 3U, 0U, 3U, 2U, 1U, 2U, 3U}) {
+        small.indices.push(index);
+    }
+    static_cast<void>(model.materials.emplace());
+    static_cast<void>(model.materials.emplace());
+    de::cooker::Diagnostics diagnostics;
+    const AssetId materials[] = {AssetId::from_value(0x1), AssetId::from_value(0x2)};
+    const auto cooked =
+        de::cooker::cook_mesh(model, materials, {.lod_count = 8}, AssetId::from_value(0x3), "test", diagnostics);
+    REQUIRE(cooked.ok());
+    const auto& mesh = *reinterpret_cast<const MeshAsset*>(cooked->data());
+    const auto lods = mesh.lods.get(cooked->data());
+    bool any_gone = false;
+    for (size_t i = 1; i < lods.size(); ++i) {
+        CAPTURE(i);
+        if (lods[i].part_count < lods[0].part_count) {
+            any_gone = true;
+            CHECK(lods[i].error >= kSmallSize);
+        }
+    }
+    MESSAGE("a part was simplified away: ", any_gone);
+}
+
 TEST_CASE("LODs keep material seams closed") {
     const Sandbox sandbox;
     // One wavy grid, its left half in one material and its right half in another: the halves
