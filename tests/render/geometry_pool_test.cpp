@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -785,33 +786,58 @@ TEST_CASE("instances stay on the GPU until something about them changes") {
 TEST_CASE("a freed slot draws nothing, until something else takes it") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        fprintf(stderr, "DIAG step 1\n"); fflush(stderr);
         put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        fprintf(stderr, "DIAG step 2\n"); fflush(stderr);
         const AssetHandle red = scene.load(kCenter);
+        fprintf(stderr, "DIAG step 3\n"); fflush(stderr);
         const AssetHandle green = scene.load(kSides);
+        fprintf(stderr, "DIAG step 4\n"); fflush(stderr);
         scene.uploader.flush_and_wait();
+        fprintf(stderr, "DIAG step 5\n"); fflush(stderr);
 
         de::world::RenderFrame frame = PoolScene::frame_of({});
+        fprintf(stderr, "DIAG step 6\n"); fflush(stderr);
         frame.slot_count = 2;
+        fprintf(stderr, "DIAG step 7\n"); fflush(stderr);
         frame.instances.push(instance_at(red, 0, -1.0f));
+        fprintf(stderr, "DIAG step 8\n"); fflush(stderr);
         frame.instances.push(instance_at(red, 1, 1.0f));
+        fprintf(stderr, "DIAG step 9\n"); fflush(stderr);
         scene.submit(frame);
+        fprintf(stderr, "DIAG step 10\n"); fflush(stderr);
         frame.instances.clear();
+        fprintf(stderr, "DIAG step 11\n"); fflush(stderr);
         frame.freed_slots.push(0);
+        fprintf(stderr, "DIAG step 12\n"); fflush(stderr);
         scene.submit_for_stats(frame);
+        fprintf(stderr, "DIAG step 13\n"); fflush(stderr);
         CHECK(scene.renderer.stats().instances == 1);
+        fprintf(stderr, "DIAG step 14\n"); fflush(stderr);
         CHECK(scene.renderer.stats().draws == 1); // and the draw lists know
         CHECK(scene.renderer.stats().visible_draws == 1);
+        fprintf(stderr, "DIAG step 15\n"); fflush(stderr);
         de::core::Array<std::byte> pixels = de::test::read_texture(scene.device, scene.target);
+        fprintf(stderr, "DIAG step 16\n"); fflush(stderr);
         CHECK_FALSE(is_red(pixels, kLeft));
+        fprintf(stderr, "DIAG step 17\n"); fflush(stderr);
         CHECK(is_red(pixels, kRight));
+        fprintf(stderr, "DIAG step 18\n"); fflush(stderr);
 
         frame.freed_slots.clear();
+        fprintf(stderr, "DIAG step 19\n"); fflush(stderr);
         frame.instances.push(instance_at(green, 0, 0.0f));
+        fprintf(stderr, "DIAG step 20\n"); fflush(stderr);
         scene.submit_for_stats(frame);
+        fprintf(stderr, "DIAG step 21\n"); fflush(stderr);
         CHECK(scene.renderer.stats().instances == 2);
+        fprintf(stderr, "DIAG step 22\n"); fflush(stderr);
         pixels = de::test::read_texture(scene.device, scene.target);
+        fprintf(stderr, "DIAG step 23\n"); fflush(stderr);
         CHECK(is_green(pixels, kMiddle));
+        fprintf(stderr, "DIAG step 24\n"); fflush(stderr);
         CHECK(is_red(pixels, kRight));
+        fprintf(stderr, "DIAG step 25\n"); fflush(stderr);
     });
 }
 

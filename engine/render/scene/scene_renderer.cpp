@@ -12,6 +12,7 @@
 #include <glm/mat4x4.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <new>
@@ -1382,6 +1383,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             [renderer = &state, pipeline = instance_update, frame_address,
              updates = plan.updates](PassContext& context) {
                 DE_PROFILE_ZONE("instance update pass");
+                fprintf(stderr, "DIAG update pass %u\n", updates); fflush(stderr);
                 const InstanceUpdatePush push{.updates = frame_address + kInstanceUpdatesOffset,
                                               .instances = renderer->instance_rows_address,
                                               .instance_meshes = renderer->instance_meshes_address,
@@ -1418,6 +1420,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         },
         [](const CullPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gpu cull pass");
+            fprintf(stderr, "DIAG cull slots %u draws %u\n", data.plan.slots, data.plan.draws); fflush(stderr);
             const SceneRendererState& renderer = *data.state;
             if (data.plan.slots == 0) {
                 return;
