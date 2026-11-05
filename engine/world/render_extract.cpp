@@ -1,5 +1,6 @@
 #include "world/render_extract.h"
 
+#include "core/assert.h"
 #include "core/job_system.h"
 #include "core/profile.h"
 
@@ -65,6 +66,7 @@ void register_render_components(flecs::world& ecs) {
     ecs.component<MeshInstance>("de::MeshInstance").member<asset::AssetHandle>("mesh");
     ecs.component<Camera>("de::Camera").member<float>("vertical_fov_rad").member<float>("near_m");
     ecs.component<ActiveCamera>("de::ActiveCamera").member<flecs::entity_t>("entity");
+    ecs.component<FogVolume>("de::FogVolume");
 }
 
 namespace {
@@ -108,7 +110,41 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
         DE_PROFILE_ZONE("render extract view");
         extract_camera(it.world(), *desc.alpha, *desc.frame);
         desc.frame->instances.clear(); // keeps its capacity: no allocation once the world has settled
+        desc.frame->fog_volumes.clear();
     });
+    // A few, not worth a job. Moving ones are where they're seen, like anything else.
+    ecs.system<const WorldTransform, const PreviousWorldTransform, const FogVolume>("de::ExtractRenderFogVolumes")
+        .kind(phase)
+        .run([desc](flecs::iter& it) {
+            DE_PROFILE_ZONE("render extract fog volumes");
+            while (it.next()) {
+                const auto currents = it.field<const WorldTransform>(0);
+                const auto previouses = it.field<const PreviousWorldTransform>(1);
+                const auto volumes = it.field<const FogVolume>(2);
+                for (const auto entity_row : it) {
+                    const WorldTransform& current = currents[entity_row];
+                    const PreviousWorldTransform& previous = previouses[entity_row];
+                    const FogVolume& volume = volumes[entity_row];
+                    DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f); // cooked ones are checked at load
+                    const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
+                    const Vec3 center(seen.position - desc.frame->origin);
+                    const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
+                    RenderFogVolume out{
+                        .density_per_m = volume.density_per_m, .edge_m = volume.edge_m, .ellipsoid = volume.ellipsoid};
+                    for (int row = 0; row < 3; ++row) {
+                        const Vec3 axis(to_axes[0][row], to_axes[1][row], to_axes[2][row]);
+                        out.to_local[static_cast<size_t>(row) * 4 + 0] = axis.x;
+                        out.to_local[static_cast<size_t>(row) * 4 + 1] = axis.y;
+                        out.to_local[static_cast<size_t>(row) * 4 + 2] = axis.z;
+                        out.to_local[static_cast<size_t>(row) * 4 + 3] = -glm::dot(axis, center);
+                        out.center[row] = center[row];
+                        out.half_extents[row] = std::abs(seen.scale[row]);
+                        out.tint[row] = volume.tint[row];
+                    }
+                    desc.frame->fog_volumes.push(out);
+                }
+            }
+        });
     // Every table cut into chunks first (the column pointers stay valid: nothing structural happens
     // during the phase), then one parallel job over all chunks, whatever the tables' sizes.
     ecs.system<const WorldTransform, const PreviousWorldTransform, const MeshInstance>("de::ExtractRenderInstances")

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/math.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
@@ -27,6 +28,9 @@ struct FrameStats {
     rhi::UploaderStats uploads{};
     std::span<const render::PassGpuTime> gpu_passes{}; // RenderGraph::gpu_times(): copied by record()
     float gpu_frame_ms = 0.0f;
+    bool has_camera = false; // the active camera's place, to come back to a spot
+    DVec3 camera_position{0.0};
+    Quat camera_rotation{1.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // The frame stats panel (M0a): frame time and its history, heap allocations per frame, GPU memory

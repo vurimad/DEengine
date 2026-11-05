@@ -18,20 +18,26 @@ set_source_files_properties(shader_compiler.cpp PROPERTIES COMPILE_OPTIONS "$<$<
 
 # Slang's runtime: the compiler library, its SPIR-V helpers and its precompiled standard modules,
 # which it loads from beside slang.dll. On Linux it finds them in vcpkg's lib folder through the
-# rpath; on Windows they are copied next to each executable that compiles shaders. slang-llvm
-# (CPU targets, 80 MB) is left out.
+# rpath; on Windows they are copied next to the executables that compile shaders, which share a
+# folder: by one target they all depend on, since copying it after each link collides in a parallel
+# build. slang-llvm (CPU targets, 80 MB) is left out.
 function(de_deploy_slang_runtime target)
     if(NOT WIN32)
         return()
     endif()
-    set(bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
-    file(GLOB modules LIST_DIRECTORIES true "${bin}/slang-standard-module-*")
-    get_filename_component(modules_name "${modules}" NAME)
-    add_custom_command(TARGET ${target} POST_BUILD
-        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${bin}/slang.dll" "${bin}/slang-compiler.dll" "${bin}/slang-glslang.dll" "${bin}/slang-glsl-module.dll"
-            "$<TARGET_FILE_DIR:${target}>"
-        COMMAND "${CMAKE_COMMAND}" -E copy_directory_if_different
-            "${modules}" "$<TARGET_FILE_DIR:${target}>/${modules_name}"
-        VERBATIM)
+    if(NOT TARGET de_slang_runtime)
+        set(bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+        file(GLOB modules LIST_DIRECTORIES true "${bin}/slang-standard-module-*")
+        get_filename_component(modules_name "${modules}" NAME)
+        set(destination "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>")
+        add_custom_target(de_slang_runtime
+            COMMAND "${CMAKE_COMMAND}" -E make_directory "${destination}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${bin}/slang.dll" "${bin}/slang-compiler.dll" "${bin}/slang-glslang.dll" "${bin}/slang-glsl-module.dll"
+                "${destination}"
+            COMMAND "${CMAKE_COMMAND}" -E copy_directory_if_different
+                "${modules}" "${destination}/${modules_name}"
+            VERBATIM)
+    endif()
+    add_dependencies(${target} de_slang_runtime)
 endfunction()

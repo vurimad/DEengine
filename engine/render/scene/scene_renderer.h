@@ -99,11 +99,13 @@ struct SceneRendererDesc {
 };
 
 struct SceneRendererStats {
-    uint32_t instances = 0;      // in the frame
-    uint32_t drawn = 0;          // with their mesh on the GPU
-    uint32_t draws = 0;          // draw calls (one per mesh part)
-    uint32_t shadow_draws = 0;   // into the shadow cascades
-    float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
+    uint32_t fog_volumes = 0;         // in the froxel grid this frame
+    uint32_t fog_volumes_dropped = 0; // in reach, but past the limit of the nearest 64
+    uint32_t instances = 0;           // in the frame
+    uint32_t drawn = 0;               // with their mesh on the GPU
+    uint32_t draws = 0;               // draw calls (one per mesh part)
+    uint32_t shadow_draws = 0;        // into the shadow cascades
+    float froxel_reach_m = 0.0f;      // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 
 // A cascade of the sun's shadow map: where it reaches along the view, and its projection.

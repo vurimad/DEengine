@@ -103,11 +103,26 @@ struct FogPush {
     uint32_t depth = 0;
     uint32_t integrated = 0;
     uint32_t sampler = 0;
+    uint64_t fog_volumes = 0;
+    uint64_t fog_slice_masks = 0;
+    uint32_t fog_volume_count = 0;
+    uint32_t padding = 0;
 };
+
+// Matches FogVolumeData in shaders/common/fog.slang.
+struct GpuFogVolume {
+    float to_local[12] = {};
+    float half_extents[4] = {}; // w: edge, in meters
+    float tint_density[4] = {}; // w: extinction per meter
+    float shape[4] = {};        // x: 1 for an ellipsoid
+};
+static_assert(sizeof(GpuFogVolume) == 96);
 
 // Matches FogInjectPush in shaders/scene/fog_inject.slang.
 struct FogInjectPush {
     uint64_t frame = 0;
+    uint64_t fog_volumes = 0;
+    uint64_t fog_slice_masks = 0;
     uint32_t volume = 0;
     uint32_t atlas = 0;
     uint32_t width = 0;
@@ -117,6 +132,8 @@ struct FogInjectPush {
     float jitter_x = 0.0f;
     float jitter_y = 0.0f;
     float jitter_z = 0.0f;
+    uint32_t fog_volume_count = 0;
+    uint32_t padding = 0;
 };
 
 // Matches FogIntegratePush in shaders/scene/fog_integrate.slang.
@@ -133,6 +150,7 @@ struct FogIntegratePush {
 constexpr uint32_t kFroxelTilePixels = 8;
 constexpr uint32_t kFroxelSlices = 64;
 constexpr uint32_t kFroxelJitterSamples = 16; // the places a froxel's samples go through, over and over
+constexpr uint32_t kFroxelIdleFrames = 240;   // how long the kept textures wait for fog volumes to come back in view
 constexpr float kFroxelSliceOffsetM = 2.0f;
 constexpr rhi::Format kFroxelFormat = rhi::Format::RGBA16Float;
 
@@ -177,8 +195,14 @@ struct TonemapPush {
     uint32_t motion = 0;
 };
 
-constexpr uint64_t kInstancesOffset = 1024; // after the SceneFrame
-constexpr uint64_t kInstanceBytes = 96;     // six float4 rows: its transform, and last frame's
+constexpr uint64_t kFogVolumesOffset = 1024; // after the SceneFrame
+// The nearest this many in reach go into the froxel grid each frame.
+constexpr uint32_t kMaxFogVolumes = 64;
+static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
+// Per slice of the grid, which volumes reach it: a froxel tests only those.
+constexpr uint64_t kFogSliceMasksOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
+constexpr uint64_t kInstancesOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
+constexpr uint64_t kInstanceBytes = 96; // six float4 rows: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
@@ -280,8 +304,10 @@ struct SceneRendererState {
     uint32_t froxels_width = 0;
     uint32_t froxels_height = 0;
     uint32_t froxels_current = 0;
+    uint32_t froxels_idle_frames = 0;
     uint64_t froxels_frame = 0;   // the RenderFrame the injection last ran for: froxel_sets[froxels_current] then
     float froxels_reach_m = 0.0f; // where its slices reached
+    uint32_t fog_volumes_now = 0; // written into this frame's constants
     rhi::Format programs_format = rhi::Format::Unknown; // the target's, for the tonemap
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
@@ -484,6 +510,122 @@ struct SceneRendererState {
         return frame_buffers[slot];
     }
 
+    // What sets a fog volume's place in the view, worked out once a frame. The camera's axes without any
+    // scale it may carry, as the view itself.
+    struct FogVolumeCamera {
+        Vec3 position{0.0f};
+        Vec3 right{1.0f, 0.0f, 0.0f};
+        Vec3 up{0.0f, 1.0f, 0.0f};
+        Vec3 forward{0.0f, 0.0f, -1.0f};
+        float tan_x = 0.0f;
+        float tan_y = 0.0f;
+    };
+    static FogVolumeCamera fog_volume_camera(const world::RenderFrame& frame, float aspect) {
+        const float* camera = frame.camera.transform;
+        const float tan_y = std::tan(frame.camera.vertical_fov_rad * 0.5f);
+        return {.position = Vec3(camera[3], camera[7], camera[11]),
+                .right = glm::normalize(Vec3(camera[0], camera[4], camera[8])),
+                .up = glm::normalize(Vec3(camera[1], camera[5], camera[9])),
+                .forward = glm::normalize(Vec3(-camera[2], -camera[6], -camera[10])),
+                .tan_x = tan_y * aspect,
+                .tan_y = tan_y};
+    }
+
+    // Where a fog volume is from the camera, by its bounding sphere, and whether it reaches what the froxel
+    // grid sees: in the view and within its reach, which is in view depth. What that lets through costs a
+    // little and adds nothing.
+    struct FogVolumeView {
+        float ahead = 0.0f;
+        float radius = 0.0f;
+        float nearest = 0.0f; // of its sphere from the camera: 0 around the camera
+        bool visible = false;
+    };
+    static FogVolumeView fog_volume_view(const FogVolumeCamera& camera, const world::RenderFogVolume& volume,
+                                         float froxel_reach) {
+        const Vec3 to = Vec3(volume.center[0], volume.center[1], volume.center[2]) - camera.position;
+        const Vec3 half_extents(volume.half_extents[0], volume.half_extents[1], volume.half_extents[2]);
+        const float ahead = glm::dot(to, camera.forward);
+        const float aside = std::abs(glm::dot(to, camera.right));
+        const float above = std::abs(glm::dot(to, camera.up));
+        const float radius =
+            volume.ellipsoid ? std::max({half_extents.x, half_extents.y, half_extents.z}) : glm::length(half_extents);
+        const bool visible = ahead - radius <= froxel_reach && ahead >= -radius &&
+                             (aside - ahead * camera.tan_x) / std::sqrt(1.0f + camera.tan_x * camera.tan_x) <= radius &&
+                             (above - ahead * camera.tan_y) / std::sqrt(1.0f + camera.tan_y * camera.tan_y) <= radius;
+        return {
+            .ahead = ahead, .radius = radius, .nearest = std::max(glm::length(to) - radius, 0.0f), .visible = visible};
+    }
+
+    // The fog volumes that reach the froxel grid, the nearest if there are too many, into the frame's
+    // buffer. Each gets a bit in the masks of the slices its sphere's depth covers.
+    void write_fog_volumes(std::span<std::byte> mapped, const world::RenderFrame& frame, float froxel_reach,
+                           float aspect) {
+        fog_volumes_now = 0;
+        stats.fog_volumes = 0;
+        stats.fog_volumes_dropped = 0;
+        if (froxel_reach <= 0.0f || frame.fog_volumes.empty()) {
+            return;
+        }
+        struct KeptVolume {
+            uint32_t index = 0;
+            FogVolumeView seen;
+        };
+        // Once full, a heap with the farthest first: anything nearer takes its place.
+        const auto nearer = [](const KeptVolume& a, const KeptVolume& b) { return a.seen.nearest < b.seen.nearest; };
+        const FogVolumeCamera camera = fog_volume_camera(frame, aspect);
+        KeptVolume kept[kMaxFogVolumes];
+        uint32_t dropped = 0;
+        for (uint32_t i = 0; i < frame.fog_volumes.size(); ++i) {
+            const FogVolumeView seen = fog_volume_view(camera, frame.fog_volumes[i], froxel_reach);
+            if (!seen.visible) {
+                continue;
+            }
+            if (fog_volumes_now < kMaxFogVolumes) {
+                kept[fog_volumes_now++] = {.index = i, .seen = seen};
+                if (fog_volumes_now == kMaxFogVolumes) {
+                    std::make_heap(kept, kept + kMaxFogVolumes, nearer);
+                }
+                continue;
+            }
+            ++dropped;
+            if (seen.nearest < kept[0].seen.nearest) {
+                std::pop_heap(kept, kept + kMaxFogVolumes, nearer);
+                kept[kMaxFogVolumes - 1] = {.index = i, .seen = seen};
+                std::push_heap(kept, kept + kMaxFogVolumes, nearer);
+            }
+        }
+        uint64_t slice_masks[kFroxelSlices] = {};
+        const auto slice_of = [&](float depth) {
+            const float t = std::log(std::max(depth, 0.0f) / kFroxelSliceOffsetM + 1.0f) /
+                            std::log(froxel_reach / kFroxelSliceOffsetM + 1.0f);
+            return static_cast<uint32_t>(
+                std::clamp(t * static_cast<float>(kFroxelSlices), 0.0f, static_cast<float>(kFroxelSlices - 1)));
+        };
+        for (uint32_t k = 0; k < fog_volumes_now; ++k) {
+            const world::RenderFogVolume& volume = frame.fog_volumes[kept[k].index];
+            const FogVolumeView& seen = kept[k].seen;
+            const uint32_t last_slice = slice_of(seen.ahead + seen.radius);
+            for (uint32_t slice = slice_of(seen.ahead - seen.radius); slice <= last_slice; ++slice) {
+                slice_masks[slice] |= uint64_t{1} << k;
+            }
+            GpuFogVolume gpu;
+            std::memcpy(gpu.to_local, volume.to_local, sizeof(gpu.to_local));
+            gpu.half_extents[0] = volume.half_extents[0];
+            gpu.half_extents[1] = volume.half_extents[1];
+            gpu.half_extents[2] = volume.half_extents[2];
+            gpu.half_extents[3] = volume.edge_m;
+            gpu.tint_density[0] = volume.tint[0];
+            gpu.tint_density[1] = volume.tint[1];
+            gpu.tint_density[2] = volume.tint[2];
+            gpu.tint_density[3] = volume.density_per_m;
+            gpu.shape[0] = volume.ellipsoid ? 1.0f : 0.0f;
+            std::memcpy(mapped.data() + kFogVolumesOffset + k * sizeof(GpuFogVolume), &gpu, sizeof(gpu));
+        }
+        std::memcpy(mapped.data() + kFogSliceMasksOffset, slice_masks, sizeof(slice_masks));
+        stats.fog_volumes = fog_volumes_now;
+        stats.fog_volumes_dropped = dropped;
+    }
+
     // Writes the frame's constants and instance transforms; false without a buffer.
     bool write_frame(rhi::BufferHandle buffer, const world::RenderFrame& frame, const SceneLighting& lighting,
                      float froxel_reach, uint32_t taa_sample_now, uint32_t width, uint32_t height) {
@@ -577,6 +719,7 @@ struct SceneRendererState {
             std::memcpy(rows, frame.instances[i].transform, kInstanceBytes / 2);
             std::memcpy(rows + kInstanceBytes / 2, frame.instances[i].previous_transform, kInstanceBytes / 2);
         }
+        write_fog_volumes(mapped, frame, froxel_reach, aspect);
         device->flush_mapped(buffer, 0, kInstancesOffset + frame.instances.size() * kInstanceBytes);
         return true;
     }
@@ -814,8 +957,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
     // scene. The grid likewise (the closed form goes on alone). What it adds over the closed form is
     // the sun's shadows, so it reaches no farther than they do.
-    const bool foggy = view == SceneView::Lit && fog.is_valid() &&
-                       (lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f);
+    // Fog volumes alone keep it on only where they can be seen.
+    bool volume_in_view = false;
+    const bool world_fog = lighting.fog.density_per_m > 0.0f || lighting.fog.height_density_per_m > 0.0f;
+    if (view == SceneView::Lit && !world_fog && lighting.fog.volume_distance_m > 0.0f) {
+        const float reach = std::min(lighting.fog.volume_distance_m, state.shadows.distance_m);
+        const float view_aspect =
+            static_cast<float>(graph.reference_width()) / static_cast<float>(std::max(graph.reference_height(), 1U));
+        const SceneRendererState::FogVolumeCamera volume_camera =
+            SceneRendererState::fog_volume_camera(frame, view_aspect);
+        for (const world::RenderFogVolume& volume : frame.fog_volumes) {
+            if (SceneRendererState::fog_volume_view(volume_camera, volume, reach).visible) {
+                volume_in_view = true;
+                break;
+            }
+        }
+    }
+    const bool foggy = view == SceneView::Lit && fog.is_valid() && (world_fog || volume_in_view);
     const bool froxels_on =
         foggy && lighting.fog.volume_distance_m > 0.0f && fog_inject.is_valid() && fog_integrate.is_valid();
     const float froxel_reach = froxels_on ? std::min(lighting.fog.volume_distance_m, state.shadows.distance_m) : 0.0f;
@@ -1064,8 +1222,15 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // back (so the composite reads the fog from the camera to any depth with one sample).
     GraphTexture integrated;
     if (!froxels_on) {
-        state.destroy_froxels(); // a grid no one's using holds no memory
+        // A grid no one's using holds no memory; but fog volumes just out of view may well be back next frame.
+        const bool volumes_may_return =
+            view == SceneView::Lit && lighting.fog.volume_distance_m > 0.0f && !frame.fog_volumes.empty();
+        ++state.froxels_idle_frames;
+        if (!volumes_may_return || state.froxels_idle_frames > kFroxelIdleFrames) {
+            state.destroy_froxels();
+        }
     } else {
+        state.froxels_idle_frames = 0;
         const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
         const uint32_t grid_height =
             std::max((graph.reference_height() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
@@ -1122,6 +1287,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     },
                     [atlas, last_froxels, froxels_have_history, injection, fog_inject, grid_width, grid_height,
                      renderer = &state, frame_number = frame.number,
+                     fog_volumes_address = frame_address + kFogVolumesOffset,
                      froxel_reach](const GridPass& data, PassContext& context) {
                         DE_PROFILE_ZONE("fog inject pass");
                         // Only now: a skipped pass leaves no history.
@@ -1133,6 +1299,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                         push.atlas = context.device.texture_index(context.texture(atlas));
                         push.width = grid_width;
                         push.height = grid_height;
+                        push.fog_volumes = fog_volumes_address;
+                        push.fog_slice_masks = fog_volumes_address + (kFogSliceMasksOffset - kFogVolumesOffset);
+                        push.fog_volume_count = renderer->fog_volumes_now;
                         push.history =
                             froxels_have_history ? context.device.texture_index(context.texture(last_froxels)) : 0;
                         context.list.push_constants(push);
@@ -1184,7 +1353,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                         }
                         pass.use(data.fogged, rhi::ResourceState::RenderTarget);
                     },
-                    [targets, frame_address, fog, froxels_on, integrated](const FogPass& data, PassContext& context) {
+                    [targets, frame_address, fog, froxels_on, integrated, renderer = &state](const FogPass& data,
+                                                                                             PassContext& context) {
                         DE_PROFILE_ZONE("fog pass");
                         const rhi::ColorAttachment color{.texture = context.texture(data.fogged),
                                                          .load = rhi::LoadOp::DontCare};
@@ -1196,6 +1366,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                             .depth = context.device.texture_index(context.texture(targets.depth)),
                             .integrated = froxels_on ? context.device.texture_index(context.texture(integrated)) : 0,
                             .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
+                            .fog_volumes = frame_address + kFogVolumesOffset,
+                            .fog_slice_masks = frame_address + kFogSliceMasksOffset,
+                            .fog_volume_count = froxels_on ? renderer->fog_volumes_now : 0,
                         });
                         context.list.draw(3);
                         context.list.end_rendering();

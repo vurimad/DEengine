@@ -17,6 +17,19 @@ enum class CellEntityFlags : uint16_t {
 };
 DE_ENUM_FLAGS(CellEntityFlags)
 
+enum class CellFogShape : uint32_t { Box, Ellipsoid };
+
+inline constexpr float kMaxFogVolumeDensityPerM = 4.0f;
+
+// A fog volume a cell places: its size is its entity's scale (half extents, in meters).
+struct CellFogVolume {
+    float density_per_m = 0.1f; // extinction at its heart, on top of the world's fog
+    float edge_m = 1.0f;        // how far in from its surface it takes to reach that
+    float tint[3] = {1, 1, 1};  // of the light it scatters
+    CellFogShape shape = CellFogShape::Box;
+};
+static_assert(sizeof(CellFogVolume) == 24);
+
 // One entity placed in a cell. Its transform is relative to its parent, or the world without one.
 struct CellEntity {
     static constexpr uint32_t kNone = UINT32_MAX;
@@ -29,7 +42,7 @@ struct CellEntity {
     uint32_t name_offset = 0;         // into CellAsset::names
     uint16_t name_length = 0;         // unique in the cell; may be empty
     CellEntityFlags flags = CellEntityFlags::None;
-    uint32_t reserved = 0;
+    uint32_t fog_volume = kNone; // into CellAsset::fog_volumes
 };
 static_assert(sizeof(CellEntity) == 72);
 
@@ -40,22 +53,24 @@ static_assert(sizeof(CellEntity) == 72);
 // Entities are in an order where every parent comes before its children.
 struct CellAsset {
     static constexpr AssetType kType = AssetType::Cell;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2;
 
     AssetHeader header;
     int32_t coord_x = 0; // the cell's place in the grid (world::CellCoord)
     int32_t coord_z = 0;
     OffsetSpan<CellEntity> entities;
     OffsetSpan<char> names; // every entity's name, back to back, no terminators
+    OffsetSpan<CellFogVolume> fog_volumes;
 
     // Arrays inside the file; parents earlier in the list, meshes among the dependencies (and of
-    // type Mesh), names inside the names array, and finite transforms.
+    // type Mesh), names inside the names array, finite transforms, and fog volumes in the list, with
+    // finite values, a density up to the limit, an edge of 0 or more, and a known shape.
     core::Result<void> validate(std::span<const std::byte> file) const;
 
     std::string_view name(const void* file, const CellEntity& entity) const {
         return {names.get(file).data() + entity.name_offset, entity.name_length};
     }
 };
-static_assert(sizeof(CellAsset) == 88);
+static_assert(sizeof(CellAsset) == 88 + sizeof(OffsetSpan<CellFogVolume>));
 
 } // namespace de::asset

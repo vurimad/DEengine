@@ -6,6 +6,7 @@
 #include <imgui.h>
 
 #include <algorithm>
+#include <cmath>
 #include <iterator>
 
 namespace de::tools {
@@ -80,6 +81,12 @@ void StatsPanel::draw(bool* open) {
                        "heap allocations: %llu this frame (%llu frames with any)",
                        static_cast<unsigned long long>(last_.heap_allocations),
                        static_cast<unsigned long long>(frames_with_allocations_));
+    if (last_.has_camera) {
+        const Vec3 forward = last_.camera_rotation * Vec3(0.0f, 0.0f, -1.0f);
+        ImGui::Text("camera %.1f %.1f %.1f  yaw %.1f  pitch %.1f deg", last_.camera_position.x, last_.camera_position.y,
+                    last_.camera_position.z, static_cast<double>(glm::degrees(std::atan2(-forward.x, -forward.z))),
+                    static_cast<double>(glm::degrees(std::asin(std::clamp(forward.y, -1.0f, 1.0f)))));
+    }
 
     if (ImGui::CollapsingHeader("GPU memory", ImGuiTreeNodeFlags_DefaultOpen)) {
         const rhi::GpuMemoryStats& memory = last_.memory;

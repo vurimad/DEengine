@@ -16,6 +16,7 @@ struct CellBuild {
     int32_t coord_z = 0;
     core::Array<asset::CellEntity> entities{tools_heap()}; // parents first
     core::Array<char> names{tools_heap()};
+    core::Array<asset::CellFogVolume> fog_volumes{tools_heap()};
     core::Array<asset::AssetRef> meshes{tools_heap()};  // the dependencies, in first-use order
     core::Array<SourcePath> mesh_sources{tools_heap()}; // their sources, in the same order
 };
@@ -26,6 +27,12 @@ struct CellBuild {
 //       "entities": [
 //         {
 //           "name": "statue",                     // optional; unique in the cell
+//           "fog_volume": {                       // optional: fog here, sized by its scale (half extents);
+//             "shape": "box",                     //   "box" (default) or "ellipsoid"
+//             "density_per_m": 0.2,               //   extinction per meter at its heart, on top of the world's
+//             "edge_m": 2,                        //   how far in from its surface it takes to reach that
+//             "tint": [1, 1, 1]                   //   of the light it scatters
+//           },
 //           "mesh": "../props/statue/statue.gltf", // optional: a model source, relative to the cell
 //           "position": [12, 0, 30.5],            // meters; world space, or the parent's
 //           "rotation_deg": [0, 45, 0],           // degrees about x, y, z (roll z, then pitch x,

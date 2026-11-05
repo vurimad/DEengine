@@ -21,6 +21,14 @@ struct MeshInstance {
     asset::AssetHandle mesh;
 };
 
+// Fog in the shape of a box or an ellipsoid around the entity: its world scale is its half extents.
+struct FogVolume {
+    float density_per_m = 0.1f;         // extinction at its heart, on top of the world's fog
+    float edge_m = 1.0f;                // how far in from its surface it takes to reach that
+    float tint[3] = {1.0f, 1.0f, 1.0f}; // of the light it scatters
+    bool ellipsoid = false;
+};
+
 // A point of view. The active one (ActiveCamera) is what render extraction looks through.
 struct Camera {
     float vertical_fov_rad = 1.0f;
@@ -57,6 +65,17 @@ struct RenderView {
     bool previous_valid = false;
 };
 
+// One fog volume this frame, relative to the frame's render origin.
+struct RenderFogVolume {
+    float to_local[12] = {}; // rows: a point relative to the origin into the volume's own axes, in meters
+    float center[3] = {};    // relative to the origin
+    float half_extents[3] = {1.0f, 1.0f, 1.0f};
+    float density_per_m = 0.1f;
+    float edge_m = 1.0f;
+    float tint[3] = {1.0f, 1.0f, 1.0f};
+    bool ellipsoid = false;
+};
+
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
 // at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
 // list of entities; it reads this, rebuilt every frame.
@@ -67,6 +86,7 @@ struct RenderFrame {
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<RenderFogVolume> fog_volumes{core::heap_allocator(core::MemoryTag::Render)};
 };
 
 // The render origin follows the camera in steps of this, so floats near it stay precise (0.06 mm at
