@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 namespace de::cooker {
 
@@ -205,6 +206,7 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
     core::Array<uint8_t> locks(tools_heap());
     lock_seams(vertices.span(), indices.span(), parts.span(), locks);
     core::Array<uint32_t> simplified(tools_heap());
+    core::Array<uint32_t> permissive(tools_heap());
     for (uint32_t level = 1; level < settings.lod_count; ++level) {
         const float keep = std::pow(settings.lod_ratio, static_cast<float>(level));
         const auto first_part = static_cast<uint32_t>(mesh_parts.size());
@@ -212,12 +214,26 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
         float error = 0.0f;
         for (const PartBuild& part : parts) {
             const auto target = static_cast<size_t>(static_cast<float>(part.index_count) * keep) / 3 * 3;
-            simplified.resize_uninit(part.index_count);
             float part_error = 0.0f;
-            const size_t count = meshopt_simplifyWithAttributes(
-                simplified.data(), indices.data() + part.first_index, part.index_count, positions, vertices.size(),
-                sizeof(ModelVertex), nullptr, 0, nullptr, 0, locks.data(), std::max<size_t>(target, 3), target_error,
-                meshopt_SimplifyErrorAbsolute, &part_error);
+            const auto simplify = [&](core::Array<uint32_t>& out, unsigned int options, float& out_error) {
+                out.resize_uninit(part.index_count);
+                return meshopt_simplifyWithAttributes(
+                    out.data(), indices.data() + part.first_index, part.index_count, positions, vertices.size(),
+                    sizeof(ModelVertex), nullptr, 0, nullptr, 0, locks.data(), std::max<size_t>(target, 3),
+                    target_error, meshopt_SimplifyErrorAbsolute | options, &out_error);
+            };
+            size_t count = simplify(simplified, 0, part_error);
+            // A mesh whose vertices are split all over (normals or uvs that don't carry across triangles) has few edges
+            // it may collapse without moving those seams, so it stops short of the target, or gets there at a high
+            // price. Then the seams may move, as a coarser LOD only shows from further away. Seams between parts stay:
+            // they're locked.
+            float permissive_error = 0.0f;
+            const size_t permissive_count = simplify(permissive, meshopt_SimplifyPermissive, permissive_error);
+            if (count > target + (target / 4) || part_error > 2.0f * permissive_error) {
+                std::swap(simplified, permissive);
+                count = permissive_count;
+                part_error = permissive_error;
+            }
             if (count == 0) {
                 continue; // simplified away entirely at this distance
             }
@@ -239,7 +255,8 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
             mesh_parts.resize(first_part);
             break;
         }
-        lods.push(asset::MeshLod{.error = error,
+        // Never less than the LOD before: a renderer stops at the first one that's too coarse.
+        lods.push(asset::MeshLod{.error = std::max(error, lods.back().error),
                                  .first_part = first_part,
                                  .part_count = static_cast<uint32_t>(mesh_parts.size()) - first_part});
         previous_indices = level_indices;

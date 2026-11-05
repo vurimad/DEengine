@@ -746,6 +746,97 @@ TEST_CASE("a malformed embedded image is reported, not trusted") {
     CHECK(has_message(report, "content/broken/bad.gltf", "isn't valid base64"));
 }
 
+TEST_CASE("a mesh with its vertices split all over still gets a long LOD chain, with errors that only rise") {
+    const Sandbox sandbox;
+    std::vector<Vertex> welded;
+    std::vector<uint32_t> welded_indices;
+    grid(48, welded, welded_indices);
+    // Every triangle has vertices of its own, kept apart by its uvs, as in a scan with its uvs in pieces.
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    for (size_t i = 0; i < welded_indices.size(); ++i) {
+        Vertex vertex = welded[welded_indices[i]];
+        const size_t triangle = i / 3;
+        vertex.uv[0] += 0.001f * static_cast<float>(triangle);
+        indices.push_back(static_cast<uint32_t>(vertices.size()));
+        vertices.push_back(vertex);
+    }
+    write_src(sandbox, "content/split/split.gltf", gltf(vertices, indices, 0.0f, R"([{}])", "[]", "[]"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    REQUIRE(report.ok());
+    const AssetId split = asset_id(guid_of(vfs, "src:/meta/split/split.gltf.json"));
+
+    Cooked file(vfs, split, AssetType::Mesh);
+    const auto& mesh = file.load<MeshAsset>();
+    const auto lods = mesh.lods.get(file.data());
+    const auto parts = mesh.parts.get(file.data());
+    CHECK(lods.size() >= 6); // what the default setting allows, this far
+    CHECK(lods.size() <= 8);
+    for (size_t i = 1; i < lods.size(); ++i) {
+        CAPTURE(i);
+        CHECK(lods[i].error >= lods[i - 1].error);
+        CHECK(parts[lods[i].first_part].index_count < parts[lods[i - 1].first_part].index_count * 3 / 4);
+    }
+}
+
+TEST_CASE("a mesh that simplifies well keeps its uv seams in every LOD") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(48, vertices, indices);
+    // A seam down the middle: each side has its own vertices along it, with uvs far apart.
+    constexpr uint32_t kN = 48;
+    std::vector<Vertex> split_vertices;
+    std::vector<uint32_t> split_indices;
+    const auto add_side = [&](uint32_t first_x, uint32_t end_x, float uv_offset) {
+        const auto first_vertex = static_cast<uint32_t>(split_vertices.size());
+        for (uint32_t y = 0; y <= kN; ++y) {
+            for (uint32_t x = first_x; x <= end_x; ++x) {
+                Vertex vertex = vertices[(y * (kN + 1)) + x];
+                vertex.uv[0] += uv_offset;
+                split_vertices.push_back(vertex);
+            }
+        }
+        const uint32_t width = end_x - first_x + 1;
+        for (uint32_t y = 0; y < kN; ++y) {
+            for (uint32_t x = 0; x + 1 < width; ++x) {
+                const uint32_t i = first_vertex + (y * width) + x;
+                for (const uint32_t index : {i, i + width, i + 1, i + 1, i + width, i + width + 1}) {
+                    split_indices.push_back(index);
+                }
+            }
+        }
+    };
+    add_side(0, kN / 2, 0.0f);
+    add_side(kN / 2, kN, 10.0f);
+    write_src(sandbox, "content/seam/seam.gltf", gltf(split_vertices, split_indices, 0.0f, R"([{}])", "[]", "[]"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    REQUIRE(report.ok());
+    const AssetId seam = asset_id(guid_of(vfs, "src:/meta/seam/seam.gltf.json"));
+
+    Cooked file(vfs, seam, AssetType::Mesh);
+    const auto& mesh = file.load<MeshAsset>();
+    const auto lods = mesh.lods.get(file.data());
+    const auto parts = mesh.parts.get(file.data());
+    const auto mesh_vertices = mesh.vertices.get(file.data());
+    const auto mesh_indices = mesh.indices.get(file.data());
+    REQUIRE(lods.size() >= 4);
+    for (size_t l = 0; l < 4; ++l) {
+        const MeshPart& part = parts[lods[l].first_part];
+        uint32_t crossing = 0;
+        for (uint32_t i = 0; i < part.index_count; i += 3) {
+            const auto side = [&](uint32_t corner) {
+                return mesh_vertices[mesh_indices[part.first_index + i + corner]].uv[0] > 5.0f;
+            };
+            crossing += side(0) != side(1) || side(1) != side(2) ? 1 : 0;
+        }
+        CAPTURE(l);
+        CHECK(crossing == 0); // a triangle across it would smear the whole texture over itself
+    }
+}
+
 TEST_CASE("LODs keep material seams closed") {
     const Sandbox sandbox;
     // One wavy grid, its left half in one material and its right half in another: the halves

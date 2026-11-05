@@ -109,6 +109,8 @@ struct SceneRendererStats {
     // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.
     uint32_t visible_draws = 0;
     uint32_t visible_shadow_draws = 0;
+    uint32_t visible_triangles = 0;
+    uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 

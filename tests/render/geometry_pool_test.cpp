@@ -19,6 +19,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
@@ -78,7 +79,7 @@ void put_squares(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material
     put_mesh(vfs, model, mesh_id, material);
 }
 
-// A flat grid 2 m wide, which simplifies into coarser LODs.
+// A grid 2 m wide with bumps in it, which simplifies into coarser LODs that lie further from it each time.
 void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
     constexpr uint32_t kCells = 32;
     de::cooker::ModelData model;
@@ -89,6 +90,7 @@ void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
             de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
             vertex.position[0] = (static_cast<float>(x) / kCells * 2.0f) - 1.0f;
             vertex.position[1] = (static_cast<float>(y) / kCells * 2.0f) - 1.0f;
+            vertex.position[2] = 0.05f * std::sin(vertex.position[0] * 7.0f) * std::sin(vertex.position[1] * 5.0f);
             vertex.normal[1] = 0.0f;
             vertex.normal[2] = 1.0f;
         }
@@ -102,7 +104,7 @@ void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
             }
         }
     }
-    put_mesh(vfs, model, mesh_id, material, 3);
+    put_mesh(vfs, model, mesh_id, material, 4);
 }
 
 void put_material(const de::platform::Vfs& vfs, AssetId id, float red, float green) {
@@ -117,6 +119,7 @@ struct PoolOptions {
     uint32_t pool_indices = 1024;
     uint32_t max_meshes = 64;
     uint32_t max_parts = 1024;
+    uint32_t max_lods = 1024;
     uint64_t frame_budget_bytes = uint64_t{16} << 20U;
     bool hot_reload = false;
 };
@@ -238,7 +241,8 @@ void with_pool(const PoolOptions& options, Body body) {
                                                          .pool_vertices = options.pool_vertices,
                                                          .pool_indices = options.pool_indices,
                                                          .max_meshes = options.max_meshes,
-                                                         .max_parts = options.max_parts});
+                                                         .max_parts = options.max_parts,
+                                                         .max_lods = options.max_lods});
         REQUIRE(gpu_assets.ok());
         auto renderer =
             de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
@@ -734,11 +738,11 @@ TEST_CASE("a mesh in the pool isn't drawn before all of it is recorded") {
         put_squares(scene.vfs, kSides, kRed, {-1.0f, 1.0f});
         static_cast<void>(scene.load(kCenter));
         scene.uploader.flush_and_wait();
-        // Its material is on the GPU already, so it's waiting for only its own four uploads.
+        // Its material is on the GPU already, so it's waiting for only its own five uploads.
         const AssetHandle sides = scene.load(kSides);
         CHECK(scene.gpu_assets.mesh(sides) == nullptr);
         CHECK(scene.gpu_assets.stats().pending > 0);
-        for (const char* upload : {"the vertices", "the indices", "its parts"}) {
+        for (const char* upload : {"the vertices", "the indices", "its parts", "its LODs"}) {
             scene.empty_frame();
             scene.gpu_assets.update();
             CAPTURE(upload);
@@ -1041,5 +1045,106 @@ TEST_CASE("a mesh's bounds and every LOD are kept, and only LOD 0 is drawn") {
         CHECK(mesh->lod_parts(1)[0].index_count < mesh->lod_parts(0)[0].index_count);
         CHECK(is_green(scene.draw({grid}), kMiddle));
         CHECK(scene.renderer.stats().draws == mesh->lods[0].part_count);
+    });
+}
+
+TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen);
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const GpuMesh* mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        REQUIRE(mesh->lods.size() >= 3);
+        const auto triangles = [&](size_t lod) { return mesh->lod_parts(lod)[0].index_count / 3; };
+        for (size_t lod = 1; lod < mesh->lods.size(); ++lod) {
+            CHECK(mesh->lods[lod].error_m > mesh->lods[lod - 1].error_m);
+            CHECK(triangles(lod) < triangles(lod - 1));
+        }
+        // A pixel of error at this distance in a 64 pixel target, seen from the nearest point of its sphere.
+        const float pixels_per_radian = static_cast<float>(kSize) / (2.0f * std::tan(0.5f));
+        const auto distance_for = [&](float error_m, float scale) {
+            return (error_m * scale * pixels_per_radian) + (mesh->bounds_radius_m * scale);
+        };
+        const auto kept_at = [&](float distance, float scale) {
+            de::world::RenderFrame frame = PoolScene::frame_of({grid});
+            const float transform[12] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 3.0f - distance};
+            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            scene.submit_for_stats(frame);
+            return scene.renderer.stats().visible_triangles;
+        };
+        CAPTURE(mesh->lods[1].error_m);
+        // Right up close, all of it.
+        CHECK(kept_at(mesh->bounds_radius_m * 1.01f, 1.0f) == triangles(0));
+        for (size_t lod = 1; lod < mesh->lods.size(); ++lod) {
+            CAPTURE(lod);
+            const float boundary = distance_for(mesh->lods[lod].error_m, 1.0f);
+            // Just inside the distance where its error would be a pixel, the LOD before it; just outside, it.
+            CHECK(kept_at(boundary * 0.98f, 1.0f) == triangles(lod - 1));
+            CHECK(kept_at(boundary * 1.02f, 1.0f) == triangles(lod));
+            // Its error scales with the instance: twice as big, twice as far.
+            const float scaled = distance_for(mesh->lods[lod].error_m, 2.0f);
+            CHECK(kept_at(scaled * 0.98f, 2.0f) == triangles(lod - 1));
+            CHECK(kept_at(scaled * 1.02f, 2.0f) == triangles(lod));
+        }
+        // Past the last, the last.
+        const size_t last = mesh->lods.size() - 1;
+        CHECK(kept_at(distance_for(mesh->lods[last].error_m, 1.0f) * 3.0f, 1.0f) == triangles(last));
+    });
+}
+
+TEST_CASE("each shadow cascade picks its LOD by its own texels, wherever the camera is") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen);
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const GpuMesh* mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        REQUIRE(mesh->lods.size() >= 3);
+        const uint32_t lod0 = mesh->lod_parts(0)[0].index_count / 3;
+        const uint32_t last = mesh->lod_parts(mesh->lods.size() - 1)[0].index_count / 3;
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        const auto shadow_triangles = [&](uint32_t resolution) {
+            light.shadows = {.resolution = resolution, .distance_m = 8.0f, .split_lambda = 0.0f};
+            scene.submit_for_stats(PoolScene::frame_of({grid}), light, de::render::SceneView::ShadowMask);
+            return scene.renderer.stats().visible_shadow_triangles;
+        };
+        // Texels so coarse that no LOD's error shows, and fine enough that they show.
+        const uint32_t coarse = shadow_triangles(64);
+        const uint32_t fine = shadow_triangles(4096);
+        CHECK(coarse > 0);
+        CHECK(coarse < fine);
+        CHECK(coarse <= last * 4 + lod0 * 4);
+        CHECK(fine >= lod0);
+    });
+}
+
+TEST_CASE("a mesh's LODs need room in the table too") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536, .max_lods = 1}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen);
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.mesh(grid) == nullptr);
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
+
+        // One LOD fits, and its place comes back for the next.
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        const AssetHandle first = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.mesh(first) != nullptr);
+        const AssetHandle waiting = scene.load(kSides);
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 2);
+        scene.assets.release(first);
+        scene.assets.update();
+        scene.settle();
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.mesh(waiting) != nullptr);
+        CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
     });
 }

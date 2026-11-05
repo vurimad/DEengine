@@ -64,9 +64,9 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `mesh` setting | Values | Default |
 | --- | --- | --- |
 | `scale` | multiplier on top of the importer's conversion to meters | 1 |
-| `lod_count` | 1 to 8, LOD 0 included | 4 |
+| `lod_count` | 1 to 8, LOD 0 included | 8 |
 | `lod_ratio` | triangles kept from one LOD to the next | 0.5 |
-| `lod_error` | largest error a LOD may add, relative to the mesh's size | 0.02 |
+| `lod_error` | largest error a LOD may add, relative to the mesh's size. The renderer picks a LOD only where its error stays under a pixel, so a large error costs nothing up close | 0.5 |
 | `optimize` | vertex cache, overdraw and fetch order | true |
 
 ## What a source cooks to

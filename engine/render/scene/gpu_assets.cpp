@@ -73,6 +73,8 @@ struct PoolPlace {
     uint64_t index_count = 0;
     uint64_t first_part = 0; // in the part table
     uint64_t part_count = 0;
+    uint64_t first_lod = 0; // in the LOD table
+    uint64_t lod_count = 0;
     uint32_t table_slot = 0; // in the mesh table
 };
 
@@ -113,9 +115,12 @@ struct GpuAssetsState {
     core::RangeAllocator index_ranges;
     // The tables the GPU cull reads: a mesh's slot, and its parts.
     rhi::BufferHandle mesh_table;
+    rhi::BufferHandle lod_table;
     rhi::BufferHandle part_table;
     uint64_t mesh_table_address = 0;
+    uint64_t lod_table_address = 0;
     uint64_t part_table_address = 0;
+    core::RangeAllocator lod_ranges;
     core::RangeAllocator part_ranges;
     core::Array<uint32_t> free_mesh_slots{render_heap()};
     // A material's flags changed: meshes count their parts' kinds again once the GPU sees them too, so the draw lists
@@ -132,8 +137,8 @@ struct GpuAssetsState {
     // Meshes that didn't fit: tried again as places come back. A full pool may be full for only a few frames.
     core::Array<asset::AssetHandle> dropped_meshes{render_heap()};
 
-    GpuAssetsState(uint32_t vertices, uint32_t indices, uint32_t parts)
-        : vertex_ranges(render_heap(), vertices), index_ranges(render_heap(), indices),
+    GpuAssetsState(uint32_t vertices, uint32_t indices, uint32_t lods, uint32_t parts)
+        : vertex_ranges(render_heap(), vertices), index_ranges(render_heap(), indices), lod_ranges(render_heap(), lods),
           part_ranges(render_heap(), parts) {}
     uint32_t max_materials = 0;
     rhi::TextureHandle defaults[DefaultCount];
@@ -165,6 +170,7 @@ struct GpuAssetsState {
         device->destroy(pool_vertices);
         device->destroy(pool_indices);
         device->destroy(mesh_table);
+        device->destroy(lod_table);
         device->destroy(part_table);
         device->destroy(fog_noise);
         for (const rhi::TextureHandle texture : defaults) {
@@ -426,8 +432,8 @@ struct GpuAssetsState {
     // Whether a place in the pool and the tables is free for this mesh: first fit finds one if it's this big.
     bool fits(const asset::MeshAsset& asset) const {
         return asset.vertices.count <= vertex_ranges.largest_free() &&
-               asset.indices.count <= index_ranges.largest_free() && part_total(asset) <= part_ranges.largest_free() &&
-               !free_mesh_slots.empty();
+               asset.indices.count <= index_ranges.largest_free() && asset.lods.count <= lod_ranges.largest_free() &&
+               part_total(asset) <= part_ranges.largest_free() && !free_mesh_slots.empty();
     }
 
     static uint64_t part_total(const asset::MeshAsset& asset) {
@@ -441,6 +447,7 @@ struct GpuAssetsState {
     void free_place(const PoolPlace& place) {
         vertex_ranges.free(place.first_vertex, place.vertex_count);
         index_ranges.free(place.first_index, place.index_count);
+        lod_ranges.free(place.first_lod, place.lod_count);
         part_ranges.free(place.first_part, place.part_count);
         free_mesh_slots.push(place.table_slot);
     }
@@ -482,6 +489,8 @@ struct GpuAssetsState {
                        .index_count = indices.size(),
                        .first_part = part_ranges.allocate(parts_total),
                        .part_count = parts_total,
+                       .first_lod = lod_ranges.allocate(asset->lods.count),
+                       .lod_count = asset->lods.count,
                        .table_slot = free_mesh_slots.back()};
         free_mesh_slots.pop();
         entry.gpu.vertex_offset = static_cast<uint32_t>(entry.place.first_vertex);
@@ -498,8 +507,8 @@ struct GpuAssetsState {
 
         GpuMeshInfo info{.radius_m = asset->bounds.radius,
                          .vertex_offset = entry.gpu.vertex_offset,
-                         .first_part = static_cast<uint32_t>(entry.place.first_part),
-                         .part_count = entry.lods[0].part_count};
+                         .first_lod = static_cast<uint32_t>(entry.place.first_lod),
+                         .lod_count = static_cast<uint32_t>(entry.lods.size())};
         std::memcpy(info.center, asset->bounds.center, sizeof(info.center));
         // A new place is read by nothing, so none of this waits for the frame in flight.
         core::Result<void> queued = uploader->upload_buffer(
@@ -512,6 +521,18 @@ struct GpuAssetsState {
         }
         if (queued) {
             queued = upload_parts(entry, rhi::BufferRange::Unread);
+        }
+        if (queued) {
+            // In the table, a LOD's parts are found in the part table.
+            core::Array<GpuMeshLod> table_lods{render_heap()};
+            for (const GpuMeshLod& lod : entry.lods) {
+                table_lods.push({.error_m = lod.error_m,
+                                 .first_part = static_cast<uint32_t>(entry.place.first_part) + lod.first_part,
+                                 .part_count = lod.part_count});
+            }
+            queued = uploader->upload_buffer(lod_table, entry.place.first_lod * sizeof(GpuMeshLod),
+                                             std::as_bytes(table_lods.span()), rhi::ResourceState::ShaderRead,
+                                             rhi::ShaderStages::All, rhi::BufferRange::Unread);
         }
         if (queued) {
             queued = uploader->upload_buffer(mesh_table, uint64_t{entry.place.table_slot} * sizeof(GpuMeshInfo),
@@ -528,16 +549,19 @@ struct GpuAssetsState {
         entry.upload_ticket = uploader->buffer_upload_ticket();
     }
 
-    // How many of LOD 0's parts draw each way: what sizes the draw lists.
+    // The most parts of each kind in any LOD, which the cull may pick for any view: what sizes the draw lists.
     static void count_kinds(MeshEntry& entry, const core::Array<GpuMaterial>& materials_now) {
         for (uint32_t& count : entry.gpu.kind_parts) {
             count = 0;
         }
-        if (entry.lods.empty()) {
-            return;
-        }
-        for (const GpuMeshPart& part : entry.gpu.lod_parts(0)) {
-            ++entry.gpu.kind_parts[draw_kind(materials_now[part.material].flags)];
+        for (size_t lod = 0; lod < entry.lods.size(); ++lod) {
+            uint32_t kinds[kDrawKindCount] = {};
+            for (const GpuMeshPart& part : entry.gpu.lod_parts(lod)) {
+                ++kinds[draw_kind(materials_now[part.material].flags)];
+            }
+            for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+                entry.gpu.kind_parts[kind] = std::max(entry.gpu.kind_parts[kind], kinds[kind]);
+            }
         }
     }
 
@@ -636,7 +660,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
         return core::fail(core::ErrorCode::InvalidArgument, "GpuAssets needs a device, an uploader and a registry");
     }
     auto* state = ::new (render_heap().allocate(sizeof(GpuAssetsState), alignof(GpuAssetsState)))
-        GpuAssetsState(desc.pool_vertices, desc.pool_indices, desc.max_parts);
+        GpuAssetsState(desc.pool_vertices, desc.pool_indices, desc.max_lods, desc.max_parts);
     state->device = desc.device;
     state->uploader = desc.uploader;
     state->assets = desc.assets;
@@ -719,6 +743,15 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
     }
     state->mesh_table = *mesh_table;
     state->mesh_table_address = desc.device->buffer_address(*mesh_table);
+    const core::Result<rhi::BufferHandle> lod_table =
+        desc.device->create_buffer({.size = uint64_t{desc.max_lods} * sizeof(GpuMeshLod),
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "LOD table"});
+    if (!lod_table) {
+        return core::fail(lod_table.error());
+    }
+    state->lod_table = *lod_table;
+    state->lod_table_address = desc.device->buffer_address(*lod_table);
     const core::Result<rhi::BufferHandle> part_table =
         desc.device->create_buffer({.size = uint64_t{desc.max_parts} * sizeof(GpuMeshPart),
                                     .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
@@ -861,6 +894,10 @@ void GpuAssets::update() {
 
 uint64_t GpuAssets::mesh_table_address() const {
     return state_->mesh_table_address;
+}
+
+uint64_t GpuAssets::lod_table_address() const {
+    return state_->lod_table_address;
 }
 
 uint64_t GpuAssets::part_table_address() const {

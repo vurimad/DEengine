@@ -62,8 +62,8 @@ struct GpuMeshInfo {
     float center[3] = {};
     float radius_m = 0.0f;
     uint32_t vertex_offset = 0;
-    uint32_t first_part = 0; // of LOD 0, in the part table
-    uint32_t part_count = 0;
+    uint32_t first_lod = 0; // in the LOD table
+    uint32_t lod_count = 0;
     uint32_t padding = 0;
 };
 static_assert(sizeof(GpuMeshInfo) == 32);
@@ -76,19 +76,22 @@ constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
            (core::has_any(flags, GpuMaterialFlags::DoubleSided) ? 1U : 0U);
 }
 
-// One level of detail: LOD 0 first, coarser after.
+// One level of detail: LOD 0 first, coarser after. An entry of the LOD table too, as GpuMeshLod in
+// shaders/scene/scene_common.slang, where first_part is in the part table, not the mesh's own parts.
 struct GpuMeshLod {
     float error_m = 0.0f; // object space: how far this LOD may lie from LOD 0
     uint32_t first_part = 0;
     uint32_t part_count = 0;
 };
+static_assert(sizeof(GpuMeshLod) == 12);
 
 // A mesh on the GPU: its place in the geometry pool. Its indices count from its own first vertex, which a draw
 // passes as its vertex offset.
 struct GpuMesh {
     uint32_t vertex_offset = 0;
-    uint32_t table_slot = 0;                  // in the mesh table
-    uint32_t kind_parts[kDrawKindCount] = {}; // LOD 0's parts of each kind, by what the material table says now
+    uint32_t table_slot = 0; // in the mesh table
+    uint32_t kind_parts[kDrawKindCount] =
+        {}; // the most parts of each kind in any LOD, by what the material table says now
     float bounds_min[3] = {};
     float bounds_max[3] = {};
     float bounds_center[3] = {}; // of the bounding sphere
@@ -125,6 +128,7 @@ struct GpuAssetsDesc {
     // The tables the GPU cull reads, made once too. Meshes of more than this don't fit, like the pool.
     uint32_t max_meshes = 16384;
     uint32_t max_parts = 256U * 1024U;
+    uint32_t max_lods = 64U * 1024U;
 };
 
 struct GpuAssetsState;
@@ -159,8 +163,9 @@ public:
     // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
     uint64_t pool_vertex_address() const;
     rhi::BufferHandle pool_index_buffer() const;
-    // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, and GpuMeshPart.
+    // The tables the GPU cull reads: GpuMeshInfo by GpuMesh::table_slot, GpuMeshLod and GpuMeshPart.
     uint64_t mesh_table_address() const;
+    uint64_t lod_table_address() const;
     uint64_t part_table_address() const;
     // The fog noise's bindless index (3D, fog_noise.h), or 0 until it's uploaded.
     uint32_t fog_noise_index() const;
