@@ -141,6 +141,14 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
         out.window_width_points = width;
         out.window_height_points = height;
     }
+    if (const char* lod_error = flag_value(out, "--lod-error-pixels")) {
+        char* end = nullptr;
+        out.lod_error_pixels = std::strtof(lod_error, &end);
+        if (end == lod_error || *end != '\0' || !(out.lod_error_pixels >= 0.0f)) {
+            DE_LOG_ERROR("render", "--lod-error-pixels must be a number, 0 or more");
+            return false;
+        }
+    }
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -261,6 +269,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
         if (created) {
             scene_renderer.emplace(std::move(*created));
+            scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }

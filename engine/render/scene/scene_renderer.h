@@ -162,6 +162,10 @@ public:
                     const SceneLighting& lighting, SceneView view = SceneView::Lit, bool taa = false,
                     rhi::Color empty = kEmptySceneColor);
 
+    // How far a LOD may lie from LOD 0 where it's picked: this many pixels on screen, and shadow map texels in a
+    // cascade. 0 draws LOD 0 everywhere, to compare with.
+    void set_lod_error_pixels(float pixels);
+
     SceneRendererStats stats() const;
 
 private:

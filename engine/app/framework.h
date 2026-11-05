@@ -49,6 +49,7 @@ struct FrameworkArgs {
     const char* game_dir = "cooked";
     const char* src_dir = nullptr;       // null: this repository, in dev builds
     float deadzone = -1.0f;              // below 0: the default
+    float lod_error_pixels = 1.0f;       // --lod-error-pixels: 0 draws LOD 0 everywhere, to compare with
     uint32_t window_width_points = 1600; // --window 2560x1440
     uint32_t window_height_points = 900;
     bool fullscreen = false; // --fullscreen: the display's own size, whatever the window's

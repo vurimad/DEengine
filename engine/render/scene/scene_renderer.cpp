@@ -258,9 +258,6 @@ struct GpuDrawList {
 constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
 // The counts the cull writes: per draw list, then the triangles it kept for the camera and for the cascades.
 constexpr uint32_t kCullCounterCount = kDrawListCount + 2;
-// How far a LOD may lie from LOD 0: a pixel on screen, a texel in a shadow map.
-constexpr float kLodErrorPixels = 1.0f;
-constexpr float kLodErrorTexels = 1.0f;
 constexpr uint32_t kNoMesh = UINT32_MAX;
 // The views and lists, then the instances: their rows, and then their slots in the mesh table.
 constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
@@ -356,6 +353,7 @@ struct SceneRendererState {
     bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
     bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
     bool warned_draw_limit = false;
+    float lod_error_pixels = 1.0f;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -719,6 +717,8 @@ struct SceneRendererState {
     // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
                          uint32_t height, CullPlan& plan) {
+        // At 0, no LOD's error is small enough. LOD 0's is 0, so it always is.
+        const float lod_error = std::max(lod_error_pixels, 1e-9f);
         // Made here and copied: this memory is fast to write and very slow to read.
         GpuCullView views[kCullViewCount];
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
@@ -729,7 +729,7 @@ struct SceneRendererState {
                     .lod_perspective = 1,
                     .eye = {frame.camera.transform[3], frame.camera.transform[7], frame.camera.transform[11]},
                     .lod_scale = static_cast<float>(height) /
-                                 (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f) * kLodErrorPixels)};
+                                 (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f) * lod_error)};
         set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
         // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
         // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
@@ -738,7 +738,7 @@ struct SceneRendererState {
             view = {.plane_count = 6,
                     .first_list = cascade_list(c, false),
                     .lists_by_kind = 0,
-                    .lod_scale = 1.0f / (std::max(scene.cascade_texel_m[c], 1e-6f) * kLodErrorTexels)};
+                    .lod_scale = 1.0f / (std::max(scene.cascade_texel_m[c], 1e-6f) * lod_error)};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             set_side_planes(view, view_proj);
             std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
@@ -1765,6 +1765,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.draw(3);
             context.list.end_rendering();
         });
+}
+
+void SceneRenderer::set_lod_error_pixels(float pixels) {
+    state_->lod_error_pixels = pixels;
 }
 
 SceneRendererStats SceneRenderer::stats() const {

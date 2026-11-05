@@ -19,8 +19,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <span>
@@ -80,7 +82,8 @@ void put_squares(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material
 }
 
 // A grid 2 m wide with bumps in it, which simplifies into coarser LODs that lie further from it each time.
-void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
+void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material, float bump_m = 0.05f,
+              uint32_t lod_count = 4) {
     constexpr uint32_t kCells = 32;
     de::cooker::ModelData model;
     de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
@@ -90,7 +93,7 @@ void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
             de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
             vertex.position[0] = (static_cast<float>(x) / kCells * 2.0f) - 1.0f;
             vertex.position[1] = (static_cast<float>(y) / kCells * 2.0f) - 1.0f;
-            vertex.position[2] = 0.05f * std::sin(vertex.position[0] * 7.0f) * std::sin(vertex.position[1] * 5.0f);
+            vertex.position[2] = bump_m * std::sin(vertex.position[0] * 7.0f) * std::sin(vertex.position[1] * 5.0f);
             vertex.normal[1] = 0.0f;
             vertex.normal[2] = 1.0f;
         }
@@ -104,7 +107,7 @@ void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material) {
             }
         }
     }
-    put_mesh(vfs, model, mesh_id, material, 4);
+    put_mesh(vfs, model, mesh_id, material, lod_count);
 }
 
 void put_material(const de::platform::Vfs& vfs, AssetId id, float red, float green) {
@@ -1091,6 +1094,84 @@ TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
         // Past the last, the last.
         const size_t last = mesh->lods.size() - 1;
         CHECK(kept_at(distance_for(mesh->lods[last].error_m, 1.0f) * 3.0f, 1.0f) == triangles(last));
+    });
+}
+
+TEST_CASE("a picked LOD stays within a pixel of LOD 0 on screen") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen, 0.4f, 8);
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const GpuMesh* mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        // Seen side on, so its bumps are its outline. The topmost covered row of each column.
+        const auto outline = [&](float distance, float lod_error_pixels, uint32_t& triangles) {
+            scene.renderer.set_lod_error_pixels(lod_error_pixels);
+            de::world::RenderFrame frame = PoolScene::frame_of({grid});
+            const float transform[12] = {1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 3.0f - distance};
+            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            scene.submit_for_stats(frame);
+            triangles = scene.renderer.stats().visible_triangles;
+            const auto pixels = de::test::read_texture(scene.device, scene.target);
+            de::core::Array<int> rows;
+            for (uint32_t x = 0; x < kSize; ++x) {
+                int top = -1;
+                for (uint32_t y = 0; y < kSize && top < 0; ++y) {
+                    top = texel(pixels, x, y)[1] > 200 ? static_cast<int>(y) : -1;
+                }
+                rows.push(top);
+            }
+            return rows;
+        };
+        // How far apart two outlines get: from each point on one, to the nearest point on the other, in pixels. Columns
+        // alone would overstate it: on a steep bump, a pixel sideways is several rows.
+        const auto one_way = [](const de::core::Array<int>& from, const de::core::Array<int>& to) {
+            constexpr auto kColumns = static_cast<int>(kSize);
+            const auto at = [](const de::core::Array<int>& rows, int column) {
+                return rows[static_cast<size_t>(column)];
+            };
+            int worst = 0;
+            for (int x = 0; x < kColumns; ++x) {
+                if (at(from, x) < 0) {
+                    continue;
+                }
+                int nearest = kColumns;
+                for (int other = std::max(x - 8, 0); other < std::min(x + 9, kColumns); ++other) {
+                    if (at(to, other) >= 0) {
+                        nearest =
+                            std::min(nearest, std::max(std::abs(other - x), std::abs(at(to, other) - at(from, x))));
+                    }
+                }
+                worst = std::max(worst, nearest);
+            }
+            return worst;
+        };
+        const auto worst_difference = [&](const de::core::Array<int>& a, const de::core::Array<int>& b) {
+            return std::max(one_way(a, b), one_way(b, a));
+        };
+        const uint32_t lod0_triangles = mesh->lod_parts(0)[0].index_count / 3;
+        bool any_coarser = false;
+        for (const float distance : {4.0f, 6.0f, 9.0f, 14.0f}) {
+            CAPTURE(distance);
+            uint32_t exact_triangles = 0;
+            uint32_t picked_triangles = 0;
+            const auto exact = outline(distance, 0.0f, exact_triangles);
+            const auto picked = outline(distance, 1.0f, picked_triangles);
+            CHECK(exact_triangles == lod0_triangles);
+            any_coarser = any_coarser || picked_triangles < lod0_triangles;
+            // A pixel of error, and a pixel from where a row's center falls.
+            CHECK(worst_difference(exact, picked) <= 2);
+        }
+        CHECK(any_coarser);
+
+        // What this test would see if the limit weren't kept.
+        uint32_t coarse_triangles = 0;
+        uint32_t exact_triangles = 0;
+        const auto exact = outline(4.0f, 0.0f, exact_triangles);
+        const auto coarse = outline(4.0f, 100.0f, coarse_triangles);
+        CHECK(coarse_triangles < exact_triangles);
+        CHECK(worst_difference(exact, coarse) > 2);
     });
 }
 
