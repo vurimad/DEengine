@@ -409,6 +409,12 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             debug_ui.add_pass(*graph, back, device->swapchain_format());
 #endif
             graph->execute();
+            if (scene_renderer) { // a frame that drew: minimized, these would repeat the last one's
+                const render::SceneRendererStats drawn = scene_renderer->stats();
+                DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
+                DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
+                static_cast<void>(drawn);
+            }
         }
         device->end_frame();
         if (!backbuffer.is_valid()) {
@@ -430,11 +436,6 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // The "zero heap allocations per frame" rule, made visible in the profiler and the panel.
         const uint64_t allocations = core::heap_allocation_count() - frame_start_allocations;
         DE_PROFILE_PLOT("heap allocations/frame", static_cast<int64_t>(allocations));
-        if (scene_renderer) {
-            const render::SceneRendererStats drawn = scene_renderer->stats();
-            DE_PROFILE_PLOT("render draws", static_cast<int64_t>(drawn.draws));
-            DE_PROFILE_PLOT("shadow draws", static_cast<int64_t>(drawn.shadow_draws));
-        }
 #if DE_BUILD_DEV
         const flecs::world& ecs = engine.world.ecs();
         const auto* active_camera = ecs.try_get<world::ActiveCamera>();
