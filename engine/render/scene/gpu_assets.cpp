@@ -471,13 +471,14 @@ struct GpuAssetsState {
         const uint64_t parts_total = part_total(*asset);
         if (!fits(*asset)) {
             DE_LOG_ERROR("render",
-                         "mesh %s doesn't fit in the geometry pool (%zu vertices, %zu indices, %llu parts; %llu, %llu "
-                         "and %llu free in one piece, %zu mesh slots free)",
+                         "mesh %s doesn't fit in the geometry pool (%zu vertices, %zu indices, %llu parts, %u LODs; "
+                         "%llu, %llu, %llu and %llu free in one piece, %zu mesh slots free)",
                          asset::format_asset_id(asset->header.id).c_str(), vertices.size(), indices.size(),
-                         static_cast<unsigned long long>(parts_total),
+                         static_cast<unsigned long long>(parts_total), asset->lods.count,
                          static_cast<unsigned long long>(vertex_ranges.largest_free()),
                          static_cast<unsigned long long>(index_ranges.largest_free()),
-                         static_cast<unsigned long long>(part_ranges.largest_free()), free_mesh_slots.size());
+                         static_cast<unsigned long long>(part_ranges.largest_free()),
+                         static_cast<unsigned long long>(lod_ranges.largest_free()), free_mesh_slots.size());
             dropped_meshes.push(handle);
             return;
         }
@@ -935,7 +936,8 @@ GpuAssetsStats GpuAssets::stats() const {
             .meshes_dropped = static_cast<uint32_t>(state.dropped_meshes.size()),
             .pool_vertices_free = state.vertex_ranges.free_total(),
             .pool_indices_free = state.index_ranges.free_total(),
-            .table_parts_free = state.part_ranges.free_total()};
+            .table_parts_free = state.part_ranges.free_total(),
+            .table_lods_free = state.lod_ranges.free_total()};
 }
 
 } // namespace de::render

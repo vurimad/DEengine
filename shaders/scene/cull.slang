@@ -50,16 +50,21 @@ bool in_view(GpuCullView* view, float3 center, float radius)
     return true;
 }
 
-// The coarsest LOD whose error is at most a pixel (or shadow map texel) in this view, seen from the sphere's nearest point.
+// The coarsest LOD whose error is at most a pixel (or shadow map texel) in this view, from the sphere's nearest depth:
+// what's on screen scales with depth, not distance, so a mesh in a corner gets what it would get in the middle.
 GpuMeshLod pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radius, float scale)
 {
+    GpuMeshLod picked = push.lods[mesh.first_lod];
+    if (view.lod_scale < 0.0)
+    {
+        return picked;
+    }
     float error_scale = scale * view.lod_scale;
     if (view.lod_perspective != 0)
     {
         // At the sphere itself or inside it, no error is small enough.
-        error_scale /= max(length(center - view.eye) - radius, 1e-4);
+        error_scale /= max(dot(view.depth_plane.xyz, center) + view.depth_plane.w - radius, 1e-4);
     }
-    GpuMeshLod picked = push.lods[mesh.first_lod];
     for (uint l = 1; l < mesh.lod_count; ++l)
     {
         const GpuMeshLod coarser = push.lods[mesh.first_lod + l];
@@ -107,6 +112,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
             continue;
         }
         const GpuMeshLod lod = pick_lod(view, mesh, center, radius, scale);
+        uint triangles = 0;
         for (uint p = 0; p < lod.part_count; ++p)
         {
             const GpuMeshPart part = push.parts[lod.first_part + p];
@@ -135,8 +141,9 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
             record.instance = instance;
             record.material = part.material;
             push.records[slot] = record;
-            uint ignored;
-            InterlockedAdd(push.counts[kDrawListCount + (v == 0 ? 0u : 1u)], part.index_count / 3, ignored);
+            triangles += part.index_count / 3;
         }
+        uint ignored;
+        InterlockedAdd(push.counts[kDrawListCount + (v == 0 ? 0u : 1u)], triangles, ignored);
     }
 }

@@ -245,10 +245,11 @@ struct GpuCullView {
     uint32_t first_list = 0;
     uint32_t lists_by_kind = 0;
     uint32_t lod_perspective = 0;
-    float eye[3] = {};
+    float depth_plane[4] = {};
     float lod_scale = 0.0f;
+    float padding_end[3] = {};
 };
-static_assert(sizeof(GpuCullView) == 128);
+static_assert(sizeof(GpuCullView) == 144);
 
 struct GpuDrawList {
     uint32_t first_slot = 0;
@@ -717,8 +718,10 @@ struct SceneRendererState {
     // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
                          uint32_t height, CullPlan& plan) {
-        // At 0, no LOD's error is small enough. LOD 0's is 0, so it always is.
-        const float lod_error = std::max(lod_error_pixels, 1e-9f);
+        // At 0, LOD 0 everywhere, however small a LOD's error.
+        const auto lod_scale_for = [this](float per_unit_of_error) {
+            return lod_error_pixels > 0.0f ? per_unit_of_error / lod_error_pixels : -1.0f;
+        };
         // Made here and copied: this memory is fast to write and very slow to read.
         GpuCullView views[kCullViewCount];
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
@@ -727,9 +730,17 @@ struct SceneRendererState {
                     .first_list = 0,
                     .lists_by_kind = 1,
                     .lod_perspective = 1,
-                    .eye = {frame.camera.transform[3], frame.camera.transform[7], frame.camera.transform[11]},
-                    .lod_scale = static_cast<float>(height) /
-                                 (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f) * lod_error)};
+                    .lod_scale = lod_scale_for(static_cast<float>(height) /
+                                               (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f)))};
+        // Depth along where it looks, its -Z axis. A camera's transform may scale.
+        const float* const camera = frame.camera.transform;
+        const float look[3] = {-camera[2], -camera[6], -camera[10]};
+        const float look_length = std::sqrt((look[0] * look[0]) + (look[1] * look[1]) + (look[2] * look[2]));
+        for (uint32_t k = 0; k < 3; ++k) {
+            views[0].depth_plane[k] = look[k] / look_length;
+        }
+        views[0].depth_plane[3] = -((views[0].depth_plane[0] * camera[3]) + (views[0].depth_plane[1] * camera[7]) +
+                                    (views[0].depth_plane[2] * camera[11]));
         set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
         // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
         // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
@@ -738,7 +749,7 @@ struct SceneRendererState {
             view = {.plane_count = 6,
                     .first_list = cascade_list(c, false),
                     .lists_by_kind = 0,
-                    .lod_scale = 1.0f / (std::max(scene.cascade_texel_m[c], 1e-6f) * lod_error)};
+                    .lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f))};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             set_side_planes(view, view_proj);
             std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));

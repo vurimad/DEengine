@@ -115,6 +115,7 @@ struct GpuAssetsStats {
     uint64_t pool_vertices_free = 0;
     uint64_t pool_indices_free = 0;
     uint64_t table_parts_free = 0;
+    uint64_t table_lods_free = 0;
 };
 
 struct GpuAssetsDesc {
@@ -128,7 +129,7 @@ struct GpuAssetsDesc {
     // The tables the GPU cull reads, made once too. Meshes of more than this don't fit, like the pool.
     uint32_t max_meshes = 16384;
     uint32_t max_parts = 256U * 1024U;
-    uint32_t max_lods = 64U * 1024U;
+    uint32_t max_lods = 128U * 1024U; // 8 per mesh, the most the cooker makes
 };
 
 struct GpuAssetsState;

@@ -6,7 +6,10 @@
 #include <meshoptimizer.h>
 
 #include <algorithm>
+#include <array>
+#include <cfloat>
 #include <cmath>
+#include <cstddef>
 #include <utility>
 
 namespace de::cooker {
@@ -27,6 +30,16 @@ struct PartBuild {
 };
 
 // Marks every vertex whose position two or more parts use: what no part may move when it simplifies.
+// What a LOD may change besides its shape, as ModelVertex has them from normal on, relative to the mesh's size. A
+// flat floor with painted colors has no error in its shape, and a triangle across two uv islands hardly any, so
+// without these they'd look fine to a renderer picking by error.
+constexpr std::array<float, 13> kAttributeWeights = {0.1f,  0.1f,  0.1f,        // normal
+                                                     0.0f,  0.0f,  0.0f, 0.0f,  // tangent, follows the normal
+                                                     0.25f, 0.25f,              // uv
+                                                     0.5f,  0.5f,  0.5f, 0.5f}; // color
+static_assert(offsetof(ModelVertex, uv) - offsetof(ModelVertex, normal) == 7 * sizeof(float));
+static_assert(offsetof(ModelVertex, color) - offsetof(ModelVertex, normal) == 9 * sizeof(float));
+
 void lock_seams(std::span<const ModelVertex> vertices, std::span<const uint32_t> indices,
                 std::span<const PartBuild> parts, core::Array<uint8_t>& locks) {
     locks.clear();
@@ -207,35 +220,56 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
     lock_seams(vertices.span(), indices.span(), parts.span(), locks);
     core::Array<uint32_t> simplified(tools_heap());
     core::Array<uint32_t> permissive(tools_heap());
+    core::Array<float> part_errors(tools_heap()); // at the last level
+    part_errors.resize(parts.size(), 0.0f);
+    core::Array<float> part_sizes(tools_heap()); // the diagonal of each part's box
+    part_sizes.resize(parts.size(), 0.0f);
+    for (size_t p = 0; p < parts.size(); ++p) {
+        float low[3] = {FLT_MAX, FLT_MAX, FLT_MAX};
+        float high[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (uint32_t i = parts[p].first_index; i < parts[p].first_index + parts[p].index_count; ++i) {
+            for (int axis = 0; axis < 3; ++axis) {
+                low[axis] = std::min(low[axis], vertices[indices[i]].position[axis]);
+                high[axis] = std::max(high[axis], vertices[indices[i]].position[axis]);
+            }
+        }
+        part_sizes[p] = std::hypot(high[0] - low[0], high[1] - low[1], high[2] - low[2]);
+    }
     for (uint32_t level = 1; level < settings.lod_count; ++level) {
         const float keep = std::pow(settings.lod_ratio, static_cast<float>(level));
         const auto first_part = static_cast<uint32_t>(mesh_parts.size());
         const size_t first_index = indices.size();
         float error = 0.0f;
-        for (const PartBuild& part : parts) {
+        for (size_t p = 0; p < parts.size(); ++p) {
+            const PartBuild& part = parts[p];
             const auto target = static_cast<size_t>(static_cast<float>(part.index_count) * keep) / 3 * 3;
-            float part_error = 0.0f;
+            const size_t wanted = std::max<size_t>(target, 3);
             const auto simplify = [&](core::Array<uint32_t>& out, unsigned int options, float& out_error) {
                 out.resize_uninit(part.index_count);
                 return meshopt_simplifyWithAttributes(
                     out.data(), indices.data() + part.first_index, part.index_count, positions, vertices.size(),
-                    sizeof(ModelVertex), nullptr, 0, nullptr, 0, locks.data(), std::max<size_t>(target, 3),
-                    target_error, meshopt_SimplifyErrorAbsolute | options, &out_error);
+                    sizeof(ModelVertex), &vertices[0].normal[0], sizeof(ModelVertex), kAttributeWeights.data(),
+                    kAttributeWeights.size(), locks.data(), wanted, target_error,
+                    meshopt_SimplifyErrorAbsolute | options, &out_error);
             };
+            float part_error = 0.0f;
             size_t count = simplify(simplified, 0, part_error);
             // A mesh whose vertices are split all over (normals or uvs that don't carry across triangles) has few edges
             // it may collapse without moving those seams, so it stops short of the target, or gets there at a high
-            // price. Then the seams may move, as a coarser LOD only shows from further away. Seams between parts stay:
-            // they're locked.
-            float permissive_error = 0.0f;
-            const size_t permissive_count = simplify(permissive, meshopt_SimplifyPermissive, permissive_error);
-            if (count > target + (target / 4) || part_error > 2.0f * permissive_error) {
-                std::swap(simplified, permissive);
-                count = permissive_count;
-                part_error = permissive_error;
+            // price. Then the seams may move, if that's no worse. Seams between parts stay: they're locked.
+            if (count > wanted + (wanted / 4) || part_error > 4.0f * part_errors[p]) {
+                float permissive_error = 0.0f;
+                const size_t permissive_count = simplify(permissive, meshopt_SimplifyPermissive, permissive_error);
+                if (permissive_count > 0 && permissive_count <= count && permissive_error <= 4.0f * part_error) {
+                    std::swap(simplified, permissive);
+                    count = permissive_count;
+                    part_error = permissive_error;
+                }
             }
+            part_errors[p] = part_error;
             if (count == 0) {
-                continue; // simplified away entirely at this distance
+                error = std::max(error, part_sizes[p]); // it's gone: from where this shows, that has to not show
+                continue;
             }
             if (settings.optimize) {
                 meshopt_optimizeVertexCache(simplified.data(), simplified.data(), count, vertices.size());

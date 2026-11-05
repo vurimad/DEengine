@@ -554,6 +554,7 @@ TEST_CASE("the cull adds every part of a mesh, each with its own material") {
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().draws == 2);
         CHECK(scene.renderer.stats().visible_draws == 2);
+        CHECK(scene.renderer.stats().visible_triangles == 4); // two squares, not the last one twice
         const auto pixels = de::test::read_texture(scene.device, scene.target);
         CHECK(is_red(pixels, kLeft));
         CHECK(is_green(pixels, kRight));
@@ -995,7 +996,7 @@ TEST_CASE("a mesh waits for its own material's table upload, not for the ones qu
     });
 }
 
-TEST_CASE("a mesh's bounds and every LOD are kept, and only LOD 0 is drawn") {
+TEST_CASE("a mesh's bounds and every LOD are kept") {
     with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f}); // so the grid isn't at the start of the pool
         put_grid(scene.vfs, kGrid, kGreen);
@@ -1091,6 +1092,21 @@ TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
             CHECK(kept_at(scaled * 0.98f, 2.0f) == triangles(lod - 1));
             CHECK(kept_at(scaled * 1.02f, 2.0f) == triangles(lod));
         }
+        // Off to the side at the same depth, the same: what's on screen goes by depth.
+        const auto kept_off_axis = [&](float depth) {
+            de::world::RenderFrame frame = PoolScene::frame_of({grid});
+            const float offset = depth * 0.6f; // about 31 degrees: well in view at this aspect
+            const float transform[12] = {1, 0, 0, 0, 0, 1, 0, offset, 0, 0, 1, 3.0f - depth};
+            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            scene.submit_for_stats(frame);
+            return scene.renderer.stats().visible_triangles;
+        };
+        for (size_t lod = 1; lod < mesh->lods.size(); ++lod) {
+            CAPTURE(lod);
+            const float boundary = distance_for(mesh->lods[lod].error_m, 1.0f);
+            CHECK(kept_off_axis(boundary * 0.98f) == triangles(lod - 1));
+            CHECK(kept_off_axis(boundary * 1.02f) == triangles(lod));
+        }
         // Past the last, the last.
         const size_t last = mesh->lods.size() - 1;
         CHECK(kept_at(distance_for(mesh->lods[last].error_m, 1.0f) * 3.0f, 1.0f) == triangles(last));
@@ -1172,6 +1188,26 @@ TEST_CASE("a picked LOD stays within a pixel of LOD 0 on screen") {
         const auto coarse = outline(4.0f, 100.0f, coarse_triangles);
         CHECK(coarse_triangles < exact_triangles);
         CHECK(worst_difference(exact, coarse) > 2);
+    });
+}
+
+TEST_CASE("a limit of 0 draws LOD 0 however small a LOD's error, in every view") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen, 0.0f, 8); // flat: its LODs lie nowhere from it
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const GpuMesh* mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        const uint32_t lod0 = mesh->lod_parts(0)[0].index_count / 3;
+        REQUIRE(mesh->lods.size() >= 2);
+        const de::world::RenderFrame frame = PoolScene::frame_of({grid});
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        scene.renderer.set_lod_error_pixels(0.0f);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_triangles == lod0);
+        CHECK(scene.renderer.stats().visible_shadow_triangles >= lod0);
+        CHECK(scene.renderer.stats().visible_shadow_triangles % lod0 == 0);
     });
 }
 

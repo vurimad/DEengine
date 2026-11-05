@@ -837,6 +837,99 @@ TEST_CASE("a mesh that simplifies well keeps its uv seams in every LOD") {
     }
 }
 
+TEST_CASE("a flat mesh's LODs have an error for the colors and uvs they lose") {
+    de::cooker::ModelData model;
+    de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
+    primitive.material = 0;
+    constexpr uint32_t kCells = 32;
+    for (uint32_t y = 0; y <= kCells; ++y) {
+        for (uint32_t x = 0; x <= kCells; ++x) {
+            const float u = static_cast<float>(x) / kCells;
+            const float v = static_cast<float>(y) / kCells;
+            de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
+            vertex.position[0] = u;
+            vertex.position[2] = v; // flat, so every LOD has the same shape
+            vertex.color[0] = 0.5f + (0.5f * std::sin(u * 40.0f) * std::sin(v * 30.0f)); // painted
+        }
+    }
+    for (uint32_t y = 0; y < kCells; ++y) {
+        for (uint32_t x = 0; x < kCells; ++x) {
+            const uint32_t a = (y * (kCells + 1)) + x;
+            const uint32_t b = a + kCells + 1;
+            for (const uint32_t index : {a, b, a + 1, a + 1, b, b + 1}) {
+                primitive.indices.push(index);
+            }
+        }
+    }
+    static_cast<void>(model.materials.emplace());
+    de::cooker::Diagnostics diagnostics;
+    const AssetId materials[] = {AssetId::from_value(0x1)};
+    const auto cooked =
+        de::cooker::cook_mesh(model, materials, {.lod_count = 4}, AssetId::from_value(0x2), "test", diagnostics);
+    REQUIRE(cooked.ok());
+    const auto& mesh = *reinterpret_cast<const MeshAsset*>(cooked->data());
+    const auto lods = mesh.lods.get(cooked->data());
+    REQUIRE(lods.size() >= 2);
+    CHECK(lods[1].error > 0.0f);
+    CHECK(lods[lods.size() - 1].error > 0.01f); // a real share of its size, so it's only picked from far enough away
+}
+
+TEST_CASE("a part simplified away counts as that much error") {
+    // A big bumpy grid, and a tiny part of another material far off to its side, that simplifies to nothing.
+    de::cooker::ModelData model;
+    de::cooker::ModelPrimitive& big = model.primitives.emplace();
+    big.material = 0;
+    constexpr uint32_t kCells = 32;
+    for (uint32_t y = 0; y <= kCells; ++y) {
+        for (uint32_t x = 0; x <= kCells; ++x) {
+            const float u = static_cast<float>(x) / kCells;
+            const float v = static_cast<float>(y) / kCells;
+            de::cooker::ModelVertex& vertex = big.vertices.emplace();
+            vertex.position[0] = u * 4.0f;
+            vertex.position[1] = 0.1f * std::sin(u * 9.0f) * std::sin(v * 7.0f);
+            vertex.position[2] = v * 4.0f;
+        }
+    }
+    for (uint32_t y = 0; y < kCells; ++y) {
+        for (uint32_t x = 0; x < kCells; ++x) {
+            const uint32_t a = (y * (kCells + 1)) + x;
+            const uint32_t b = a + kCells + 1;
+            for (const uint32_t index : {a, b, a + 1, a + 1, b, b + 1}) {
+                big.indices.push(index);
+            }
+        }
+    }
+    de::cooker::ModelPrimitive& small = model.primitives.emplace();
+    small.material = 1;
+    constexpr float kSmallSize = 0.2f;
+    const float corners[4][3] = {{10, 0, 0}, {10 + kSmallSize, 0, 0}, {10, kSmallSize, 0}, {10, 0, kSmallSize}};
+    for (const auto& corner : corners) {
+        de::cooker::ModelVertex& vertex = small.vertices.emplace();
+        std::copy_n(corner, 3, vertex.position);
+    }
+    for (const uint32_t index : {0U, 2U, 1U, 0U, 1U, 3U, 0U, 3U, 2U, 1U, 2U, 3U}) {
+        small.indices.push(index);
+    }
+    static_cast<void>(model.materials.emplace());
+    static_cast<void>(model.materials.emplace());
+    de::cooker::Diagnostics diagnostics;
+    const AssetId materials[] = {AssetId::from_value(0x1), AssetId::from_value(0x2)};
+    const auto cooked =
+        de::cooker::cook_mesh(model, materials, {.lod_count = 8}, AssetId::from_value(0x3), "test", diagnostics);
+    REQUIRE(cooked.ok());
+    const auto& mesh = *reinterpret_cast<const MeshAsset*>(cooked->data());
+    const auto lods = mesh.lods.get(cooked->data());
+    bool any_gone = false;
+    for (size_t i = 1; i < lods.size(); ++i) {
+        CAPTURE(i);
+        if (lods[i].part_count < lods[0].part_count) {
+            any_gone = true;
+            CHECK(lods[i].error >= kSmallSize);
+        }
+    }
+    MESSAGE("a part was simplified away: ", any_gone);
+}
+
 TEST_CASE("LODs keep material seams closed") {
     const Sandbox sandbox;
     // One wavy grid, its left half in one material and its right half in another: the halves

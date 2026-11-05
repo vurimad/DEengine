@@ -75,9 +75,11 @@ public struct GpuCullView
     public uint plane_count;
     public uint first_list;
     public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
-    public uint lod_perspective; // a LOD's error shrinks with distance from the eye, or else it doesn't
-    public float3 eye;           // in render-origin space
-    public float lod_scale;      // what makes a LOD's error (in meters, over the distance if perspective) 1 where it's the most it may be
+    public uint lod_perspective; // a LOD's error shrinks with depth, or else it doesn't
+    public float4 depth_plane;   // dot(xyz, p) + w is the depth in front of the eye, in render-origin space
+    public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
+                                 // be. Below 0: LOD 0 everywhere
+    public float padding[3];
 };
 
 public struct GpuDrawList

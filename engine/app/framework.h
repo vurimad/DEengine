@@ -41,6 +41,7 @@ namespace de::app {
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked)
 //   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
+//   --lod-error-pixels X  how far a LOD may lie from LOD 0 (default 1); 0 draws LOD 0 everywhere
 //   --show-sticks    dev builds: deadzone off, raw stick values logged twice a second (drift)
 struct FrameworkArgs {
     int argc = 0;
