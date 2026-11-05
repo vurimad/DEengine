@@ -94,7 +94,9 @@ public float3 fog_ambient_light(FogMedium medium, float height)
 }
 
 // The grid stores extinction (1/m) times this: thin fog stays a normal half float (a subnormal may
-// flush to zero on some GPUs), and extinction up to twice the limit of 1 per meter still fits.
+// flush to zero on some GPUs). What it must hold: 3 per meter of world fog (FogLimits: 1 constant, and 1 of
+// height fog that doubles below its base), and fog_inject's kMostVolumeDensity of 12 from volumes. That's
+// 61440 of a half float's 65504, so raising either needs a smaller scale.
 public static const float kFroxelDensityScale = 4096.0;
 // A froxel stores (light * e / kFroxelLightScale, e), e being extinction * kFroxelDensityScale: light
 // weighted by fog, so filtering across a froxel with none doesn't dim it, with room in a half float for
@@ -149,10 +151,11 @@ float fog_volume_share(FogVolumeData volume, float3 local)
 
 // A volume's optical depth along a ray between two distances. The ray is clipped to the volume first and
 // tested through what's left, so the points belong to the volume, not to what asked: however thin it is
-// they can't all miss it, and they don't slide through it as the grid's slices do with the camera. It
-// fades out over the last tenth of the grid's reach, where the fog past it, which can't hold it, takes over.
+// along the ray they can't all miss it, and they don't slide through it as the grid's slices do with the
+// camera. It fades out over the last tenth of the grid's reach, where the fog past it, which can't hold it,
+// takes over. Widens span to what of the ray it covers.
 float fog_volume_optical_depth(FogVolumeData volume, float3 camera, float3 direction, float view_per_ray, float reach,
-                               float from_distance, float to_distance)
+                               float from_distance, float to_distance, inout float2 span)
 {
     const float3 origin = float3(dot(volume.to_local[0], float4(camera, 1.0)), dot(volume.to_local[1], float4(camera, 1.0)),
                                  dot(volume.to_local[2], float4(camera, 1.0)));
@@ -190,6 +193,7 @@ float fog_volume_optical_depth(FogVolumeData volume, float3 camera, float3 direc
     {
         return 0.0;
     }
+    span = float2(min(span.x, enter), max(span.y, leave));
     float sum = 0.0;
     for (uint i = 0; i < kFogVolumeSamples; ++i)
     {
@@ -201,17 +205,18 @@ float fog_volume_optical_depth(FogVolumeData volume, float3 camera, float3 direc
 }
 
 // All the volumes in a slice's mask, along a ray between two distances: (their tint by optical depth,
-// their optical depth).
+// their optical depth), and the span of the ray they cover: empty (x > y) if none.
 public float4 fog_volumes_along(FogVolumeData* volumes, uint2 mask, float3 camera, float3 direction, float view_per_ray,
-                                float reach, float from_distance, float to_distance)
+                                float reach, float from_distance, float to_distance, out float2 span)
 {
+    span = float2(1e30, -1e30);
     float4 total = float4(0.0);
     for (uint word = 0; word < 2; ++word)
     {
         for (uint bits = mask[word]; bits != 0; bits &= bits - 1)
         {
             const FogVolumeData volume = volumes[word * 32 + firstbitlow(bits)];
-            const float depth = fog_volume_optical_depth(volume, camera, direction, view_per_ray, reach, from_distance, to_distance);
+            const float depth = fog_volume_optical_depth(volume, camera, direction, view_per_ray, reach, from_distance, to_distance, span);
             total += float4(volume.tint_density.rgb * depth, depth);
         }
     }

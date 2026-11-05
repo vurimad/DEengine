@@ -1486,6 +1486,28 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes.clear();
         static_cast<void>(render(clear_air));
         CHECK(device->stats().live_textures <= textures_in_view - 2);
+        // They wait a while, counted from when one was last in view, then one out of view doesn't hold them. Each
+        // check looks at the step when no volumes are left, as the render graph's pool lets go of its own over time.
+        const auto volume_in_view_then_out = [&](int frames_out) {
+            frame.fog_volumes.clear();
+            frame.fog_volumes.push(volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f));
+            static_cast<void>(render(clear_air));
+            frame.fog_volumes[0] = volume_at(40.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
+            for (int i = 0; i < frames_out; ++i) {
+                record_on(*target, kSize, lit_by(clear_air));
+            }
+        };
+        volume_in_view_then_out(200);
+        volume_in_view_then_out(200); // over the wait in all, but not since it was last seen
+        const uint32_t textures_waiting = device->stats().live_textures;
+        frame.fog_volumes.clear();
+        static_cast<void>(render(clear_air));
+        CHECK(device->stats().live_textures <= textures_waiting - 2);
+        volume_in_view_then_out(245);
+        const uint32_t textures_past_wait = device->stats().live_textures;
+        frame.fog_volumes.clear();
+        static_cast<void>(render(clear_air));
+        CHECK(device->stats().live_textures >= textures_past_wait);
         frame.fog_volumes.push(volume_at(7.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f)); // 4 m aside, and the view reaches 5.5
         const de::core::Array<std::byte> reaching_in = render(clear_air);
         CHECK(renderer->stats().fog_volumes == 1);
@@ -1525,6 +1547,14 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes[0].half_extents[2] = 5.0f;
         const de::core::Array<std::byte> short_view = render(clear_air);
         CHECK(std::abs(at_pixel(long_view, heart, heart, 1) - at_pixel(short_view, heart, heart, 1)) > 5);
+        // The same for an ellipsoid: its sphere reaches as far as its longest axis. Thin, to see all the way along.
+        frame.fog_volumes[0].ellipsoid = true;
+        frame.fog_volumes[0].density_per_m = 0.03f;
+        frame.fog_volumes[0].half_extents[2] = 3.0f;
+        const de::core::Array<std::byte> short_ellipsoid = render(clear_air);
+        frame.fog_volumes[0].half_extents[2] = 25.0f;
+        const de::core::Array<std::byte> long_ellipsoid = render(clear_air);
+        CHECK(std::abs(at_pixel(long_ellipsoid, heart, heart, 1) - at_pixel(short_ellipsoid, heart, heart, 1)) > 5);
         frame.fog_volumes.clear();
 
         // Past the first 32 of them, read from the mask's second half.
@@ -1594,6 +1624,19 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         }
         mist_in_slice(clear_air);
         frame.fog_volumes.clear();
+
+        // A thin wall's light is where it is: wholly under a roof no wider than it, it's as dark as under one that
+        // covers everything, though the rest of its slice is sunlit.
+        wall_at(55.0f);
+        frame.fog_volumes.push(mist_slab(49.2f, 0.4f));
+        const de::core::Array<std::byte> thin_lit = render(clear_air);
+        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, -49.2f}, .mesh = mesh});
+        const de::core::Array<std::byte> thin_all_roofed = render(clear_air);
+        frame.instances.back() = {.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 0.8f, 0, -49.2f}, .mesh = mesh};
+        const de::core::Array<std::byte> thin_narrow_roof = render(clear_air);
+        frame.fog_volumes.clear();
+        CHECK(at_pixel(thin_lit, heart, heart, 1) > at_pixel(thin_all_roofed, heart, heart, 1) + 15);
+        CHECK(std::abs(at_pixel(thin_narrow_roof, heart, heart, 1) - at_pixel(thin_all_roofed, heart, heart, 1)) <= 6);
 
         // Slid along the view, through thick far slices, mist doesn't come and go: its points are its own. That
         // goes for a thin wall, thinner than the space between points in a slice, too.

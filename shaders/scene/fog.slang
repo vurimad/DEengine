@@ -46,14 +46,18 @@ float fog_share_in_slice(SceneFrame* frame, float3 direction, float view_per_ray
     const float near_distance = froxel_depth(frame.fog, float(slice) / slices) / view_per_ray;
     const float far_distance = froxel_depth(frame.fog, float(slice + 1) / slices) / view_per_ray;
     const float3 camera = frame.camera_position.xyz;
-    const float in_front = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, view_depth / view_per_ray).a;
-    const float through = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, far_distance).a;
+    float2 span;
+    const float through = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, far_distance, span).a;
+    if (through <= 0.0)
+    {
+        return by_depth;
+    }
+    const float in_front = fog_volumes_along(push.fog_volumes, mask, camera, direction, view_per_ray, reach, near_distance, view_depth / view_per_ray, span).a;
     // As the slice stored it: within where the world's fog starts and ends.
     const float fog_near = clamp(frame.fog.ambient.w, near_distance, far_distance);
     const float fog_far = clamp(frame.fog.range.x, near_distance, far_distance);
     const float world_fog = fog_far > fog_near ? optical_depth(frame.fog, camera.y, direction.y, fog_near, fog_far) : 0.0;
-    const float all_fog = through + world_fog;
-    return all_fog > 0.0 ? saturate((in_front + world_fog * by_depth) / all_fog) : by_depth;
+    return saturate((in_front + world_fog * by_depth) / (through + world_fog));
 }
 
 [shader("vertex")]
