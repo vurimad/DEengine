@@ -115,7 +115,7 @@ struct GpuFogVolume {
     float half_extents[4] = {}; // w: edge, in meters
     float tint_density[4] = {}; // w: extinction per meter
     float shape[4] = {};        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
-    float noise[4] = {};        // xyz: how far its noise has moved, in tiles; w: its tiles a meter
+    float noise[4] = {};        // xyz: how far its noise has moved, in tiles, wrapped to [0, 4); w: its tiles a meter
 };
 static_assert(sizeof(GpuFogVolume) == 112);
 

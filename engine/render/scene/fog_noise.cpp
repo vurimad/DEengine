@@ -90,7 +90,8 @@ float billows(float x, float y, float z, int period, uint32_t seed) {
 void make_fog_noise(std::span<uint8_t> out) {
     DE_VERIFY(out.size() == kFogNoiseBytes);
     core::Array<float> values(core::heap_allocator(core::MemoryTag::Render));
-    values.resize(kFogNoiseBytes);
+    const size_t top_bytes = size_t{kFogNoiseSize} * kFogNoiseSize * kFogNoiseSize;
+    values.resize(top_bytes);
     const float per_texel = 1.0f / static_cast<float>(kFogNoiseSize);
     float lowest = 1e30f;
     float highest = -1e30f;
@@ -118,9 +119,31 @@ void make_fog_noise(std::span<uint8_t> out) {
         }
     }
     const float scale = 255.0f / std::max(highest - lowest, 1e-6f);
-    for (size_t i = 0; i < kFogNoiseBytes; ++i) {
+    for (size_t i = 0; i < top_bytes; ++i) {
         out[i] = static_cast<uint8_t>((values[i] - lowest) * scale + 0.5f);
     }
+    // Each mip: the mean of the 8 texels above each of its own. A cube halves evenly, so it still tiles.
+    size_t above = 0;
+    size_t at = top_bytes;
+    for (uint32_t size = kFogNoiseSize / 2; size >= 1; size /= 2) {
+        const uint32_t above_size = size * 2;
+        for (uint32_t z = 0; z < size; ++z) {
+            for (uint32_t y = 0; y < size; ++y) {
+                for (uint32_t x = 0; x < size; ++x) {
+                    uint32_t sum = 4; // rounds
+                    for (uint32_t k = 0; k < 8; ++k) {
+                        const size_t tx = size_t{x} * 2 + (k & 1U);
+                        const size_t ty = size_t{y} * 2 + ((k >> 1U) & 1U);
+                        const size_t tz = size_t{z} * 2 + ((k >> 2U) & 1U);
+                        sum += out[above + tz * above_size * above_size + ty * above_size + tx];
+                    }
+                    out[at++] = static_cast<uint8_t>(sum / 8);
+                }
+            }
+        }
+        above += size_t{above_size} * above_size * above_size;
+    }
+    DE_VERIFY(at == kFogNoiseBytes);
 }
 
 } // namespace de::render

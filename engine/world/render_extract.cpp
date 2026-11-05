@@ -147,7 +147,7 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                         // In double, however long the world has run; wrapped, so a float holds it.
                         const double moved = static_cast<double>(glm::dot(axis, drift)) * *desc.time_s *
                                              static_cast<double>(noise_per_m);
-                        out.noise_offset[row] = static_cast<float>(moved - std::floor(moved));
+                        out.noise_offset[row] = static_cast<float>(moved - 4.0 * std::floor(moved * 0.25));
                     }
                     desc.frame->fog_volumes.push(out);
                 }

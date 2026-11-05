@@ -486,6 +486,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
         desc.device->create_texture({.width = kFogNoiseSize,
                                      .height = kFogNoiseSize,
                                      .depth = kFogNoiseSize,
+                                     .mip_count = kFogNoiseMips,
                                      .format = rhi::Format::R8Unorm,
                                      .usage = rhi::TextureUsage::Sampled | rhi::TextureUsage::CopyDst,
                                      .dimension = rhi::TextureDimension::Texture3D,
