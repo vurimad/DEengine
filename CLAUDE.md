@@ -18,7 +18,7 @@ build/msvc/bin/Debug/cooker                 # cook content/ (+ meta/) and shader
 tools/profile.ps1 -Seconds 10               # headless Tracy capture of the dev build: zone and plot tables in text (median,
                                             # p95, p99, past the first 2 s), the GPU's clocks, CSVs + trace.tracy in
                                             # build/profiles/<timestamp>/ (build msvc-dev first). For GPU numbers pass
-                                            # -EngineArgs '--no-validation','--no-vsync','--window','2560x1440'
+                                            # -EngineArgs '--no-validation','--window','2560x1440'
 ```
 
 Before calling work done: it builds warning-free (warnings are errors), tests pass, clang-format and clang-tidy are clean.
