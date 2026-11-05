@@ -70,6 +70,8 @@ public:
     // What the last advance() extracted for the renderer: the camera and every MeshInstance,
     // interpolated, relative to the render origin. Valid until the next advance().
     const RenderFrame& render_frame() const;
+    // The next frame holds every instance, for a renderer that missed some frame's changes.
+    void resync_render_instances();
     // The phase entity a system goes in: .kind(world.phase(Phase::Combat)).
     flecs::entity phase(Phase phase) const;
 

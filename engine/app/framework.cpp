@@ -403,6 +403,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             if (scene_renderer) {
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
                                            engine.lighting, engine.view, engine.taa);
+                if (scene_renderer->instances_stale()) {
+                    world->resync_render_instances();
+                }
             } else {
                 // No scene renderer: the window is cleared.
                 graph->add_pass(

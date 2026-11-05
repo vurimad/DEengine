@@ -282,12 +282,12 @@ constexpr uint64_t frame_bytes(uint64_t update_count) {
 // What the frame's instances may draw, which sizes what the cull writes.
 struct CullPlan {
     GpuDrawList lists[kDrawListCount];
-    uint32_t slots = 0;           // to cull
-    uint32_t updates = 0;         // changes to apply
-    bool clear_instances = false; // before them, forget every slot
-    uint32_t drawn = 0;           // instances whose mesh is on the GPU
-    uint32_t draws = 0;           // their parts, into the G-buffer
-    uint32_t shadow_draws = 0;    // and into the cascades
+    uint32_t slots = 0;        // to cull
+    uint32_t updates = 0;      // changes to apply
+    uint32_t clear_first = 0;  // from here to slots, they hold nothing yet
+    uint32_t drawn = 0;        // instances whose mesh is on the GPU
+    uint32_t draws = 0;        // their parts, into the G-buffer
+    uint32_t shadow_draws = 0; // and into the cascades
     uint64_t slot_capacity = 0;
 
     // The draw arguments come first in the cull's buffer, then the records.
@@ -371,7 +371,11 @@ struct SceneRendererState {
     uint64_t instance_rows_address = 0;
     uint64_t instance_meshes_address = 0;
     uint32_t max_instances = 0;
-    bool instances_written = false;     // the buffers have held something
+    uint32_t cleared_slots = 0;                        // slots the GPU knows hold nothing or something real
+    core::Array<uint32_t> slot_written{render_heap()}; // the update each slot was last in
+    uint32_t update_number = 0;
+    uint32_t used_mesh_slots = 0; // none past this has instances
+    bool warned_mesh_table = false;
     bool instance_buffers_read = false; // and the graph has left them for reading
     bool instances_stale_now = false;
     bool warned_instance_limit = false;
@@ -761,6 +765,7 @@ struct SceneRendererState {
         if (mesh != kNoMesh) {
             ++mesh_instances[mesh];
             ++live_instances;
+            used_mesh_slots = std::max(used_mesh_slots, mesh + 1);
         }
         slot_meshes[slot] = mesh;
     }
@@ -782,31 +787,41 @@ struct SceneRendererState {
             set_slot_mesh(slot, kNoMesh);
         }
         slot_meshes.resize(plan.slots, kNoMesh);
-        plan.clear_instances = frame.all_instances || !instances_written;
-        instances_written = true;
+        slot_written.resize(plan.slots, 0);
+        // Slots coming into use may hold anything, or what was there before the list last shrank.
+        plan.clear_first = frame.all_instances ? 0 : cleared_slots;
+        ++update_number;
 
         uint32_t count = 0;
-        for (const uint32_t slot : frame.freed_slots) {
-            if (slot < plan.slots) {
-                set_slot_mesh(slot, kNoMesh);
-                updates[count].slot = slot;
-                updates[count].mesh = kNoMesh;
-                ++count;
-            }
-        }
         for (size_t i = 0; i < frame.instances.size(); ++i) {
             const world::RenderInstance& instance = frame.instances[i];
             const uint32_t slot = instance.slot == world::kAutoRenderSlot ? static_cast<uint32_t>(i) : instance.slot;
             if (slot >= plan.slots) { // past the limit, or kSkipRenderInstance
                 continue;
             }
+            DE_ASSERT_MSG(slot_written[slot] != update_number, "two records for a slot would land in either order");
+            slot_written[slot] = update_number;
             const uint32_t mesh = gpu_assets->mesh_slot(instance.mesh);
+            if (mesh == kNoMesh && instance.mesh.is_valid() && !warned_mesh_table) {
+                DE_LOG_ERROR("render",
+                             "the mesh table is full, or a mesh went before its instances: they aren't drawn");
+                warned_mesh_table = true;
+            }
             set_slot_mesh(slot, mesh);
             GpuInstanceUpdate& update = updates[count++];
             std::memcpy(update.rows, instance.transform, kInstanceBytes / 2);
             std::memcpy(update.rows + 12, instance.previous_transform, kInstanceBytes / 2);
             update.slot = slot;
             update.mesh = mesh;
+        }
+        // The records land in any order, so a slot freed and taken again in one frame gets only the one above.
+        for (const uint32_t slot : frame.freed_slots) {
+            if (slot < plan.slots && slot_written[slot] != update_number) {
+                set_slot_mesh(slot, kNoMesh);
+                updates[count].slot = slot;
+                updates[count].mesh = kNoMesh;
+                ++count;
+            }
         }
         plan.updates = count;
     }
@@ -858,7 +873,7 @@ struct SceneRendererState {
         // What the instances can draw, from how many there are of each mesh.
         uint64_t kind_parts[kDrawKindCount] = {};
         const std::span<const GpuMeshKinds> kinds = gpu_assets->mesh_kinds();
-        for (size_t mesh = 0; mesh < kinds.size(); ++mesh) {
+        for (size_t mesh = 0; mesh < used_mesh_slots; ++mesh) {
             const uint32_t count = mesh_instances[mesh];
             if (count == 0) {
                 continue;
@@ -1241,8 +1256,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.stats = {};
     state.read_cull_stats();
     // A frame not drawn left a gap in the numbers (hand-made frames have no numbers).
-    state.instances_stale_now =
-        frame.number != 0 && state.last_frame_number != 0 && frame.number != state.last_frame_number + 1;
+    state.instances_stale_now = frame.number != 0 && frame.number != state.last_frame_number + 1;
     state.last_frame_number = frame.number;
     const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
     const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
@@ -1349,13 +1363,15 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
          .state = state.instance_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
          .final_state = rhi::ResourceState::ShaderRead});
     state.instance_buffers_read = true;
-    if (plan.clear_instances) {
+    if (plan.clear_first < plan.slots) {
         graph.add_pass(
             "instances clear", [&](PassBuilder& pass) { pass.use(instance_meshes_graph, rhi::ResourceState::CopyDst); },
-            [instance_meshes_graph, bytes = uint64_t{state.max_instances} * sizeof(uint32_t)](PassContext& context) {
-                context.list.fill_buffer(context.buffer(instance_meshes_graph), 0, bytes, kNoMesh);
+            [instance_meshes_graph, first = uint64_t{plan.clear_first} * sizeof(uint32_t),
+             bytes = uint64_t{plan.slots - plan.clear_first} * sizeof(uint32_t)](PassContext& context) {
+                context.list.fill_buffer(context.buffer(instance_meshes_graph), first, bytes, kNoMesh);
             });
     }
+    state.cleared_slots = plan.slots;
     if (plan.updates > 0) {
         graph.add_pass(
             "instance update",

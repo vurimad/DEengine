@@ -16,6 +16,8 @@
 #include "support/readback.h"
 #include "support/sandbox.h"
 #include "world/render_extract.h"
+#include "world/transform.h"
+#include "world/world.h"
 
 #include <doctest/doctest.h>
 
@@ -922,6 +924,160 @@ TEST_CASE("an instance stops drawing when its mesh unloads") {
     });
 }
 
+TEST_CASE("a world's instances draw through the frames that send nothing") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        auto world = de::world::World::create();
+        REQUIRE(world.ok());
+        const flecs::world& ecs = world->ecs();
+        const auto rock_at = [&](double x_m) {
+            const flecs::entity rock =
+                ecs.entity().add<de::world::StaticTransform>().set(de::world::MeshInstance{.mesh = mesh});
+            de::world::place(rock, de::world::Transform{.position = {x_m, 0.0, 0.0}});
+            return rock;
+        };
+        const flecs::entity left = rock_at(-1.0);
+        const flecs::entity right = rock_at(1.0);
+        const flecs::entity eye = ecs.entity().set(de::world::Camera{.vertical_fov_rad = 1.0f});
+        de::world::place(eye, de::world::Transform{.position = {0.0, 0.0, 3.0}});
+        ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+        const auto frame_of_world = [&] {
+            world->advance(1.0 / 60.0);
+            scene.submit(world->render_frame());
+            return de::test::read_texture(scene.device, scene.target);
+        };
+        de::core::Array<std::byte> pixels = frame_of_world();
+        for (int i = 0; i < 4; ++i) {
+            pixels = frame_of_world();
+        }
+        CHECK(scene.renderer.stats().instance_updates == 0);
+        CHECK(scene.renderer.stats().instances == 2);
+        CHECK(is_red(pixels, kLeft));
+        CHECK(is_red(pixels, kRight));
+
+        // One goes, and the other stays with nothing sent for it.
+        left.destruct();
+        for (int i = 0; i < 3; ++i) {
+            pixels = frame_of_world();
+        }
+        CHECK(scene.renderer.stats().instances == 1);
+        CHECK_FALSE(is_red(pixels, kLeft));
+        CHECK(is_red(pixels, kRight));
+        CHECK_FALSE(scene.renderer.instances_stale());
+
+        // A frame not drawn, then one with what changed in the meantime.
+        de::world::place(right, de::world::Transform{.position = {0.0, 0.0, 0.0}});
+        world->advance(1.0 / 60.0); // not drawn: this frame's change never reaches the renderer
+        world->advance(1.0 / 60.0);
+        scene.submit(world->render_frame());
+        CHECK(scene.renderer.instances_stale());
+        world->resync_render_instances();
+        pixels = frame_of_world();
+        CHECK_FALSE(scene.renderer.instances_stale());
+        CHECK(is_red(pixels, kMiddle));
+        CHECK_FALSE(is_red(pixels, kRight));
+    });
+}
+
+TEST_CASE("a slot freed and taken again in one frame draws what took it") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        // Many of them, so a wrong order would show: the two records would be far apart.
+        constexpr uint32_t kCount = 256;
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = kCount;
+        for (uint32_t slot = 0; slot < kCount; ++slot) {
+            frame.instances.push(instance_at(red, slot, 0.0f));
+        }
+        scene.submit(frame);
+        frame.instances.clear();
+        for (uint32_t slot = 0; slot < kCount; ++slot) {
+            frame.freed_slots.push(slot);
+            frame.instances.push(instance_at(green, slot, 50.0f + static_cast<float>(slot % 2)));
+        }
+        scene.submit(frame);
+        CHECK(scene.renderer.stats().instance_updates == kCount); // no second record for any of them
+        CHECK(scene.renderer.stats().instances == kCount);
+        frame.instances.clear();
+        frame.freed_slots.clear();
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().draws == kCount);
+    });
+}
+
+TEST_CASE("slots a shrunken list leaves don't come back as they were") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 3;
+        frame.instances.push(instance_at(mesh, 0, -1.0f));
+        frame.instances.push(instance_at(mesh, 1, 0.0f));
+        frame.instances.push(instance_at(mesh, 2, 1.0f));
+        scene.submit(frame);
+        frame.instances.clear();
+        frame.slot_count = 1;
+        scene.submit(frame);
+        CHECK(scene.renderer.stats().instances == 1);
+        frame.slot_count = 3;
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().instances == 1);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        CHECK(is_red(pixels, kLeft));
+        CHECK_FALSE(is_red(pixels, kMiddle));
+        CHECK_FALSE(is_red(pixels, kRight));
+    });
+}
+
+TEST_CASE("a mesh on its way out keeps room in the draw lists until the cull stops finding it") {
+    with_pool({.frame_budget_bytes = 1}, [](const PoolScene& scene) { // one upload a frame: the queue backs up
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kRed, {0.0f});
+        const AssetHandle going = scene.load(kCenter);
+        const AssetHandle staying = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 2;
+        frame.instances.push(instance_at(going, 0, -1.0f));
+        frame.instances.push(instance_at(staying, 1, 1.0f));
+        scene.submit(frame);
+        scene.uploader.flush_and_wait();
+        frame.instances.clear();
+        scene.assets.release(going);
+        scene.assets.update();
+        // Its table entry hasn't gone up yet, so it's still in the draw lists: they have to fit both.
+        scene.submit(frame);
+        CHECK(scene.renderer.stats().draws == 2);
+        scene.uploader.flush_and_wait();
+        scene.submit(frame);
+        CHECK(scene.renderer.stats().draws == 1);
+    });
+}
+
+TEST_CASE("a handle that's gone takes no mesh slot") {
+    with_pool({.max_meshes = 2}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        CHECK(scene.gpu_assets.mesh_slot(mesh) != de::render::kNoMeshSlot);
+        scene.assets.release(mesh);
+        scene.assets.update();
+        CHECK(scene.gpu_assets.mesh_slot(mesh) == de::render::kNoMeshSlot);
+        CHECK(scene.gpu_assets.mesh_slot(AssetHandle{}) == de::render::kNoMeshSlot);
+    });
+}
+
 TEST_CASE("instances past the limit aren't drawn, and the rest are") {
     with_pool({.max_instances = 1}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
@@ -945,19 +1101,19 @@ TEST_CASE("the renderer says when instances went stale") {
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
         de::world::RenderFrame frame = PoolScene::frame_of({mesh});
-        frame.number = 10;
-        scene.submit(frame);
-        CHECK_FALSE(scene.renderer.instances_stale());
-        frame.number = 11;
-        scene.submit(frame);
-        CHECK_FALSE(scene.renderer.instances_stale());
-        frame.number = 13; // a frame wasn't drawn
+        frame.number = 4; // the frames before it weren't drawn
         scene.submit(frame);
         CHECK(scene.renderer.instances_stale());
-        frame.number = 14;
+        frame.number = 5;
         scene.submit(frame);
         CHECK_FALSE(scene.renderer.instances_stale());
-        frame.number = 15;
+        frame.number = 7; // a frame wasn't drawn
+        scene.submit(frame);
+        CHECK(scene.renderer.instances_stale());
+        frame.number = 8;
+        scene.submit(frame);
+        CHECK_FALSE(scene.renderer.instances_stale());
+        frame.number = 9;
         frame.camera.valid = false; // this one has nothing to look through
         scene.submit(frame);
         CHECK(scene.renderer.instances_stale());

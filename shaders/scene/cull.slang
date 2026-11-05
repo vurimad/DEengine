@@ -129,7 +129,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
             uint index;
             InterlockedAdd(push.counts[list], 1, index);
             const GpuDrawList draws = push.lists[list];
-            if (index >= draws.capacity) // only if a material's flags changed since the lists were sized
+            if (index >= draws.capacity) // a material changed kind, or a mesh is on its way out
             {
                 continue;
             }

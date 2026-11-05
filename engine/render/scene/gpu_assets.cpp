@@ -133,7 +133,9 @@ struct GpuAssetsState {
     // A mesh's old place, freed once the last frame that may have drawn from it is done.
     struct RetiredPlace {
         PoolPlace place;
-        uint64_t table_ticket = 0;        // the upload that stops the mesh table pointing here
+        uint32_t mesh_slot = 0;
+        bool table_cleared = false;       // the upload that stops the mesh table pointing here is queued
+        uint64_t table_ticket = 0;        // and this is it
         uint64_t last_frame = UINT64_MAX; // the first frame that has that upload, once it's recorded
     };
     core::Array<RetiredPlace> retired_places{render_heap()};
@@ -327,7 +329,6 @@ struct GpuAssetsState {
                     // The GPU may be reading the old ones until this is recorded; it can't draw a part it lost.
                     mesh.parts_stale = true; // update() uploads them
                     mesh.ready = false;
-                    publish_kinds(mesh);
                     mesh.needs_table = UINT64_MAX;
                     pending_meshes.push(mesh_key);
                 }
@@ -480,9 +481,31 @@ struct GpuAssetsState {
         }
     }
 
-    // Tells the renderer what a mesh draws, or that it doesn't.
+    // Tells the renderer what a mesh draws, for the draw lists to have room. Only once the cull will find it. A mesh
+    // waiting for new parts or a new place is still found, in its old place, until its entry changes.
     void publish_kinds(const MeshEntry& entry) {
-        slot_kinds[entry.gpu.table_slot] = entry.ready ? entry.gpu.kinds : GpuMeshKinds{};
+        if (entry.ready) {
+            slot_kinds[entry.gpu.table_slot] = entry.gpu.kinds;
+        }
+    }
+
+    // A slot whose old entry hasn't gone yet: a new one has to wait, so they land in the right order.
+    bool slot_clear_pending(uint32_t slot) const {
+        for (const RetiredPlace& gone : retired_places) {
+            if (gone.mesh_slot == slot && !gone.table_cleared) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void clear_table_entry(RetiredPlace& gone) {
+        if (const core::Result<void> queued = upload_mesh_entry(gone.mesh_slot, GpuMeshInfo{}); queued) {
+            gone.table_cleared = true;
+            gone.table_ticket = uploader->buffer_upload_ticket();
+        } else {
+            DE_LOG_ERROR("render", "mesh table upload: %s", queued.error().message); // tried again each update
+        }
     }
 
     core::Result<void> upload_mesh_entry(uint32_t slot, const GpuMeshInfo& info) {
@@ -639,11 +662,9 @@ struct GpuAssetsState {
     void unload_mesh(asset::AssetHandle handle) {
         if (const MeshEntry* entry = meshes.find(key_of(handle)); entry != nullptr) {
             // The mesh table goes first, in the order of uploads: nothing draws this place after that's recorded.
-            slot_kinds[entry->gpu.table_slot] = {};
-            if (const core::Result<void> queued = upload_mesh_entry(entry->gpu.table_slot, GpuMeshInfo{}); !queued) {
-                DE_LOG_ERROR("render", "mesh table upload: %s", queued.error().message);
-            }
-            retired_places.push({.place = entry->place, .table_ticket = uploader->buffer_upload_ticket()});
+            RetiredPlace gone{.place = entry->place, .mesh_slot = entry->gpu.table_slot};
+            clear_table_entry(gone);
+            retired_places.push(gone);
             bytes -= entry->bytes;
             meshes.remove(key_of(handle)); // a pending key that's gone is skipped
         }
@@ -664,8 +685,14 @@ struct GpuAssetsState {
         const uint64_t completed = device->completed_frame();
         size_t kept = 0;
         for (RetiredPlace& gone : retired_places) {
-            if (gone.last_frame == UINT64_MAX && uploader->recorded(gone.table_ticket)) {
+            if (!gone.table_cleared) {
+                clear_table_entry(gone);
+            }
+            if (gone.table_cleared && gone.last_frame == UINT64_MAX && uploader->recorded(gone.table_ticket)) {
                 gone.last_frame = device->frame_index();
+                // The cull won't find it from this frame on. Before now, the draw lists still needed room for it. A new
+                // entry for this slot is queued after this one, so it can't be ready yet.
+                slot_kinds[gone.mesh_slot] = {};
             }
             if (gone.last_frame != UINT64_MAX && completed >= gone.last_frame) {
                 free_place(gone.place);
@@ -910,6 +937,8 @@ void GpuAssets::update() {
         }
     }
     state.retired.resize(kept);
+    // First: an old entry's end is seen before a new one's start.
+    state.free_retired_places();
     // Meshes become drawable once their uploads and the table upload with their materials are in.
     kept = 0;
     for (size_t i = 0; i < state.pending_meshes.size(); ++i) {
@@ -932,7 +961,8 @@ void GpuAssets::update() {
                 continue;
             }
         }
-        if (state.table_recorded >= entry->needs_table && state.uploader->recorded(entry->upload_ticket)) {
+        if (state.table_recorded >= entry->needs_table && state.uploader->recorded(entry->upload_ticket) &&
+            !state.slot_clear_pending(entry->gpu.table_slot)) {
             // Its entry is what lets the cull find it. Tried again next update if it fails.
             if (const core::Result<void> queued = state.upload_mesh_entry(entry->gpu.table_slot, entry->info); queued) {
                 entry->ready = true;
@@ -946,11 +976,11 @@ void GpuAssets::update() {
         }
     }
     state.pending_meshes.resize(kept);
-    state.free_retired_places();
 }
 
 uint32_t GpuAssets::mesh_slot(asset::AssetHandle mesh) {
-    return mesh.is_valid() ? state_->take_mesh_slot(mesh) : kNoMeshSlot;
+    // Nothing would ever give back a slot for a handle that's already gone.
+    return state_->assets->asset(mesh).id.is_valid() ? state_->take_mesh_slot(mesh) : kNoMeshSlot;
 }
 
 std::span<const GpuMeshKinds> GpuAssets::mesh_kinds() const {

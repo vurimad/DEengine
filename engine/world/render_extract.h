@@ -2,6 +2,7 @@
 
 #include "asset/registry.h"
 #include "core/array.h"
+#include "core/hash_map.h"
 #include "core/math.h"
 #include "world/transform.h"
 
@@ -19,6 +20,12 @@ namespace de::world {
 // does (its cell), and outlives it.
 struct MeshInstance {
     asset::AssetHandle mesh;
+};
+
+// An entity's place in the renderer's instance data, which stays between frames. Comes and goes with its MeshInstance,
+// given and freed by observers.
+struct RenderSlot {
+    uint32_t slot = 0;
 };
 
 // Fog in the shape of a box or an ellipsoid around the entity: its world scale is its half extents.
@@ -91,7 +98,8 @@ struct RenderFogVolume {
 
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
 // at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
-// list of entities; it reads this, rebuilt every frame.
+// list of entities. Instances are what changed since the last frame, for it to keep: all of them only
+// when the render origin moves, or when the renderer asks (World::resync_render_instances).
 struct RenderFrame {
     uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
     DVec3 origin{0.0};         // the render origin: what instance positions are relative to
@@ -117,10 +125,21 @@ struct RenderExtractScratch {
         const WorldTransform* current = nullptr;
         const PreviousWorldTransform* previous = nullptr;
         const MeshInstance* meshes = nullptr;
+        const RenderSlot* slots = nullptr;
+        uint64_t table = 0;
         uint32_t count = 0;
-        uint32_t first = 0; // where its rows go in RenderFrame::instances
+        uint32_t first = 0;     // where its rows go in RenderFrame::instances
+        bool write_all = false; // something wrote to its table: every row is sent, not only what's moving
+        bool any_moving = false;
     };
     core::Array<Chunk> chunks{core::heap_allocator(core::MemoryTag::Render)};
+    // The frame each table last had something moving in it: what to look at though nothing wrote to it.
+    core::HashMap<uint64_t, uint64_t> moving_tables{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> free_slots{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
+    uint32_t next_slot = 0;
+    uint64_t sent_origin_moves = 0;
+    bool resync = false; // send all of them, next frame
 };
 
 struct RenderExtractDesc {
@@ -133,12 +152,17 @@ struct RenderExtractDesc {
 };
 
 // Adds the RenderExtract systems that fill desc.frame: the active camera, then interpolated world
-// transforms of everything with a MeshInstance, relative to the render origin. Each instance's pose
+// transforms of what changed with a MeshInstance, relative to the render origin. Each instance's pose
 // a frame ago comes from the same two ticks, stepped back by alpha_step (a frame longer than a tick
 // goes back past the previous tick, by the same motion): no history per entity, exact for steady
-// motion, and none for what hasn't moved or was place()d. Every table's rows are cut into
-// chunks and run as one parallel job over all of them. After the first frames it doesn't allocate
-// (the arrays keep their capacity).
+// motion, and none for what hasn't moved or was place()d.
+//
+// A table nothing wrote to, with nothing moving in it, costs next to nothing, whatever its size. A table
+// something wrote to sends all its rows, so what moves shouldn't share one with what doesn't (StaticTransform
+// keeps them apart). What stopped moving is sent once more when its previous transform catches up, in a tick,
+// which writes to its table: that row has no motion in it. Those tables' rows are
+// cut into chunks and run as one parallel job. After the first frames it doesn't allocate (the arrays keep
+// their capacity).
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
 } // namespace de::world

@@ -369,6 +369,6 @@ TEST_CASE("benchmark: 10k entities in typical shapes, ticked and extracted") {
     // stats stored once on the prefabs), and the props one more.
     const int32_t tables = renderable.c_ptr() != nullptr ? ecs_query_count(renderable.c_ptr()).tables : 0;
     MESSAGE("10k entities: ", ms / kFrames, " ms per frame (tick + extraction), ", tables, " tables extracted");
-    CHECK(world->render_frame().instances.size() == 10000);
+    CHECK(world->render_frame().slot_count == 10000);
     CHECK(tables == 5);
 }

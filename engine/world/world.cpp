@@ -141,6 +141,10 @@ flecs::world& World::ecs() {
     return state_->ecs;
 }
 
+void World::resync_render_instances() {
+    state_->extract_scratch.resync = true;
+}
+
 const RenderFrame& World::render_frame() const {
     return state_->render_frame;
 }
