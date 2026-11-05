@@ -298,17 +298,21 @@ constexpr uint64_t frame_bytes(uint64_t instance_count) {
            std::max<uint64_t>(instance_count, 1) * sizeof(uint32_t);
 }
 
-// The plane where a combination of a matrix's rows is 0, inside where it's positive, scaled to meters.
-void set_plane(float (&plane)[4], const float* view_proj, uint32_t row, float sign) {
-    float length_squared = 0.0f;
-    for (uint32_t k = 0; k < 4; ++k) {
-        plane[k] = view_proj[12 + k] + sign * view_proj[row * 4 + k];
-        length_squared += k < 3 ? plane[k] * plane[k] : 0.0f;
-    }
+// Scales a plane so that it measures meters.
+void normalize_plane(float (&plane)[4]) {
+    const float length_squared = (plane[0] * plane[0]) + (plane[1] * plane[1]) + (plane[2] * plane[2]);
     const float scale = 1.0f / std::sqrt(std::max(length_squared, 1e-12f));
     for (float& value : plane) {
         value *= scale;
     }
+}
+
+// The plane where w + sign * a row of a matrix is 0, inside where it's positive.
+void set_plane(float (&plane)[4], const float* view_proj, uint32_t row, float sign) {
+    for (uint32_t k = 0; k < 4; ++k) {
+        plane[k] = view_proj[12 + k] + (sign * view_proj[(row * 4) + k]);
+    }
+    normalize_plane(plane);
 }
 
 // The sides of a clip space, inside for |x| <= w and |y| <= w.
@@ -704,7 +708,8 @@ struct SceneRendererState {
     // The cull's views, each instance's slot in the mesh table, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
                          CullPlan& plan) {
-        auto* const views = reinterpret_cast<GpuCullView*>(mapped.data() + kCullViewsOffset);
+        // Made here and copied: this memory is fast to write and very slow to read.
+        GpuCullView views[kCullViewCount];
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
         // plane.
         views[0] = {.plane_count = 4, .first_list = 0, .lists_by_kind = 1};
@@ -716,18 +721,10 @@ struct SceneRendererState {
             view = {.plane_count = 5, .first_list = cascade_list(c, false), .lists_by_kind = 0};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             set_side_planes(view, view_proj);
-            float far_plane[4];
-            for (uint32_t k = 0; k < 4; ++k) {
-                far_plane[k] = view_proj[8 + k];
-            }
-            const float scale =
-                1.0f / std::sqrt(std::max((far_plane[0] * far_plane[0]) + (far_plane[1] * far_plane[1]) +
-                                              (far_plane[2] * far_plane[2]),
-                                          1e-12f));
-            for (uint32_t k = 0; k < 4; ++k) {
-                view.planes[4][k] = far_plane[k] * scale;
-            }
+            std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
+            normalize_plane(view.planes[4]);
         }
+        std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
 
         auto* const instance_meshes =
             reinterpret_cast<uint32_t*>(mapped.data() + instance_meshes_offset(frame.instances.size()));
