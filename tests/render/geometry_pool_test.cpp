@@ -783,6 +783,55 @@ TEST_CASE("instances stay on the GPU until something about them changes") {
     });
 }
 
+TEST_CASE("DIAG A: slot 1 freed, slot 0 alive") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 2;
+        frame.instances.push(instance_at(red, 0, -1.0f));
+        frame.instances.push(instance_at(red, 1, 1.0f));
+        scene.submit(frame);
+        frame.instances.clear();
+        frame.freed_slots.push(1);
+        fprintf(stderr, "DIAG A before\n"); fflush(stderr);
+        scene.submit(frame);
+        fprintf(stderr, "DIAG A after\n"); fflush(stderr);
+    });
+}
+
+TEST_CASE("DIAG B: slot 0 never had a mesh, slot 1 alive, no free record") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 2;
+        frame.instances.push(instance_at(red, 1, 1.0f));
+        fprintf(stderr, "DIAG B before\n"); fflush(stderr);
+        scene.submit(frame);
+        fprintf(stderr, "DIAG B after\n"); fflush(stderr);
+    });
+}
+
+TEST_CASE("DIAG C: slot 0 freed, nothing else alive") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.slot_count = 1;
+        frame.instances.push(instance_at(red, 0, -1.0f));
+        scene.submit(frame);
+        frame.instances.clear();
+        frame.freed_slots.push(0);
+        fprintf(stderr, "DIAG C before\n"); fflush(stderr);
+        scene.submit(frame);
+        fprintf(stderr, "DIAG C after\n"); fflush(stderr);
+    });
+}
+
 TEST_CASE("a freed slot draws nothing, until something else takes it") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
