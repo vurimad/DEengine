@@ -533,6 +533,7 @@ struct Physics::State {
     ecs_id_t transform_id = 0;
     uint32_t transforms_written = 0;
     uint32_t transforms_compared = 0;
+    uint32_t tables_written = 0;
 
     // Named, so the world owns them. It goes first, and a query's destructor reads it, so they're never destroyed here.
     struct Queries {
@@ -764,6 +765,7 @@ void Physics::State::update_characters(float tick_s) {
 // that has it looking through a table next tick.
 void Physics::State::write_transforms(const flecs::world& world) {
     transforms_written = 0;
+    tables_written = 0;
     const JPH::uint active = system.GetNumActiveBodies(JPH::EBodyType::RigidBody);
     const JPH::BodyID* const awake = system.GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
     const uint32_t asleep = fell_asleep.count();
@@ -804,6 +806,7 @@ void Physics::State::write_transforms(const flecs::world& world) {
         }
         last_table = table;
     }
+    tables_written = static_cast<uint32_t>(written_tables.size());
     // Going through a table without skipping it is what tells a query it's seen that table's state.
     queries().placed_bodies.run([](flecs::iter& it) {
         while (it.next()) {
@@ -1015,7 +1018,8 @@ PhysicsStats Physics::stats() const {
             .characters = state_->characters,
             .shapes = static_cast<uint32_t>(state_->shapes.size()),
             .transforms_written = state_->transforms_written,
-            .transforms_compared = state_->transforms_compared};
+            .transforms_compared = state_->transforms_compared,
+            .tables_written = state_->tables_written};
 }
 
 } // namespace de::physics

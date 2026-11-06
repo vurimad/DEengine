@@ -18,11 +18,16 @@ Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, P
 
 `cmake/vcpkg-ports/joltphysics` is vcpkg's port with `DOUBLE_PRECISION` and `CROSS_PLATFORM_DETERMINISTIC` on, because the design doc asks for doubles and strict determinism and both change Jolt's types and code. It's built as a static library (`cmake/vcpkg-triplets/port-options.cmake`).
 
+It needs AVX2, on Windows and Linux: that's Jolt's default, and the port names the platform on Windows, where vcpkg's Ninja build would otherwise leave Jolt on SSE2 without a word. `CROSS_PLATFORM_DETERMINISTIC` keeps fused multiply-add off.
+
+Jolt has to be built by the compiler that calls it, as its API passes vectors by value. Under `linux-clang`, `cmake/vcpkg-triplets/x64-linux-clang.cmake` sees to that, where vcpkg would use GCC.
+
 ## Limits
 
 - **Moving bodies allocate.** Jolt's broad phase takes one small scratch block per tick while anything is moving (`QuadTree::UpdatePrepare`), through `MemoryTag::Physics`, and whatever the body count. It stops when everything sleeps. Static bodies and characters allocate nothing per tick.
 - **Characters run on the game thread, one after another,** before the step. Fine for a handful; it hasn't been measured with many enemies.
 - **Moving a static body does nothing,** by design: there's no per-tick look at them.
+- **What moves shouldn't share a table with thousands that don't.** The world copies transforms a table at a time, so 100 bodies falling among 100k asleep in one table take about 1.8 ms a tick, against about 0.2 ms in a table of their own.
 - **Moving bodies must be roots.** Only their own `Transform` is read and written.
 
 ## Not here yet

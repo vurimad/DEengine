@@ -90,6 +90,7 @@ struct PhysicsStats {
     // Last tick: dynamic bodies whose pose reached their Transform, and rows looked at for a place().
     uint32_t transforms_written = 0;
     uint32_t transforms_compared = 0;
+    uint32_t tables_written = 0; // told of what moved in them, once each
 };
 
 // What's between a query and what it hit.

@@ -9,12 +9,15 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <thread>
 
 using de::DVec3;
+using de::Quat;
 using de::Vec3;
 using de::physics::BodyKind;
 using de::physics::CharacterController;
@@ -82,6 +85,26 @@ DVec3 where(flecs::entity entity) {
 
 const CharacterController& controller(flecs::entity entity) {
     return entity.get<CharacterController>();
+}
+
+} // namespace
+
+namespace {
+
+struct InATableOfItsOwn {};
+
+// Holds a worker until it's let go, which leaves jobs queued that only the thread waiting for them can get to.
+struct HeldWorkers {
+    std::atomic<uint32_t> held{0};
+    std::atomic<bool> let_go{false};
+};
+
+void hold_worker(void* context) {
+    auto& workers = *static_cast<HeldWorkers*>(context);
+    workers.held.fetch_add(1);
+    while (!workers.let_go.load()) {
+        std::this_thread::yield();
+    }
 }
 
 } // namespace
@@ -374,15 +397,125 @@ TEST_CASE("an entity given only a Transform has its body where and as big as tha
 
 TEST_CASE("a body's Transform ends where physics has it, through the step it falls asleep in") {
     Scene scene;
-    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
-    const flecs::entity ball = scene.sphere({1.25, 2.0, -0.75});
-    scene.ticks(300);
+    // A slope gentle enough, and a ball damped enough, that it goes to sleep while it's still creeping down.
+    const flecs::entity slope = scene.ecs().entity();
+    slope.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {50.0f, 0.5f, 50.0f}});
+    slope.set(RigidBody{});
+    slope.set(Transform{.position = {0.0, -0.5, 0.0}, .rotation = glm::angleAxis(0.02f, Vec3(0.0f, 0.0f, 1.0f))});
+    const flecs::entity ball = scene.ecs().entity();
+    ball.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    ball.set(RigidBody{.kind = BodyKind::Dynamic, .linear_damping = 8.0f, .angular_damping = 8.0f});
+    ball.set(Transform{.position = {0.0, 0.52, 0.0}});
+    double last_step_m = 0.0;
+    double last_x = 0.0;
+    for (int tick = 0; tick < 600 && (tick == 0 || scene.physics.stats().active_bodies > 0); ++tick) {
+        scene.ticks(1);
+        const double x = where(ball).x;
+        if (x != last_x) {
+            last_step_m = std::abs(x - last_x);
+        }
+        last_x = x;
+    }
     REQUIRE(scene.physics.stats().active_bodies == 0);
+    REQUIRE(last_step_m > 3e-5); // or this says nothing: a step left out would be too small to see
+    // From the side it was going, where a step's move shows in full.
     QueryHit hit;
-    REQUIRE(scene.physics.ray_cast(where(ball) + DVec3(0.0, 2.0, 0.0), {0.0f, -1.0f, 0.0f}, 3.0f, hit));
+    REQUIRE(scene.physics.ray_cast(where(ball) - DVec3(5.0, 0.0, 0.0), {1.0f, 0.0f, 0.0f}, 10.0f, hit));
     REQUIRE(hit.entity == ball.id());
-    // Its top, half a meter above its center, to well under what a last step of settling moves it.
-    CHECK(std::abs(hit.position.y - (where(ball).y + 0.5)) < 1e-6);
+    CHECK(std::abs(hit.position.x - (where(ball).x - 0.5)) < 1e-5);
+}
+
+TEST_CASE("what reads transforms sees what physics moved, in every table, and each table is told once") {
+    Scene scene;
+    const flecs::entity plain[2] = {scene.sphere({0.0, 500.0, 0.0}), scene.sphere({4.0, 500.0, 0.0})};
+    const flecs::entity marked = scene.sphere({8.0, 500.0, 0.0});
+    marked.add<InATableOfItsOwn>();
+    scene.ticks(3);
+    CHECK(scene.physics.stats().transforms_written == 3);
+    CHECK(scene.physics.stats().tables_written == 2);
+    for (const flecs::entity entity : {plain[0], plain[1], marked}) {
+        const auto* const world = entity.try_get<de::world::WorldTransform>();
+        REQUIRE(world != nullptr);
+        CHECK(where(entity).y < 500.0);
+        CHECK(world->position == where(entity));
+    }
+}
+
+TEST_CASE("a kinematic body is told where to go, and doesn't write its Transform") {
+    Scene scene;
+    const flecs::entity lift = scene.box({0.0, 0.0, 0.0}, {1.0f, 1.0f, 1.0f}, BodyKind::Kinematic);
+    scene.ticks(1);
+    lift.set(Transform{.position = {0.0, 5.0, 0.0}});
+    scene.ticks(1);
+    CHECK(scene.physics.stats().active_bodies == 1);
+    CHECK(scene.physics.stats().transforms_written == 0);
+    CHECK(where(lift).y == 5.0);
+}
+
+TEST_CASE("a body's rotation reaches its Transform, and a place() can turn it alone") {
+    Scene scene;
+    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+    // Let go on a corner, it settles flat, turned from how it began.
+    const Quat tilted = glm::angleAxis(0.7f, glm::normalize(Vec3(1.0f, 0.0f, 0.5f)));
+    const flecs::entity crate = scene.ecs().entity();
+    crate.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {0.5f, 0.5f, 0.5f}});
+    crate.set(RigidBody{.kind = BodyKind::Dynamic});
+    crate.set(Transform{.position = {0.0, 3.0, 0.0}, .rotation = tilted});
+    scene.ticks(300);
+    CHECK(std::abs(glm::dot(crate.try_get<Transform>()->rotation, tilted)) < 0.99f);
+
+    // A quarter of a turn on the spot: its corner reaches past where its side was.
+    const flecs::entity high = scene.box({10.0, 200.0, 0.0}, {1.0f, 1.0f, 1.0f}, BodyKind::Dynamic);
+    scene.ticks(1);
+    const Vec3 down(0.0f, -1.0f, 0.0f);
+    QueryHit hit;
+    CHECK_FALSE(scene.physics.ray_cast(where(high) + DVec3(1.2, 5.0, 0.0), down, 10.0f, hit));
+    constexpr float kEighthTurnRad = 0.785398f;
+    de::world::place(
+        high, Transform{.position = where(high), .rotation = glm::angleAxis(kEighthTurnRad, Vec3(0.0f, 1.0f, 0.0f))});
+    scene.ticks(1);
+    CHECK(scene.physics.ray_cast(where(high) + DVec3(1.2, 5.0, 0.0), down, 10.0f, hit));
+}
+
+TEST_CASE("no job of a step's is left behind when physics goes, with no worker free to run them") {
+    constexpr uint32_t kWorkers = 2;
+    de::core::JobSystem jobs({.worker_count = kWorkers});
+    HeldWorkers workers;
+    de::core::JobCounter held;
+    for (uint32_t i = 0; i < kWorkers; ++i) {
+        jobs.submit(de::core::Job{.entry = &hold_worker, .context = &workers, .counter = &held, .name = "hold"});
+    }
+    while (workers.held.load() < kWorkers) {
+        std::this_thread::yield();
+    }
+    {
+        Scene scene(&jobs);
+        scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+        for (int i = 0; i < 50; ++i) {
+            scene.sphere({static_cast<double>(i) * 1.5, 2000.0, 0.0});
+        }
+        // Long enough to run out of jobs if each step left its own behind, which would hang here.
+        scene.ticks(400);
+        CHECK(scene.physics.stats().active_bodies == 50);
+    } // Jolt asserts in Debug if a job is still held by what would run it
+    workers.let_go.store(true);
+    jobs.wait(held);
+}
+
+TEST_CASE("a child's body is made where its parent puts it") {
+    Scene scene;
+    const flecs::entity parent = scene.ecs().entity();
+    de::world::place(parent, Transform{.position = {100.0, 0.0, 0.0}});
+    scene.ticks(1);
+    const flecs::entity child = scene.ecs().entity().child_of(parent);
+    child.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {1.0f, 1.0f, 1.0f}});
+    child.set(RigidBody{});
+    child.set(Transform{.position = {0.0, 5.0, 0.0}});
+    scene.ticks(1);
+    QueryHit hit;
+    REQUIRE(scene.physics.ray_cast({100.0, 20.0, 0.0}, {0.0f, -1.0f, 0.0f}, 30.0f, hit));
+    CHECK(hit.entity == child.id());
+    CHECK(hit.distance_m == doctest::Approx(14.0f));
 }
 
 TEST_CASE("a few bodies awake among many asleep cost what the few do, and a place() still reaches the rest") {
@@ -805,6 +938,26 @@ TEST_CASE("benchmark: physics at scale") {
             }
             scene.ticks(1);
             report("asleep, and 100 falling", scene, median_step_us(scene, ticks));
+        }
+        {
+            // The same with what moves in a table of its own, which is what the world's per-table transforms want.
+            Scene scene(&jobs, desc);
+            scene.box({0.0, -0.5, 0.0}, {2000.0f, 0.5f, 2000.0f});
+            for (int i = 0; i < statics; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+                de::world::place(entity, Transform{.position = grid(i, 2.0) + DVec3(-300.0, 0.4, -100.0)});
+            }
+            for (int i = 0; i < 100; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                entity.add<InATableOfItsOwn>();
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic});
+                de::world::place(entity, Transform{.position = {-400.0 - (static_cast<double>(i) * 2.0), 2000.0, 0.0}});
+            }
+            scene.ticks(1);
+            report("asleep, and 100 falling apart", scene, median_step_us(scene, ticks));
         }
     }
 }
