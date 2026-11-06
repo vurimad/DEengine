@@ -242,7 +242,7 @@ constexpr uint32_t cascade_list(uint32_t cascade, bool masked) {
 
 // Matches GpuCullView and GpuDrawList in shaders/scene/scene_common.slang.
 struct GpuCullView {
-    float planes[6][4] = {};
+    float planes[kShadowCasterPlanes + 1][4] = {}; // for a cascade, how far toward the sun it goes too
     uint32_t plane_count = 0;
     uint32_t first_list = 0;
     uint32_t lists_by_kind = 0;
@@ -250,9 +250,10 @@ struct GpuCullView {
     float depth_plane[4] = {};
     float lod_scale = 0.0f;
     float lod_fade_end = 1.0f;
-    float padding_end[2] = {};
+    float min_radius_m = 0.0f;
+    float padding_end = 0.0f;
 };
-static_assert(sizeof(GpuCullView) == 144);
+static_assert(sizeof(GpuCullView) == 240);
 
 struct GpuDrawList {
     uint32_t first_slot = 0;
@@ -402,6 +403,8 @@ struct SceneRendererState {
     bool warned_draws_lost = false;
     float lod_error_pixels = 1.0f;
     float lod_fade = 0.2f;
+    bool shadow_caster_cull = true;
+    float shadow_min_texels = 1.0f;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -858,7 +861,7 @@ struct SceneRendererState {
 
     // The cull's views, what changed in the instances, and from them the draw lists' sizes.
     void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
-                         uint32_t height, CullPlan& plan) {
+                         const ShadowCascade (&cascades)[kShadowCascadeCount], uint32_t height, CullPlan& plan) {
         // At 0, LOD 0 everywhere, however small a LOD's error.
         const auto lod_scale_for = [this](float per_unit_of_error) {
             return lod_error_pixels > 0.0f ? per_unit_of_error / lod_error_pixels : -1.0f;
@@ -884,19 +887,27 @@ struct SceneRendererState {
         views[0].depth_plane[3] = -((views[0].depth_plane[0] * camera[3]) + (views[0].depth_plane[1] * camera[7]) +
                                     (views[0].depth_plane[2] * camera[11]));
         set_side_planes(views[0], scene.view_proj); // jittered, as it's drawn
-        // A cascade: its sides and both ends of its depth (0 <= z <= w). Depth isn't clamped, so a caster past either
-        // end would be clipped anyway. How far toward the sun a cascade reaches is SceneShadows::caster_reach_m.
+        // A cascade: what can shadow what it's read for, as far toward the sun as its depth goes (z <= w: depth isn't
+        // clamped, so a caster past that would be clipped anyway, and how far that is is SceneShadows::caster_reach_m).
+        // With that cull off, all its map could hold: its sides and both ends of its depth.
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             GpuCullView& view = views[1 + c];
-            view = {.plane_count = 6,
-                    .first_list = cascade_list(c, false),
+            view = {.first_list = cascade_list(c, false),
                     .lists_by_kind = 0,
-                    .lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f))};
+                    .lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f)),
+                    .min_radius_m = 0.5f * shadow_min_texels * scene.cascade_texel_m[c]};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
-            set_side_planes(view, view_proj);
-            std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
-            normalize_plane(view.planes[4]);
-            set_plane(view.planes[5], view_proj, 2, -1.0f);
+            if (shadow_caster_cull) {
+                view.plane_count = cascades[c].caster_plane_count;
+                std::memcpy(view.planes, cascades[c].caster_planes, sizeof(cascades[c].caster_planes));
+            } else {
+                set_side_planes(view, view_proj);
+                std::memcpy(view.planes[4], view_proj + 8, sizeof(view.planes[4]));
+                normalize_plane(view.planes[4]);
+                view.plane_count = 5;
+            }
+            set_plane(view.planes[view.plane_count], view_proj, 2, -1.0f);
+            ++view.plane_count;
         }
         std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
 
@@ -1049,7 +1060,7 @@ struct SceneRendererState {
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
-        write_cull_data(mapped, frame, scene, height, plan);
+        write_cull_data(mapped, frame, scene, cascades, height, plan);
         device->flush_mapped(buffer, 0, frame_bytes(plan.updates));
         return true;
     }
@@ -1145,6 +1156,71 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
     }
 }
 
+namespace {
+
+// The planes of what can shadow a slice of the view: the slice swept toward the sun, and a margin around it. A box with
+// corners numbered by bits (x, y, and near or far): a face that the sweep moves away from stays, and so does the edge
+// between it and one the sweep crosses, as a plane along the sun. A slice's sides aren't parallel, so more of them can
+// stay than a box's would, but it's at most 11 planes: and with one left out, what's inside only gets bigger.
+uint32_t shadow_caster_planes(const glm::dvec3 (&corners)[8], const glm::dvec3& toward_sun, double margin_m,
+                              float (&out)[kShadowCasterPlanes][4]) {
+    glm::dvec3 middle(0.0);
+    for (const glm::dvec3& corner : corners) {
+        middle += corner * 0.125;
+    }
+    uint32_t count = 0;
+    const auto add = [&](glm::dvec3 normal, const glm::dvec3& on_it) {
+        const double length = glm::length(normal);
+        if (length < 1e-9 || count == kShadowCasterPlanes) {
+            return; // an edge along the sun: the faces beside it already bound the sweep
+        }
+        normal /= length;
+        if (glm::dot(normal, middle - on_it) < 0.0) {
+            normal = -normal;
+        }
+        out[count][0] = static_cast<float>(normal.x);
+        out[count][1] = static_cast<float>(normal.y);
+        out[count][2] = static_cast<float>(normal.z);
+        out[count][3] = static_cast<float>(margin_m - glm::dot(normal, on_it));
+        ++count;
+    };
+    // A face is one bit held, with its corners running over the other two.
+    bool stays[3][2] = {};
+    for (uint32_t bit = 0; bit < 3; ++bit) {
+        const uint32_t next = 1U << ((bit + 1) % 3);
+        const uint32_t after = 1U << ((bit + 2) % 3);
+        for (uint32_t side = 0; side < 2; ++side) {
+            const glm::dvec3& first = corners[side << bit];
+            glm::dvec3 normal =
+                glm::cross(corners[(side << bit) | next] - first, corners[(side << bit) | after] - first);
+            if (glm::dot(normal, middle - first) < 0.0) {
+                normal = -normal; // inward
+            }
+            stays[bit][side] = glm::dot(normal, toward_sun) >= 0.0;
+            if (stays[bit][side]) {
+                add(normal, first);
+            }
+        }
+    }
+    // An edge runs along one bit, with the other two held: those are its two faces.
+    for (uint32_t bit = 0; bit < 3; ++bit) {
+        const uint32_t next = (bit + 1) % 3;
+        const uint32_t after = (bit + 2) % 3;
+        for (uint32_t side_next = 0; side_next < 2; ++side_next) {
+            for (uint32_t side_after = 0; side_after < 2; ++side_after) {
+                if (stays[next][side_next] != stays[after][side_after]) {
+                    const glm::dvec3& first = corners[(side_next << next) | (side_after << after)];
+                    const glm::dvec3& second = corners[(side_next << next) | (side_after << after) | (1U << bit)];
+                    add(glm::cross(second - first, toward_sun), first);
+                }
+            }
+        }
+    }
+    return count;
+}
+
+} // namespace
+
 void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float vertical_fov_rad, float near_m,
                          float aspect, const float (&sun_direction)[3], const SceneShadows& shadows,
                          ShadowCascade (&out)[kShadowCascadeCount]) {
@@ -1161,7 +1237,14 @@ void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float v
     const double near = std::max(static_cast<double>(near_m), 0.05);
     const double far = std::max(static_cast<double>(shadows.distance_m), near * 2.0);
     const double lambda = std::clamp(static_cast<double>(shadows.split_lambda), 0.0, 1.0);
+    const double blend_band = std::clamp(static_cast<double>(shadows.blend_band), 0.0, 1.0);
+    const glm::dvec3 camera_right = glm::normalize(glm::dvec3(camera[0], camera[4], camera[8]));
+    const glm::dvec3 camera_up = glm::normalize(glm::dvec3(camera[1], camera[5], camera[9]));
+    // Wider than the view: TAA's offset moves it, and the fog's columns reach a little past it.
+    constexpr double kViewMargin = 1.05;
     double slice_near = near;
+    double before_slice =
+        0.0; // the far edge of the cascade before the one before, as shaders/scene/scene_common.slang has it
     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
         // The practical split scheme: a blend of logarithmic and even splits.
         const double t = static_cast<double>(c + 1) / static_cast<double>(kShadowCascadeCount);
@@ -1208,6 +1291,20 @@ void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float v
         cascade.far_m = static_cast<float>(slice_far);
         cascade.texel_m = static_cast<float>(texel);
         cascade.depth_per_m = static_cast<float>(1.0 / depth_range);
+        // What it's read for starts where the cascade before starts handing pixels on (cascade_band), and the filter
+        // reads around a pixel: at most max_penumbra_texels each way, twice over for the blocker search and the taps.
+        const double read_near =
+            c == 0 ? near : std::max(near, before_slice + ((slice_near - before_slice) * (1.0 - blend_band)));
+        glm::dvec3 corners[8];
+        for (uint32_t i = 0; i < 8; ++i) {
+            const double depth = (i & 4U) != 0 ? slice_far : read_near;
+            const double x = ((i & 1U) != 0 ? 1.0 : -1.0) * depth * tan_x * kViewMargin;
+            const double y = ((i & 2U) != 0 ? 1.0 : -1.0) * depth * tan_y * kViewMargin;
+            corners[i] = position + (forward * depth) + (camera_right * x) + (camera_up * y);
+        }
+        const double filter_m = texel * (2.0 * std::max(static_cast<double>(shadows.max_penumbra_texels), 1.0) + 2.0);
+        cascade.caster_plane_count = shadow_caster_planes(corners, back, filter_m, cascade.caster_planes);
+        before_slice = slice_near;
         slice_near = slice_far;
     }
 }
@@ -2026,6 +2123,14 @@ void SceneRenderer::set_lod_error_pixels(float pixels) {
 
 void SceneRenderer::set_lod_fade(float share) {
     state_->lod_fade = share;
+}
+
+void SceneRenderer::set_shadow_caster_cull(bool on) {
+    state_->shadow_caster_cull = on;
+}
+
+void SceneRenderer::set_shadow_min_texels(float texels) {
+    state_->shadow_min_texels = texels;
 }
 
 bool SceneRenderer::instances_stale() const {
