@@ -957,8 +957,8 @@ struct SceneRendererState {
             }
             plan.drawn += drawable ? count : 0;
         }
-        // Each list has room for a draw for all that could land in it, whether they turn out merged or not, and there's
-        // a record for each of them.
+        // Each list has room for a draw for all that could land in it, which merged is at most one per part in the
+        // table, and there's a record for each of them.
         uint32_t slot = 0;
         uint64_t records = 0;
         const uint32_t call_limit = std::min(device->capabilities().max_draw_indirect_count, max_draws_per_call);
@@ -973,7 +973,8 @@ struct SceneRendererState {
                             capacity, call_limit);
                 warned_draw_limit = true;
             }
-            const uint32_t kept = std::min(capacity, call_limit);
+            const uint32_t draws = merged_draws ? std::min(capacity, gpu_assets->part_table_used()) : capacity;
+            const uint32_t kept = std::min(draws, call_limit);
             plan.lists[index] = {.first_slot = slot, .capacity = kept};
             slot += kept;
         };
