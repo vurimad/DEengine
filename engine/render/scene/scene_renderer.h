@@ -122,10 +122,10 @@ struct SceneRendererStats {
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 
-// A cascade of the sun's shadow map: where it reaches along the view, and its projection.
 // The most planes it takes to bound what can shadow a slice of the view.
 inline constexpr uint32_t kShadowCasterPlanes = 11;
 
+// A cascade of the sun's shadow map: where it reaches along the view, and its projection.
 struct ShadowCascade {
     float far_m = 0.0f;       // its far edge, as distance along the view
     float texel_m = 0.0f;     // a shadow texel's size

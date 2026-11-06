@@ -435,34 +435,38 @@ TEST_CASE("what can shadow a cascade reaches exactly as far as what reads it") {
     de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, ahead, shadows, cascades);
     const auto filter_m = [&](uint32_t c) {
         return static_cast<double>(cascades[c].texel_m) *
-               (2.0 * static_cast<double>(shadows.max_penumbra_texels) + 2.0);
+               ((1.25 * static_cast<double>(shadows.max_penumbra_texels)) + 3.0);
     };
-    for (uint32_t c = 2; c < de::render::kShadowCascadeCount; ++c) {
+    for (uint32_t c = 1; c < de::render::kShadowCascadeCount; ++c) {
         CAPTURE(c);
-        const auto before = static_cast<double>(cascades[c - 2].far_m);
+        const double before = c == 1 ? 0.0 : static_cast<double>(cascades[c - 2].far_m);
         const auto last_far = static_cast<double>(cascades[c - 1].far_m);
         const auto far = static_cast<double>(cascades[c].far_m);
         // It starts where the cascade before hands pixels on, less what the filter reads around them.
         const double read_near = before + ((last_far - before) * (1.0 - static_cast<double>(shadows.blend_band)));
-        CHECK(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (0.5 * filter_m(c)))));
-        CHECK_FALSE(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (1.5 * filter_m(c)))));
-        // The sides: the view and 5% around it, and the filter's reach, measured across a side that leans.
+        CHECK(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (0.98 * filter_m(c)))));
+        CHECK_FALSE(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (1.02 * filter_m(c)))));
+        // The sides: the view and 2% around it, and the filter's reach, measured across a side that leans.
         const double depth = (read_near + far) * 0.5;
-        const double wide = tan_y * 1.05;
+        const double wide = tan_y * 1.02;
         const double across = filter_m(c) * std::sqrt(1.0 + (wide * wide));
-        CHECK(can_shadow(cascades[c], (depth * wide) + (0.5 * across), 0.0, -depth));
-        CHECK_FALSE(can_shadow(cascades[c], (depth * wide) + (1.5 * across), 0.0, -depth));
-        CHECK(can_shadow(cascades[c], 0.0, -((depth * wide) + (0.5 * across)), -depth));
-        CHECK_FALSE(can_shadow(cascades[c], 0.0, -((depth * wide) + (1.5 * across)), -depth));
+        CHECK(can_shadow(cascades[c], (depth * wide) + (0.98 * across), 0.0, -depth));
+        CHECK_FALSE(can_shadow(cascades[c], (depth * wide) + (1.02 * across), 0.0, -depth));
+        CHECK(can_shadow(cascades[c], 0.0, -((depth * wide) + (0.98 * across)), -depth));
+        CHECK_FALSE(can_shadow(cascades[c], 0.0, -((depth * wide) + (1.02 * across)), -depth));
         // Past its far edge, toward the sun, a caster still shadows what's before it.
         CHECK(can_shadow(cascades[c], 0.0, 0.0, -(far + 50.0)));
     }
+    // Cascade 0 is read from the eye, by fog nearer than the near plane, even with a far-off near plane.
+    const float side_on[3] = {1, 0, 0.1f};
+    de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 2.0f, 1.0f, side_on, shadows, cascades);
+    CHECK(can_shadow(cascades[0], 5.0, 0.0, -0.5));
     // With the sun behind the camera, it's the far edge that stays, and the near end that's swept open.
     const float behind[3] = {0, 0, 1};
     de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, behind, shadows, cascades);
     CHECK(can_shadow(cascades[3], 0.0, 0.0, 5.0));
-    CHECK(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (0.5 * filter_m(3)))));
-    CHECK_FALSE(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (1.5 * filter_m(3)))));
+    CHECK(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (0.98 * filter_m(3)))));
+    CHECK_FALSE(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (1.02 * filter_m(3)))));
 }
 
 TEST_CASE(
@@ -491,7 +495,7 @@ TEST_CASE(
         de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, cascades);
         for (uint32_t cascade = 0; cascade < de::render::kShadowCascadeCount; ++cascade) {
             most_planes = std::max(most_planes, cascades[cascade].caster_plane_count);
-            const double start = cascade == 0 ? 0.2 : static_cast<double>(cascades[cascade - 1].far_m);
+            const double start = cascade == 0 ? 0.002 : static_cast<double>(cascades[cascade - 1].far_m);
             const auto end = static_cast<double>(cascades[cascade].far_m);
             // Points all through its part of the view, out to the corners, and each a way toward the sun from there.
             for (int point = 0; point < 40; ++point) {

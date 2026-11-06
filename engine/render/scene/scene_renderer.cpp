@@ -404,7 +404,7 @@ struct SceneRendererState {
     float lod_error_pixels = 1.0f;
     float lod_fade = 0.2f;
     bool shadow_caster_cull = true;
-    float shadow_min_texels = 1.0f;
+    float shadow_min_texels = 0.0f;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -1171,8 +1171,12 @@ uint32_t shadow_caster_planes(const glm::dvec3 (&corners)[8], const glm::dvec3& 
     uint32_t count = 0;
     const auto add = [&](glm::dvec3 normal, const glm::dvec3& on_it) {
         const double length = glm::length(normal);
-        if (length < 1e-9 || count == kShadowCasterPlanes) {
+        if (length < 1e-9) {
             return; // an edge along the sun: the faces beside it already bound the sweep
+        }
+        DE_ASSERT(count < kShadowCasterPlanes);
+        if (count == kShadowCasterPlanes) {
+            return; // with one left out, what's inside only gets bigger
         }
         normal /= length;
         if (glm::dot(normal, middle - on_it) < 0.0) {
@@ -1240,11 +1244,12 @@ void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float v
     const double blend_band = std::clamp(static_cast<double>(shadows.blend_band), 0.0, 1.0);
     const glm::dvec3 camera_right = glm::normalize(glm::dvec3(camera[0], camera[4], camera[8]));
     const glm::dvec3 camera_up = glm::normalize(glm::dvec3(camera[1], camera[5], camera[9]));
-    // Wider than the view: TAA's offset moves it, and the fog's columns reach a little past it.
-    constexpr double kViewMargin = 1.05;
+    // Wider than the view: TAA's offset moves it by up to half a pixel, and this covers that down to a view 50 pixels
+    // tall.
+    constexpr double kViewMargin = 1.02;
     double slice_near = near;
     double before_slice =
-        0.0; // the far edge of the cascade before the one before, as shaders/scene/scene_common.slang has it
+        0.0; // where the cascade before starts, as cascade_band in shaders/scene/scene_common.slang has it
     for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
         // The practical split scheme: a blend of logarithmic and even splits.
         const double t = static_cast<double>(c + 1) / static_cast<double>(kShadowCascadeCount);
@@ -1291,10 +1296,11 @@ void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float v
         cascade.far_m = static_cast<float>(slice_far);
         cascade.texel_m = static_cast<float>(texel);
         cascade.depth_per_m = static_cast<float>(1.0 / depth_range);
-        // What it's read for starts where the cascade before starts handing pixels on (cascade_band), and the filter
-        // reads around a pixel: at most max_penumbra_texels each way, twice over for the blocker search and the taps.
-        const double read_near =
-            c == 0 ? near : std::max(near, before_slice + ((slice_near - before_slice) * (1.0 - blend_band)));
+        // What it's read for starts where the cascade before starts handing pixels on, or for the first, at the eye:
+        // fog is read from there, whatever the near plane. The shadow mask reads around a pixel: its search and its
+        // taps each reach up to about 1.25 of the widest penumbra, and a pixel's normal offset and bilinear filtering
+        // add 3 texels at most.
+        const double read_near = c == 0 ? 1e-3 : before_slice + ((slice_near - before_slice) * (1.0 - blend_band));
         glm::dvec3 corners[8];
         for (uint32_t i = 0; i < 8; ++i) {
             const double depth = (i & 4U) != 0 ? slice_far : read_near;
@@ -1302,9 +1308,9 @@ void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float v
             const double y = ((i & 2U) != 0 ? 1.0 : -1.0) * depth * tan_y * kViewMargin;
             corners[i] = position + (forward * depth) + (camera_right * x) + (camera_up * y);
         }
-        const double filter_m = texel * (2.0 * std::max(static_cast<double>(shadows.max_penumbra_texels), 1.0) + 2.0);
+        const double filter_m = texel * (1.25 * std::max(static_cast<double>(shadows.max_penumbra_texels), 1.0) + 3.0);
         cascade.caster_plane_count = shadow_caster_planes(corners, back, filter_m, cascade.caster_planes);
-        before_slice = slice_near;
+        before_slice = c == 0 ? 0.0 : slice_near;
         slice_near = slice_far;
     }
 }
