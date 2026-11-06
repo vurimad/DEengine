@@ -1,6 +1,6 @@
 # shaders
 
-Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine compiles them from `src:/shaders/` in dev builds and rebuilds them live when a file changes. The cooker compiles them into `.deshader` files, which ship builds (and dev builds without `src:/`) load instead (`engine/render/shader/README.md`).
+Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine compiles them from `src:/shaders/` in dev builds and rebuilds them live when a file changes. The cooker compiles them into `.deshader` files, which ship builds (and dev builds without `src:/`) load instead (`engine/render/shader/README.md`). They refuse to start on `.deshader` files cooked from other sources than they were built from, so after changing anything here, rebuild and re-run the cooker to run those builds.
 
 ## Layout
 

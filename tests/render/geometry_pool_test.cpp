@@ -749,7 +749,6 @@ TEST_CASE("casters whose shadow lands out of sight are left out, and no picture 
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
-        scene.renderer.set_shadow_min_texels(0.0f);
 
         de::world::RenderFrame frame = scattered_casters(mesh);
         // A wide spread of evenings and noons, ahead and turned, with the cascades' hand-over bands where the floor is.
@@ -805,7 +804,6 @@ TEST_CASE("a caster beside what a cascade lights stays out, though the cascade's
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
-        scene.renderer.set_shadow_min_texels(0.0f);
 
         // The sun behind the camera, so its near and side faces are all swept across: only the planes along the sun,
         // from the edges, keep this out. It's to the right of the view, inside the last cascade's sphere.
@@ -867,25 +865,230 @@ TEST_CASE("a caster too small for a cascade's texels stays out of it, and in the
     });
 }
 
+TEST_CASE("the same part in the same list is one instanced draw, and each instance reads its own record") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const float x : {-1.0f, 0.0f, 1.0f}) {
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.4f, 0, 0, x, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}), .mesh = red});
+        }
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.4f, 0, 0, 0, 0, 0.4f, 0, 1, 0, 0, 0.4f, 0}), .mesh = green});
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        scene.submit_for_stats(frame, light);
+        const auto merged = de::test::read_texture(scene.device, scene.target);
+        const de::render::SceneRendererStats stats = scene.renderer.stats();
+        CHECK(stats.visible_draws == 4);
+        CHECK(stats.merged_draws == 2);
+        CHECK(stats.draws_lost == 0);
+        CHECK(stats.visible_shadow_draws >= 4);
+        CHECK(stats.merged_shadow_draws < stats.visible_shadow_draws);
+
+        // A draw each, to compare with: the same picture.
+        scene.renderer.set_merged_draws(false);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_draws == 4);
+        CHECK(scene.renderer.stats().merged_draws == 4);
+        CHECK(scene.renderer.stats().merged_shadow_draws == scene.renderer.stats().visible_shadow_draws);
+        const auto apart = de::test::read_texture(scene.device, scene.target);
+        CHECK(pixels_apart(merged, apart) == 0);
+        scene.renderer.set_merged_draws(true);
+    });
+}
+
+TEST_CASE("merged draws fit however few draws a call can take, and what has no room is counted and left out") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+
+        // Three of one mesh and three of another, in the same list.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const AssetHandle mesh : {red, green}) {
+            for (const float x : {-1.0f, 0.0f, 1.0f}) {
+                frame.instances.push({.transform = de::test::render_transform(
+                                          {0.4f, 0, 0, x, 0, 0.4f, 0, mesh == red ? 0.6f : -0.6f, 0, 0, 0.4f, 0}),
+                                      .mesh = mesh});
+            }
+        }
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        scene.renderer.set_max_draws_per_call(2);
+        scene.submit_for_stats(frame, light);
+        // More objects than a call can draw one by one, all drawn.
+        CHECK(scene.renderer.stats().merged_draws == 2);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        const auto both = de::test::read_texture(scene.device, scene.target);
+
+        // One draw: one mesh is drawn whole, and the other is counted as lost. The cull's second run stays off its
+        // records, and what's drawn doesn't run into the next list.
+        scene.renderer.set_max_draws_per_call(1);
+        scene.submit_for_stats(frame, light);
+        // Each view's list has its own room, so this is what the camera's kept, and what it reports isn't what was
+        // lost.
+        CHECK(scene.renderer.stats().merged_draws == 1);
+        CHECK(scene.renderer.stats().visible_draws == 3);
+        CHECK(scene.renderer.stats().visible_triangles == 6);
+        CHECK(scene.renderer.stats().draws_lost >= 3);
+        const auto one = de::test::read_texture(scene.device, scene.target);
+        CHECK(pixels_apart(both, one) > 0);
+        // About 19.5 pixels a meter, so a row is 12 pixels from the middle, and each square's center 20 from the next.
+        const auto squares = [&](uint32_t row, bool is_red_row) {
+            int shown = 0;
+            for (const uint32_t x : {kLeft, kMiddle, kRight}) {
+                const uint8_t* const color = texel(one, x, row);
+                shown += (is_red_row ? color[0] > 200 && color[1] < 60 : color[1] > 200 && color[0] < 60) ? 1 : 0;
+            }
+            return shown;
+        };
+        // Whichever got the draw, it's all three of it in their own places: nothing of the other's landed in its
+        // records.
+        const int red_shown = squares(kMiddle - 12, true);
+        const int green_shown = squares(kMiddle + 12, false);
+        CHECK(((red_shown == 3 && green_shown == 0) || (red_shown == 0 && green_shown == 3)));
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        CHECK(pixels_apart(both, de::test::read_texture(scene.device, scene.target)) == 0);
+    });
+}
+
+TEST_CASE("what has no room leaves no draw reading old arguments, a draw per object or merged") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const AssetHandle mesh : {red, green}) {
+            for (const float x : {-1.0f, 0.0f, 1.0f}) {
+                frame.instances.push({.transform = de::test::render_transform(
+                                          {0.4f, 0, 0, x, 0, 0.4f, 0, mesh == red ? 0.6f : -0.6f, 0, 0, 0.4f, 0}),
+                                      .mesh = mesh});
+            }
+        }
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        const auto squares = [&](const de::core::Array<std::byte>& pixels, uint32_t row, bool is_red_row) {
+            int shown = 0;
+            for (const uint32_t x : {kLeft, kMiddle, kRight}) {
+                const uint8_t* const color = texel(pixels, x, row);
+                shown += (is_red_row ? color[0] > 200 && color[1] < 60 : color[1] > 200 && color[0] < 60) ? 1 : 0;
+            }
+            return shown;
+        };
+        // A draw each: the frames before it leave every slot holding a real draw, of all six.
+        scene.renderer.set_merged_draws(false);
+        scene.submit_for_stats(frame, light);
+        CHECK(squares(de::test::read_texture(scene.device, scene.target), kMiddle - 12, true) == 3);
+        // Room for 4: the first mesh takes 3 slots, the second is left out, and the slot of its it could have had draws
+        // nothing rather than what was there.
+        scene.renderer.set_max_draws_per_call(4);
+        scene.submit_for_stats(frame, light);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        const int red_shown = squares(pixels, kMiddle - 12, true);
+        const int green_shown = squares(pixels, kMiddle + 12, false);
+        CHECK(((red_shown == 3 && green_shown == 0) || (red_shown == 0 && green_shown == 3)));
+        CHECK(scene.renderer.stats().visible_draws == 3);
+        CHECK(scene.renderer.stats().merged_draws == 3);
+        CHECK(scene.renderer.stats().draws_lost >= 3);
+        scene.renderer.set_merged_draws(true);
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
+    });
+}
+
+TEST_CASE("a frame finds nothing left of the parts the last frame used") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        // From both meshes to one, and back, many times: a key left over would count records that aren't there.
+        const auto frame_with = [&](bool with_green) {
+            de::world::RenderFrame frame = PoolScene::frame_of({});
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.4f, 0, 0, -1, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}), .mesh = red});
+            if (with_green) {
+                frame.instances.push(
+                    {.transform = de::test::render_transform({0.4f, 0, 0, 1, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}),
+                     .mesh = green});
+            }
+            return frame;
+        };
+        const auto shown = [&](bool with_green) {
+            scene.submit_for_stats(frame_with(with_green));
+            return de::test::read_texture(scene.device, scene.target);
+        };
+        const de::core::Array<std::byte> both = shown(true);
+        const de::core::Array<std::byte> only_red = shown(false);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(pixels_apart(only_red, shown(false)) == 0);
+            CHECK(scene.renderer.stats().visible_draws == 1);
+            CHECK(scene.renderer.stats().merged_draws == 1);
+            CHECK(pixels_apart(both, shown(true)) == 0);
+            CHECK(scene.renderer.stats().visible_draws == 2);
+            CHECK(scene.renderer.stats().merged_draws == 2);
+        }
+    });
+}
+
+TEST_CASE("merged draws have a record for every object, however few draws a call can take") {
+    with_pool({.max_instances = 4096}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        // More than the smallest room the records are given, in one list and one draw.
+        constexpr int kCount = 3000;
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (int i = 0; i < kCount; ++i) {
+            const float x = -1.0f + (2.0f * static_cast<float>(i % 60) / 60.0f);
+            const int row = i / 60;
+            const float y = -1.0f + (2.0f * static_cast<float>(row) / 50.0f);
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.01f, 0, 0, x, 0, 0.01f, 0, y, 0, 0, 0.01f, 0}),
+                 .mesh = mesh});
+        }
+        scene.renderer.set_max_draws_per_call(2);
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == kCount);
+        CHECK(scene.renderer.stats().merged_draws == 1);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
+    });
+}
+
 TEST_CASE("a cascade drops casters past either end of its depth") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
-        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
-        de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
-        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
-        CHECK(in_reach > 0);
-        // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
-        frame.instances[0].transform.set_position_m(2, 5000.0f);
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
-        // And past the far end of every cascade.
-        frame.instances[0].transform.set_position_m(2, -5000.0f);
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        // With the cull, and with all a map could hold, which is what the cull's pictures are compared with.
+        for (const bool cull : {true, false}) {
+            CAPTURE(cull);
+            scene.renderer.set_shadow_caster_cull(cull);
+            de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+            de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
+            light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
+            CHECK(in_reach > 0);
+            // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
+            frame.instances[0].transform.set_position_m(2, 5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+            // And past the far end of every cascade.
+            frame.instances[0].transform.set_position_m(2, -5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        }
     });
 }
 
@@ -2663,21 +2866,86 @@ TEST_CASE("what was fading when the cull froze keeps its room in the draw lists,
         const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
         const de::world::RenderFrame frame = view.frame_at(0.9f);
 
-        scene.renderer.set_cull_frozen(true);
-        scene.submit_for_stats(frame);
-        CHECK(scene.renderer.stats().visible_fading_draws == 2);
-        scene.renderer.set_lod_fade(0.0f);
-        scene.submit_for_stats(frame);
-        CHECK(scene.renderer.stats().visible_fading_draws == 2);
-        CHECK(scene.renderer.stats().draws_lost == 0);
-        const FadeView::Pixels seen = FadeView::count(de::test::read_texture(scene.device, scene.target));
-        CHECK(seen.first > 0);
-        CHECK(seen.second > 0);
-        CHECK(seen.other == 0);
+        for (const bool merged : {true, false}) {
+            CAPTURE(merged);
+            scene.renderer.set_merged_draws(merged);
+            scene.renderer.set_lod_fade(0.2f);
+            scene.renderer.set_cull_frozen(true);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 2);
+            scene.renderer.set_lod_fade(0.0f);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 2);
+            CHECK(scene.renderer.stats().draws_lost == 0);
+            const FadeView::Pixels seen = FadeView::count(de::test::read_texture(scene.device, scene.target));
+            CHECK(seen.first > 0);
+            CHECK(seen.second > 0);
+            CHECK(seen.other == 0);
 
-        scene.renderer.set_cull_frozen(false);
-        scene.submit_for_stats(frame);
-        CHECK(scene.renderer.stats().visible_fading_draws == 0);
+            scene.renderer.set_cull_frozen(false);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 0);
+        }
+    });
+}
+
+TEST_CASE("a frozen cull holds with draws merged or not, and with the caster cull on or off") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        constexpr double kStep = de::world::kRenderOriginStep;
+        const de::DVec3 start{kStep, 0.0, 0.0};
+        const de::DVec3 next{2.0 * kStep, 0.0, 0.0};
+        for (const bool merged : {true, false}) {
+            for (const bool caster_cull : {true, false}) {
+                CAPTURE(merged);
+                CAPTURE(caster_cull);
+                scene.renderer.set_merged_draws(merged);
+                scene.renderer.set_shadow_caster_cull(caster_cull);
+                // Two red squares at one place, which is one draw if they merge, and the green ones where the origin
+                // goes.
+                de::world::RenderFrame frame = assets.frame_at(start, next);
+                const de::world::RenderInstance red = frame.instances[0];
+                frame.instances.push(red);
+                const uint32_t camera_draws = merged ? 1 : 2;
+
+                scene.renderer.set_cull_frozen(true);
+                scene.submit_for_stats(frame, light);
+                const uint32_t shadow_draws = scene.renderer.stats().visible_shadow_draws;
+                const uint32_t shadow_triangles = scene.renderer.stats().visible_shadow_triangles;
+                REQUIRE(shadow_draws > 0);
+                const auto holds = [&](uint32_t merged_camera_draws) {
+                    scene.submit_for_stats(frame, light);
+                    const de::render::SceneRendererStats stats = scene.renderer.stats();
+                    CHECK(stats.visible_draws == 2);
+                    CHECK(stats.merged_draws == merged_camera_draws);
+                    CHECK(stats.visible_triangles == 4);
+                    CHECK(stats.visible_shadow_draws == shadow_draws);
+                    CHECK(stats.visible_shadow_triangles == shadow_triangles);
+                    CHECK(stats.draws_lost == 0);
+                };
+                holds(camera_draws);
+
+                // The origin and the camera go to the green squares, and they stay out of every view.
+                frame.origin = next;
+                holds(camera_draws);
+                CHECK_FALSE(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+
+                // Neither setting reaches what's frozen: the caster cull made its planes, and merging only draws them.
+                scene.renderer.set_shadow_caster_cull(!caster_cull);
+                holds(camera_draws);
+                scene.renderer.set_shadow_caster_cull(caster_cull);
+                scene.renderer.set_merged_draws(!merged);
+                holds(merged ? 2 : 1);
+                scene.renderer.set_merged_draws(merged);
+
+                scene.renderer.set_cull_frozen(false);
+                scene.submit(frame, light);
+                CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+            }
+        }
+        scene.renderer.set_merged_draws(true);
+        scene.renderer.set_shadow_caster_cull(true);
     });
 }
 

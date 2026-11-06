@@ -408,6 +408,118 @@ TEST_CASE("a mesh with many materials and mipped textures is ready within a few 
     de::test::check_clean(*device);
 }
 
+namespace {
+
+// Whether a point is in what a cascade says can shadow what it's read for.
+bool can_shadow(const de::render::ShadowCascade& cascade, double x, double y, double z) {
+    for (uint32_t p = 0; p < cascade.caster_plane_count; ++p) {
+        const float* const plane = cascade.caster_planes[p];
+        if ((static_cast<double>(plane[0]) * x) + (static_cast<double>(plane[1]) * y) +
+                (static_cast<double>(plane[2]) * z) + static_cast<double>(plane[3]) <
+            0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+TEST_CASE("what can shadow a cascade reaches exactly as far as what reads it") {
+    const de::render::SceneShadows shadows;
+    const float camera[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}; // at the origin, looking down -Z
+    const double tan_y = std::tan(0.5);
+    // With the sun straight ahead, the sweep moves away from the near face and the sides, so they stay where they are.
+    const float ahead[3] = {0, 0, -1};
+    de::render::ShadowCascade cascades[de::render::kShadowCascadeCount];
+    de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, ahead, shadows, cascades);
+    const auto filter_m = [&](uint32_t c) {
+        return static_cast<double>(cascades[c].texel_m) *
+               ((1.25 * static_cast<double>(shadows.max_penumbra_texels)) + 3.0);
+    };
+    for (uint32_t c = 1; c < de::render::kShadowCascadeCount; ++c) {
+        CAPTURE(c);
+        const double before = c == 1 ? 0.0 : static_cast<double>(cascades[c - 2].far_m);
+        const auto last_far = static_cast<double>(cascades[c - 1].far_m);
+        const auto far = static_cast<double>(cascades[c].far_m);
+        // It starts where the cascade before hands pixels on, less what the filter reads around them.
+        const double read_near = before + ((last_far - before) * (1.0 - static_cast<double>(shadows.blend_band)));
+        CHECK(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (0.98 * filter_m(c)))));
+        CHECK_FALSE(can_shadow(cascades[c], 0.0, 0.0, -(read_near - (1.02 * filter_m(c)))));
+        // The sides: the view and 2% around it, and the filter's reach, measured across a side that leans.
+        const double depth = (read_near + far) * 0.5;
+        const double wide = tan_y * 1.02;
+        const double across = filter_m(c) * std::sqrt(1.0 + (wide * wide));
+        CHECK(can_shadow(cascades[c], (depth * wide) + (0.98 * across), 0.0, -depth));
+        CHECK_FALSE(can_shadow(cascades[c], (depth * wide) + (1.02 * across), 0.0, -depth));
+        CHECK(can_shadow(cascades[c], 0.0, -((depth * wide) + (0.98 * across)), -depth));
+        CHECK_FALSE(can_shadow(cascades[c], 0.0, -((depth * wide) + (1.02 * across)), -depth));
+        // Past its far edge, toward the sun, a caster still shadows what's before it.
+        CHECK(can_shadow(cascades[c], 0.0, 0.0, -(far + 50.0)));
+    }
+    // Cascade 0 is read from the eye, by fog nearer than the near plane, even with a far-off near plane.
+    const float side_on[3] = {1, 0, 0.1f};
+    de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 2.0f, 1.0f, side_on, shadows, cascades);
+    CHECK(can_shadow(cascades[0], 5.0, 0.0, -0.5));
+    // With the sun behind the camera, it's the far edge that stays, and the near end that's swept open.
+    const float behind[3] = {0, 0, 1};
+    de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, behind, shadows, cascades);
+    CHECK(can_shadow(cascades[3], 0.0, 0.0, 5.0));
+    CHECK(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (0.98 * filter_m(3)))));
+    CHECK_FALSE(can_shadow(cascades[3], 0.0, 0.0, -(static_cast<double>(cascades[3].far_m) + (1.02 * filter_m(3)))));
+}
+
+TEST_CASE(
+    "whatever the sun and camera, what's lit and anything between it and the sun can shadow it, in few enough planes") {
+    const de::render::SceneShadows shadows;
+    uint32_t state = 4242;
+    const auto next = [&state](float low, float high) {
+        state = (state * 1664525U) + 1013904223U;
+        return low + ((high - low) * static_cast<float>(state >> 16U) / 65536.0f);
+    };
+    uint32_t most_planes = 0;
+    for (int trial = 0; trial < 400; ++trial) {
+        const float turn = next(0.0f, 6.28f);
+        const float c = std::cos(turn);
+        const float s = std::sin(turn);
+        const float camera[12] = {c, 0, s, next(-50, 50), 0, 1, 0, next(0, 10), -s, 0, c, next(-50, 50)};
+        float sun[3] = {next(-1, 1), next(-1, 1), next(-1, 1)};
+        const float length = std::sqrt((sun[0] * sun[0]) + (sun[1] * sun[1]) + (sun[2] * sun[2]));
+        if (length < 0.1f) {
+            continue;
+        }
+        for (float& axis : sun) {
+            axis /= length;
+        }
+        de::render::ShadowCascade cascades[de::render::kShadowCascadeCount];
+        de::render::fit_shadow_cascades(camera, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, cascades);
+        for (uint32_t cascade = 0; cascade < de::render::kShadowCascadeCount; ++cascade) {
+            most_planes = std::max(most_planes, cascades[cascade].caster_plane_count);
+            const double start = cascade == 0 ? 0.002 : static_cast<double>(cascades[cascade - 1].far_m);
+            const auto end = static_cast<double>(cascades[cascade].far_m);
+            // Points all through its part of the view, out to the corners, and each a way toward the sun from there.
+            for (int point = 0; point < 40; ++point) {
+                const double depth = start + ((end - start) * static_cast<double>(next(0, 1)));
+                const double right = depth * std::tan(0.5) * (16.0 / 9.0) * static_cast<double>(next(-1, 1));
+                const double up = depth * std::tan(0.5) * static_cast<double>(next(-1, 1));
+                const auto away = static_cast<double>(next(0, 200));
+                const auto x = static_cast<double>(camera[3]) + (right * static_cast<double>(camera[0])) +
+                               (up * static_cast<double>(camera[1])) - (depth * static_cast<double>(camera[2])) +
+                               (away * static_cast<double>(sun[0]));
+                const auto y = static_cast<double>(camera[7]) + (right * static_cast<double>(camera[4])) +
+                               (up * static_cast<double>(camera[5])) - (depth * static_cast<double>(camera[6])) +
+                               (away * static_cast<double>(sun[1]));
+                const auto z = static_cast<double>(camera[11]) + (right * static_cast<double>(camera[8])) +
+                               (up * static_cast<double>(camera[9])) - (depth * static_cast<double>(camera[10])) +
+                               (away * static_cast<double>(sun[2]));
+                CHECK(can_shadow(cascades[cascade], x, y, z));
+            }
+        }
+    }
+    CHECK(most_planes >= 9);
+    CHECK(most_planes <= de::render::kShadowCasterPlanes);
+}
+
 TEST_CASE("a cascade's texel grid stays put in the world as the render origin moves") {
     const de::render::SceneShadows shadows;
     const float sun[3] = {0.3f, 0.7f, 0.6f};
@@ -1401,7 +1513,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
                 taa_total += std::abs(static_cast<int>(static_cast<uint8_t>(with_taa[at])) -
                                       static_cast<int>(static_cast<uint8_t>(without_taa[at])));
             }
-            const double taa_mean = static_cast<double>(taa_total) / (static_cast<double>(with_taa.size()) / 4.0);
+            const auto taa_mean = static_cast<double>(taa_total) / (static_cast<double>(with_taa.size()) / 4.0);
             CHECK(taa_mean < 0.42);
             frame.instances.clear();
             restart();

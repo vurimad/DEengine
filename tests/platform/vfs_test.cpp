@@ -66,6 +66,20 @@ private:
 
 } // namespace
 
+TEST_CASE("the working directory is known, in forward slashes") {
+    const de::core::Result<de::platform::PathString> folder = de::platform::working_directory();
+    REQUIRE(folder.ok());
+    CHECK_FALSE(folder->empty());
+    CHECK(folder->view().find('\\') == std::string_view::npos);
+    CHECK_FALSE(folder->view().ends_with('/'));
+}
+
+TEST_CASE("test sandboxes each get a folder of their own") {
+    const Sandbox first;
+    const Sandbox second;
+    CHECK(first.game().view() != second.game().view());
+}
+
 TEST_CASE("paths follow the rules: mount prefix, lowercase, forward slashes, no dot segments") {
     const QuietLog quiet;
     const Sandbox sandbox;

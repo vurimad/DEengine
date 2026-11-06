@@ -22,6 +22,7 @@
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/scene/gpu_assets.h"
+#include "render/shader/shader_asset.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 #include "tools/debug_ui.h"
@@ -159,6 +160,7 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
         }
     }
     out.shadow_caster_cull = !has_flag(out, "--no-shadow-caster-cull");
+    out.merged_draws = !has_flag(out, "--no-merged-draws");
     if (const char* min_texels = flag_value(out, "--shadow-min-texels")) {
         char* end = nullptr;
         out.shadow_min_texels = std::strtof(min_texels, &end);
@@ -227,6 +229,31 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     if (!vfs) {
         return EXIT_FAILURE;
     }
+    core::Result<shader::ShaderCompiler> compiler =
+        core::fail(core::ErrorCode::Unsupported, "no src:/ to compile shaders from");
+    if (src_root != nullptr) {
+        compiler = shader::ShaderCompiler::create(*vfs);
+    }
+    if (!compiler && src_root != nullptr) {
+        // Sources are there but can't be compiled: no hot reload.
+        DE_LOG_WARN("engine", "the shader compiler didn't start (%s): using cooked shaders from game:/",
+                    compiler.error().message);
+    } else if (!compiler) {
+        DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
+    }
+    // Stale cooked shaders would crash the GPU: refused before there's a window or a device. The
+    // cooker can't help if this is the wrong folder, so the message says which one it is.
+    if (const core::Result<void> fresh =
+            !compiler ? shader::check_cooked_shaders(*vfs, shader::built_source_hash()) : core::Result<void>();
+        !fresh) {
+        const core::Result<platform::PathString> folder = platform::working_directory();
+        DE_LOG_ERROR("engine",
+                     "can't start: %s. game:/ is '%s' (working directory '%s'): pass --game-dir if the cooked "
+                     "data is elsewhere",
+                     fresh.error().message, vfs->mount_root(platform::Mount::Game),
+                     folder ? folder->c_str() : "unknown");
+        return EXIT_FAILURE;
+    }
     auto window = platform::Window::create({.title = "DEengine",
                                             .width_points = args.window_width_points,
                                             .height_points = args.window_height_points,
@@ -239,20 +266,12 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_ERROR("engine", "no usable GPU: %s", device.error().message);
         return EXIT_FAILURE;
     }
-    core::Result<shader::ShaderCompiler> compiler =
-        core::fail(core::ErrorCode::Unsupported, "no src:/ to compile shaders from");
-    if (src_root != nullptr) {
-        compiler = shader::ShaderCompiler::create(*vfs);
-    }
     core::Result<shader::ShaderLibrary> shaders = compiler
                                                       ? shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler)
                                                       : shader::ShaderLibrary::create_cooked(*device, *vfs, jobs);
-    if (!compiler && src_root != nullptr) {
-        // Sources are there but can't be compiled: no hot reload, and cooked shaders may be stale.
-        DE_LOG_WARN("engine", "the shader compiler didn't start (%s): using cooked shaders from game:/",
-                    compiler.error().message);
-    } else if (!compiler) {
-        DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
+    if (!shaders) {
+        DE_LOG_ERROR("engine", "can't start: %s", shaders.error().message); // a cook started just now, say
+        return EXIT_FAILURE;
     }
     auto uploader = rhi::Uploader::create(*device, {.staging_bytes = uint64_t{8} << 20U});
     if (!uploader) {
@@ -282,18 +301,17 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     std::optional<render::SceneRenderer> scene_renderer;
-    if (shaders) {
-        auto created =
-            render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
-        if (created) {
-            scene_renderer.emplace(std::move(*created));
-            scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
-            scene_renderer->set_lod_fade(args.lod_fade);
-            scene_renderer->set_shadow_caster_cull(args.shadow_caster_cull);
-            scene_renderer->set_shadow_min_texels(args.shadow_min_texels);
-        } else {
-            DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
-        }
+    auto created =
+        render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+    if (created) {
+        scene_renderer.emplace(std::move(*created));
+        scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
+        scene_renderer->set_lod_fade(args.lod_fade);
+        scene_renderer->set_shadow_caster_cull(args.shadow_caster_cull);
+        scene_renderer->set_merged_draws(args.merged_draws);
+        scene_renderer->set_shadow_min_texels(args.shadow_min_texels);
+    } else {
+        DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
     }
 
     // Engine settings (text, like the bindings): read once, kept for setting().
@@ -320,7 +338,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .device = *device,
                   .uploader = *uploader,
                   .graph = *graph,
-                  .shaders = shaders ? &*shaders : nullptr,
+                  .shaders = *shaders,
                   .assets = *assets,
                   .world = *world,
                   .gpu_assets = *gpu_assets,
@@ -381,9 +399,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (window->resized()) {
             DE_LOG_INFO("platform", "drawable size %ux%u", window->pixel_width(), window->pixel_height());
         }
-        if (shaders) {
-            shaders->update(); // hot reload: picks up edits to shaders/*.slang
-        }
+        shaders->update(); // hot reload: picks up edits to shaders/*.slang
         if (!application.update(engine, static_cast<float>(frame_s))) {
             break; // the application is done (quit)
         }
@@ -455,6 +471,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("visible draws", static_cast<int64_t>(drawn.visible_draws));
                 DE_PROFILE_PLOT("visible fading draws", static_cast<int64_t>(drawn.visible_fading_draws));
                 DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
+                DE_PROFILE_PLOT("merged draws", static_cast<int64_t>(drawn.merged_draws));
+                DE_PROFILE_PLOT("merged shadow draws", static_cast<int64_t>(drawn.merged_shadow_draws));
                 DE_PROFILE_PLOT("draws lost", static_cast<int64_t>(drawn.draws_lost));
                 DE_PROFILE_PLOT("visible triangles", static_cast<int64_t>(drawn.visible_triangles));
                 DE_PROFILE_PLOT("visible shadow triangles", static_cast<int64_t>(drawn.visible_shadow_triangles));

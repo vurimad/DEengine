@@ -1,12 +1,11 @@
 #pragma once
 
 #include "platform/file.h"
-#include "platform/time.h"
+#include "platform/random.h"
 #include "platform/vfs.h"
 
 #include <doctest/doctest.h>
 
-#include <atomic>
 #include <cstddef>
 #include <span>
 #include <string_view>
@@ -23,11 +22,13 @@ inline std::span<const std::byte> bytes_of(std::string_view text) {
 class Sandbox {
 public:
     Sandbox() {
-        static std::atomic<int> counter{0};
         root_ = *platform::system_temp_folder();
         REQUIRE(root_.append("/deengine_tests/"));
         char id[32];
-        const unsigned long long stamp = platform::time_ns() + static_cast<unsigned long long>(counter.fetch_add(1));
+        // Random, not from a clock, which starts near zero in each process: other test runs may be going at once, and a
+        // crashed one may have left its folder behind.
+        unsigned long long stamp = 0;
+        REQUIRE(platform::random_bytes(std::as_writable_bytes(std::span(&stamp, 1))).ok());
         size_t length = 0;
         for (unsigned long long value = stamp; value != 0 || length == 0; value /= 10) {
             id[length++] = static_cast<char>('0' + value % 10);

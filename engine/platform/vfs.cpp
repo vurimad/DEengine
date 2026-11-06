@@ -5,6 +5,9 @@
 #include "platform/thread.h"
 #include "platform/time.h"
 
+#include <SDL3/SDL_filesystem.h>
+#include <SDL3/SDL_stdinc.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -401,6 +404,16 @@ core::Result<PathString> prepare_temp_root(const char* configured) {
 }
 
 } // namespace
+
+core::Result<PathString> working_directory() {
+    char* folder = SDL_GetCurrentDirectory();
+    if (folder == nullptr) {
+        return fail(ErrorCode::IoError, "the working directory isn't known");
+    }
+    const PathString path = normalized(PathString(std::string_view(folder)));
+    SDL_free(folder);
+    return path;
+}
 
 core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     if (desc.game_root == nullptr) {

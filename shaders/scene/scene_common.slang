@@ -79,10 +79,9 @@ public struct GpuMeshInfo
 {
     public float3 center; // of its bounding sphere, in object space
     public float radius;
-    public uint vertex_offset; // its first vertex in the geometry pool
-    public uint first_lod;     // in the LOD table
+    public uint first_lod; // in the LOD table
     public uint lod_count;
-    public uint padding;
+    public uint2 padding;
 };
 
 public struct GpuMeshLod
@@ -97,18 +96,42 @@ public struct GpuMeshPart
     public uint first_index; // in the geometry pool
     public uint index_count;
     public uint material;
+    public uint vertex_offset; // its mesh's first vertex in the geometry pool
 };
 
 public static const uint kCullViewCount = 1 + kCascadeCount; // the camera, then each cascade
 public static const uint kNoMesh = 0xffffffffu;
 
+// Draws of one part in one group merge into one instanced draw. The camera's plain draws, what's fading, and each cascade
+// are a group each.
+public static const uint kDrawKinds = 4;
+public static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
+public static const uint kCullGroups = 2 + kCascadeCount;
+public static const uint kPartLost = 0xffffffffu; // in place of where a part's records start: no room for it
+
+// Which draw list a group's part lands in. The camera's groups have a list for every pipeline state ([masked][double-sided]);
+// a cascade's casters differ only by the alpha test. As in scene_renderer.cpp.
+public uint draw_list_of(uint group, uint material_flags)
+{
+    const uint masked = (material_flags & kMaterialMasked) != 0 ? 1u : 0u;
+    const uint double_sided = (material_flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
+    return group < 2 ? group * kDrawKinds + masked * 2 + double_sided : 2 * kDrawKinds + 2 * (group - 2) + masked;
+}
+
+// What the draw assignment counts, after a count of draw slots per list, which a counted draw reads. What's drawn is
+// counted, not what's lost.
+public static const uint kCountTriangles = kDrawListCount; // for the camera, then for the cascades
+public static const uint kCountRecordsUsed = kDrawListCount + 2;
+public static const uint kCountRecordsLost = kDrawListCount + 3;
+public static const uint kCountDraws = kDrawListCount + 4; // for the camera, then for the cascades
+public static const uint kCountRecordsPerList = kDrawListCount + 6;
+
 public struct GpuCullView
 {
     public float4 planes[12]; // inside: dot(xyz, p) + w >= 0, in render-origin space
     public uint plane_count;
-    public uint first_list;
-    public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
     public uint lod_perspective; // a LOD's error shrinks with depth, or else it doesn't
+    public uint view_padding[2];
     public float4 depth_plane;   // dot(xyz, p) + w is the depth in front of the eye, in render-origin space
     public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
                                  // be. Below 0: LOD 0 everywhere

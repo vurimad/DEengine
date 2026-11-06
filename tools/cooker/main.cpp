@@ -2,9 +2,10 @@
 //   cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debug] [--shader-checks]
 //   --src DIR         the repository root, mounted as src:/ (default: this repository)
 //   --out DIR         where cooked files go, mounted as game:/ (default: <src>/cooked)
-//   --check           check the source and meta trees, write nothing (CI); exit code 1 on errors
+//   --check           check the source and meta trees and that cooked shaders aren't stale, write
+//                     nothing (CI); exit code 1 on errors
 //   --force           cook everything again
-//   --no-shaders      skip shaders (no Slang compiler needed)
+//   --no-shaders      skip shaders (no Slang compiler needed), in --check too
 //   --shader-debug    keep source-level debug info in cooked shaders (RenderDoc, Nsight)
 //   --shader-checks   compile shaders with DE_SHADER_CHECKS=1
 // Exit code 0 when there are no errors. A JSON report goes to <out>/cook_report.json.
@@ -63,6 +64,7 @@ int main(int argc, char** argv) {
         .force = has_flag(argc, argv, "--force"),
         .shader_debug_info = has_flag(argc, argv, "--shader-debug"),
         .shader_checks = has_flag(argc, argv, "--shader-checks"),
+        .check_shaders = !has_flag(argc, argv, "--no-shaders"),
     };
     auto vfs = de::platform::Vfs::create(
         {.game_root = game_root.c_str(), .src_root = src_root, .game_writable = !options.check_only});

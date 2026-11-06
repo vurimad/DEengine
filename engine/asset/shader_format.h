@@ -6,6 +6,10 @@
 #include <cstdint>
 #include <string_view>
 
+namespace de::platform {
+class Vfs;
+}
+
 namespace de::asset {
 
 // Numbers are stored in files: never renumber, only add.
@@ -86,5 +90,19 @@ struct ShaderDefineText {
     std::string_view value;
 };
 uint64_t shader_defines_hash(std::span<const ShaderDefineText> defines);
+
+// C++ and shaders share data layouts by hand, and a mismatch reaches the GPU as wild pointers. So
+// cooked shaders and the engine both name the sources they came from, by this hash: every .slang
+// under src:/shaders/ except shaders/tests/ (which games never load), by path and content, the same
+// on a Windows and a Linux checkout (CRLF reads as LF). Any edit counts, even to a comment. Fails
+// with NotFound if src:/shaders/ isn't there. Blocking, for tools.
+core::Result<uint64_t> shader_sources_hash(const platform::Vfs& vfs);
+
+// Written by the cooker once every module in game:/ is cooked from those sources, removed while it
+// works on them: 16 hex digits of shader_sources_hash(). The engine compares it at startup.
+inline constexpr const char* kShaderStampPath = "game:/shader_sources.hash";
+// NotFound without a stamp, CorruptData for anything else that isn't one.
+core::Result<uint64_t> read_shader_stamp(const platform::Vfs& vfs);
+core::Result<void> write_shader_stamp(const platform::Vfs& vfs, uint64_t sources_hash);
 
 } // namespace de::asset

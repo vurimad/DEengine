@@ -69,14 +69,12 @@ struct DebugUiState {
     bool frame_built = false; // a UI frame was built since the last add_pass
 };
 
-DebugUi DebugUi::create(platform::Window& window, rhi::Device& device, shader::ShaderLibrary* shaders,
+DebugUi DebugUi::create(platform::Window& window, rhi::Device& device, shader::ShaderLibrary& shaders,
                         rhi::Uploader& uploader) {
     create_imgui();
     platform::imgui_platform_init(window);
     auto* state = ::new (tools_heap().allocate(sizeof(DebugUiState), alignof(DebugUiState))) DebugUiState();
-    if (shaders != nullptr) {
-        state->renderer = render::ImGuiRenderer::create(device, *shaders, uploader);
-    }
+    state->renderer = render::ImGuiRenderer::create(device, shaders, uploader);
     return DebugUi(state);
 }
 

@@ -61,7 +61,8 @@ struct ShaderLibraryStats {
 //
 // Builds without src:/ (ship) use create_cooked() instead: programs come from the cooker's
 // .deshader files in game:/, compiled ahead of time with the same compiler. With hot reload on,
-// a re-cooked file is picked up the same way an edited source is.
+// a re-cooked file is picked up the same way an edited source is, as long as it's cooked from the
+// sources this build was compiled from: otherwise the running pipelines stay.
 //
 // Create programs at load time (the first compile blocks). Call update() once per frame on the
 // thread that renders (the main thread today). Pipelines are created and destroyed on that thread only; rebuilds run
@@ -73,6 +74,8 @@ public:
                                               ShaderCompiler& compiler, const ShaderLibraryDesc& desc = {});
     // Programs from cooked .deshader files (game:/), with the permutation that matches each
     // program's defines. A module or permutation that wasn't cooked fails like a compile error.
+    // Fails at once, logged, if game:/ wasn't cooked from the sources this build was compiled from
+    // (check_cooked_shaders).
     static core::Result<ShaderLibrary> create_cooked(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
                                                      const ShaderLibraryDesc& desc = {});
 
@@ -116,6 +119,11 @@ private:
 
     LibraryState* state_ = nullptr;
 };
+
+// Whether the shaders in game:/ are cooked from the sources with this hash (the engine's own is
+// built_source_hash()): shared layouts could disagree otherwise, and that's a GPU crash. A missing
+// stamp (nothing cooked, a cook that failed or stopped, or an older cooker) doesn't pass. Logs what to do.
+core::Result<void> check_cooked_shaders(const platform::Vfs& vfs, uint64_t sources_hash);
 
 // Whether a descriptor binding is one of the bindless tables of shaders/common/bindless.slang: the
 // only descriptor bindings the engine's pipelines have (the library refuses programs with others).
