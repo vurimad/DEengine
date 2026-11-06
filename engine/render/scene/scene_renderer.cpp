@@ -264,7 +264,8 @@ constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
 // and lost in all; and then records per list. As in shaders/scene/scene_common.slang.
 constexpr uint32_t kCountTriangles = kDrawListCount;
 constexpr uint32_t kCountRecordsLost = kDrawListCount + 3;
-constexpr uint32_t kCountRecordsPerList = kDrawListCount + 4;
+constexpr uint32_t kCountDraws = kDrawListCount + 4;
+constexpr uint32_t kCountRecordsPerList = kDrawListCount + 6;
 constexpr uint32_t kCullCounterCount = kCountRecordsPerList + kDrawListCount;
 constexpr uint32_t kCullGroups = 2 + kShadowCascadeCount; // the camera's plain draws, what's fading, and each cascade
 constexpr uint32_t kNoMesh = UINT32_MAX;
@@ -313,13 +314,11 @@ struct CullPush {
     uint64_t meshes = 0;
     uint64_t lods = 0;
     uint64_t parts = 0;
-    uint64_t materials = 0;
     uint64_t views = 0;
-    uint64_t lists = 0;
-    uint64_t args = 0;
     uint64_t records = 0;
-    uint64_t counts = 0;
     uint64_t part_keys = 0;
+    uint64_t part_used = 0;
+    uint64_t part_dispatch = 0;
     uint32_t instance_count = 0;
     uint32_t part_count = 0;
     uint32_t writing = 0;
@@ -333,9 +332,11 @@ struct CullAssignPush {
     uint64_t args = 0;
     uint64_t counts = 0;
     uint64_t part_keys = 0;
+    uint64_t part_used = 0;
     uint32_t part_count = 0;
     uint32_t record_capacity = 0;
     uint32_t merged = 0;
+    uint32_t resetting = 0;
 };
 
 // Matches InstanceUpdatePush in shaders/scene/instance_update.slang.
@@ -398,6 +399,16 @@ struct SceneRendererState {
     // lists without walking the instances.
     rhi::BufferHandle instance_data;
     rhi::BufferHandle instance_meshes;
+    // What the cull counts per part and group, 0 between frames; what's in use this frame; and the dispatch over those.
+    // They stay, so a frame clears only what it used.
+    rhi::BufferHandle part_keys;
+    rhi::BufferHandle part_used;
+    rhi::BufferHandle part_dispatch;
+    uint64_t part_keys_address = 0;
+    uint64_t part_used_address = 0;
+    uint64_t part_dispatch_address = 0;
+    bool part_buffers_read = false;
+    bool part_keys_zero = false; // false at first, and if a frame didn't get as far as putting them back
     uint64_t instance_data_address = 0;
     uint64_t instance_meshes_address = 0;
     uint32_t max_instances = 0;
@@ -474,6 +485,9 @@ struct SceneRendererState {
         }
         device->destroy(instance_data);
         device->destroy(instance_meshes);
+        device->destroy(part_keys);
+        device->destroy(part_used);
+        device->destroy(part_dispatch);
         destroy_temporal();
         destroy_froxels();
     }
@@ -649,19 +663,20 @@ struct SceneRendererState {
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
             const uint32_t records = counts[kCountRecordsPerList + list];
             (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += records;
-            const uint32_t draws = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
-            (list < kCameraListCount ? stats.merged_draws : stats.merged_shadow_draws) += draws;
             if (list >= kDrawKindCount && list < kCameraListCount) {
                 stats.visible_fading_draws += records;
             }
         }
         stats.draws_lost = counts[kCountRecordsLost];
         if (stats.draws_lost > 0 && !warned_draws_lost) {
-            DE_LOG_WARN("render",
-                        "%u draws had no room in their list: a material changing kind can do this for a frame",
-                        stats.draws_lost);
+            DE_LOG_WARN(
+                "render",
+                "%u draws had no room: a material changing kind can do this for a frame, or a device call limit",
+                stats.draws_lost);
             warned_draws_lost = true;
         }
+        stats.merged_draws = counts[kCountDraws];
+        stats.merged_shadow_draws = counts[kCountDraws + 1];
         stats.visible_triangles = counts[kCountTriangles];
         stats.visible_shadow_triangles = counts[kCountTriangles + 1];
     }
@@ -967,13 +982,13 @@ struct SceneRendererState {
             const auto capacity = static_cast<uint32_t>(std::min<uint64_t>(wanted, UINT32_MAX));
             // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
             // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
-            if (capacity > call_limit && !merged_draws && !warned_draw_limit) {
+            const uint32_t draws = merged_draws ? std::min(capacity, gpu_assets->part_table_used()) : capacity;
+            if (draws > call_limit && !warned_draw_limit) {
                 DE_LOG_WARN("render",
-                            "a draw list holds %u draws, and this device draws %u in a call: the rest are lost",
-                            capacity, call_limit);
+                            "a draw list may hold %u draws, and this device draws %u in a call: the rest are lost",
+                            draws, call_limit);
                 warned_draw_limit = true;
             }
-            const uint32_t draws = merged_draws ? std::min(capacity, gpu_assets->part_table_used()) : capacity;
             const uint32_t kept = std::min(draws, call_limit);
             plan.lists[index] = {.first_slot = slot, .capacity = kept};
             slot += kept;
@@ -1399,6 +1414,32 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     }
     state->instance_meshes = *meshes;
     state->instance_meshes_address = desc.device->buffer_address(*meshes);
+    const uint64_t part_key_count = uint64_t{kCullGroups} * desc.gpu_assets->part_table_size();
+    const core::Result<rhi::BufferHandle> part_keys =
+        desc.device->create_buffer({.size = part_key_count * sizeof(uint32_t),
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .debug_name = "part keys"});
+    if (!part_keys) {
+        return core::fail(part_keys.error());
+    }
+    state->part_keys = *part_keys;
+    state->part_keys_address = desc.device->buffer_address(*part_keys);
+    const core::Result<rhi::BufferHandle> part_used = desc.device->create_buffer(
+        {.size = part_key_count * sizeof(uint32_t), .usage = rhi::BufferUsage::Storage, .debug_name = "parts in use"});
+    if (!part_used) {
+        return core::fail(part_used.error());
+    }
+    state->part_used = *part_used;
+    state->part_used_address = desc.device->buffer_address(*part_used);
+    const core::Result<rhi::BufferHandle> part_dispatch = desc.device->create_buffer(
+        {.size = 3 * sizeof(uint32_t),
+         .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect | rhi::BufferUsage::CopyDst,
+         .debug_name = "parts dispatch"});
+    if (!part_dispatch) {
+        return core::fail(part_dispatch.error());
+    }
+    state->part_dispatch = *part_dispatch;
+    state->part_dispatch_address = desc.device->buffer_address(*part_dispatch);
     state->make_scene_programs();
     return renderer;
 }
@@ -1522,32 +1563,51 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.stats.shadow_draws = plan.shadow_draws;
 
     // The GPU cull: what's in each view, into the draw lists the G-buffer and shadow passes draw.
+    const GraphBuffer part_keys_graph = graph.import_buffer(
+        {.buffer = state.part_keys,
+         .name = "part keys",
+         .state = state.part_buffers_read ? rhi::ResourceState::ShaderWrite : rhi::ResourceState::Undefined,
+         .final_state = rhi::ResourceState::ShaderWrite});
+    const GraphBuffer part_used_graph = graph.import_buffer(
+        {.buffer = state.part_used,
+         .name = "parts in use",
+         .state = state.part_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
+         .final_state = rhi::ResourceState::ShaderRead});
+    const GraphBuffer part_dispatch_graph = graph.import_buffer(
+        {.buffer = state.part_dispatch,
+         .name = "parts dispatch",
+         .state = state.part_buffers_read ? rhi::ResourceState::IndirectArgument : rhi::ResourceState::Undefined,
+         .final_state = rhi::ResourceState::IndirectArgument});
+    state.part_buffers_read = true;
     struct CullClearPass {
+        SceneRendererState* state = nullptr;
         GraphBuffer counts;
-        GraphBuffer part_keys;
-        uint64_t part_keys_bytes = 0;
     };
-    const uint32_t part_count = std::max(state.gpu_assets->part_table_used(), 1U);
     const auto& cull_clear = graph.add_pass<CullClearPass>(
         "cull clear",
         [&](PassBuilder& pass, CullClearPass& data) {
+            data.state = &state;
             data.counts = pass.create_buffer({.size = kCullCounterCount * sizeof(uint32_t),
                                               .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect |
                                                        rhi::BufferUsage::CopyDst | rhi::BufferUsage::CopySrc,
                                               .debug_name = "draw counts"});
             pass.use(data.counts, rhi::ResourceState::CopyDst);
-            data.part_keys_bytes = uint64_t{kCullGroups} * part_count * sizeof(uint32_t);
-            data.part_keys = pass.create_buffer({.size = data.part_keys_bytes,
-                                                 .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
-                                                 .debug_name = "draw part keys"});
-            pass.use(data.part_keys, rhi::ResourceState::CopyDst);
+            pass.use(part_keys_graph, rhi::ResourceState::CopyDst);
+            pass.use(part_dispatch_graph, rhi::ResourceState::CopyDst);
         },
-        [](const CullClearPass& data, PassContext& context) {
+        [part_keys_graph, part_dispatch_graph](const CullClearPass& data, PassContext& context) {
             context.list.fill_buffer(context.buffer(data.counts), 0, kCullCounterCount * sizeof(uint32_t), 0);
-            context.list.fill_buffer(context.buffer(data.part_keys), 0, data.part_keys_bytes, 0);
+            if (!data.state->part_keys_zero) {
+                context.list.fill_buffer(
+                    context.buffer(part_keys_graph), 0,
+                    uint64_t{kCullGroups} * data.state->gpu_assets->part_table_size() * sizeof(uint32_t), 0);
+            }
+            data.state->part_keys_zero = false; // until the frame gets as far as putting them back
+            // None so far, one by one: a dispatch of 1 group for each.
+            context.list.fill_buffer(context.buffer(part_dispatch_graph), 0, sizeof(uint32_t), 0);
+            context.list.fill_buffer(context.buffer(part_dispatch_graph), sizeof(uint32_t), 2 * sizeof(uint32_t), 1);
         });
     const GraphBuffer draw_counts = cull_clear.counts;
-    const GraphBuffer part_keys = cull_clear.part_keys;
 
     // What changed in the instances. They stay between frames, so the graph is told how they were left.
     const GraphBuffer instance_data_graph = graph.import_buffer(
@@ -1589,11 +1649,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 context.list.dispatch((updates + 63) / 64);
             });
     }
-    // The cull counts what's in each view, each part gets its draw and its records, and the cull writes them.
+    // The cull counts what's in each view, each part in use gets its draw and its records, the cull writes them, and
+    // what was used goes back to 0.
     struct CullPass {
         SceneRendererState* state = nullptr;
         GraphBuffer counts;
-        GraphBuffer part_keys;
         GraphBuffer draws;
         rhi::PipelineHandle pipeline;
         uint64_t frame_address = 0;
@@ -1613,13 +1673,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                             .meshes = renderer.gpu_assets->mesh_table_address(),
                             .lods = renderer.gpu_assets->lod_table_address(),
                             .parts = renderer.gpu_assets->part_table_address(),
-                            .materials = renderer.gpu_assets->material_table_address(),
                             .views = data.frame_address + kCullViewsOffset,
-                            .lists = data.frame_address + kDrawListsOffset,
-                            .args = draws,
                             .records = draws + data.plan.records_offset(),
-                            .counts = renderer.device->buffer_address(context.buffer(data.counts)),
-                            .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
+                            .part_keys = renderer.part_keys_address,
+                            .part_used = renderer.part_used_address,
+                            .part_dispatch = renderer.part_dispatch_address,
                             .instance_count = data.plan.slots,
                             .part_count = data.part_count,
                             .writing = writing};
@@ -1627,23 +1685,41 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         context.list.push_constants(push);
         context.list.dispatch((data.plan.slots + 63) / 64);
     };
-    const auto use_for_cull = [&](PassBuilder& pass) {
-        pass.use(draw_counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-        pass.use(part_keys, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+    const auto run_assign = [part_dispatch_graph](const CullPass& data, PassContext& context, uint32_t resetting) {
+        const SceneRendererState& renderer = *data.state;
+        if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
+            return;
+        }
+        const CullAssignPush push{
+            .parts = renderer.gpu_assets->part_table_address(),
+            .materials = renderer.gpu_assets->material_table_address(),
+            .lists = data.frame_address + kDrawListsOffset,
+            .args = data.draws.is_valid() ? renderer.device->buffer_address(context.buffer(data.draws)) : 0,
+            .counts = data.counts.is_valid() ? renderer.device->buffer_address(context.buffer(data.counts)) : 0,
+            .part_keys = renderer.part_keys_address,
+            .part_used = renderer.part_used_address,
+            .part_count = data.part_count,
+            .record_capacity = static_cast<uint32_t>(std::min<uint64_t>(data.plan.record_capacity, UINT32_MAX)),
+            .merged = renderer.merged_draws ? 1U : 0U,
+            .resetting = resetting};
+        context.list.bind_pipeline(data.pipeline);
+        context.list.push_constants(push);
+        context.list.dispatch_indirect(context.buffer(part_dispatch_graph), 0);
     };
     const CullPass cull_base{.state = &state,
-                             .counts = draw_counts,
-                             .part_keys = part_keys,
+                             .counts = {},
                              .draws = {},
                              .pipeline = cull,
                              .frame_address = frame_address,
                              .plan = plan,
-                             .part_count = part_count};
+                             .part_count = state.gpu_assets->part_table_size()};
     graph.add_pass<CullPass>(
         "gpu cull count",
         [&](PassBuilder& pass, CullPass& data) {
             data = cull_base;
-            use_for_cull(pass);
+            pass.use(part_keys_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(part_used_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(part_dispatch_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
             pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
         },
@@ -1656,31 +1732,19 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [&](PassBuilder& pass, CullPass& data) {
             data = cull_base;
             data.pipeline = cull_assign;
+            data.counts = draw_counts;
             data.draws = pass.create_buffer({.size = plan.buffer_bytes(),
                                              .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
                                              .debug_name = "draw lists"});
             pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-            use_for_cull(pass);
+            pass.use(draw_counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(part_keys_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(part_used_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(part_dispatch_graph, rhi::ResourceState::IndirectArgument);
         },
-        [](const CullPass& data, PassContext& context) {
+        [run_assign](const CullPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gpu cull assign pass");
-            const SceneRendererState& renderer = *data.state;
-            if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
-                return;
-            }
-            const CullAssignPush push{
-                .parts = renderer.gpu_assets->part_table_address(),
-                .materials = renderer.gpu_assets->material_table_address(),
-                .lists = data.frame_address + kDrawListsOffset,
-                .args = renderer.device->buffer_address(context.buffer(data.draws)),
-                .counts = renderer.device->buffer_address(context.buffer(data.counts)),
-                .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
-                .part_count = data.part_count,
-                .record_capacity = static_cast<uint32_t>(std::min<uint64_t>(data.plan.record_capacity, UINT32_MAX)),
-                .merged = renderer.merged_draws ? 1U : 0U};
-            context.list.bind_pipeline(data.pipeline);
-            context.list.push_constants(push);
-            context.list.dispatch(((kCullGroups * data.part_count) + 63) / 64);
+            run_assign(data, context, 0);
         });
     graph.add_pass<CullPass>(
         "gpu cull write",
@@ -1688,13 +1752,27 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             data = cull_base;
             data.draws = cull_pass.draws;
             pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-            use_for_cull(pass);
+            pass.use(part_keys_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
             pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
         },
         [run_cull](const CullPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gpu cull write pass");
             run_cull(data, context, 1);
+        });
+    graph.add_pass<CullPass>(
+        "gpu cull reset",
+        [&](PassBuilder& pass, CullPass& data) {
+            data = cull_base;
+            data.pipeline = cull_assign;
+            pass.use(part_keys_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(part_used_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(part_dispatch_graph, rhi::ResourceState::IndirectArgument);
+        },
+        [run_assign](const CullPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("gpu cull reset pass");
+            run_assign(data, context, 1);
+            data.state->part_keys_zero = true;
         });
     const GraphBuffer draw_lists = cull_pass.draws;
 

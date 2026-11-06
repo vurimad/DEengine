@@ -931,7 +931,11 @@ TEST_CASE("merged draws fit however few draws a call can take, and what has no r
         // records, and what's drawn doesn't run into the next list.
         scene.renderer.set_max_draws_per_call(1);
         scene.submit_for_stats(frame, light);
+        // Each view's list has its own room, so this is what the camera's kept, and what it reports isn't what was
+        // lost.
         CHECK(scene.renderer.stats().merged_draws == 1);
+        CHECK(scene.renderer.stats().visible_draws == 3);
+        CHECK(scene.renderer.stats().visible_triangles == 6);
         CHECK(scene.renderer.stats().draws_lost >= 3);
         const auto one = de::test::read_texture(scene.device, scene.target);
         CHECK(pixels_apart(both, one) > 0);
@@ -953,6 +957,86 @@ TEST_CASE("merged draws fit however few draws a call can take, and what has no r
         scene.submit_for_stats(frame, light);
         CHECK(scene.renderer.stats().draws_lost == 0);
         CHECK(pixels_apart(both, de::test::read_texture(scene.device, scene.target)) == 0);
+    });
+}
+
+TEST_CASE("what has no room leaves no draw reading old arguments, a draw per object or merged") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const AssetHandle mesh : {red, green}) {
+            for (const float x : {-1.0f, 0.0f, 1.0f}) {
+                frame.instances.push({.transform = de::test::render_transform(
+                                          {0.4f, 0, 0, x, 0, 0.4f, 0, mesh == red ? 0.6f : -0.6f, 0, 0, 0.4f, 0}),
+                                      .mesh = mesh});
+            }
+        }
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        const auto squares = [&](const de::core::Array<std::byte>& pixels, uint32_t row, bool is_red_row) {
+            int shown = 0;
+            for (const uint32_t x : {kLeft, kMiddle, kRight}) {
+                const uint8_t* const color = texel(pixels, x, row);
+                shown += (is_red_row ? color[0] > 200 && color[1] < 60 : color[1] > 200 && color[0] < 60) ? 1 : 0;
+            }
+            return shown;
+        };
+        // A draw each: the frames before it leave every slot holding a real draw, of all six.
+        scene.renderer.set_merged_draws(false);
+        scene.submit_for_stats(frame, light);
+        CHECK(squares(de::test::read_texture(scene.device, scene.target), kMiddle - 12, true) == 3);
+        // Room for 4: the first mesh takes 3 slots, the second is left out, and the slot of its it could have had draws
+        // nothing rather than what was there.
+        scene.renderer.set_max_draws_per_call(4);
+        scene.submit_for_stats(frame, light);
+        const auto pixels = de::test::read_texture(scene.device, scene.target);
+        const int red_shown = squares(pixels, kMiddle - 12, true);
+        const int green_shown = squares(pixels, kMiddle + 12, false);
+        CHECK(((red_shown == 3 && green_shown == 0) || (red_shown == 0 && green_shown == 3)));
+        CHECK(scene.renderer.stats().visible_draws == 3);
+        CHECK(scene.renderer.stats().merged_draws == 3);
+        CHECK(scene.renderer.stats().draws_lost >= 3);
+        scene.renderer.set_merged_draws(true);
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
+    });
+}
+
+TEST_CASE("a frame finds nothing left of the parts the last frame used") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+        // From both meshes to one, and back, many times: a key left over would count records that aren't there.
+        const auto frame_with = [&](bool with_green) {
+            de::world::RenderFrame frame = PoolScene::frame_of({});
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.4f, 0, 0, -1, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}), .mesh = red});
+            if (with_green) {
+                frame.instances.push(
+                    {.transform = de::test::render_transform({0.4f, 0, 0, 1, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}),
+                     .mesh = green});
+            }
+            return frame;
+        };
+        const auto shown = [&](bool with_green) {
+            scene.submit_for_stats(frame_with(with_green));
+            return de::test::read_texture(scene.device, scene.target);
+        };
+        const de::core::Array<std::byte> both = shown(true);
+        const de::core::Array<std::byte> only_red = shown(false);
+        for (int i = 0; i < 4; ++i) {
+            CHECK(pixels_apart(only_red, shown(false)) == 0);
+            CHECK(scene.renderer.stats().visible_draws == 1);
+            CHECK(scene.renderer.stats().merged_draws == 1);
+            CHECK(pixels_apart(both, shown(true)) == 0);
+            CHECK(scene.renderer.stats().visible_draws == 2);
+            CHECK(scene.renderer.stats().merged_draws == 2);
+        }
     });
 }
 

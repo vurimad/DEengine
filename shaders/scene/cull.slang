@@ -9,16 +9,6 @@
 
 import scene.scene_common;
 
-// Matches rhi::DrawIndexedIndirectArgs.
-struct DrawIndexedArgs
-{
-    uint index_count;
-    uint instance_count;
-    uint first_index;
-    int vertex_offset;
-    uint first_instance;
-};
-
 struct CullPush
 {
     SceneFrame* frame;
@@ -27,13 +17,11 @@ struct CullPush
     GpuMeshInfo* meshes;
     GpuMeshLod* lods;
     GpuMeshPart* parts;
-    GpuMaterial* materials;
     GpuCullView* views;
-    GpuDrawList* lists;
-    DrawIndexedArgs* args; // by slot, as a draw's first instance
-    GpuDraw* records;      // by slot
-    uint* counts;          // as in scene_common
-    uint* part_keys;       // per group and part: how many, and then the next of its records to write
+    GpuDraw* records;
+    uint* part_keys;     // per group and part: how many, and then the next of its records to write. 0 between frames
+    uint* part_used;     // the keys in use this frame
+    uint* part_dispatch; // the dispatch over them: first of all, how many there are
     uint instance_count;
     uint part_count;
     uint writing; // 0: count, 1: write the records
@@ -105,23 +93,24 @@ LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radiu
     return pick;
 }
 
-// A LOD's parts, counted or written, and how many triangles they are. fade is as in GpuDraw.
-uint add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
+// A LOD's parts, counted or written. fade is as in GpuDraw.
+void add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
 {
-    uint triangles = 0;
     const uint group = view_index == 0 ? (fade != 0.0 ? 1u : 0u) : 1 + view_index;
     for (uint p = 0; p < lod.part_count; ++p)
     {
         const uint part_index = lod.first_part + p;
-        const GpuMeshPart part = push.parts[part_index];
         const uint key = group * push.part_count + part_index;
         if (push.writing == 0)
         {
-            uint ignored;
-            InterlockedAdd(push.part_keys[key], 1, ignored);
-            const uint list = draw_list_of(group, push.materials[part.material].flags);
-            InterlockedAdd(push.counts[kCountRecordsPerList + list], 1, ignored);
-            triangles += part.index_count / 3;
+            uint before;
+            InterlockedAdd(push.part_keys[key], 1, before);
+            if (before == 0)
+            {
+                uint used;
+                InterlockedAdd(push.part_dispatch[0], 1, used);
+                push.part_used[used] = key;
+            }
         }
         else if (push.part_keys[key] != kPartLost)
         {
@@ -129,12 +118,11 @@ uint add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
             InterlockedAdd(push.part_keys[key], 1, slot);
             GpuDraw record;
             record.instance = instance;
-            record.material = part.material;
+            record.material = push.parts[part_index].material;
             record.fade = fade;
             push.records[slot] = record;
         }
     }
-    return triangles;
 }
 
 [shader("compute")]
@@ -152,10 +140,9 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     GpuMeshInfo mesh;
     mesh.center = float3(0.0);
     mesh.radius = 0.0;
-    mesh.vertex_offset = 0;
     mesh.first_lod = 0;
     mesh.lod_count = 0;
-    mesh.padding = 0;
+    mesh.padding = uint2(0);
     if (mesh_slot != kNoMesh)
     {
         mesh = push.meshes[mesh_slot];
@@ -181,15 +168,10 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         }
         const LodPick pick = pick_lod(view, mesh, center, radius, scale);
         const bool fading = pick.fade < 1.0;
-        uint triangles = add_parts(v, pick.lod, instance, fading ? pick.fade : 0.0);
+        add_parts(v, pick.lod, instance, fading ? pick.fade : 0.0);
         if (fading)
         {
-            triangles += add_parts(v, pick.finer, instance, -pick.fade);
-        }
-        if (push.writing == 0)
-        {
-            uint ignored;
-            InterlockedAdd(push.counts[kCountTriangles + (v == 0 ? 0u : 1u)], triangles, ignored);
+            add_parts(v, pick.finer, instance, -pick.fade);
         }
     }
 }

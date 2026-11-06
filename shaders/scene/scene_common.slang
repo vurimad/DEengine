@@ -79,10 +79,9 @@ public struct GpuMeshInfo
 {
     public float3 center; // of its bounding sphere, in object space
     public float radius;
-    public uint vertex_offset; // its first vertex in the geometry pool
-    public uint first_lod;     // in the LOD table
+    public uint first_lod; // in the LOD table
     public uint lod_count;
-    public uint padding;
+    public uint2 padding;
 };
 
 public struct GpuMeshLod
@@ -119,11 +118,13 @@ public uint draw_list_of(uint group, uint material_flags)
     return group < 2 ? group * kDrawKinds + masked * 2 + double_sided : 2 * kDrawKinds + 2 * (group - 2) + masked;
 }
 
-// The counters the cull and the draw assignment share, after one draw count per list.
+// What the draw assignment counts, after a count of draw slots per list, which a counted draw reads. What's drawn is
+// counted, not what's lost.
 public static const uint kCountTriangles = kDrawListCount; // for the camera, then for the cascades
 public static const uint kCountRecordsUsed = kDrawListCount + 2;
 public static const uint kCountRecordsLost = kDrawListCount + 3;
-public static const uint kCountRecordsPerList = kDrawListCount + 4;
+public static const uint kCountDraws = kDrawListCount + 4; // for the camera, then for the cascades
+public static const uint kCountRecordsPerList = kDrawListCount + 6;
 
 public struct GpuCullView
 {

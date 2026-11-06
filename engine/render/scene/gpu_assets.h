@@ -62,10 +62,9 @@ static_assert(sizeof(GpuMeshPart) == 16);
 struct GpuMeshInfo {
     float center[3] = {};
     float radius_m = 0.0f;
-    uint32_t vertex_offset = 0;
     uint32_t first_lod = 0; // in the LOD table
     uint32_t lod_count = 0;
-    uint32_t padding = 0;
+    uint32_t padding[2] = {};
 };
 static_assert(sizeof(GpuMeshInfo) == 32);
 
@@ -188,6 +187,8 @@ public:
     uint64_t part_table_address() const;
     // How much of the part table has ever been used: every part in it is below this.
     uint32_t part_table_used() const;
+    // How much it can hold.
+    uint32_t part_table_size() const;
     // The fog noise's bindless index (3D, fog_noise.h), or 0 until it's uploaded.
     uint32_t fog_noise_index() const;
 
