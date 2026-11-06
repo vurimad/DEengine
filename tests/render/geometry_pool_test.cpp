@@ -804,10 +804,11 @@ TEST_CASE("a caster beside what a cascade lights stays out, though the cascade's
         scene.uploader.flush_and_wait();
         scene.renderer.set_shadow_min_texels(0.0f);
 
-        // The sun behind the camera, so its near and side faces are all swept across: only the planes along the sun, from
-        // the edges, keep this out. It's to the right of the view, inside the last cascade's sphere.
+        // The sun behind the camera, so its near and side faces are all swept across: only the planes along the sun,
+        // from the edges, keep this out. It's to the right of the view, inside the last cascade's sphere.
         de::world::RenderFrame frame = PoolScene::frame_of({});
-        frame.instances.push({.transform = de::test::render_transform({0.5f, 0, 0, 25, 0, 0.5f, 0, 0, 0, 0, 0.5f, -20}), .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 25, 0, 0.5f, 0, 0, 0, 0, 0.5f, -20}), .mesh = mesh});
         de::render::SceneLighting light{.sun_direction = {0, 0.3f, 1}};
         light.shadows = {.resolution = 512, .distance_m = 40.0f};
         scene.renderer.set_shadow_caster_cull(false);
@@ -860,6 +861,43 @@ TEST_CASE("a caster too small for a cascade's texels stays out of it, and in the
         CHECK(finer_only < all);
         CHECK(drawn(0.99f * diameter_m / cascades[0].texel_m) >= 1);
         CHECK(drawn(1.01f * diameter_m / cascades[0].texel_m) == 0);
+    });
+}
+
+TEST_CASE("the same part in the same list is one instanced draw, and each instance reads its own record") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const float x : {-1.0f, 0.0f, 1.0f}) {
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.4f, 0, 0, x, 0, 0.4f, 0, 0, 0, 0, 0.4f, 0}), .mesh = red});
+        }
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.4f, 0, 0, 0, 0, 0.4f, 0, 1, 0, 0, 0.4f, 0}), .mesh = green});
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        scene.submit_for_stats(frame, light);
+        const auto merged = de::test::read_texture(scene.device, scene.target);
+        const de::render::SceneRendererStats stats = scene.renderer.stats();
+        CHECK(stats.visible_draws == 4);
+        CHECK(stats.merged_draws == 2);
+        CHECK(stats.draws_lost == 0);
+        CHECK(stats.visible_shadow_draws >= 4);
+        CHECK(stats.merged_shadow_draws < stats.visible_shadow_draws);
+
+        // A draw each, to compare with: the same picture.
+        scene.renderer.set_merged_draws(false);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_draws == 4);
+        CHECK(scene.renderer.stats().merged_draws == 4);
+        CHECK(scene.renderer.stats().merged_shadow_draws == scene.renderer.stats().visible_shadow_draws);
+        const auto apart = de::test::read_texture(scene.device, scene.target);
+        CHECK(pixels_apart(merged, apart) == 0);
+        scene.renderer.set_merged_draws(true);
     });
 }
 

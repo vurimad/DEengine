@@ -43,6 +43,7 @@ namespace de::app {
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
 //   --lod-error-pixels X  how far a LOD may lie from LOD 0 (default 1); 0 draws LOD 0 everywhere
 //   --lod-fade X     how long LODs take to fade into each other, as a share of a LOD's error (default 0.2); 0 cuts
+//   --no-merged-draws        a draw per object, instead of one instanced draw per mesh part, to compare
 //   --no-shadow-caster-cull  cascades draw all their maps could hold, to compare: no picture should change
 //   --shadow-min-texels X    casters narrower than this many of a cascade's texels don't draw in it (default 1); 0: all
 //   --show-sticks    dev builds: deadzone off, raw stick values logged twice a second (drift)
@@ -57,6 +58,7 @@ struct FrameworkArgs {
     float lod_fade = 0.2f;               // --lod-fade: 0 cuts between LODs, to compare with
     float shadow_min_texels = 1.0f;      // --shadow-min-texels
     bool shadow_caster_cull = true;      // --no-shadow-caster-cull
+    bool merged_draws = true;            // --no-merged-draws
     uint32_t window_width_points = 1600; // --window 2560x1440
     uint32_t window_height_points = 900;
     bool fullscreen = false; // --fullscreen: the display's own size, whatever the window's

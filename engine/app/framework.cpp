@@ -159,6 +159,7 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
         }
     }
     out.shadow_caster_cull = !has_flag(out, "--no-shadow-caster-cull");
+    out.merged_draws = !has_flag(out, "--no-merged-draws");
     if (const char* min_texels = flag_value(out, "--shadow-min-texels")) {
         char* end = nullptr;
         out.shadow_min_texels = std::strtof(min_texels, &end);
@@ -290,6 +291,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
             scene_renderer->set_lod_fade(args.lod_fade);
             scene_renderer->set_shadow_caster_cull(args.shadow_caster_cull);
+            scene_renderer->set_merged_draws(args.merged_draws);
             scene_renderer->set_shadow_min_texels(args.shadow_min_texels);
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
@@ -450,6 +452,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("visible draws", static_cast<int64_t>(drawn.visible_draws));
                 DE_PROFILE_PLOT("visible fading draws", static_cast<int64_t>(drawn.visible_fading_draws));
                 DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
+                DE_PROFILE_PLOT("merged draws", static_cast<int64_t>(drawn.merged_draws));
+                DE_PROFILE_PLOT("merged shadow draws", static_cast<int64_t>(drawn.merged_shadow_draws));
                 DE_PROFILE_PLOT("draws lost", static_cast<int64_t>(drawn.draws_lost));
                 DE_PROFILE_PLOT("visible triangles", static_cast<int64_t>(drawn.visible_triangles));
                 DE_PROFILE_PLOT("visible shadow triangles", static_cast<int64_t>(drawn.visible_shadow_triangles));

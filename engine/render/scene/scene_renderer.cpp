@@ -244,9 +244,8 @@ constexpr uint32_t cascade_list(uint32_t cascade, bool masked) {
 struct GpuCullView {
     float planes[kShadowCasterPlanes + 1][4] = {}; // for a cascade, how far toward the sun it goes too
     uint32_t plane_count = 0;
-    uint32_t first_list = 0;
-    uint32_t lists_by_kind = 0;
     uint32_t lod_perspective = 0;
+    uint32_t padding[2] = {};
     float depth_plane[4] = {};
     float lod_scale = 0.0f;
     float lod_fade_end = 1.0f;
@@ -261,8 +260,12 @@ struct GpuDrawList {
 };
 
 constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
-// The counts the cull writes: per draw list, then the triangles it kept for the camera and for the cascades.
-constexpr uint32_t kCullCounterCount = kDrawListCount + 2;
+// The counts the cull writes: draws per list; the triangles it kept for the camera and for the cascades; records used
+// in all; and then records per list. As in shaders/scene/scene_common.slang.
+constexpr uint32_t kCountTriangles = kDrawListCount;
+constexpr uint32_t kCountRecordsPerList = kDrawListCount + 3;
+constexpr uint32_t kCullCounterCount = kCountRecordsPerList + kDrawListCount;
+constexpr uint32_t kCullGroups = 2 + kShadowCascadeCount; // the camera's plain draws, what's fading, and each cascade
 constexpr uint32_t kNoMesh = UINT32_MAX;
 // The views and lists, then what changed in the instances, which stay on the GPU between frames.
 constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
@@ -314,7 +317,23 @@ struct CullPush {
     uint64_t args = 0;
     uint64_t records = 0;
     uint64_t counts = 0;
+    uint64_t part_keys = 0;
     uint32_t instance_count = 0;
+    uint32_t part_count = 0;
+    uint32_t writing = 0;
+};
+
+// Matches CullAssignPush in shaders/scene/cull_assign.slang.
+struct CullAssignPush {
+    uint64_t parts = 0;
+    uint64_t materials = 0;
+    uint64_t lists = 0;
+    uint64_t args = 0;
+    uint64_t counts = 0;
+    uint64_t part_keys = 0;
+    uint32_t part_count = 0;
+    uint32_t record_capacity = 0;
+    uint32_t merged = 0;
 };
 
 // Matches InstanceUpdatePush in shaders/scene/instance_update.slang.
@@ -371,6 +390,7 @@ struct SceneRendererState {
     shader::ProgramHandle fog_inject;
     shader::ProgramHandle fog_integrate;
     shader::ProgramHandle cull;
+    shader::ProgramHandle cull_assign;
     shader::ProgramHandle instance_update;
     // The instances, on the GPU between frames, and what the CPU keeps of them: each slot's mesh, to size the draw
     // lists without walking the instances.
@@ -403,6 +423,7 @@ struct SceneRendererState {
     bool warned_draws_lost = false;
     float lod_error_pixels = 1.0f;
     float lod_fade = 0.2f;
+    bool merged_draws = true;
     bool shadow_caster_cull = true;
     float shadow_min_texels = 1.0f;
     SceneShadows shadows; // this frame's, within limits
@@ -439,7 +460,7 @@ struct SceneRendererState {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, gbuffer_opaque_fading, gbuffer_masked_fading, deferred_light, tonemap,
               shadow_caster_opaque, shadow_caster_masked, shadow_mask, fog_program, fog_inject, fog_integrate, cull,
-              instance_update, taa_program}) {
+              cull_assign, instance_update, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -575,6 +596,9 @@ struct SceneRendererState {
         const core::Result<shader::ProgramHandle> cull_program =
             shaders->create_compute({.module = "scene.cull", .debug_name = "gpu cull"});
         cull = cull_program ? *cull_program : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> assign_program =
+            shaders->create_compute({.module = "scene.cull_assign", .debug_name = "gpu cull assign"});
+        cull_assign = assign_program ? *assign_program : shader::ProgramHandle{};
         const core::Result<shader::ProgramHandle> update_program =
             shaders->create_compute({.module = "scene.instance_update", .debug_name = "instance update"});
         instance_update = update_program ? *update_program : shader::ProgramHandle{};
@@ -620,20 +644,23 @@ struct SceneRendererState {
         uint32_t counts[kCullCounterCount];
         std::memcpy(counts, mapped.data(), sizeof(counts));
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
-            const uint32_t kept = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
+            const uint32_t records = counts[kCountRecordsPerList + list];
+            const uint32_t kept = std::min(records, cull_readback_plan[slot].lists[list].capacity);
             (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
-            stats.draws_lost += counts[list] - kept;
-            if (counts[list] > kept && !warned_draws_lost) {
+            const uint32_t draws = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
+            (list < kCameraListCount ? stats.merged_draws : stats.merged_shadow_draws) += draws;
+            stats.draws_lost += records - kept;
+            if (records > kept && !warned_draws_lost) {
                 DE_LOG_WARN("render", "draw list %u lost %u draws: a material changing kind can do this for a frame",
-                            list, counts[list] - kept);
+                            list, records - kept);
                 warned_draws_lost = true;
             }
             if (list >= kDrawKindCount && list < kCameraListCount) {
                 stats.visible_fading_draws += kept;
             }
         }
-        stats.visible_triangles = counts[kDrawListCount];
-        stats.visible_shadow_triangles = counts[kDrawListCount + 1];
+        stats.visible_triangles = counts[kCountTriangles];
+        stats.visible_shadow_triangles = counts[kCountTriangles + 1];
     }
 
     // A list the cull filled, with the bound pipeline and the geometry pool's index buffer.
@@ -871,8 +898,6 @@ struct SceneRendererState {
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
         // plane.
         views[0] = {.plane_count = 4,
-                    .first_list = 0,
-                    .lists_by_kind = 1,
                     .lod_perspective = 1,
                     .lod_scale = lod_scale_for(static_cast<float>(height) /
                                                (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f))),
@@ -892,9 +917,7 @@ struct SceneRendererState {
         // With that cull off, all its map could hold: its sides and both ends of its depth.
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             GpuCullView& view = views[1 + c];
-            view = {.first_list = cascade_list(c, false),
-                    .lists_by_kind = 0,
-                    .lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f)),
+            view = {.lod_scale = lod_scale_for(1.0f / std::max(scene.cascade_texel_m[c], 1e-6f)),
                     .min_radius_m = 0.5f * shadow_min_texels * scene.cascade_texel_m[c]};
             const float* const view_proj = &scene.cascade_view_proj[static_cast<size_t>(c) * 16];
             if (shadow_caster_cull) {
@@ -1413,6 +1436,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle mask = state.shaders->pipeline(state.shadow_mask);
     const rhi::PipelineHandle fog = state.shaders->pipeline(state.fog_program);
     const rhi::PipelineHandle cull = state.shaders->pipeline(state.cull);
+    const rhi::PipelineHandle cull_assign = state.shaders->pipeline(state.cull_assign);
     const rhi::PipelineHandle instance_update = state.shaders->pipeline(state.instance_update);
     const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
     const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
@@ -1459,7 +1483,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() &&
                        gbuffer_opaque_fading.is_valid() && gbuffer_masked_fading.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
-                       cull.is_valid() && instance_update.is_valid();
+                       cull.is_valid() && cull_assign.is_valid() && instance_update.is_valid();
     if (!ready) {
         // Nothing to look through, or shaders missing: the target is cleared, and this frame's changes are lost.
         state.instances_stale_now = true;
@@ -1483,7 +1507,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     // The GPU cull: what's in each view, into the draw lists the G-buffer and shadow passes draw.
     struct CullClearPass {
         GraphBuffer counts;
+        GraphBuffer part_keys;
+        uint64_t part_keys_bytes = 0;
     };
+    const uint32_t part_count = std::max(state.gpu_assets->part_table_used(), 1U);
     const auto& cull_clear = graph.add_pass<CullClearPass>(
         "cull clear",
         [&](PassBuilder& pass, CullClearPass& data) {
@@ -1492,11 +1519,18 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                                        rhi::BufferUsage::CopyDst | rhi::BufferUsage::CopySrc,
                                               .debug_name = "draw counts"});
             pass.use(data.counts, rhi::ResourceState::CopyDst);
+            data.part_keys_bytes = uint64_t{kCullGroups} * part_count * sizeof(uint32_t);
+            data.part_keys = pass.create_buffer({.size = data.part_keys_bytes,
+                                                 .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                                 .debug_name = "draw part keys"});
+            pass.use(data.part_keys, rhi::ResourceState::CopyDst);
         },
         [](const CullClearPass& data, PassContext& context) {
             context.list.fill_buffer(context.buffer(data.counts), 0, kCullCounterCount * sizeof(uint32_t), 0);
+            context.list.fill_buffer(context.buffer(data.part_keys), 0, data.part_keys_bytes, 0);
         });
     const GraphBuffer draw_counts = cull_clear.counts;
+    const GraphBuffer part_keys = cull_clear.part_keys;
 
     // What changed in the instances. They stay between frames, so the graph is told how they were left.
     const GraphBuffer instance_data_graph = graph.import_buffer(
@@ -1538,55 +1572,111 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 context.list.dispatch((updates + 63) / 64);
             });
     }
+    // The cull counts what's in each view, each part gets its draw and its records, and the cull writes them.
     struct CullPass {
         SceneRendererState* state = nullptr;
         GraphBuffer counts;
+        GraphBuffer part_keys;
         GraphBuffer draws;
         rhi::PipelineHandle pipeline;
         uint64_t frame_address = 0;
         CullPlan plan;
+        uint32_t part_count = 0;
     };
-    const auto& cull_pass = graph.add_pass<CullPass>(
-        "gpu cull",
+    const auto run_cull = [](const CullPass& data, PassContext& context, uint32_t writing) {
+        const SceneRendererState& renderer = *data.state;
+        // Before the mesh table holds anything, there's nothing to cull against.
+        if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
+            return;
+        }
+        const uint64_t draws = data.draws.is_valid() ? renderer.device->buffer_address(context.buffer(data.draws)) : 0;
+        const CullPush push{.frame = data.frame_address,
+                            .instances = renderer.instance_data_address,
+                            .instance_meshes = renderer.instance_meshes_address,
+                            .meshes = renderer.gpu_assets->mesh_table_address(),
+                            .lods = renderer.gpu_assets->lod_table_address(),
+                            .parts = renderer.gpu_assets->part_table_address(),
+                            .materials = renderer.gpu_assets->material_table_address(),
+                            .views = data.frame_address + kCullViewsOffset,
+                            .lists = data.frame_address + kDrawListsOffset,
+                            .args = draws,
+                            .records = draws + data.plan.records_offset(),
+                            .counts = renderer.device->buffer_address(context.buffer(data.counts)),
+                            .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
+                            .instance_count = data.plan.slots,
+                            .part_count = data.part_count,
+                            .writing = writing};
+        context.list.bind_pipeline(data.pipeline);
+        context.list.push_constants(push);
+        context.list.dispatch((data.plan.slots + 63) / 64);
+    };
+    const auto use_for_cull = [&](PassBuilder& pass) {
+        pass.use(draw_counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+        pass.use(part_keys, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+    };
+    const CullPass cull_base{.state = &state,
+                             .counts = draw_counts,
+                             .part_keys = part_keys,
+                             .draws = {},
+                             .pipeline = cull,
+                             .frame_address = frame_address,
+                             .plan = plan,
+                             .part_count = part_count};
+    graph.add_pass<CullPass>(
+        "gpu cull count",
         [&](PassBuilder& pass, CullPass& data) {
-            data = {.state = &state,
-                    .counts = draw_counts,
-                    .draws = {},
-                    .pipeline = cull,
-                    .frame_address = frame_address,
-                    .plan = plan};
+            data = cull_base;
+            use_for_cull(pass);
+            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+        },
+        [run_cull](const CullPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("gpu cull count pass");
+            run_cull(data, context, 0);
+        });
+    const auto& cull_pass = graph.add_pass<CullPass>(
+        "gpu cull assign",
+        [&](PassBuilder& pass, CullPass& data) {
+            data = cull_base;
+            data.pipeline = cull_assign;
             data.draws = pass.create_buffer({.size = plan.buffer_bytes(),
                                              .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
                                              .debug_name = "draw lists"});
             pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-            pass.use(data.counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
-            pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            use_for_cull(pass);
         },
         [](const CullPass& data, PassContext& context) {
-            DE_PROFILE_ZONE("gpu cull pass");
+            DE_PROFILE_ZONE("gpu cull assign pass");
             const SceneRendererState& renderer = *data.state;
-            // Before the mesh table holds anything, there's nothing to cull against.
             if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
                 return;
             }
-            const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));
-            const CullPush push{.frame = data.frame_address,
-                                .instances = renderer.instance_data_address,
-                                .instance_meshes = renderer.instance_meshes_address,
-                                .meshes = renderer.gpu_assets->mesh_table_address(),
-                                .lods = renderer.gpu_assets->lod_table_address(),
-                                .parts = renderer.gpu_assets->part_table_address(),
-                                .materials = renderer.gpu_assets->material_table_address(),
-                                .views = data.frame_address + kCullViewsOffset,
-                                .lists = data.frame_address + kDrawListsOffset,
-                                .args = draws,
-                                .records = draws + data.plan.records_offset(),
-                                .counts = renderer.device->buffer_address(context.buffer(data.counts)),
-                                .instance_count = data.plan.slots};
+            const CullAssignPush push{.parts = renderer.gpu_assets->part_table_address(),
+                                      .materials = renderer.gpu_assets->material_table_address(),
+                                      .lists = data.frame_address + kDrawListsOffset,
+                                      .args = renderer.device->buffer_address(context.buffer(data.draws)),
+                                      .counts = renderer.device->buffer_address(context.buffer(data.counts)),
+                                      .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
+                                      .part_count = data.part_count,
+                                      .record_capacity = static_cast<uint32_t>(data.plan.slot_capacity),
+                                      .merged = renderer.merged_draws ? 1U : 0U};
             context.list.bind_pipeline(data.pipeline);
             context.list.push_constants(push);
-            context.list.dispatch((data.plan.slots + 63) / 64);
+            context.list.dispatch(((kCullGroups * data.part_count) + 63) / 64);
+        });
+    graph.add_pass<CullPass>(
+        "gpu cull write",
+        [&](PassBuilder& pass, CullPass& data) {
+            data = cull_base;
+            data.draws = cull_pass.draws;
+            pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            use_for_cull(pass);
+            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+        },
+        [run_cull](const CullPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("gpu cull write pass");
+            run_cull(data, context, 1);
         });
     const GraphBuffer draw_lists = cull_pass.draws;
 
@@ -2123,6 +2213,10 @@ void SceneRenderer::set_lod_error_pixels(float pixels) {
 
 void SceneRenderer::set_lod_fade(float share) {
     state_->lod_fade = share;
+}
+
+void SceneRenderer::set_merged_draws(bool on) {
+    state_->merged_draws = on;
 }
 
 void SceneRenderer::set_shadow_caster_cull(bool on) {
