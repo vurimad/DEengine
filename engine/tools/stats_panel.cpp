@@ -87,6 +87,10 @@ void StatsPanel::draw(bool* open) {
                     last_.camera_position.z, static_cast<double>(glm::degrees(std::atan2(-forward.x, -forward.z))),
                     static_cast<double>(glm::degrees(std::asin(std::clamp(forward.y, -1.0f, 1.0f)))));
     }
+    if (last_.cull_frozen) {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "cull frozen (F4): %u shadow draws, %u triangles",
+                           last_.visible_shadow_draws, last_.visible_shadow_triangles);
+    }
 
     if (ImGui::CollapsingHeader("GPU memory", ImGuiTreeNodeFlags_DefaultOpen)) {
         const rhi::GpuMemoryStats& memory = last_.memory;

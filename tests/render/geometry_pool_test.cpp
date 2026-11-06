@@ -2619,3 +2619,428 @@ TEST_CASE("a mesh's LODs need room in the table too") {
         CHECK(scene.gpu_assets.stats().meshes_dropped == 1);
     });
 }
+
+namespace {
+
+// A red square where the frame starts, and a green pair of squares somewhere out of its sight. They have 2 and 4
+// triangles, so what the cull kept says which of them it found, in any view.
+struct FreezeScene {
+    AssetHandle here;
+    AssetHandle there;
+
+    explicit FreezeScene(const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {-1.0f, 1.0f});
+        here = scene.load(kCenter);
+        there = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+    }
+
+    // Each at its place in the world, with the frame's origin there too.
+    de::world::RenderFrame frame_at(const de::DVec3& origin, const de::DVec3& there_m) const {
+        de::world::RenderFrame frame = PoolScene::frame_of({here, there});
+        frame.origin = origin;
+        for (int axis = 0; axis < 3; ++axis) {
+            frame.instances[0].transform.set_position_m(axis, origin[axis]);
+            frame.instances[1].transform.set_position_m(axis, there_m[axis]);
+        }
+        return frame;
+    }
+};
+
+void put_camera(de::world::RenderFrame& frame, float x_m, float y_m, float z_m) {
+    frame.camera.transform[3] = x_m;
+    frame.camera.transform[7] = y_m;
+    frame.camera.transform[11] = z_m;
+}
+
+de::render::SceneLighting freeze_light() {
+    de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+    light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+    return light;
+}
+
+} // namespace
+
+TEST_CASE("a frozen cull keeps every view where it was, while the picture follows the camera") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        de::world::RenderFrame frame = assets.frame_at(de::DVec3(0.0), {500.0, 0.0, 0.0});
+        const auto kept = [&](uint32_t triangles, uint32_t shadow_triangles) {
+            scene.submit_for_stats(frame, light);
+            CHECK(scene.renderer.stats().visible_triangles == triangles);
+            CHECK(scene.renderer.stats().visible_shadow_triangles == shadow_triangles);
+            return de::test::read_texture(scene.device, scene.target);
+        };
+
+        // What each place finds, live: there, more triangles in every view.
+        scene.submit_for_stats(frame, light);
+        const uint32_t shadows_here = scene.renderer.stats().visible_shadow_triangles;
+        put_camera(frame, 500.0f, 0.0f, 3.0f);
+        scene.submit_for_stats(frame, light);
+        const uint32_t shadows_there = scene.renderer.stats().visible_shadow_triangles;
+        REQUIRE(shadows_here > 0);
+        REQUIRE(shadows_there > shadows_here);
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+
+        // Frozen here: going there shows nothing, though the green squares are right in front of it.
+        scene.renderer.set_cull_frozen(true);
+        CHECK(is_red(kept(2, shadows_here), kMiddle));
+        put_camera(frame, 500.0f, 0.0f, 3.0f);
+        const auto frozen_there = kept(2, shadows_here);
+        CHECK_FALSE(is_green(frozen_there, kLeft));
+        CHECK_FALSE(
+            is_red(frozen_there, kMiddle)); // it's drawn, but that's 500 m away: the picture is the live camera's
+
+        // Unfrozen, the very next frame is live. What the cull kept takes a few frames to read.
+        scene.renderer.set_cull_frozen(false);
+        scene.submit(frame, light);
+        CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+        CHECK(is_green(kept(4, shadows_there), kRight));
+
+        // Frozen again, it's where the camera is now, with nothing left of the first time.
+        scene.renderer.set_cull_frozen(true);
+        CHECK(is_green(kept(4, shadows_there), kLeft));
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        CHECK_FALSE(is_red(kept(4, shadows_there), kMiddle));
+        scene.renderer.set_cull_frozen(false);
+        scene.submit(frame, light);
+        CHECK(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}
+
+TEST_CASE("a cull frozen with nothing to look through freezes at the first camera") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        de::world::RenderFrame frame = assets.frame_at(de::DVec3(0.0), {500.0, 0.0, 0.0});
+        scene.renderer.set_cull_frozen(true);
+        frame.camera.valid = false;
+        scene.submit(frame, light);
+        frame.camera.valid = true;
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_triangles == 2);
+        put_camera(frame, 500.0f, 0.0f, 3.0f);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_triangles == 2);
+    });
+}
+
+TEST_CASE("a frozen view stays in the same place in the world as the render origin moves") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        // The green squares are exactly as far from where the origin goes as the red one is from where it was, so a
+        // view left as it was would find them instead.
+        constexpr double kStep = de::world::kRenderOriginStep;
+        const de::DVec3 start{2.0 * kStep, kStep, -kStep};
+        const de::DVec3 moved{kStep, -2.0 * kStep, 3.0 * kStep};
+        const de::DVec3 next = start + moved;
+        de::world::RenderFrame frame = assets.frame_at(start, next);
+
+        scene.renderer.set_cull_frozen(true);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_triangles == 2);
+        const uint32_t shadows = scene.renderer.stats().visible_shadow_triangles;
+        REQUIRE(shadows > 0);
+        const auto kept_is_the_same = [&] {
+            scene.submit_for_stats(frame, light);
+            CHECK(scene.renderer.stats().visible_triangles == 2);
+            CHECK(scene.renderer.stats().visible_shadow_triangles == shadows);
+            return de::test::read_texture(scene.device, scene.target);
+        };
+
+        // The origin goes, and the camera stays in the world: the same picture.
+        frame.origin = next;
+        put_camera(frame, static_cast<float>(-moved.x), static_cast<float>(-moved.y),
+                   static_cast<float>(3.0 - moved.z));
+        CHECK(is_red(kept_is_the_same(), kMiddle));
+        // The camera goes with it, to the green squares, which stay out.
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        CHECK_FALSE(is_green(kept_is_the_same(), kLeft));
+        // And further on the origin's way, and back: it's how far it is that counts, not how it got there.
+        frame.origin = next + moved;
+        put_camera(frame, static_cast<float>(-moved.x), static_cast<float>(-moved.y),
+                   static_cast<float>(3.0 - moved.z));
+        CHECK_FALSE(is_green(kept_is_the_same(), kLeft));
+        frame.origin = start;
+        CHECK_FALSE(is_red(kept_is_the_same(), kMiddle)); // that camera is relative to start, nowhere near the square
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        CHECK(is_red(kept_is_the_same(), kMiddle));
+
+        // Frozen after the origin has moved is relative to that origin, with nothing left of this one.
+        scene.renderer.set_cull_frozen(false);
+        frame.origin = next;
+        scene.submit(frame, light);
+        CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+        scene.renderer.set_cull_frozen(true);
+        scene.submit(frame, light);
+        frame.origin = start;
+        put_camera(frame, static_cast<float>(moved.x), static_cast<float>(moved.y), static_cast<float>(3.0 + moved.z));
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().visible_triangles == 4);
+        CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+    });
+}
+
+TEST_CASE("a frozen view's LODs stay as they were, wherever the camera and the render origin go") {
+    with_pool({.pool_vertices = 8192, .pool_indices = 65536}, [](const PoolScene& scene) {
+        put_grid(scene.vfs, kGrid, kGreen);
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const GpuMesh* const mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        REQUIRE(mesh->lods.size() >= 3);
+        scene.renderer.set_lod_fade(0.0f); // so one LOD's triangles are all there are
+        const auto triangles = [&](size_t lod) { return mesh->lod_parts(lod)[0].index_count / 3; };
+
+        // Where LOD 1 is the coarsest good enough. The grid's nearest depth is the camera's less its radius.
+        const float pixels_per_radian = static_cast<float>(kSize) / (2.0f * std::tan(0.5f));
+        const float depth_m = (mesh->lods[1].error_m * pixels_per_radian * 1.1f) + mesh->bounds_radius_m;
+        de::world::RenderFrame frame = PoolScene::frame_of({grid});
+        const float transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3.0f - depth_m};
+        frame.instances[0].transform = de::test::render_transform(transform);
+        const auto picked = [&](uint32_t want) {
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_triangles == want);
+        };
+        picked(triangles(1));
+
+        // Frozen, it stays at that LOD with the camera right up close, where LOD 0 would be picked, and far away.
+        scene.renderer.set_cull_frozen(true);
+        picked(triangles(1));
+        const float close_z = 3.0f - depth_m + (mesh->bounds_radius_m * 1.01f);
+        put_camera(frame, 0.0f, 0.0f, close_z);
+        picked(triangles(1));
+        put_camera(frame, 0.0f, 0.0f, 3.0f + (10.0f * depth_m));
+        picked(triangles(1));
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+
+        // The origin moves along the view, either way: the depth a LOD is picked by is the world's. Left relative to
+        // the old origin, it would be behind the grid one way, and a kilometer farther the other.
+        constexpr auto kStep = static_cast<float>(de::world::kRenderOriginStep);
+        for (const float sign : {1.0f, -1.0f}) {
+            CAPTURE(sign);
+            frame.origin = de::DVec3(0.0, 0.0, static_cast<double>(sign * kStep));
+            put_camera(frame, 0.0f, 0.0f, 3.0f - (sign * kStep));
+            picked(triangles(1));
+        }
+        frame.origin = de::DVec3(0.0);
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+
+        // A limit changed meanwhile waits too. Unfrozen, it applies at once.
+        scene.renderer.set_lod_error_pixels(0.0f);
+        picked(triangles(1));
+        scene.renderer.set_cull_frozen(false);
+        picked(triangles(0));
+        scene.renderer.set_lod_error_pixels(1.0f);
+        picked(triangles(1));
+
+        // A cascade's too, whose LODs go by its texels: these change with the shadows, which stay live.
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        const auto shadow_triangles = [&](uint32_t resolution) {
+            light.shadows = {.resolution = resolution, .distance_m = 8.0f, .split_lambda = 0.0f};
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            return scene.renderer.stats().visible_shadow_triangles;
+        };
+        const uint32_t coarse = shadow_triangles(64);
+        const uint32_t fine = shadow_triangles(4096);
+        REQUIRE(coarse < fine);
+        shadow_triangles(64);
+        scene.renderer.set_cull_frozen(true);
+        shadow_triangles(64);
+        CHECK(shadow_triangles(4096) == coarse);
+        scene.renderer.set_cull_frozen(false);
+        CHECK(shadow_triangles(4096) == fine);
+    });
+}
+
+TEST_CASE("what was fading when the cull froze keeps its room in the draw lists, whatever the fade is now") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        const de::world::RenderFrame frame = view.frame_at(0.9f);
+
+        for (const bool merged : {true, false}) {
+            CAPTURE(merged);
+            scene.renderer.set_merged_draws(merged);
+            scene.renderer.set_lod_fade(0.2f);
+            scene.renderer.set_cull_frozen(true);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 2);
+            scene.renderer.set_lod_fade(0.0f);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 2);
+            CHECK(scene.renderer.stats().draws_lost == 0);
+            const FadeView::Pixels seen = FadeView::count(de::test::read_texture(scene.device, scene.target));
+            CHECK(seen.first > 0);
+            CHECK(seen.second > 0);
+            CHECK(seen.other == 0);
+
+            scene.renderer.set_cull_frozen(false);
+            scene.submit_for_stats(frame);
+            CHECK(scene.renderer.stats().visible_fading_draws == 0);
+        }
+    });
+}
+
+TEST_CASE("a frozen cull holds with draws merged or not, and with the caster cull on or off") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        constexpr double kStep = de::world::kRenderOriginStep;
+        const de::DVec3 start{kStep, 0.0, 0.0};
+        const de::DVec3 next{2.0 * kStep, 0.0, 0.0};
+        for (const bool merged : {true, false}) {
+            for (const bool caster_cull : {true, false}) {
+                CAPTURE(merged);
+                CAPTURE(caster_cull);
+                scene.renderer.set_merged_draws(merged);
+                scene.renderer.set_shadow_caster_cull(caster_cull);
+                // Two red squares at one place, which is one draw if they merge, and the green ones where the origin
+                // goes.
+                de::world::RenderFrame frame = assets.frame_at(start, next);
+                const de::world::RenderInstance red = frame.instances[0];
+                frame.instances.push(red);
+                const uint32_t camera_draws = merged ? 1 : 2;
+
+                scene.renderer.set_cull_frozen(true);
+                scene.submit_for_stats(frame, light);
+                const uint32_t shadow_draws = scene.renderer.stats().visible_shadow_draws;
+                const uint32_t shadow_triangles = scene.renderer.stats().visible_shadow_triangles;
+                REQUIRE(shadow_draws > 0);
+                const auto holds = [&](uint32_t merged_camera_draws) {
+                    scene.submit_for_stats(frame, light);
+                    const de::render::SceneRendererStats stats = scene.renderer.stats();
+                    CHECK(stats.visible_draws == 2);
+                    CHECK(stats.merged_draws == merged_camera_draws);
+                    CHECK(stats.visible_triangles == 4);
+                    CHECK(stats.visible_shadow_draws == shadow_draws);
+                    CHECK(stats.visible_shadow_triangles == shadow_triangles);
+                    CHECK(stats.draws_lost == 0);
+                };
+                holds(camera_draws);
+
+                // The origin and the camera go to the green squares, and they stay out of every view.
+                frame.origin = next;
+                holds(camera_draws);
+                CHECK_FALSE(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+
+                // Neither setting reaches what's frozen: the caster cull made its planes, and merging only draws them.
+                scene.renderer.set_shadow_caster_cull(!caster_cull);
+                holds(camera_draws);
+                scene.renderer.set_shadow_caster_cull(caster_cull);
+                scene.renderer.set_merged_draws(!merged);
+                holds(merged ? 2 : 1);
+                scene.renderer.set_merged_draws(merged);
+
+                scene.renderer.set_cull_frozen(false);
+                scene.submit(frame, light);
+                CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+            }
+        }
+        scene.renderer.set_merged_draws(true);
+        scene.renderer.set_shadow_caster_cull(true);
+    });
+}
+
+TEST_CASE("a frozen cull picks the casters, and shadows still go through the live camera's cascades") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // A floor, and high above it toward the sun, out of the picture, a caster. The camera at z = 3 sees its shadow
+        // on the floor, about 5 m ahead of it. It's 3 m wide, but stretched along its flat side: its bounding sphere is
+        // 21 m across each way from it, with nothing more to draw.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.instances.push(
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, -1, 0, -100, 0, 0}), .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({3, 0, 0, 0, 0, 2, 0, 11, 0, 0, 30, -14}), .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 1, -1}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        const auto mask = [&] {
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            return de::test::read_texture(scene.device, scene.target);
+        };
+        // The floor about 5 m ahead lands on this row.
+        const auto in_shadow = [](const de::core::Array<std::byte>& pixels) {
+            return texel(pixels, kMiddle, kMiddle + 12)[0] < 40;
+        };
+        const auto lit_beside_it = [](const de::core::Array<std::byte>& pixels) {
+            return texel(pixels, kMiddle + 28, kMiddle + 12)[0] > 215;
+        };
+        const auto live = mask();
+        REQUIRE(in_shadow(live));
+        REQUIRE(lit_beside_it(live));
+
+        // Frozen 20 m to the side, the sphere still reaches those cascades, so the caster is in their lists, but their
+        // maps stop well short of where it is and where its shadow lands. So the picture here comes out the same only
+        // through this camera's cascades.
+        put_camera(frame, 20.0f, 0.0f, 3.0f);
+        scene.renderer.set_cull_frozen(true);
+        scene.submit(frame, light, de::render::SceneView::ShadowMask);
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        const auto frozen_near = mask();
+        CHECK(in_shadow(frozen_near));
+        CHECK(pixels_apart(live, frozen_near) == 0);
+
+        // Frozen far to the side, the caster is in none of those cascades: no shadow, though the floor is still drawn.
+        scene.renderer.set_cull_frozen(false);
+        put_camera(frame, 60.0f, 0.0f, 3.0f);
+        scene.renderer.set_cull_frozen(true);
+        scene.submit(frame, light, de::render::SceneView::ShadowMask);
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        const auto frozen_aside = mask();
+        CHECK_FALSE(in_shadow(frozen_aside));
+        CHECK(lit_beside_it(frozen_aside));
+        CHECK(scene.renderer.stats().visible_draws == 1);
+
+        // And all of it comes back at once.
+        scene.renderer.set_cull_frozen(false);
+        scene.submit(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(pixels_apart(live, de::test::read_texture(scene.device, scene.target)) == 0);
+    });
+}
+
+TEST_CASE(
+    "a cull held frozen stays, and one frozen anew over frames that drew nothing takes the next drawn frame's views") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        de::world::RenderFrame frame = assets.frame_at(de::DVec3(0.0), {500.0, 0.0, 0.0});
+        const auto kept = [&] {
+            scene.submit_for_stats(frame, light);
+            return scene.renderer.stats().visible_triangles;
+        };
+
+        // The framework says so every frame, drawn or not: that isn't freezing again.
+        scene.renderer.set_cull_frozen(true);
+        CHECK(kept() == 2);
+        put_camera(frame, 500.0f, 0.0f, 3.0f);
+        for (int i = 0; i < 3; ++i) {
+            scene.renderer.set_cull_frozen(true);
+            scene.empty_frame();
+        }
+        scene.renderer.set_cull_frozen(true);
+        CHECK(kept() == 2);
+
+        // Minimized, it's off for a frame and on again. Nothing was drawn meanwhile, and it's a new freeze all the
+        // same.
+        scene.renderer.set_cull_frozen(false);
+        scene.empty_frame();
+        scene.renderer.set_cull_frozen(true);
+        scene.empty_frame();
+        CHECK(kept() == 4);
+        CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        CHECK(kept() == 4);
+        CHECK_FALSE(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}

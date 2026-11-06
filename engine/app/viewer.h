@@ -12,8 +12,10 @@ namespace de::app {
 // The application deengine runs until the game's own lands: loads a world (every cell of it, until
 // the streamer picks cells around the player), lights it by its environment, and flies a free camera
 // through it from the world's start (WASD/QE and the right mouse button, or a gamepad). A re-cooked
-// world or environment applies as it lands. In dev builds F2 steps through the G-buffer's channels.
-//   --world ID   the cooked world (asset ID, 16 hex digits; default: config/engine.settings' world)
+// world or environment applies as it lands. In dev builds F2 steps through the G-buffer's channels, and F4 freezes
+// the cull where the camera is.
+//   --world ID      the cooked world (asset ID, 16 hex digits; default: config/engine.settings' world)
+//   --freeze-cull   dev builds: start with the cull frozen, at the first frame's camera
 class Viewer final : public Application {
 public:
     Viewer();
@@ -40,8 +42,9 @@ private:
     tools::FreeCamera free_camera_;
     flecs::entity camera_;
 #if DE_BUILD_DEV
-    platform::ActionId next_view_{};  // F2: the next G-buffer view
-    platform::ActionId toggle_taa_{}; // F3: temporal anti-aliasing on and off, to compare
+    platform::ActionId next_view_{};   // F2: the next G-buffer view
+    platform::ActionId toggle_taa_{};  // F3: temporal anti-aliasing on and off, to compare
+    platform::ActionId freeze_cull_{}; // F4: the cull stays where it is, and the camera can leave it
 #endif
 };
 

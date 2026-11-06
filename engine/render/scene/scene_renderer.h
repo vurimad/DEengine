@@ -205,6 +205,17 @@ public:
     // them.
     void set_shadow_min_texels(float texels);
 
+    // Freezes the cull, to check it. From the next frame with a camera, every view it culls and picks LODs with (the
+    // camera's and each cascade's) stays as it was then, at the same place in the world wherever the camera or the
+    // render origin goes, while the picture follows the live camera. Unfrozen, the next frame is as usual; freezing
+    // again takes that frame's views.
+    //
+    // Camera culling and LODs can be judged by eye from any distance. Shadow casters can only for small moves: the
+    // frozen lists are drawn through cascades fitted to the live camera, so after flying far away shadows vanish
+    // whether the caster cull was right or wrong. What can still be trusted from there is the numbers it kept,
+    // SceneRendererStats::visible_shadow_draws and visible_shadow_triangles.
+    void set_cull_frozen(bool frozen);
+
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).
     bool instances_stale() const;
