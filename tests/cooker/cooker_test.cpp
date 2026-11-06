@@ -12,6 +12,7 @@
 #include "core/job_system.h"
 #include "platform/file.h"
 #include "platform/vfs.h"
+#include "render/shader/shader_asset.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 #include "support/gpu.h"
@@ -1356,7 +1357,233 @@ TEST_CASE("shader modules cook to .deshader, and the library builds pipelines fr
     const auto other = library->create_compute({.module = "tests.fill_buffer", .defines = defines});
     REQUIRE(other.ok());
     CHECK_FALSE(library->pipeline(*other).is_valid()); // that permutation wasn't cooked
+
+    // Shaders cooked from other sources than this build's are refused, and refused only here:
+    // compiling from source (dev builds, hot reload) doesn't look at what's cooked.
+    REQUIRE(de::asset::write_shader_stamp(*vfs, de::shader::built_source_hash() + 1).ok());
+    const auto stale = de::shader::ShaderLibrary::create_cooked(*device, *vfs, jobs, {.hot_reload = false});
+    REQUIRE_FALSE(stale.ok());
+    CHECK(std::string_view(stale.error().message).find("re-run the cooker") != std::string_view::npos);
+    auto from_source = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(from_source.ok());
+    const auto compiled_program = from_source->create_compute({.module = "tests.fill_buffer"});
+    REQUIRE(compiled_program.ok());
+    CHECK(from_source->pipeline(*compiled_program).is_valid());
     de::test::check_clean(*device);
+}
+
+TEST_CASE("the hash of the shader sources follows what cooked shaders are made from") {
+    const Sandbox sandbox;
+    write_src(sandbox, "shaders/a.slang", "float a() { return 1; }\nfloat a2() { return 2; }\n");
+    write_src(sandbox, "shaders/scene/b.slang", "float b();\n");
+    const Vfs vfs = cooker_vfs(sandbox);
+    const auto hash = [&] {
+        const de::core::Result<uint64_t> result = shader_sources_hash(vfs);
+        REQUIRE(result.ok());
+        return *result;
+    };
+    const uint64_t original = hash();
+    CHECK(hash() == original);
+
+    // Line endings don't count: a Windows and a Linux checkout hash the same.
+    write_src(sandbox, "shaders/a.slang", "float a() { return 1; }\r\nfloat a2() { return 2; }\r\n");
+    CHECK(hash() == original);
+    // What cooked shaders don't come from doesn't count: documents, the test suite's modules, other files.
+    write_src(sandbox, "shaders/readme.md", "notes");
+    write_src(sandbox, "shaders/tests/solid.slang", "float t();");
+    write_src(sandbox, "shaders/scene/b.slang.orig", "float b_old();");
+    CHECK(hash() == original);
+
+    // Anything else does: an edit in any file, however small.
+    write_src(sandbox, "shaders/scene/b.slang", "float b(); \n");
+    const uint64_t edited = hash();
+    CHECK(edited != original);
+    write_src(sandbox, "shaders/scene/b.slang", "float b();\n");
+    CHECK(hash() == original);
+    // A new file, an emptied one, a file moved, a file deleted.
+    write_src(sandbox, "shaders/scene/c.slang", "");
+    const uint64_t added = hash();
+    CHECK(added != original);
+    write_src(sandbox, "shaders/scene/c.slang", "float b();\n");
+    CHECK(hash() != added);
+    remove_src(sandbox, "shaders/scene/c.slang");
+    CHECK(hash() == original);
+    write_src(sandbox, "shaders/b.slang", "float b();\n");
+    remove_src(sandbox, "shaders/scene/b.slang");
+    CHECK(hash() != original);
+    remove_src(sandbox, "shaders/b.slang");
+    CHECK(hash() != original);
+
+    // No sources is an answer of its own.
+    remove_src(sandbox, "shaders");
+    const de::core::Result<uint64_t> none = shader_sources_hash(vfs);
+    REQUIRE_FALSE(none.ok());
+    CHECK(none.error().code == de::core::ErrorCode::NotFound);
+}
+
+TEST_CASE("this build's shader hash is the hash of the shaders it was built from") {
+    const Sandbox sandbox;
+    const de::platform::PathString game_root = sandbox.game();
+    const de::platform::PathString user_root = sandbox.folder("user");
+    const de::platform::PathString temp_root = sandbox.folder("temp");
+    const auto vfs = Vfs::create({.game_root = game_root.c_str(),
+                                  .user_root = user_root.c_str(),
+                                  .temp_root = temp_root.c_str(),
+                                  .src_root = DE_SOURCE_DIR});
+    REQUIRE(vfs.ok());
+    const de::core::Result<uint64_t> sources = shader_sources_hash(*vfs);
+    REQUIRE(sources.ok());
+    CHECK(de::shader::built_source_hash() == *sources);
+}
+
+TEST_CASE("cooked shaders are told from other sources' by their stamp") {
+    const Sandbox sandbox;
+    const Vfs vfs = cooker_vfs(sandbox);
+    constexpr uint64_t kHash = 0x0123456789abcdef;
+    const auto code_of = [&](uint64_t hash) {
+        const de::core::Result<void> checked = de::shader::check_cooked_shaders(vfs, hash);
+        return checked ? de::core::ErrorCode::Unknown : checked.error().code;
+    };
+    const auto message_of = [&](uint64_t hash) {
+        const de::core::Result<void> checked = de::shader::check_cooked_shaders(vfs, hash);
+        return std::string_view(checked ? "" : checked.error().message);
+    };
+
+    // Nothing cooked: refused, saying what to do.
+    CHECK(code_of(kHash) == de::core::ErrorCode::NotFound);
+    CHECK(message_of(kHash).find("re-run the cooker") != std::string_view::npos);
+
+    REQUIRE(write_shader_stamp(vfs, kHash).ok());
+    const de::core::Result<uint64_t> stamp = read_shader_stamp(vfs);
+    REQUIRE(stamp.ok());
+    CHECK(*stamp == kHash);
+    CHECK(de::shader::check_cooked_shaders(vfs, kHash).ok());
+    // Near misses in either half of the hash, and a hash with leading zeros.
+    CHECK(code_of(kHash + 1) == de::core::ErrorCode::CorruptData);
+    CHECK(code_of(kHash ^ (uint64_t{1} << 63U)) == de::core::ErrorCode::CorruptData);
+    CHECK(message_of(kHash + 1).find("re-run the cooker") != std::string_view::npos);
+    REQUIRE(write_shader_stamp(vfs, 0x12).ok());
+    CHECK(de::shader::check_cooked_shaders(vfs, 0x12).ok());
+
+    // What isn't a stamp is refused, however close.
+    for (const std::string_view broken :
+         {"", "0123456789abcde", "0123456789abcdefa", "0123456789abcdeg", "-123456789abcdef",
+          "this file is far longer than a stamp could ever be", "0x23456789abcdef", "0123456789abcdef\nmore"}) {
+        sandbox.add_game_file("shader_sources.hash", broken);
+        CHECK(code_of(kHash) == de::core::ErrorCode::CorruptData);
+        CHECK(message_of(kHash).find("re-run the cooker") != std::string_view::npos);
+    }
+    // One that came through a text editor still is one.
+    sandbox.add_game_file("shader_sources.hash", "0123456789abcdef\r\n");
+    CHECK(de::shader::check_cooked_shaders(vfs, kHash).ok());
+}
+
+TEST_CASE("a cook stamps the shader sources it read, and --check reports cooked shaders as stale") {
+    constexpr std::string_view kModule = "[shader(\"compute\")] [numthreads(1, 1, 1)] void compute_main() {}\n";
+    constexpr std::string_view kEdited = "[shader(\"compute\")] [numthreads(2, 1, 1)] void compute_main() {}\n";
+    constexpr std::string_view kBroken = "[shader(\"compute\")] [numthreads(1, 1, 1)] void compute_main() { nope }\n";
+    constexpr std::string_view kStale = "stale";
+    const Sandbox sandbox;
+    Vfs vfs = cooker_vfs(sandbox);
+    de::core::JobSystem jobs({.worker_count = 1});
+    auto compiler = de::shader::ShaderCompiler::create(vfs, {.debug_info = false, .checks = false});
+    REQUIRE(compiler.ok());
+    const auto cook = [&](de::shader::ShaderCompiler* with) {
+        return de::cooker::cook(vfs, jobs, with, {.content = false});
+    };
+    const auto check = [&](bool check_shaders = true) {
+        return de::cooker::cook(vfs, jobs, nullptr,
+                                {.check_only = true, .content = false, .check_shaders = check_shaders});
+    };
+    const auto sources = [&] {
+        const de::core::Result<uint64_t> result = shader_sources_hash(vfs);
+        REQUIRE(result.ok());
+        return *result;
+    };
+
+    // Nothing cooked yet is nothing stale: what CI sees.
+    write_src(sandbox, "shaders/one.slang", kModule);
+    write_src(sandbox, "shaders/library.slang", "float helper();\n");
+    CHECK(check().ok());
+    CHECK_FALSE(vfs.exists(kShaderStampPath));
+
+    REQUIRE(cook(&*compiler).ok());
+    const de::core::Result<uint64_t> stamp = read_shader_stamp(vfs);
+    REQUIRE(stamp.ok());
+    CHECK(*stamp == sources());
+    CHECK(de::shader::check_cooked_shaders(vfs, sources()).ok());
+    CHECK(check().ok());
+    // Up to date is still stamped, and a checkout with other line endings is the same sources.
+    CookReport again = cook(&*compiler);
+    CHECK(again.stats.up_to_date == 1);
+    CHECK(read_shader_stamp(vfs).ok());
+    write_src(sandbox, "shaders/library.slang", "float helper();\r\n");
+    CHECK(check().ok());
+
+    // An edit makes them stale, even of a module with no cooked file of its own.
+    write_src(sandbox, "shaders/library.slang", "float helper(); // changed\n");
+    CookReport checked = check();
+    CHECK_FALSE(checked.ok());
+    CHECK(has_message(checked, "shaders", kStale));
+    CHECK(has_message(checked, "shaders", "re-run the cooker"));
+    CHECK_FALSE(de::shader::check_cooked_shaders(vfs, sources()).ok());
+    // And --check still writes nothing, its stamp included.
+    CHECK(*read_shader_stamp(vfs) == *stamp);
+    // Unless told to leave shaders out.
+    CHECK(check(false).ok());
+
+    // Cooking without a compiler leaves the shaders as they are, and so the stamp: still stale.
+    REQUIRE(cook(nullptr).ok());
+    CHECK(*read_shader_stamp(vfs) == *stamp);
+    CHECK_FALSE(check().ok());
+
+    // Cooking again settles it.
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(*read_shader_stamp(vfs) == sources());
+    CHECK(*read_shader_stamp(vfs) != *stamp);
+    CHECK(check().ok());
+    write_src(sandbox, "shaders/one.slang", kEdited);
+    CHECK_FALSE(check().ok());
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(check().ok());
+
+    // A cook that fails leaves a mix of old and new: no stamp, for any engine, even one built from
+    // the very sources the stamp had named, and --check says so.
+    const uint64_t good = sources();
+    write_src(sandbox, "shaders/two.slang", kBroken);
+    const CookReport broken = cook(&*compiler);
+    CHECK_FALSE(broken.ok());
+    CHECK(broken.stats.failed == 1);
+    CHECK_FALSE(vfs.exists(kShaderStampPath));
+    CHECK_FALSE(de::shader::check_cooked_shaders(vfs, good).ok());
+    CHECK_FALSE(de::shader::check_cooked_shaders(vfs, sources()).ok());
+    checked = check();
+    CHECK(has_message(checked, "shaders", kStale));
+    write_src(sandbox, "shaders/two.slang", kModule);
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(de::shader::check_cooked_shaders(vfs, sources()).ok());
+    CHECK(check().ok());
+
+    // A test module that fails doesn't count: games never load those, and they aren't in the hash.
+    write_src(sandbox, "shaders/tests/broken.slang", kBroken);
+    const CookReport test_broken = de::cooker::cook(vfs, jobs, &*compiler, {.test_shaders = true, .content = false});
+    CHECK(test_broken.stats.failed == 1);
+    CHECK(de::shader::check_cooked_shaders(vfs, sources()).ok());
+    remove_src(sandbox, "shaders/tests");
+    REQUIRE(cook(&*compiler).ok());
+
+    // Files cooked by a cooker from before stamps, or a stamp lost.
+    REQUIRE(vfs.remove_file(kShaderStampPath).ok());
+    checked = check();
+    CHECK(has_message(checked, "shaders", kStale));
+    // A stamp that isn't one.
+    sandbox.add_game_file("shader_sources.hash", "garbled");
+    checked = check();
+    CHECK(has_message(checked, "shaders", "re-run the cooker"));
+    // Cooking heals both, with every module up to date.
+    again = cook(&*compiler);
+    CHECK(again.stats.cooked == 0);
+    CHECK(check().ok());
 }
 
 TEST_CASE("normals pack to two snorm16 and back") {

@@ -27,6 +27,7 @@ include(cmake/compile_options.cmake)
 
 add_subdirectory(engine)
 add_subdirectory(tools/cooker)
+add_subdirectory(tools/shader_hash)
 
 if(DE_BUILD_TESTS)
     enable_testing()

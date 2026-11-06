@@ -8,7 +8,7 @@ Slang compilation, reflection and hot reload (docs/design.md, Shaders, materials
 | --- | --- |
 | `shader_compiler.h` | `ShaderCompiler`: the entry points of a Slang module to SPIR-V in one compile, with reflection (push constant fields, thread group size, descriptor slots) and a report of the files it read and Slang's messages |
 | `shader_library.h` | `ShaderLibrary`: graphics and compute programs with stable handles, their RHI pipelines, and live rebuilds when sources change; `create_cooked()` takes programs from the cooker's `.deshader` files instead |
-| `shader_asset.h` | Between the RHI's stages and defines and what `.deshader` files store |
+| `shader_asset.h` | Between the RHI's stages and defines and what `.deshader` files store; `built_source_hash()`, the hash of the shaders this build was compiled from |
 
 ## How it works
 
@@ -19,6 +19,9 @@ Slang compilation, reflection and hot reload (docs/design.md, Shaders, materials
 - Names (module, entries, defines) longer than 63 characters are refused, never cut short.
 - Programs are referenced by `ProgramHandle`, which stays valid across rebuilds: look up `pipeline(handle)` when binding.
 - Builds without `src:/` (ship) use `ShaderLibrary::create_cooked()`: each program reads its module's `.deshader` from `game:/` (`cooked_path(shader_asset_id(module))`), picks the permutation whose defines match and the entry points by name. The cooker compiles a module's every entry point with the same compiler and checks the pipeline layout the same way. With hot reload on, a re-cooked file is picked up like an edited source.
+
+- `create_cooked()` first compares `game:/shader_sources.hash`, which the cooker writes, with `built_source_hash()` (`check_cooked_shaders()`), and fails with "re-run the cooker" if they differ or the stamp is missing: layouts shared with C++ are matched by hand and reached through pointers, so stale shaders are a GPU crash rather than an error. The engine doesn't start then. Compiling from source (`create()`, dev builds with `src:/`) never looks at the stamp. Hot reload of cooked files doesn't either, once started: what is re-cooked while running is taken as it is, like an edited source.
+- `built_source_hash()` is generated at build time: `tools/shader_hash` runs `asset::shader_sources_hash()`, the cooker's own code, over `shaders/` and writes a source file of this library. An edited `.slang` reruns it (a new, renamed or deleted one through the glob's re-check), a changed hash relinks the executables, and an unchanged one does nothing.
 
 ## Rules and invariants
 

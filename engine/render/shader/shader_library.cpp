@@ -513,6 +513,23 @@ bool is_bindless_binding(const ResourceBinding& binding) {
     return false;
 }
 
+core::Result<void> check_cooked_shaders(const platform::Vfs& vfs, uint64_t sources_hash) {
+    const core::Result<uint64_t> stamp = asset::read_shader_stamp(vfs);
+    if (!stamp) {
+        DE_LOG_ERROR("shader", "%s: %s. Re-run the cooker (a cook that failed must succeed first)",
+                     asset::kShaderStampPath, stamp.error().message);
+        return core::fail(stamp.error().code, "no complete cook of the shaders: re-run the cooker");
+    }
+    if (*stamp != sources_hash) {
+        DE_LOG_ERROR("shader",
+                     "the shaders in game:/ are stale: cooked from sources %016llx, but this build was compiled from "
+                     "%016llx. Re-run the cooker (and rebuild the engine, if the sources changed since it was built)",
+                     static_cast<unsigned long long>(*stamp), static_cast<unsigned long long>(sources_hash));
+        return core::fail(core::ErrorCode::CorruptData, "the cooked shaders are stale: re-run the cooker");
+    }
+    return {};
+}
+
 uint64_t defines_hash(std::span<const ShaderDefine> defines) {
     asset::ShaderDefineText texts[kMaxShaderDefines];
     const size_t count = std::min(defines.size(), kMaxShaderDefines);
@@ -569,6 +586,9 @@ core::Result<ShaderLibrary> ShaderLibrary::create(rhi::Device& device, platform:
 
 core::Result<ShaderLibrary> ShaderLibrary::create_cooked(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
                                                          const ShaderLibraryDesc& desc) {
+    if (const core::Result<void> fresh = check_cooked_shaders(vfs, built_source_hash()); !fresh) {
+        return core::fail(fresh.error());
+    }
     return make(device, vfs, jobs, nullptr, desc);
 }
 

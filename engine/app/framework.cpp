@@ -245,6 +245,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     } else if (!compiler) {
         DE_LOG_INFO("engine", "shaders from cooked files in game:/ (%s)", compiler.error().message);
     }
+    if (!shaders) {
+        DE_LOG_ERROR("engine", "can't start: %s", shaders.error().message); // stale shaders would crash the GPU
+        return EXIT_FAILURE;
+    }
     auto uploader = rhi::Uploader::create(*device, {.staging_bytes = uint64_t{8} << 20U});
     if (!uploader) {
         DE_LOG_ERROR("render", "uploader: %s", uploader.error().message);

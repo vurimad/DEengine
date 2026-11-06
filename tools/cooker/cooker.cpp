@@ -74,6 +74,8 @@ public:
         stats_.metas_relinked = scan.metas_relinked;
         if (!options_.check_only) {
             cook_all();
+        } else if (options_.check_shaders) {
+            check_cooked_shaders();
         }
         CookReport report{.stats = stats_};
         report.diagnostics = diagnostics_.all();
@@ -330,6 +332,17 @@ private:
             }
             return;
         }
+        // The stamp says every cooked shader comes from these sources, so it goes before the first
+        // is written and comes back only if they all made it: a cook that fails or stops halfway
+        // leaves a mix of old and new, which no engine should load.
+        const core::Result<uint64_t> sources = asset::shader_sources_hash(vfs_);
+        if (!sources && vfs_.exists("src:/shaders")) {
+            diagnostics_.error("shaders", "could not be hashed: %s", sources.error().message);
+        }
+        if (const core::Result<void> removed = vfs_.remove_file(asset::kShaderStampPath); !removed) {
+            diagnostics_.error("", "%s could not be removed: %s", asset::kShaderStampPath, removed.error().message);
+        }
+        bool all_cooked = true;
         core::Array<SourcePath> files(tools_heap());
         list_tree(vfs_, "shaders", false, diagnostics_, files);
         const asset::ShaderFlags flags =
@@ -337,13 +350,14 @@ private:
             (options_.shader_checks ? asset::ShaderFlags::Checks : asset::ShaderFlags::None);
         for (const SourcePath& file : files) {
             shader::ShaderName module;
-            if ((!options_.test_shaders && file.view().starts_with(kShaderTests)) ||
-                !shader::shader_module_name(file.view(), module)) {
+            const bool test_module = file.view().starts_with(kShaderTests); // games never load these
+            if ((!options_.test_shaders && test_module) || !shader::shader_module_name(file.view(), module)) {
                 continue;
             }
             const core::Result<core::Array<std::byte>> bytes = read_source(file.view());
             if (!bytes) {
                 failed(file.view()); // keeps what was cooked from it
+                all_cooked = all_cooked && test_module;
                 continue;
             }
             if (!defines_entry_points(bytes->span())) {
@@ -371,6 +385,7 @@ private:
                 cook_shader(*compiler_, module.view(), flags, record.dependencies, file.view(), diagnostics_);
             if (!cooked || !write(record, asset::shader_asset_id(module.view()), asset::AssetType::Shader, *cooked)) {
                 failed(file.view());
+                all_cooked = all_cooked && test_module;
                 continue;
             }
             std::ranges::sort(record.dependencies,
@@ -378,6 +393,42 @@ private:
             record.input_hash = input_hash(record.dependencies.span());
             next_.put(std::move(record));
             ++stats_.cooked;
+        }
+        if (sources && all_cooked) {
+            if (const core::Result<void> stamped = asset::write_shader_stamp(vfs_, *sources); !stamped) {
+                diagnostics_.error("", "%s could not be written: %s", asset::kShaderStampPath, stamped.error().message);
+            }
+        }
+    }
+
+    // --check: the stamp against the sources as they are now (not this cooker's own build, which
+    // may be older). No cooked shaders at all (CI) is nothing stale; cooked ones without a stamp are.
+    void check_cooked_shaders() {
+        const core::Result<uint64_t> sources = asset::shader_sources_hash(vfs_);
+        if (!sources) {
+            if (vfs_.exists("src:/shaders")) {
+                diagnostics_.error("shaders", "could not be hashed: %s", sources.error().message);
+            }
+            return;
+        }
+        const core::Result<uint64_t> stamp = asset::read_shader_stamp(vfs_);
+        if (!stamp && stamp.error().code == core::ErrorCode::NotFound) {
+            const bool cooked = std::ranges::any_of(previous_.records(), [](const CookRecord& record) {
+                return record.path.view().starts_with("shaders/");
+            });
+            if (cooked) {
+                diagnostics_.error("shaders", "the cooked shaders are stale: the last cook failed or stopped, or an "
+                                              "older cooker made them: re-run the cooker");
+            } else {
+                DE_LOG_INFO("cooker", "no cooked shaders to check");
+            }
+        } else if (!stamp) {
+            diagnostics_.error("shaders", "%s: %s: re-run the cooker", asset::kShaderStampPath, stamp.error().message);
+        } else if (*stamp != *sources) {
+            diagnostics_.error("shaders",
+                               "the cooked shaders are stale: cooked from sources %016llx, the sources are now "
+                               "%016llx: re-run the cooker",
+                               static_cast<unsigned long long>(*stamp), static_cast<unsigned long long>(*sources));
         }
     }
 

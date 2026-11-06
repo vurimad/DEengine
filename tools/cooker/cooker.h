@@ -14,7 +14,8 @@ class ShaderCompiler;
 namespace de::cooker {
 
 struct CookOptions {
-    // Check the source and meta trees and write nothing (no metas, no cooked files): what CI runs.
+    // Check the source and meta trees and the cooked shaders against their sources, and write
+    // nothing (no metas, no cooked files): what CI runs.
     bool check_only = false;
     // Cook every source again, even unchanged ones.
     bool force = false;
@@ -25,6 +26,8 @@ struct CookOptions {
     bool test_shaders = false;
     // Cook content/. Off: shaders only, and what was cooked from content/ stays as it is.
     bool content = true;
+    // With check_only: off skips comparing the cooked shaders with their sources.
+    bool check_shaders = true;
 };
 
 struct CookStats {
@@ -46,8 +49,9 @@ struct CookReport {
 // The asset cooker (docs/design.md, Asset formats): turns the source tree (src:/content/, with
 // the meta tree in src:/meta/, and src:/shaders/) into cooked files in game:/, named by asset ID.
 // - Metas: new sources get one, moved ones are re-linked, broken ones reported (SourceTree).
-// - Shaders: every module under shaders/ with entry points (not shaders/tests/) to .deshader.
-//   Needs a compiler; without one shaders are skipped.
+// - Shaders: every module under shaders/ with entry points (not shaders/tests/) to .deshader, and
+//   the stamp of the sources they came from (asset::kShaderStampPath), which the engine compares
+//   at startup; a module that fails leaves no stamp. Needs a compiler; without one shaders are skipped.
 // - Models (glTF, FBX): one .demesh, a .demat per material and a .detex per embedded image.
 // - Materials (.material text): a .demat.
 // - Textures: a .detex, with defaults picked by how models and materials use them, then the folder
