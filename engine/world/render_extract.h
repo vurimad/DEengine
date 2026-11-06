@@ -8,6 +8,7 @@
 
 #include <flecs.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace de::core {
@@ -59,10 +60,49 @@ struct ActiveCamera {
 inline constexpr uint32_t kAutoRenderSlot = UINT32_MAX;         // its index in RenderFrame::instances
 inline constexpr uint32_t kSkipRenderInstance = UINT32_MAX - 1; // nothing to do for this row
 
-// A mesh to draw from now on: where (relative to the frame's render origin) and what.
+// Positions the GPU keeps are the world's, in whole steps of 1/16384 m: 0.06 mm, what a float has at 1 km. They hold no
+// render origin, so it can move with nothing sent. They wrap at 32 bits, and what's read back is a wrapping subtraction
+// from the origin, so the world has no limit: only what's drawn has to be within 131 km of the origin.
+inline constexpr double kRenderStepsPerM = 16384.0;
+
+inline uint32_t render_position(double position_m) {
+    return static_cast<uint32_t>(std::llround(position_m * kRenderStepsPerM));
+}
+
+// Where an instance is, as the GPU keeps it (InstanceTransform in shaders/scene/scene_common.slang).
+struct RenderTransform {
+    struct Row {
+        float linear[3] = {};  // rotation and scale
+        uint32_t position = 0; // render_position
+    };
+    Row rows[3] = {};
+
+    void set_position_m(int axis, double position_m) { rows[axis].position = render_position(position_m); }
+
+    // Relative to an origin, as the GPU works it out.
+    float position_m(int axis, const DVec3& origin = DVec3(0.0)) const {
+        const auto steps = static_cast<int32_t>(rows[axis].position - render_position(origin[axis]));
+        return static_cast<float>(static_cast<double>(steps) / kRenderStepsPerM);
+    }
+};
+static_assert(sizeof(RenderTransform) == 48);
+
+// From a 3x4 matrix (rows x, y, z, the world position in the last column).
+inline RenderTransform render_transform(const float (&matrix)[12]) {
+    RenderTransform out;
+    for (int row = 0; row < 3; ++row) {
+        out.rows[row].linear[0] = matrix[row * 4 + 0];
+        out.rows[row].linear[1] = matrix[row * 4 + 1];
+        out.rows[row].linear[2] = matrix[row * 4 + 2];
+        out.set_position_m(row, static_cast<double>(matrix[row * 4 + 3]));
+    }
+    return out;
+}
+
+// A mesh to draw from now on: where and what.
 struct RenderInstance {
-    float transform[12] = {};          // 3x4, rows x, y, z, translation in the last column
-    float previous_transform[12] = {}; // where it was a frame ago (for motion vectors), same origin
+    RenderTransform transform = {};
+    RenderTransform previous_transform = {}; // where it was a frame ago (for motion vectors)
     asset::AssetHandle mesh;
     uint32_t slot = kAutoRenderSlot;
 };
@@ -98,13 +138,14 @@ struct RenderFogVolume {
 };
 
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
-// at this frame's interpolation point, as floats relative to a render origin. The renderer owns no
-// list of entities. Instances are what changed since the last frame, for it to keep: all of them only
-// when the render origin moves, or when the renderer asks (World::resync_render_instances).
+// at this frame's interpolation point: the camera and fog as floats relative to a render origin, instances as
+// RenderTransforms, which the GPU makes relative to it. The renderer owns no list of entities. Instances are what
+// changed since the last frame, for it to keep: all of them only when the renderer asks
+// (World::resync_render_instances).
 struct RenderFrame {
     uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
-    DVec3 origin{0.0};         // the render origin: what instance positions are relative to
-    uint64_t origin_moves = 0; // counts origin moves: GPU copies made relative to it go stale
+    DVec3 origin{0.0};         // the render origin: what the GPU's floats are relative to
+    uint64_t origin_moves = 0; // counts origin moves
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};
@@ -139,7 +180,6 @@ struct RenderExtractScratch {
     core::Array<uint32_t> free_slots{core::heap_allocator(core::MemoryTag::Render)};
     core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
     uint32_t next_slot = 0;
-    uint64_t sent_origin_moves = 0;
     bool resync = false; // send all of them, next frame
 };
 
@@ -153,7 +193,7 @@ struct RenderExtractDesc {
 };
 
 // Adds the RenderExtract systems that fill desc.frame: the active camera, then interpolated world
-// transforms of what changed with a MeshInstance, relative to the render origin. Each instance's pose
+// transforms of what changed with a MeshInstance. Each instance's pose
 // a frame ago comes from the same two ticks, stepped back by alpha_step (a frame longer than a tick
 // goes back past the previous tick, by the same motion): no history per entity, exact for steady
 // motion, and none for what hasn't moved or was place()d.

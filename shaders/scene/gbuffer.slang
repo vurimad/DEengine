@@ -8,7 +8,7 @@ import scene.scene_common;
 struct GBufferPush
 {
     SceneFrame* frame;
-    float4* instances; // kInstanceRows per instance: object to render-origin space, now and last frame
+    GpuInstance* instances;
     MeshVertex* vertices;
     GpuMaterial* materials;
     GpuDraw* draws;
@@ -44,21 +44,18 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const GpuDraw draw = push.draws[draw_id];
-    const float4 row0 = push.instances[draw.instance * kInstanceRows + 0];
-    const float4 row1 = push.instances[draw.instance * kInstanceRows + 1];
-    const float4 row2 = push.instances[draw.instance * kInstanceRows + 2];
-    const float4 local = float4(vertex.position, 1.0);
-    const float4 world = float4(dot(row0, local), dot(row1, local), dot(row2, local), 1.0);
+    const GpuInstance instance = push.instances[draw.instance];
+    const uint3 origin = push.frame.render_origin.xyz;
+    const float4 world = float4(instance_point(instance.transform, origin, vertex.position), 1.0);
     // The inverse transpose would be exact under non-uniform scale; renormalized in the pixel
     // shader, the 3x3 is close for the uniform scales cells use.
-    const float3x3 linear = float3x3(row0.xyz, row1.xyz, row2.xyz);
+    const float3x3 linear =
+        float3x3(instance.transform.row0.linear, instance.transform.row1.linear, instance.transform.row2.linear);
 
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
     output.clip = mul_rows(push.frame.unjittered_view_proj, world); // TAA's offset is no motion
-    const float4 previous_world = float4(dot(push.instances[draw.instance * kInstanceRows + 3], local),
-                                         dot(push.instances[draw.instance * kInstanceRows + 4], local),
-                                         dot(push.instances[draw.instance * kInstanceRows + 5], local), 1.0);
+    const float4 previous_world = float4(instance_point(instance.previous_transform, origin, vertex.position), 1.0);
     output.previous_clip = mul_rows(push.frame.previous_view_proj, previous_world);
     output.normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
     const float4 tangent = snorm8x4(vertex.tangent);

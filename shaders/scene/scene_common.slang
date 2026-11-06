@@ -25,12 +25,43 @@ public struct SceneFrame
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
     public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA, zw: its offset in NDC
+    public uint4 render_origin;            // xyz: the origin, as an instance's position is kept
 };
 
 public static const uint kCascadeCount = 4;
 
-// An instance in the frame's buffer: three rows of its transform, then three of last frame's.
-public static const uint kInstanceRows = 6;
+// One row of where an instance is. The position is the world's, in whole steps of a meter below (0.06 mm), and holds no
+// render origin, so the origin can move with nothing sent. It wraps at 32 bits, and so does taking the origin off it,
+// so the world has no limit: only what's drawn has to be within 131 km of the origin. Matches world::RenderTransform.
+public struct InstanceRow
+{
+    public float3 linear; // rotation and scale
+    public uint position;
+};
+
+public struct InstanceTransform
+{
+    public InstanceRow row0;
+    public InstanceRow row1;
+    public InstanceRow row2;
+};
+
+public static const float kMetersPerRenderStep = 1.0 / 16384.0;
+
+// A point in the instance's own space, relative to the render origin.
+public float3 instance_point(InstanceTransform transform, uint3 origin, float3 local)
+{
+    const uint3 position = uint3(transform.row0.position, transform.row1.position, transform.row2.position);
+    return float3(dot(transform.row0.linear, local), dot(transform.row1.linear, local), dot(transform.row2.linear, local))
+           + float3(int3(position - origin)) * kMetersPerRenderStep;
+}
+
+// An instance as the GPU keeps it between frames: where it is, and where it was last frame.
+public struct GpuInstance
+{
+    public InstanceTransform transform;
+    public InstanceTransform previous_transform;
+};
 
 // What one draw of a mesh part needs beyond its place in the geometry pool. A draw's first instance is
 // the index of its first record, so a draw of N instances reads N records: SV_VulkanInstanceID finds it.

@@ -51,6 +51,7 @@ struct SceneFrame {
     float previous_view_proj[16] = {};   // last frame's camera, relative to this frame's render origin
     float unjittered_view_proj[16] = {}; // view_proj without TAA's sub-pixel offset
     float taa_params[4] = {};            // last frame's near, TAA's sample (0 without TAA), its offset in NDC
+    uint32_t render_origin[4] = {};      // world::render_position of the origin, per axis
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -209,7 +210,7 @@ constexpr uint32_t kMaxFogVolumes = 64;
 static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
 // Per slice of the grid, which volumes reach it: a froxel tests only those.
 constexpr uint64_t kFogSliceMasksOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
-constexpr uint64_t kInstanceBytes = 96; // six float4 rows: its transform, and last frame's
+constexpr uint64_t kInstanceBytes = 96; // a GpuInstance: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
@@ -269,13 +270,14 @@ constexpr uint64_t kInstanceUpdatesOffset = kDrawListsOffset + kDrawListCount * 
 
 // Matches InstanceUpdate in shaders/scene/instance_update.slang.
 struct GpuInstanceUpdate {
-    float rows[24] = {};
+    world::RenderTransform transform;
+    world::RenderTransform previous_transform;
     uint32_t slot = 0;
     uint32_t mesh = 0;
     uint32_t padding[2] = {};
 };
 static_assert(sizeof(GpuInstanceUpdate) == 112);
-static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
+static_assert(sizeof(world::RenderTransform) * 2 == kInstanceBytes);
 
 constexpr uint64_t frame_bytes(uint64_t update_count) {
     return kInstanceUpdatesOffset + std::max<uint64_t>(update_count, 1) * sizeof(GpuInstanceUpdate);
@@ -299,6 +301,7 @@ struct CullPlan {
 
 // Matches CullPush in shaders/scene/cull.slang.
 struct CullPush {
+    uint64_t frame = 0;
     uint64_t instances = 0;
     uint64_t instance_meshes = 0;
     uint64_t meshes = 0;
@@ -836,8 +839,8 @@ struct SceneRendererState {
             }
             set_slot_mesh(slot, mesh);
             GpuInstanceUpdate& update = updates[count++];
-            std::memcpy(update.rows, instance.transform, kInstanceBytes / 2);
-            std::memcpy(update.rows + 12, instance.previous_transform, kInstanceBytes / 2);
+            update.transform = instance.transform;
+            update.previous_transform = instance.previous_transform;
             update.slot = slot;
             update.mesh = mesh;
         }
@@ -993,6 +996,9 @@ struct SceneRendererState {
         scene.camera_position[0] = frame.camera.transform[3];
         scene.camera_position[1] = frame.camera.transform[7];
         scene.camera_position[2] = frame.camera.transform[11];
+        for (int axis = 0; axis < 3; ++axis) {
+            scene.render_origin[axis] = world::render_position(frame.origin[axis]);
+        }
         const float* d = lighting.sun_direction;
         const float length = std::max(std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), 1e-6f);
         for (int i = 0; i < 3; ++i) {
@@ -1466,7 +1472,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 return;
             }
             const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));
-            const CullPush push{.instances = renderer.instance_rows_address,
+            const CullPush push{.frame = data.frame_address,
+                                .instances = renderer.instance_rows_address,
                                 .instance_meshes = renderer.instance_meshes_address,
                                 .meshes = renderer.gpu_assets->mesh_table_address(),
                                 .lods = renderer.gpu_assets->lod_table_address(),

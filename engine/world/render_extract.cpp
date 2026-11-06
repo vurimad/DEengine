@@ -77,6 +77,17 @@ namespace {
 
 constexpr uint32_t kChunkRows = 512;
 
+void to_render_transform(const WorldTransform& transform, RenderTransform& out) {
+    float matrix[12];
+    to_matrix_3x4(transform, transform.position, matrix); // its own place as the origin: the position's left out
+    for (int row = 0; row < 3; ++row) {
+        out.rows[row].linear[0] = matrix[row * 4 + 0];
+        out.rows[row].linear[1] = matrix[row * 4 + 1];
+        out.rows[row].linear[2] = matrix[row * 4 + 2];
+        out.rows[row].position = render_position(transform.position[row]);
+    }
+}
+
 // What a row depends on. Word by word: there's padding in these structs.
 uint64_t sent_hash(const WorldTransform& current, const WorldTransform& previous, asset::AssetHandle mesh) {
     uint64_t hash = 0xcbf29ce484222325ULL;
@@ -105,8 +116,7 @@ struct ExtractJob {
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
     float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
-    DVec3 origin{0.0};
-    bool all = false; // every row, whatever it last sent
+    bool all = false;            // every row, whatever it last sent
 };
 
 void extract_chunks(size_t begin, size_t end, void* context) {
@@ -129,14 +139,12 @@ void extract_chunks(size_t begin, size_t end, void* context) {
                 continue;
             }
             slot.sent = hash;
-            to_matrix_3x4(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), job.origin,
-                          instance.transform);
+            to_render_transform(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), instance.transform);
             if (still) {
-                std::memcpy(instance.previous_transform, instance.transform,
-                            sizeof(instance.transform)); // most of a world
+                instance.previous_transform = instance.transform; // most of a world
             } else {
-                to_matrix_3x4(pose_at(chunk.previous[i].value, chunk.current[i], job.previous_alpha), job.origin,
-                              instance.previous_transform);
+                to_render_transform(pose_at(chunk.previous[i].value, chunk.current[i], job.previous_alpha),
+                                    instance.previous_transform);
             }
             instance.mesh = chunk.meshes[i].mesh;
             instance.slot = slot.slot;
@@ -165,8 +173,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
     ecs.observer<MeshInstance>("de::DropRenderSlot")
         .event(flecs::OnRemove)
         .each([](flecs::entity entity, MeshInstance&) { entity.remove<RenderSlot>(); });
-    // No terms, so it runs every frame, meshes or not: the camera (which may move the origin the
-    // instances are made relative to), and a fresh list of what changed.
+    // No terms, so it runs every frame, meshes or not: the camera (which may move the origin), and a fresh list of what
+    // changed.
     ecs.system("de::ExtractRenderView").kind(phase).run([desc](flecs::iter& it) {
         DE_PROFILE_ZONE("render extract view");
         extract_camera(it.world(), *desc.alpha, *desc.frame);
@@ -235,8 +243,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
             RenderFrame& out = *desc.frame;
             RenderExtractScratch& scratch = *desc.scratch;
             scratch.chunks.clear();
-            // All of them: the origin they're relative to moved, or the renderer lost track.
-            const bool all = scratch.resync || scratch.sent_origin_moves != out.origin_moves;
+            // All of them: the renderer lost track.
+            const bool all = scratch.resync;
             if (all && !out.camera.valid) {
                 // Nothing would draw it. It's sent when something can, and tables stay marked as changed until then.
                 out.all_instances = false;
@@ -247,7 +255,6 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                 return;
             }
             scratch.resync = false;
-            scratch.sent_origin_moves = out.origin_moves;
             out.all_instances = all;
             uint32_t rows = 0;
             while (it.next()) {
@@ -281,7 +288,6 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                            .instances = out.instances.data(),
                            .alpha = *desc.alpha,
                            .previous_alpha = *desc.alpha - *desc.alpha_step,
-                           .origin = out.origin,
                            .all = all};
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
