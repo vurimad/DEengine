@@ -1,11 +1,11 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
-// bounding sphere: a cascade's view is what can shadow something it lights. What's in a view uses the parts of its mesh's
-// coarsest LOD that's good enough there. While a LOD takes over from the one before, it uses the parts of both, in a group of
-// their own.
+// bounding sphere: a cascade's view is what can shadow something it lights. What's in a view uses the parts of its
+// mesh's coarsest LOD that's good enough there. While a LOD takes over from the one before, it uses the parts of both,
+// in a group of their own.
 //
-// It runs twice around scene.cull_assign, so everything of one part in one group is one instanced draw: first it counts them,
-// then that gives each its draw and where its records go, and then it writes those records. Both runs have to find the same
-// parts. The order within a draw depends on the threads: nothing here may rely on it.
+// It runs twice around scene.cull_assign, so everything of one part in one group is one instanced draw: first it counts
+// them, then that gives each its draw and where its records go, and then it writes those records. Both runs have to
+// find the same parts. The order within a draw depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
