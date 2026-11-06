@@ -901,6 +901,46 @@ TEST_CASE("the same part in the same list is one instanced draw, and each instan
     });
 }
 
+TEST_CASE("merged draws fit however few draws a call can take, and what has no room is counted and left out") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        put_squares(scene.vfs, kSides, kGreen, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        const AssetHandle green = scene.load(kSides);
+        scene.uploader.flush_and_wait();
+
+        // Three of one mesh and three of another, in the same list.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (const AssetHandle mesh : {red, green}) {
+            for (const float x : {-1.0f, 0.0f, 1.0f}) {
+                frame.instances.push({.transform = de::test::render_transform(
+                                          {0.4f, 0, 0, x, 0, 0.4f, 0, mesh == red ? 0.6f : -0.6f, 0, 0, 0.4f, 0}),
+                                      .mesh = mesh});
+            }
+        }
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        scene.renderer.set_max_draws_per_call(2);
+        scene.submit_for_stats(frame, light);
+        // More objects than a call can draw one by one, all drawn.
+        CHECK(scene.renderer.stats().merged_draws == 2);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        const auto both = de::test::read_texture(scene.device, scene.target);
+
+        // One draw: one mesh is drawn whole, and the other is counted as lost. The cull's second run stays off its
+        // records, and what's drawn doesn't run into the next list.
+        scene.renderer.set_max_draws_per_call(1);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().merged_draws == 1);
+        CHECK(scene.renderer.stats().draws_lost >= 3);
+        const auto one = de::test::read_texture(scene.device, scene.target);
+        CHECK(pixels_apart(both, one) > 0);
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
+        scene.submit_for_stats(frame, light);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        CHECK(pixels_apart(both, de::test::read_texture(scene.device, scene.target)) == 0);
+    });
+}
+
 TEST_CASE("a cascade drops casters past either end of its depth") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});

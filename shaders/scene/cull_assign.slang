@@ -53,6 +53,8 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         if (first_draw + draw_count > draws.capacity || first_record + records > push.record_capacity)
         {
             push.part_keys[key] = kPartLost; // a material changed kind, or a mesh is on its way out
+            uint ignored;
+            InterlockedAdd(push.counts[kCountRecordsLost], records, ignored);
         }
         else
         {

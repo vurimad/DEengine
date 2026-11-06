@@ -261,9 +261,10 @@ struct GpuDrawList {
 
 constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
 // The counts the cull writes: draws per list; the triangles it kept for the camera and for the cascades; records used
-// in all; and then records per list. As in shaders/scene/scene_common.slang.
+// and lost in all; and then records per list. As in shaders/scene/scene_common.slang.
 constexpr uint32_t kCountTriangles = kDrawListCount;
-constexpr uint32_t kCountRecordsPerList = kDrawListCount + 3;
+constexpr uint32_t kCountRecordsLost = kDrawListCount + 3;
+constexpr uint32_t kCountRecordsPerList = kDrawListCount + 4;
 constexpr uint32_t kCullCounterCount = kCountRecordsPerList + kDrawListCount;
 constexpr uint32_t kCullGroups = 2 + kShadowCascadeCount; // the camera's plain draws, what's fading, and each cascade
 constexpr uint32_t kNoMesh = UINT32_MAX;
@@ -296,11 +297,12 @@ struct CullPlan {
     uint32_t drawn = 0;        // instances whose mesh is on the GPU
     uint32_t draws = 0;        // their parts, into the G-buffer
     uint32_t shadow_draws = 0; // and into the cascades
-    uint64_t slot_capacity = 0;
+    uint64_t draw_capacity = 0;
+    uint64_t record_capacity = 0;
 
     // The draw arguments come first in the cull's buffer, then the records.
-    uint64_t records_offset() const { return slot_capacity * sizeof(rhi::DrawIndexedIndirectArgs); }
-    uint64_t buffer_bytes() const { return records_offset() + slot_capacity * sizeof(GpuDraw); }
+    uint64_t records_offset() const { return draw_capacity * sizeof(rhi::DrawIndexedIndirectArgs); }
+    uint64_t buffer_bytes() const { return records_offset() + record_capacity * sizeof(GpuDraw); }
 };
 
 // Matches CullPush in shaders/scene/cull.slang.
@@ -424,6 +426,7 @@ struct SceneRendererState {
     float lod_error_pixels = 1.0f;
     float lod_fade = 0.2f;
     bool merged_draws = true;
+    uint32_t max_draws_per_call = UINT32_MAX;
     bool shadow_caster_cull = true;
     float shadow_min_texels = 1.0f;
     SceneShadows shadows; // this frame's, within limits
@@ -645,19 +648,19 @@ struct SceneRendererState {
         std::memcpy(counts, mapped.data(), sizeof(counts));
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
             const uint32_t records = counts[kCountRecordsPerList + list];
-            const uint32_t kept = std::min(records, cull_readback_plan[slot].lists[list].capacity);
-            (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
+            (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += records;
             const uint32_t draws = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
             (list < kCameraListCount ? stats.merged_draws : stats.merged_shadow_draws) += draws;
-            stats.draws_lost += records - kept;
-            if (records > kept && !warned_draws_lost) {
-                DE_LOG_WARN("render", "draw list %u lost %u draws: a material changing kind can do this for a frame",
-                            list, records - kept);
-                warned_draws_lost = true;
-            }
             if (list >= kDrawKindCount && list < kCameraListCount) {
-                stats.visible_fading_draws += kept;
+                stats.visible_fading_draws += records;
             }
+        }
+        stats.draws_lost = counts[kCountRecordsLost];
+        if (stats.draws_lost > 0 && !warned_draws_lost) {
+            DE_LOG_WARN("render",
+                        "%u draws had no room in their list: a material changing kind can do this for a frame",
+                        stats.draws_lost);
+            warned_draws_lost = true;
         }
         stats.visible_triangles = counts[kCountTriangles];
         stats.visible_shadow_triangles = counts[kCountTriangles + 1];
@@ -954,14 +957,17 @@ struct SceneRendererState {
             }
             plan.drawn += drawable ? count : 0;
         }
-        // Each list holds all that could land in it, so the cull needs no first pass to count them.
+        // Each list has room for a draw for all that could land in it, whether they turn out merged or not, and there's
+        // a record for each of them.
         uint32_t slot = 0;
-        const uint32_t call_limit = device->capabilities().max_draw_indirect_count;
+        uint64_t records = 0;
+        const uint32_t call_limit = std::min(device->capabilities().max_draw_indirect_count, max_draws_per_call);
         const auto add_list = [&](uint32_t index, uint64_t wanted) {
+            records += wanted;
             const auto capacity = static_cast<uint32_t>(std::min<uint64_t>(wanted, UINT32_MAX));
             // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
             // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
-            if (capacity > call_limit && !warned_draw_limit) {
+            if (capacity > call_limit && !merged_draws && !warned_draw_limit) {
                 DE_LOG_WARN("render",
                             "a draw list holds %u draws, and this device draws %u in a call: the rest are lost",
                             capacity, call_limit);
@@ -985,9 +991,13 @@ struct SceneRendererState {
         }
         std::memcpy(mapped.data() + kDrawListsOffset, plan.lists, sizeof(plan.lists));
         // A power of two, so a graph buffer lasts while the counts move around.
-        plan.slot_capacity = 1024;
-        while (plan.slot_capacity < slot) {
-            plan.slot_capacity *= 2;
+        plan.draw_capacity = 1024;
+        while (plan.draw_capacity < slot) {
+            plan.draw_capacity *= 2;
+        }
+        plan.record_capacity = 1024;
+        while (plan.record_capacity < records) {
+            plan.record_capacity *= 2;
         }
     }
 
@@ -1651,15 +1661,16 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             if (data.plan.slots == 0 || !renderer.gpu_assets->mesh_table_ready()) {
                 return;
             }
-            const CullAssignPush push{.parts = renderer.gpu_assets->part_table_address(),
-                                      .materials = renderer.gpu_assets->material_table_address(),
-                                      .lists = data.frame_address + kDrawListsOffset,
-                                      .args = renderer.device->buffer_address(context.buffer(data.draws)),
-                                      .counts = renderer.device->buffer_address(context.buffer(data.counts)),
-                                      .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
-                                      .part_count = data.part_count,
-                                      .record_capacity = static_cast<uint32_t>(data.plan.slot_capacity),
-                                      .merged = renderer.merged_draws ? 1U : 0U};
+            const CullAssignPush push{
+                .parts = renderer.gpu_assets->part_table_address(),
+                .materials = renderer.gpu_assets->material_table_address(),
+                .lists = data.frame_address + kDrawListsOffset,
+                .args = renderer.device->buffer_address(context.buffer(data.draws)),
+                .counts = renderer.device->buffer_address(context.buffer(data.counts)),
+                .part_keys = renderer.device->buffer_address(context.buffer(data.part_keys)),
+                .part_count = data.part_count,
+                .record_capacity = static_cast<uint32_t>(std::min<uint64_t>(data.plan.record_capacity, UINT32_MAX)),
+                .merged = renderer.merged_draws ? 1U : 0U};
             context.list.bind_pipeline(data.pipeline);
             context.list.push_constants(push);
             context.list.dispatch(((kCullGroups * data.part_count) + 63) / 64);
@@ -2217,6 +2228,10 @@ void SceneRenderer::set_lod_fade(float share) {
 
 void SceneRenderer::set_merged_draws(bool on) {
     state_->merged_draws = on;
+}
+
+void SceneRenderer::set_max_draws_per_call(uint32_t draws) {
+    state_->max_draws_per_call = draws;
 }
 
 void SceneRenderer::set_shadow_caster_cull(bool on) {

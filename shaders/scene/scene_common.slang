@@ -122,7 +122,8 @@ public uint draw_list_of(uint group, uint material_flags)
 // The counters the cull and the draw assignment share, after one draw count per list.
 public static const uint kCountTriangles = kDrawListCount; // for the camera, then for the cascades
 public static const uint kCountRecordsUsed = kDrawListCount + 2;
-public static const uint kCountRecordsPerList = kDrawListCount + 3;
+public static const uint kCountRecordsLost = kDrawListCount + 3;
+public static const uint kCountRecordsPerList = kDrawListCount + 4;
 
 public struct GpuCullView
 {
