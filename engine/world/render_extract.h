@@ -8,7 +8,6 @@
 
 #include <flecs.h>
 
-#include <cmath>
 #include <cstdint>
 
 namespace de::core {
@@ -64,40 +63,30 @@ inline constexpr uint32_t kSkipRenderInstance = UINT32_MAX - 1; // nothing to do
 // render origin, so it can move with nothing sent. They wrap at 32 bits, and what's read back is a wrapping subtraction
 // from the origin, so the world has no limit: only what's drawn has to be within 131 km of the origin.
 inline constexpr double kRenderStepsPerM = 16384.0;
+inline constexpr double kRenderReachM = 2147483648.0 / kRenderStepsPerM;
 
-inline uint32_t render_position(double position_m) {
-    return static_cast<uint32_t>(std::llround(position_m * kRenderStepsPerM));
+inline uint32_t render_position_steps(double position_m) {
+    const double steps = position_m * kRenderStepsPerM;
+    return static_cast<uint32_t>(static_cast<int64_t>(steps + (steps < 0.0 ? -0.5 : 0.5)));
 }
 
 // Where an instance is, as the GPU keeps it (InstanceTransform in shaders/scene/scene_common.slang).
 struct RenderTransform {
     struct Row {
-        float linear[3] = {};  // rotation and scale
-        uint32_t position = 0; // render_position
+        float linear[3] = {};        // rotation and scale
+        uint32_t position_steps = 0; // render_position_steps
     };
     Row rows[3] = {};
 
-    void set_position_m(int axis, double position_m) { rows[axis].position = render_position(position_m); }
+    void set_position_m(int axis, double position_m) { rows[axis].position_steps = render_position_steps(position_m); }
 
     // Relative to an origin, as the GPU works it out.
     float position_m(int axis, const DVec3& origin = DVec3(0.0)) const {
-        const auto steps = static_cast<int32_t>(rows[axis].position - render_position(origin[axis]));
+        const auto steps = static_cast<int32_t>(rows[axis].position_steps - render_position_steps(origin[axis]));
         return static_cast<float>(static_cast<double>(steps) / kRenderStepsPerM);
     }
 };
 static_assert(sizeof(RenderTransform) == 48);
-
-// From a 3x4 matrix (rows x, y, z, the world position in the last column).
-inline RenderTransform render_transform(const float (&matrix)[12]) {
-    RenderTransform out;
-    for (int row = 0; row < 3; ++row) {
-        out.rows[row].linear[0] = matrix[row * 4 + 0];
-        out.rows[row].linear[1] = matrix[row * 4 + 1];
-        out.rows[row].linear[2] = matrix[row * 4 + 2];
-        out.set_position_m(row, static_cast<double>(matrix[row * 4 + 3]));
-    }
-    return out;
-}
 
 // A mesh to draw from now on: where and what.
 struct RenderInstance {
@@ -143,15 +132,16 @@ struct RenderFogVolume {
 // changed since the last frame, for it to keep: all of them only when the renderer asks
 // (World::resync_render_instances).
 struct RenderFrame {
-    uint64_t number = 0;       // counts extractions: a frame not drawn (minimized) leaves a gap
-    DVec3 origin{0.0};         // the render origin: what the GPU's floats are relative to
-    uint64_t origin_moves = 0; // counts origin moves
+    uint64_t number = 0; // counts extractions: a frame not drawn (minimized) leaves a gap
+    DVec3 origin{0.0};   // the render origin: what the GPU's floats are relative to
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};
     core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // draw nothing from now on
     uint32_t slot_count = 0;    // slots in use may be below this. 0: instances.size()
     bool all_instances = false; // these are all there are: forget any others
+    bool instance_out_of_reach =
+        false; // one of these is past kRenderReachM from the origin, so it draws in the wrong place
     core::Array<RenderFogVolume> fog_volumes{core::heap_allocator(core::MemoryTag::Render)};
 };
 
@@ -173,6 +163,7 @@ struct RenderExtractScratch {
         uint32_t first = 0;     // where its rows go in RenderFrame::instances
         bool write_all = false; // something wrote to its table: every row is sent, not only what's moving
         bool any_moving = false;
+        bool out_of_reach = false;
     };
     core::Array<Chunk> chunks{core::heap_allocator(core::MemoryTag::Render)};
     // The frame each table last had something moving in it: what to look at though nothing wrote to it.
@@ -181,6 +172,7 @@ struct RenderExtractScratch {
     core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
     uint32_t next_slot = 0;
     bool resync = false; // send all of them, next frame
+    bool warned_out_of_reach = false;
 };
 
 struct RenderExtractDesc {
@@ -203,6 +195,9 @@ struct RenderExtractDesc {
 // sent. What stopped moving is sent once more when its previous transform catches up, in a tick: that row has no
 // motion in it. Those tables' rows are cut into chunks and run as one parallel job. After the first frames it doesn't
 // allocate (the arrays keep their capacity).
+//
+// What's sent past kRenderReachM from the origin is reported, and logged once. What the camera left that far behind
+// since it was sent isn't: streaming has to have unloaded it long before.
 //
 // An entity leaves the renderer when it loses its MeshInstance or goes. Disabling it (flecs::Disabled) only stops
 // updates: it stays drawn where it was.

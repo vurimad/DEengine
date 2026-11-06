@@ -25,18 +25,18 @@ public struct SceneFrame
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
     public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA, zw: its offset in NDC
-    public uint4 render_origin;            // xyz: the origin, as an instance's position is kept
+    public uint4 render_origin_steps;      // xyz: the origin, as an instance's position is kept
 };
 
 public static const uint kCascadeCount = 4;
 
-// One row of where an instance is. The position is the world's, in whole steps of a meter below (0.06 mm), and holds no
+// One row of where an instance is. The position is the world's, in whole kMetersPerRenderStep (0.06 mm), and holds no
 // render origin, so the origin can move with nothing sent. It wraps at 32 bits, and so does taking the origin off it,
 // so the world has no limit: only what's drawn has to be within 131 km of the origin. Matches world::RenderTransform.
 public struct InstanceRow
 {
     public float3 linear; // rotation and scale
-    public uint position;
+    public uint position_steps;
 };
 
 public struct InstanceTransform
@@ -49,11 +49,11 @@ public struct InstanceTransform
 public static const float kMetersPerRenderStep = 1.0 / 16384.0;
 
 // A point in the instance's own space, relative to the render origin.
-public float3 instance_point(InstanceTransform transform, uint3 origin, float3 local)
+public float3 instance_point(InstanceTransform transform, uint3 origin_steps, float3 local)
 {
-    const uint3 position = uint3(transform.row0.position, transform.row1.position, transform.row2.position);
+    const uint3 position_steps = uint3(transform.row0.position_steps, transform.row1.position_steps, transform.row2.position_steps);
     return float3(dot(transform.row0.linear, local), dot(transform.row1.linear, local), dot(transform.row2.linear, local))
-           + float3(int3(position - origin)) * kMetersPerRenderStep;
+           + float3(int3(position_steps - origin_steps)) * kMetersPerRenderStep;
 }
 
 // An instance as the GPU keeps it between frames: where it is, and where it was last frame.

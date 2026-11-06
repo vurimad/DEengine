@@ -45,8 +45,8 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     const MeshVertex vertex = push.vertices[vertex_id];
     const GpuDraw draw = push.draws[draw_id];
     const GpuInstance instance = push.instances[draw.instance];
-    const uint3 origin = push.frame.render_origin.xyz;
-    const float4 world = float4(instance_point(instance.transform, origin, vertex.position), 1.0);
+    const uint3 origin_steps = push.frame.render_origin_steps.xyz;
+    const float4 world = float4(instance_point(instance.transform, origin_steps, vertex.position), 1.0);
     // The inverse transpose would be exact under non-uniform scale; renormalized in the pixel
     // shader, the 3x3 is close for the uniform scales cells use.
     const float3x3 linear =
@@ -55,7 +55,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
     output.clip = mul_rows(push.frame.unjittered_view_proj, world); // TAA's offset is no motion
-    const float4 previous_world = float4(instance_point(instance.previous_transform, origin, vertex.position), 1.0);
+    const float4 previous_world = float4(instance_point(instance.previous_transform, origin_steps, vertex.position), 1.0);
     output.previous_clip = mul_rows(push.frame.previous_view_proj, previous_world);
     output.normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
     const float4 tangent = snorm8x4(vertex.tangent);

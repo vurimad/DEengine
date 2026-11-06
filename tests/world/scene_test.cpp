@@ -110,7 +110,6 @@ TEST_CASE("far from the origin, positions keep sub-millimeter precision, and so 
     world->advance(1.0 / 60.0);
     const de::world::RenderFrame& frame = world->render_frame();
     REQUIRE(frame.camera.valid);
-    CHECK(frame.origin_moves == 1);
     // The origin snapped to its grid near the camera; everything is small and exact relative to it.
     CHECK(std::fabs(far.x - frame.origin.x) <= de::world::kRenderOriginStep);
     CHECK(std::fmod(frame.origin.x, de::world::kRenderOriginStep) == 0.0);
@@ -120,15 +119,16 @@ TEST_CASE("far from the origin, positions keep sub-millimeter precision, and so 
     CHECK(near(static_cast<double>(rock_x - eye_x), 0.001, 1e-4)); // 1 mm apart, seen as 1 mm apart
 
     // The camera moves a little: the origin stays.
+    const double origin_x = frame.origin.x;
     eye.set(Transform{.position = far + DVec3(500.0, 0.0, 0.0)});
     world->advance(1.0 / 60.0);
     world->advance(1.0 / 60.0);
-    CHECK(frame.origin_moves == 1);
+    CHECK(frame.origin.x == origin_x);
     // A long way: the origin follows, once.
     eye.set(Transform{.position = far + DVec3(5000.0, 0.0, 0.0)});
     world->advance(1.0 / 60.0);
     world->advance(1.0 / 60.0);
-    CHECK(frame.origin_moves == 2);
+    CHECK(frame.origin.x != origin_x);
 }
 
 TEST_CASE("render extraction: interpolated instances and the active camera, nothing else") {
@@ -482,18 +482,18 @@ TEST_CASE("render extraction: all of them when the renderer asks, and none when 
     CHECK(frame.instances.empty());
 
     // The origin moves: no row holds it, so none is sent, and what's sent later is where it is in the world.
-    const uint64_t moves = frame.origin_moves;
+    const double origin_x = frame.origin.x;
     de::world::place(eye, Transform{.position = {5000.0, 0.0, 10.0}});
-    for (int i = 0; i < 4 && frame.origin_moves == moves; ++i) {
+    for (int i = 0; i < 4 && frame.origin.x == origin_x; ++i) {
         world->advance(kTick);
     }
-    REQUIRE(frame.origin_moves == moves + 1);
+    REQUIRE(frame.origin.x != origin_x);
     CHECK_FALSE(frame.all_instances);
     CHECK(frame.instances.empty());
     world->resync_render_instances();
     world->advance(kTick);
     REQUIRE(sent_rows(frame) == kCount);
-    CHECK(frame.instances[3].transform.rows[0].position == de::world::render_position(3.0));
+    CHECK(frame.instances[3].transform.rows[0].position_steps == de::world::render_position_steps(3.0));
     CHECK(frame.instances[3].transform.position_m(0, frame.origin) == doctest::Approx(3.0 - frame.origin.x));
 }
 
@@ -513,6 +513,37 @@ TEST_CASE("an instance's position wraps, and is right near the origin wherever t
     CHECK(transform.position_m(2, origin) == static_cast<float>(1.0 / de::world::kRenderStepsPerM));
     transform.set_position_m(2, origin.z + 0.4 / de::world::kRenderStepsPerM);
     CHECK(transform.position_m(2, origin) == 0.0f);
+    // It rounds either way, on either side of the world's zero.
+    CHECK(de::world::render_position_steps(0.6 / de::world::kRenderStepsPerM) == 1U);
+    CHECK(de::world::render_position_steps(-0.6 / de::world::kRenderStepsPerM) == UINT32_MAX);
+    CHECK(de::world::render_position_steps(-0.4 / de::world::kRenderStepsPerM) == 0U);
+}
+
+TEST_CASE("render extraction: says when something it sends is too far from the origin to draw in its place") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    constexpr double kFarOut = 1'000'000.0;
+    const flecs::entity near_it = ecs.entity().set(MeshInstance{});
+    de::world::place(near_it, Transform{.position = {kFarOut + de::world::kRenderReachM - 2000.0, 0.0, 0.0}});
+    const flecs::entity eye = ecs.entity().set(Camera{});
+    de::world::place(eye, Transform{.position = {kFarOut, 0.0, 0.0}});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    REQUIRE(sent_rows(frame) == 1);
+    CHECK_FALSE(frame.instance_out_of_reach); // in reach, though a long way from the world's zero
+
+    const flecs::entity left_behind = ecs.entity().set(MeshInstance{});
+    de::world::place(left_behind, Transform{.position = {0.0, 0.0, 0.0}});
+    world->advance(kTick);
+    CHECK(frame.instance_out_of_reach);
+    // It says so for the frame that sent it.
+    for (int i = 0; i < 4; ++i) {
+        world->advance(kTick);
+    }
+    CHECK(frame.instances.empty());
+    CHECK_FALSE(frame.instance_out_of_reach);
 }
 
 TEST_CASE("render extraction: fog volumes, relative to the render origin, and the shape of what's placed") {

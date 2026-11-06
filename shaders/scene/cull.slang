@@ -166,7 +166,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         mesh = push.meshes[mesh_slot];
     }
     const InstanceTransform transform = push.instances[instance].transform;
-    const float3 center = instance_point(transform, push.frame.render_origin.xyz, mesh.center);
+    const float3 center = instance_point(transform, push.frame.render_origin_steps.xyz, mesh.center);
     // The longest axis: exact for any rotation and scale, a little short only for a transform that shears.
     const float3 row0 = transform.row0.linear;
     const float3 row1 = transform.row1.linear;

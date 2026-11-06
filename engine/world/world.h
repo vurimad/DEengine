@@ -68,7 +68,7 @@ public:
     flecs::world& ecs();
     core::JobSystem* jobs() const;
     // What the last advance() extracted for the renderer: the camera and each MeshInstance that changed,
-    // interpolated, relative to the render origin. Valid until the next advance().
+    // interpolated. Valid until the next advance().
     const RenderFrame& render_frame() const;
     // The next frame holds every instance, for a renderer that missed some frame's changes.
     void resync_render_instances();

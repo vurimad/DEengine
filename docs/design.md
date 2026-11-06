@@ -853,11 +853,11 @@ The world is one seamless space streamed around the player in a grid of cells, w
 4. Unload reverses the order and frees the cell arena in one shot.
 5. Budgets per category with hysteresis prevent load/unload thrashing at cell borders.
 
-**Large-world precision.** World coordinates in double precision on the CPU, floats relative to a render origin near the camera on the GPU, so a 16+ km world has no jitter.
+**Large-world precision.** World coordinates in double precision on the CPU, and on the GPU floats relative to a render origin near the camera, reached from fixed point for instances, so a 16+ km world has no jitter.
 
 - Positions are doubles everywhere on the CPU (`Transform.position`); rotation and scale stay float. The simulation never rebases: physics, AI, saves and distances all see one fixed world space. At 60k entities this costs about 2 MB.
-- The GPU works in floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Extraction is the only place doubles become anything else, and only extraction and what the renderer hands the shaders know the origin. Within 1 km of the origin, precision is about 0.06 mm.
-- Instances stay on the GPU, so they hold no origin: each keeps its world position in whole steps of 1/16384 m (0.06 mm), and shaders take the origin off it. Moving the origin sends nothing. The steps wrap at 32 bits and so does the subtraction, so the world has no limit: only what's drawn has to be within 131 km of the origin. Rotation and scale stay float.
+- The GPU works in floats relative to a *render origin* that render extraction moves when the camera gets about 1 km away from it. Doubles only become anything else in extraction, and in the renderer for the origin itself and the shadow grid fixed to the world. Within 1 km of the origin, precision is about 0.06 mm.
+- Instances stay on the GPU, so they hold no origin: each keeps its world position in whole steps of 1/16384 m (0.06 mm), and shaders take the origin off it. Moving the origin sends nothing. The steps wrap at 32 bits and so does the subtraction, so the world has no limit: only what's drawn has to be within 131 km of the origin, and extraction logs anything sent past that. Rotation and scale stay float.
 
 **World model: one owner per thing, data flowing one way.** No system keeps its own copy of what exists in the world; the flecs world is the only list.
 

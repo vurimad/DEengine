@@ -2,6 +2,7 @@
 
 #include "core/assert.h"
 #include "core/job_system.h"
+#include "core/log.h"
 #include "core/profile.h"
 
 #include <algorithm>
@@ -38,7 +39,6 @@ void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
     if (std::abs(offset.x) > kRenderOriginStep || std::abs(offset.y) > kRenderOriginStep ||
         std::abs(offset.z) > kRenderOriginStep) {
         frame.origin = glm::round(seen.position / kRenderOriginStep) * kRenderOriginStep;
-        ++frame.origin_moves;
     }
     to_matrix_3x4(seen, frame.origin, frame.camera.transform);
     frame.camera.vertical_fov_rad = camera->vertical_fov_rad;
@@ -78,13 +78,12 @@ namespace {
 constexpr uint32_t kChunkRows = 512;
 
 void to_render_transform(const WorldTransform& transform, RenderTransform& out) {
-    float matrix[12];
-    to_matrix_3x4(transform, transform.position, matrix); // its own place as the origin: the position's left out
+    const Mat3 rotation = glm::mat3_cast(transform.rotation);
     for (int row = 0; row < 3; ++row) {
-        out.rows[row].linear[0] = matrix[row * 4 + 0];
-        out.rows[row].linear[1] = matrix[row * 4 + 1];
-        out.rows[row].linear[2] = matrix[row * 4 + 2];
-        out.rows[row].position = render_position(transform.position[row]);
+        out.rows[row].linear[0] = rotation[0][row] * transform.scale.x;
+        out.rows[row].linear[1] = rotation[1][row] * transform.scale.y;
+        out.rows[row].linear[2] = rotation[2][row] * transform.scale.z;
+        out.set_position_m(row, transform.position[row]);
     }
 }
 
@@ -116,7 +115,9 @@ struct ExtractJob {
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
     float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
-    bool all = false;            // every row, whatever it last sent
+    DVec3 origin{0.0};
+    bool has_camera = false; // no camera, no origin to be far from
+    bool all = false;        // every row, whatever it last sent
 };
 
 void extract_chunks(size_t begin, size_t end, void* context) {
@@ -139,6 +140,9 @@ void extract_chunks(size_t begin, size_t end, void* context) {
                 continue;
             }
             slot.sent = hash;
+            const DVec3 away = glm::abs(chunk.current[i].position - job.origin);
+            chunk.out_of_reach =
+                chunk.out_of_reach || (job.has_camera && std::max({away.x, away.y, away.z}) >= kRenderReachM);
             to_render_transform(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), instance.transform);
             if (still) {
                 instance.previous_transform = instance.transform; // most of a world
@@ -180,6 +184,7 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
         extract_camera(it.world(), *desc.alpha, *desc.frame);
         desc.frame->instances.clear(); // keeps its capacity: no allocation once the world has settled
         desc.frame->fog_volumes.clear();
+        desc.frame->instance_out_of_reach = false;
     });
     // A few, not worth a job. Moving ones are where they're seen, like anything else.
     ecs.system<const WorldTransform, const PreviousWorldTransform, const FogVolume>("de::ExtractRenderFogVolumes")
@@ -288,6 +293,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                            .instances = out.instances.data(),
                            .alpha = *desc.alpha,
                            .previous_alpha = *desc.alpha - *desc.alpha_step,
+                           .origin = out.origin,
+                           .has_camera = out.camera.valid,
                            .all = all};
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
@@ -298,6 +305,13 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                 if (chunk.any_moving) {
                     scratch.moving_tables.find_or_insert(chunk.table) = out.number;
                 }
+                out.instance_out_of_reach = out.instance_out_of_reach || chunk.out_of_reach;
+            }
+            if (out.instance_out_of_reach && !scratch.warned_out_of_reach) {
+                DE_LOG_ERROR("world",
+                             "an instance is over %.0f km from the render origin, so it draws in the wrong place",
+                             kRenderReachM / 1000.0);
+                scratch.warned_out_of_reach = true;
             }
             // What's gone since the last frame. All of them means anything not among them, so these aren't needed.
             out.freed_slots.clear();

@@ -15,6 +15,7 @@
 #include "render/shader/shader_library.h"
 #include "support/gpu.h"
 #include "support/readback.h"
+#include "support/render_transform.h"
 #include "support/sandbox.h"
 #include "world/render_extract.h"
 
@@ -235,7 +236,7 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         frame.instances.push(
-            {.transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         const auto target =
             device->create_texture({.width = kSize,
                                     .height = kSize,
@@ -407,6 +408,35 @@ TEST_CASE("a mesh with many materials and mipped textures is ready within a few 
     de::test::check_clean(*device);
 }
 
+TEST_CASE("a cascade's texel grid stays put in the world as the render origin moves") {
+    const de::render::SceneShadows shadows;
+    const float sun[3] = {0.3f, 0.7f, 0.6f};
+    // One camera in the world, relative to two origins a step apart.
+    const de::DVec3 first_origin(10'240'000.0, 0.0, 0.0);
+    const de::DVec3 next_origin = first_origin + de::DVec3(de::world::kRenderOriginStep, 0.0, 0.0);
+    const float first_camera[12] = {1, 0, 0, 1000, 0, 1, 0, 2, 0, 0, 1, 30};
+    const float next_camera[12] = {1, 0, 0, 1000 - 1024, 0, 1, 0, 2, 0, 0, 1, 30};
+    de::render::ShadowCascade first[de::render::kShadowCascadeCount];
+    de::render::ShadowCascade next[de::render::kShadowCascadeCount];
+    de::render::fit_shadow_cascades(first_camera, first_origin, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, first);
+    de::render::fit_shadow_cascades(next_camera, next_origin, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, next);
+    // A point a little ahead lands on the same place in each tile, to within what floats hold.
+    const auto clip = [](const de::render::ShadowCascade& cascade, double x, double y, double z, int row) {
+        return static_cast<double>(cascade.view_proj[row * 4 + 0]) * x +
+               static_cast<double>(cascade.view_proj[row * 4 + 1]) * y +
+               static_cast<double>(cascade.view_proj[row * 4 + 2]) * z +
+               static_cast<double>(cascade.view_proj[row * 4 + 3]);
+    };
+    for (uint32_t c = 0; c < de::render::kShadowCascadeCount; ++c) {
+        CAPTURE(c);
+        for (int row = 0; row < 2; ++row) {
+            const double there = clip(first[c], 1000.0, 2.0, 25.0, row);
+            const double here = clip(next[c], 1000.0 - 1024.0, 2.0, 25.0, row);
+            CHECK(std::abs(there - here) * 0.5 * static_cast<double>(shadows.resolution) < 0.25);
+        }
+    }
+}
+
 TEST_CASE("shadow cascades split the view, grow outward, and don't change size as the camera turns") {
     const de::render::SceneShadows shadows;
     const float sun[3] = {0.0f, 0.70710678f, 0.70710678f};
@@ -415,8 +445,8 @@ TEST_CASE("shadow cascades split the view, grow outward, and don't change size a
     const float turned[12] = {0, 0, 1, 10, 0, 1, 0, 2, -1, 0, 0, 30};
     de::render::ShadowCascade a[4];
     de::render::ShadowCascade b[4];
-    de::render::fit_shadow_cascades(looking_ahead, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, a);
-    de::render::fit_shadow_cascades(turned, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, b);
+    de::render::fit_shadow_cascades(looking_ahead, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, a);
+    de::render::fit_shadow_cascades(turned, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, b);
     for (int c = 0; c < 4; ++c) {
         CAPTURE(c);
         if (c > 0) {
@@ -430,7 +460,7 @@ TEST_CASE("shadow cascades split the view, grow outward, and don't change size a
     // No sun (a zero direction): finite cascades all the same (straight down).
     const float none[3] = {0.0f, 0.0f, 0.0f};
     de::render::ShadowCascade night[de::render::kShadowCascadeCount];
-    de::render::fit_shadow_cascades(looking_ahead, 1.0f, 0.1f, 16.0f / 9.0f, none, shadows, night);
+    de::render::fit_shadow_cascades(looking_ahead, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, none, shadows, night);
     for (const float value : night[0].view_proj) {
         CHECK(std::isfinite(value));
     }
@@ -506,9 +536,9 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         frame.instances.push(
-            {.transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         frame.instances.push(
-            {.transform = de::world::render_transform({0.25f, 0, 0, 0.6f, 0, 0.25f, 0, 0, 0, 0, 0.25f, 1}),
+            {.transform = de::test::render_transform({0.25f, 0, 0, 0.6f, 0, 0.25f, 0, 0, 0, 0, 0.25f, 1}),
              .mesh = mesh});
         const auto target =
             device->create_texture({.width = kSize,
@@ -604,7 +634,7 @@ TEST_CASE("a material whose texture was missing picks it up when it appears") {
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
         frame.instances.push(
-            {.transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         // The engine's frame, a few times over: the registry, the GPU copies, the passes.
         const auto run_frames = [&](int count) {
             for (int i = 0; i < count; ++i) {
@@ -776,7 +806,7 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
                 frame.camera.transform[11] = -3.0f;
             }
             frame.instances.push(
-                {.transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = meshes[v]});
+                {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = meshes[v]});
             device->begin_frame();
             uploader->record();
             graph->begin(kSize, kSize);
@@ -1014,7 +1044,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         agree(thin, x, 1); // looking up at the sky: no fog dims it past where the fog ends
         // A surface inside the grid, close by: the fog up to it, read from between two slices.
         frame.instances.push(
-            {.transform = de::world::render_transform({5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}), .mesh = mesh});
+            {.transform = de::test::render_transform({5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}), .mesh = mesh});
         thin.density_per_m = 0.2f;
         thin.end_m = 1000.0f;
         agree(thin, kSize / 2, kSize / 2);
@@ -1023,7 +1053,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // small extinction scale goes on falling with depth (optical depth 27.5, red's e^-2.75 and
         // white's e^-27.5, far below what a stored transmittance could hold).
         frame.instances.push(
-            {.transform = de::world::render_transform({300, 0, 0, 0, 0, 300, 0, 0, 0, 0, 300, -55}), .mesh = mesh});
+            {.transform = de::test::render_transform({300, 0, 0, 0, 0, 300, 0, 0, 0, 0, 300, -55}), .mesh = mesh});
         de::render::SceneFog deep = closed;
         deep.density_per_m = 0.5f;
         deep.extinction_tint[0] = 0.1f;
@@ -1045,7 +1075,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // closed form can't know; the grid does: what's left is the sky's light, and the sun's past
         // the roof's edge, behind nearly all of this fog.
         frame.instances.push(
-            {.transform = de::world::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
         const de::core::Array<std::byte> closed_roofed = render(closed);
         const de::core::Array<std::byte> gridded_roofed = render(gridded);
         CHECK(static_cast<int>(texel(closed_roofed, x, y)[1]) ==
@@ -1071,7 +1101,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // Over frames: a shadow edge straight ahead, the roof over the left half of the view. Each frame's
         // samples move around in the froxels; the light keeps most of last frame's at the same place.
         const de::world::RenderInstance half_roof{
-            .transform = de::world::render_transform({100, 0, 0, -100, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh};
+            .transform = de::test::render_transform({100, 0, 0, -100, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh};
         const uint32_t left = kSize / 4;
         const uint32_t right = kSize - kSize / 4;
         const uint32_t middle = kSize / 2;
@@ -1178,7 +1208,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         for (const float edge_z : {-40.0f, -50.0f, -56.0f}) {
             frame.instances.clear();
             frame.instances.push(
-                {.transform = de::world::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, edge_z - 100.0f}),
+                {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, edge_z - 100.0f}),
                  .mesh = mesh});
             restart();
             const int single_frame = green(render(far_fog), middle);
@@ -1286,7 +1316,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             REQUIRE(shaft_target.ok());
             frame.instances.clear();
             for (int i = -15; i <= 15; ++i) {
-                frame.instances.push({.transform = de::world::render_transform(
+                frame.instances.push({.transform = de::test::render_transform(
                                           {1.5f, 0, 0, 4.0f * static_cast<float>(i), 0, 0, 100, 8, 0, 100, 0, -50.0f}),
                                       .mesh = mesh});
             }
@@ -1469,7 +1499,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // It's in the sun's shadow like any fog.
         frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
         frame.instances.push(
-            {.transform = de::world::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
         const de::core::Array<std::byte> roofed_box = render(clear_air);
         frame.instances.clear();
         CHECK(at_pixel(roofed_box, heart, heart, 1) < at_pixel(box, heart, heart, 1) - 15);
@@ -1484,7 +1514,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         late_start_fog.density_per_m = 0.3f;
         late_start_fog.start_m = 500.0f;
         late_start_fog.sun_start_m = 500.0f;
-        frame.instances.push({.transform = de::world::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -40}),
+        frame.instances.push({.transform = de::test::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -40}),
                               .mesh = mesh}); // nothing past it
         const de::core::Array<std::byte> walled_clear = render(clear_air);
         const de::core::Array<std::byte> walled_late_start_fog = render(late_start_fog);
@@ -1650,7 +1680,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         const auto wall_at = [&](float depth) {
             frame.instances.clear();
             frame.instances.push(
-                {.transform = de::world::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -depth}),
+                {.transform = de::test::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -depth}),
                  .mesh = mesh});
         };
         const auto mist_slab = [&](float center_depth, float half_depth) {
@@ -1711,10 +1741,10 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         frame.fog_volumes.push(mist_slab(49.2f, 0.4f));
         const de::core::Array<std::byte> thin_lit = render(clear_air);
         frame.instances.push(
-            {.transform = de::world::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, -49.2f}), .mesh = mesh});
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, -49.2f}), .mesh = mesh});
         const de::core::Array<std::byte> thin_all_roofed = render(clear_air);
         frame.instances.back() = {
-            .transform = de::world::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 0.8f, 0, -49.2f}), .mesh = mesh};
+            .transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 0.8f, 0, -49.2f}), .mesh = mesh};
         const de::core::Array<std::byte> thin_narrow_roof = render(clear_air);
         frame.fog_volumes.clear();
         CHECK(at_pixel(thin_lit, heart, heart, 1) > at_pixel(thin_all_roofed, heart, heart, 1) + 15);
@@ -1982,8 +2012,8 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         const de::world::RenderInstance square{
-            .transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
-            .previous_transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .previous_transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
             .mesh = mesh};
         frame.instances.push(square);
         const float uv_per_m = 0.5f / (3.0f * std::tan(0.5f));
@@ -2108,8 +2138,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         const de::world::RenderInstance square{
-            .transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
-            .previous_transform = de::world::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .previous_transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
             .mesh = mesh};
         de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
         const auto draw = [&](bool taa) {
@@ -2269,8 +2299,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         };
         const auto thing = [](de::asset::AssetHandle what, float x, float z, float scale = 1.0f) {
             return de::world::RenderInstance{
-                .transform = de::world::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
-                .previous_transform = de::world::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
+                .transform = de::test::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
+                .previous_transform = de::test::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
                 .mesh = what};
         };
         const auto look_from = [&](float camera_x) { frame.camera.transform[3] = camera_x; };

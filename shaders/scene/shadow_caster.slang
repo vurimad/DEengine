@@ -31,7 +31,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     const MeshVertex vertex = push.vertices[vertex_id];
     const GpuDraw draw = push.draws[draw_id];
     const float3 world =
-        instance_point(push.instances[draw.instance].transform, push.frame.render_origin.xyz, vertex.position);
+        instance_point(push.instances[draw.instance].transform, push.frame.render_origin_steps.xyz, vertex.position);
     VertexOutput output;
     output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;
