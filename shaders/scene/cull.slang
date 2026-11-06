@@ -1,8 +1,8 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
-// bounding sphere. What's in a view adds the parts of its mesh's coarsest LOD that's good enough there to
-// that view's draw lists: a record and draw arguments per part, and a count the draw pass reads
-// (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the parts of both, to
-// lists of their own. The order within a list depends on the threads: nothing here may rely on it.
+// bounding sphere: a cascade's view is what can shadow something it lights. What's in a view adds the parts of its
+// mesh's coarsest LOD that's good enough there to that view's draw lists: a record and draw arguments per part, and a
+// count the draw pass reads (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the
+// parts of both, to lists of their own. The order within a list depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
@@ -180,7 +180,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     for (uint v = 0; v < kCullViewCount; ++v)
     {
         GpuCullView* view = push.views + v;
-        if (mesh.lod_count == 0 || !in_view(view, center, radius))
+        if (mesh.lod_count == 0 || radius < view.min_radius_m || !in_view(view, center, radius))
         {
             continue;
         }

@@ -104,7 +104,7 @@ public static const uint kNoMesh = 0xffffffffu;
 
 public struct GpuCullView
 {
-    public float4 planes[6]; // inside: dot(xyz, p) + w >= 0, in render-origin space
+    public float4 planes[12]; // inside: dot(xyz, p) + w >= 0, in render-origin space
     public uint plane_count;
     public uint first_list;
     public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
@@ -113,7 +113,8 @@ public struct GpuCullView
     public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
                                  // be. Below 0: LOD 0 everywhere
     public float lod_fade_end;   // that error (where it's 1, a LOD comes in), at which it has taken over. 1: no fade
-    public float padding[2];
+    public float min_radius_m;   // anything smaller doesn't draw here
+    public float padding;
 };
 
 public struct GpuDrawList

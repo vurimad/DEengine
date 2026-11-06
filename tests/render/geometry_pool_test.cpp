@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <numbers>
 #include <span>
 
 using de::asset::AssetHandle;
@@ -700,25 +701,194 @@ TEST_CASE("a caster out of the camera's view still casts its shadow") {
     });
 }
 
+namespace {
+
+// The floor at y = -1, seen from above, and square casters scattered over it and around, some far out of view.
+de::world::RenderFrame scattered_casters(AssetHandle mesh) {
+    de::world::RenderFrame frame = PoolScene::frame_of({});
+    frame.instances.push(
+        {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, -1, 0, -100, 0, 0}), .mesh = mesh});
+    uint32_t state = 12345;
+    const auto next = [&state](float low, float high) {
+        state = (state * 1664525U) + 1013904223U;
+        return low + ((high - low) * static_cast<float>(state >> 16U) / 65536.0f);
+    };
+    for (int i = 0; i < 400; ++i) {
+        // Half of them close by, where shadows are easy to see. Tilted, so no sun finds them all edge on.
+        const float reach_m = i % 2 == 0 ? 25.0f : 70.0f;
+        const float size = next(0.2f, 1.5f);
+        const float x = next(-reach_m, reach_m);
+        const float y = next(0.0f, 12.0f);
+        const float z = next(-reach_m, reach_m);
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.71f * size, 0, 0.71f * size, x, 0.5f * size, 0.71f * size,
+                                                      -0.5f * size, y, -0.5f * size, 0.71f * size, 0.5f * size, z}),
+             .mesh = mesh});
+    }
+    return frame;
+}
+
+int pixels_apart(const de::core::Array<std::byte>& a, const de::core::Array<std::byte>& b) {
+    int apart = 0;
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            bool differs = false;
+            for (int c = 0; c < 3; ++c) {
+                differs = differs || texel(a, x, y)[c] != texel(b, x, y)[c];
+            }
+            apart += differs ? 1 : 0;
+        }
+    }
+    return apart;
+}
+
+} // namespace
+
+TEST_CASE("casters whose shadow lands out of sight are left out, and no picture changes") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        de::world::RenderFrame frame = scattered_casters(mesh);
+        // A wide spread of evenings and noons, ahead and turned, with the cascades' hand-over bands where the floor is.
+        struct Case {
+            float sun[3];
+            float turn_rad;
+        };
+        constexpr Case kCases[] = {
+            {.sun = {1, 1, 2}, .turn_rad = 0.0f},     {.sun = {-1, 0.4f, 0.1f}, .turn_rad = 0.0f},
+            {.sun = {0, 1, 0}, .turn_rad = 0.7f},     {.sun = {0.2f, 0.3f, -1}, .turn_rad = 2.0f},
+            {.sun = {1, 0.15f, 0}, .turn_rad = 4.0f}, {.sun = {-0.6f, 0.7f, 0.6f}, .turn_rad = 5.5f}};
+        for (const Case& test_case : kCases) {
+            CAPTURE(test_case.turn_rad);
+            CAPTURE(test_case.sun[0]);
+            const float c = std::cos(test_case.turn_rad);
+            const float s = std::sin(test_case.turn_rad);
+            const float camera[12] = {c, 0, s, 3 * s, 0, 1, 0, 2, -s, 0, c, 3 * c};
+            std::memcpy(frame.camera.transform, camera, sizeof(camera));
+            de::render::SceneLighting light{.sun_direction = {test_case.sun[0], test_case.sun[1], test_case.sun[2]}};
+            light.shadows = {.resolution = 512, .distance_m = 40.0f, .blend_band = 0.3f};
+            // Light shafts read the cascades too.
+            light.fog.density_per_m = 0.02f;
+            light.fog.volume_distance_m = 30.0f;
+            const auto shown = [&](de::render::SceneView view) {
+                scene.submit_for_stats(frame, light, view);
+                return de::test::read_texture(scene.device, scene.target);
+            };
+            scene.renderer.set_shadow_caster_cull(false);
+            const auto all_mask = shown(de::render::SceneView::ShadowMask);
+            const uint32_t all_draws = scene.renderer.stats().visible_shadow_draws;
+            const auto all_lit = shown(de::render::SceneView::Lit);
+            scene.renderer.set_shadow_caster_cull(true);
+            const auto some_mask = shown(de::render::SceneView::ShadowMask);
+            const uint32_t some_draws = scene.renderer.stats().visible_shadow_draws;
+            const auto some_lit = shown(de::render::SceneView::Lit);
+            CHECK(some_draws < all_draws);
+            CHECK(pixels_apart(all_mask, some_mask) == 0);
+            CHECK(pixels_apart(all_lit, some_lit) == 0);
+            // There was something to lose.
+            int shadowed = 0;
+            for (uint32_t y = 0; y < kSize; ++y) {
+                for (uint32_t x = 0; x < kSize; ++x) {
+                    shadowed += texel(some_mask, x, y)[0] < 128 ? 1 : 0;
+                }
+            }
+            CHECK(shadowed > 20);
+        }
+    });
+}
+
+TEST_CASE("a caster beside what a cascade lights stays out, though the cascade's map could hold it") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // The sun behind the camera, so its near and side faces are all swept across: only the planes along the sun,
+        // from the edges, keep this out. It's to the right of the view, inside the last cascade's sphere.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 25, 0, 0.5f, 0, 0, 0, 0, 0.5f, -20}), .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0.3f, 1}};
+        light.shadows = {.resolution = 512, .distance_m = 40.0f};
+        scene.renderer.set_shadow_caster_cull(false);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws >= 1);
+        scene.renderer.set_shadow_caster_cull(true);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+
+        // The same thing in front of the view casts as it always did.
+        frame.instances[0].transform.set_position_m(0, 0.0);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws >= 1);
+    });
+}
+
+TEST_CASE("a caster too small for a cascade's texels stays out of it, and in the finer ones") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // Where two cascades meet, so it's in both: even splits of 8 m, 2 m apart, and it's 2 m ahead of the eye.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        constexpr float kSizeM = 0.1f;
+        frame.instances.push(
+            {.transform = de::test::render_transform({kSizeM, 0, 0, 0, 0, kSizeM, 0, 0, 0, 0, kSizeM, 1}),
+             .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        de::render::ShadowCascade cascades[de::render::kShadowCascadeCount];
+        const float sun[3] = {0, 0, 1};
+        de::render::fit_shadow_cascades(frame.camera.transform, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, sun, light.shadows,
+                                        cascades);
+        REQUIRE(cascades[1].texel_m > cascades[0].texel_m);
+
+        const auto drawn = [&](float min_texels) {
+            scene.renderer.set_shadow_min_texels(min_texels);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            return scene.renderer.stats().visible_shadow_draws;
+        };
+        const uint32_t all = drawn(0.0f);
+        REQUIRE(all >= 2);
+        CHECK(drawn(1e6f) == 0);
+        // Its bounding sphere: half a diagonal of the square, whose mesh is 1 m wide.
+        const float diameter_m = kSizeM * std::numbers::sqrt2_v<float>;
+        const float between = diameter_m / std::sqrt(cascades[0].texel_m * cascades[1].texel_m);
+        const uint32_t finer_only = drawn(between);
+        CHECK(finer_only >= 1);
+        CHECK(finer_only < all);
+        CHECK(drawn(0.99f * diameter_m / cascades[0].texel_m) >= 1);
+        CHECK(drawn(1.01f * diameter_m / cascades[0].texel_m) == 0);
+    });
+}
+
 TEST_CASE("a cascade drops casters past either end of its depth") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
-        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
-        de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
-        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
-        CHECK(in_reach > 0);
-        // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
-        frame.instances[0].transform.set_position_m(2, 5000.0f);
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
-        // And past the far end of every cascade.
-        frame.instances[0].transform.set_position_m(2, -5000.0f);
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        // With the cull, and with all a map could hold, which is what the cull's pictures are compared with.
+        for (const bool cull : {true, false}) {
+            CAPTURE(cull);
+            scene.renderer.set_shadow_caster_cull(cull);
+            de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+            de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
+            light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
+            CHECK(in_reach > 0);
+            // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
+            frame.instances[0].transform.set_position_m(2, 5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+            // And past the far end of every cascade.
+            frame.instances[0].transform.set_position_m(2, -5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        }
     });
 }
 
