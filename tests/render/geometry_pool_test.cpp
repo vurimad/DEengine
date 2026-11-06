@@ -966,7 +966,8 @@ TEST_CASE("merged draws have a record for every object, however few draws a call
         de::world::RenderFrame frame = PoolScene::frame_of({});
         for (int i = 0; i < kCount; ++i) {
             const float x = -1.0f + (2.0f * static_cast<float>(i % 60) / 60.0f);
-            const float y = -1.0f + (2.0f * static_cast<float>(i / 60) / 50.0f);
+            const int row = i / 60;
+            const float y = -1.0f + (2.0f * static_cast<float>(row) / 50.0f);
             frame.instances.push(
                 {.transform = de::test::render_transform({0.01f, 0, 0, x, 0, 0.01f, 0, y, 0, 0, 0.01f, 0}),
                  .mesh = mesh});
