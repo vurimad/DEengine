@@ -1,5 +1,6 @@
 #include "asset/shader_format.h"
 
+#include "asset/asset_id.h"
 #include "core/allocator.h"
 #include "core/array.h"
 #include "core/hash.h"
@@ -8,8 +9,6 @@
 #include "platform/vfs.h"
 
 #include <algorithm>
-#include <charconv>
-#include <cstdio>
 #include <cstring>
 
 namespace de::asset {
@@ -172,17 +171,15 @@ core::Result<uint64_t> read_shader_stamp(const platform::Vfs& vfs) {
     std::string_view rest(text, *read);
     const std::string_view digits = core::trim(core::next_line(rest));
     uint64_t hash = 0;
-    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), hash, 16);
-    if (digits.size() != 16 || !rest.empty() || error != std::errc{} || end != digits.data() + digits.size()) {
+    if (!rest.empty() || !parse_hex64(digits, hash)) {
         return core::fail(ErrorCode::CorruptData, "game:/'s shader stamp can't be read as one");
     }
     return hash;
 }
 
 core::Result<void> write_shader_stamp(const platform::Vfs& vfs, uint64_t sources_hash) {
-    char text[32];
-    const int length = std::snprintf(text, sizeof(text), "%016llx\n", static_cast<unsigned long long>(sources_hash));
-    return vfs.write_file(kShaderStampPath, std::as_bytes(std::span(text, static_cast<size_t>(length))));
+    const AssetIdText text = format_asset_id(AssetId::from_value(sources_hash));
+    return vfs.write_file(kShaderStampPath, std::as_bytes(std::span(text.c_str(), text.size())));
 }
 
 } // namespace de::asset

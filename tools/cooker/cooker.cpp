@@ -20,6 +20,7 @@
 #include "core/hash.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "platform/file.h"
 #include "platform/vfs.h"
 #include "render/shader/shader_asset.h"
 
@@ -319,39 +320,60 @@ private:
 
     // --- Shaders -----------------------------------------------------------------------------
 
+    // Not cooking shaders this time: what was cooked stays, untouched.
+    void keep_cooked_shaders() {
+        for (const CookRecord& record : previous_.records()) {
+            if (record.path.view().starts_with("shaders/")) {
+                for (const CookedOutput& output : record.outputs) {
+                    static_cast<void>(claim(record.path.view(), output.id));
+                }
+                next_.put(clone(record));
+            }
+        }
+    }
+
     void cook_shaders() {
         if (compiler_ == nullptr) {
-            // Not cooking shaders this time (--no-shaders): what was cooked stays, untouched.
-            for (const CookRecord& record : previous_.records()) {
-                if (record.path.view().starts_with("shaders/")) {
-                    for (const CookedOutput& output : record.outputs) {
-                        static_cast<void>(claim(record.path.view(), output.id));
-                    }
-                    next_.put(clone(record));
-                }
-            }
+            keep_cooked_shaders(); // --no-shaders
             return;
         }
         // The stamp says every cooked shader comes from these sources, so it goes before the first
         // is written and comes back only if they all made it: a cook that fails or stops halfway
-        // leaves a mix of old and new, which no engine should load.
+        // leaves a mix of old and new, which no engine should load. If it can't go, nothing's
+        // written: it stays true of what's cooked. Without one, the last cook didn't finish, and
+        // its records can't be trusted (a file saved during a compile can be hashed as compiled),
+        // so every module cooks.
+        const bool last_cook_finished = vfs_.exists(asset::kShaderStampPath);
+        if (const core::Result<void> removed = vfs_.remove_file(asset::kShaderStampPath); !removed) {
+            diagnostics_.error("", "%s could not be removed, so no shaders were cooked: %s", asset::kShaderStampPath,
+                               removed.error().message);
+            ++stats_.failed;
+            keep_cooked_shaders();
+            return;
+        }
         const core::Result<uint64_t> sources = asset::shader_sources_hash(vfs_);
         if (!sources && vfs_.exists("src:/shaders")) {
             diagnostics_.error("shaders", "could not be hashed: %s", sources.error().message);
         }
-        if (const core::Result<void> removed = vfs_.remove_file(asset::kShaderStampPath); !removed) {
-            diagnostics_.error("", "%s could not be removed: %s", asset::kShaderStampPath, removed.error().message);
-        }
-        bool all_cooked = true;
         core::Array<SourcePath> files(tools_heap());
+        const size_t errors_before_listing = diagnostics_.error_count();
         list_tree(vfs_, "shaders", false, diagnostics_, files);
+        bool all_cooked = diagnostics_.error_count() == errors_before_listing; // a path too long is left out
         const asset::ShaderFlags flags =
             (options_.shader_debug_info ? asset::ShaderFlags::DebugInfo : asset::ShaderFlags::None) |
             (options_.shader_checks ? asset::ShaderFlags::Checks : asset::ShaderFlags::None);
         for (const SourcePath& file : files) {
             shader::ShaderName module;
             const bool test_module = file.view().starts_with(kShaderTests); // games never load these
-            if ((!options_.test_shaders && test_module) || !shader::shader_module_name(file.view(), module)) {
+            if (!options_.test_shaders && test_module) {
+                continue;
+            }
+            if (!shader::shader_module_name(file.view(), module)) {
+                if (extension_of(file.view()) == ".slang") {
+                    diagnostics_.error(file.view(), "its module name is longer than %zu characters: it can't be cooked",
+                                       shader::kMaxShaderNameLength);
+                    all_cooked = all_cooked && test_module;
+                }
                 continue;
             }
             const core::Result<core::Array<std::byte>> bytes = read_source(file.view());
@@ -373,7 +395,7 @@ private:
                 hash_files(hasher, dependencies);
                 return hasher.value();
             };
-            if (last != nullptr) {
+            if (last != nullptr && last_cook_finished) {
                 if (const CookRecord* same = unchanged(file.view(), input_hash(last->dependencies.span()));
                     same != nullptr) {
                     keep(*same);
@@ -394,11 +416,38 @@ private:
             next_.put(std::move(record));
             ++stats_.cooked;
         }
-        if (sources && all_cooked) {
-            if (const core::Result<void> stamped = asset::write_shader_stamp(vfs_, *sources); !stamped) {
-                diagnostics_.error("", "%s could not be written: %s", asset::kShaderStampPath, stamped.error().message);
-            }
+        if (!sources || !all_cooked) {
+            return;
         }
+        if (options_.before_shader_stamp != nullptr) {
+            options_.before_shader_stamp(options_.before_shader_stamp_context);
+        }
+        // Saved during the cook: what's cooked may be from either side of it.
+        if (const core::Result<uint64_t> after = asset::shader_sources_hash(vfs_); !after || *after != *sources) {
+            diagnostics_.error("shaders", "changed during the cook, so they aren't stamped: re-run the cooker");
+            ++stats_.failed;
+            return;
+        }
+        if (const core::Result<void> stamped = asset::write_shader_stamp(vfs_, *sources); !stamped) {
+            diagnostics_.error("", "%s could not be written: %s", asset::kShaderStampPath, stamped.error().message);
+        }
+    }
+
+    // Whether game:/ holds any cooked shader: its files are the answer, not the state a killed cook
+    // never saved. They lie one folder down (asset::cooked_path).
+    bool any_cooked_shader() const {
+        const std::string_view extension = asset::asset_type_extension(asset::AssetType::Shader);
+        bool found = false;
+        static_cast<void>(vfs_.list("game:/", [&](const char* folder, bool folder_is_directory) {
+            platform::PathString path("game:/");
+            if (found || !folder_is_directory || !path.append(folder)) {
+                return;
+            }
+            static_cast<void>(vfs_.list(path.c_str(), [&](const char* name, bool is_directory) {
+                found = found || (!is_directory && std::string_view(name).ends_with(extension));
+            }));
+        }));
+        return found;
     }
 
     // --check: the stamp against the sources as they are now (not this cooker's own build, which
@@ -413,10 +462,7 @@ private:
         }
         const core::Result<uint64_t> stamp = asset::read_shader_stamp(vfs_);
         if (!stamp && stamp.error().code == core::ErrorCode::NotFound) {
-            const bool cooked = std::ranges::any_of(previous_.records(), [](const CookRecord& record) {
-                return record.path.view().starts_with("shaders/");
-            });
-            if (cooked) {
+            if (any_cooked_shader()) {
                 diagnostics_.error("shaders", "the cooked shaders are stale: the last cook failed or stopped, or an "
                                               "older cooker made them: re-run the cooker");
             } else {

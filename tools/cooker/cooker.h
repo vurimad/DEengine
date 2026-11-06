@@ -28,6 +28,9 @@ struct CookOptions {
     bool content = true;
     // With check_only: off skips comparing the cooked shaders with their sources.
     bool check_shaders = true;
+    // For tests: runs when the shader modules are cooked, before they're stamped, as a save mid-cook would.
+    void (*before_shader_stamp)(void* context) = nullptr;
+    void* before_shader_stamp_context = nullptr;
 };
 
 struct CookStats {
@@ -51,7 +54,8 @@ struct CookReport {
 // - Metas: new sources get one, moved ones are re-linked, broken ones reported (SourceTree).
 // - Shaders: every module under shaders/ with entry points (not shaders/tests/) to .deshader, and
 //   the stamp of the sources they came from (asset::kShaderStampPath), which the engine compares
-//   at startup; a module that fails leaves no stamp. Needs a compiler; without one shaders are skipped.
+//   at startup; a module that fails, or sources that change during the cook, leave no stamp, and
+//   then every module cooks again next time. Needs a compiler; without one shaders are skipped.
 // - Models (glTF, FBX): one .demesh, a .demat per material and a .detex per embedded image.
 // - Materials (.material text): a .demat.
 // - Textures: a .detex, with defaults picked by how models and materials use them, then the folder

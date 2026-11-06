@@ -16,8 +16,10 @@ target_link_libraries(de_shader
 # ShaderLibrary::create_cooked compares with the cooked shaders'. Made by the same code the cooker
 # runs, so they agree. The list of files is written only when it changes, because a deleted or a
 # renamed shader leaves no newer file behind. The tool rewrites its output only when the hash changes.
-file(GLOB_RECURSE shader_sources CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/shaders/*.slang")
-list(FILTER shader_sources EXCLUDE REGEX "/shaders/tests/")
+file(GLOB_RECURSE shader_sources RELATIVE "${PROJECT_SOURCE_DIR}/shaders" CONFIGURE_DEPENDS
+    "${PROJECT_SOURCE_DIR}/shaders/*.slang")
+list(FILTER shader_sources EXCLUDE REGEX "^tests/") # relative, so the checkout's own path can't match
+list(TRANSFORM shader_sources PREPEND "${PROJECT_SOURCE_DIR}/shaders/")
 list(JOIN shader_sources "\n" shader_source_list)
 set(shader_source_list_file "${CMAKE_CURRENT_BINARY_DIR}/shader_sources.txt")
 file(CONFIGURE OUTPUT "${shader_source_list_file}" CONTENT "${shader_source_list}\n" @ONLY)

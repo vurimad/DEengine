@@ -5,6 +5,7 @@
 #include "asset/shader_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
+#include "cooker/cook_state.h"
 #include "cooker/cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/shader_cooker.h"
@@ -1358,6 +1359,63 @@ TEST_CASE("shader modules cook to .deshader, and the library builds pipelines fr
     REQUIRE(other.ok());
     CHECK_FALSE(library->pipeline(*other).is_valid()); // that permutation wasn't cooked
 
+    // Hot reload of cooked files takes only what's stamped with this build's sources, and keeps the
+    // pipeline it has otherwise, until the stamp is right again.
+    auto reloading =
+        de::shader::ShaderLibrary::create_cooked(*device, *vfs, jobs, {.hot_reload = true, .poll_interval_ms = 0});
+    REQUIRE(reloading.ok());
+    const auto watched = reloading->create_compute({.module = "tests.fill_buffer"});
+    REQUIRE(watched.ok());
+    const de::rhi::PipelineHandle first = reloading->pipeline(*watched);
+    REQUIRE(first.is_valid());
+    const de::asset::CookedPath watched_file = cooked_path(shader_asset_id("tests.fill_buffer"), AssetType::Shader);
+    // The same bytes, written until the file's time shows it: file systems tick coarsely.
+    const auto recook_file = [&] {
+        const std::string text = read_text(*vfs, watched_file.c_str());
+        const auto before = vfs->file_info(watched_file.c_str());
+        REQUIRE(before.ok());
+        while (vfs->file_info(watched_file.c_str())->modified_time == before->modified_time) {
+            REQUIRE(vfs->write_file(watched_file.c_str(), bytes_of(text)).ok());
+        }
+    };
+    const uint64_t built = de::shader::built_source_hash();
+
+    recook_file();
+    reloading->reload_now();
+    CHECK(reloading->stats().reloads == 1);
+    const de::rhi::PipelineHandle second = reloading->pipeline(*watched);
+    CHECK(second != first);
+
+    recook_file();
+    REQUIRE(write_shader_stamp(*vfs, built + 1).ok()); // cooked from other sources
+    reloading->reload_now();
+    CHECK(reloading->stats().reloads == 1);
+    CHECK(reloading->pipeline(*watched) == second);
+    REQUIRE(vfs->remove_file(kShaderStampPath).ok()); // a cook running
+    reloading->reload_now();
+    CHECK(reloading->stats().reloads == 1);
+    CHECK(reloading->pipeline(*watched) == second);
+    REQUIRE(write_shader_stamp(*vfs, built).ok()); // it's settled: what was waiting comes in
+    reloading->reload_now();
+    CHECK(reloading->stats().reloads == 2);
+    const de::rhi::PipelineHandle third = reloading->pipeline(*watched);
+    CHECK(third != second);
+
+    // The stamp going wrong while a build is on its way stops that too.
+    recook_file();
+    reloading->update(); // starts it: nothing else can finish it but the calls below
+    CHECK(reloading->stats().compiling == 1);
+    REQUIRE(write_shader_stamp(*vfs, built + 1).ok());
+    reloading->reload_now();
+    CHECK(reloading->stats().compiling == 0);
+    CHECK(reloading->stats().reloads == 2);
+    CHECK(reloading->stats().failed_reloads == 1);
+    CHECK(reloading->pipeline(*watched) == third);
+    REQUIRE(write_shader_stamp(*vfs, built).ok());
+    reloading->reload_now();
+    CHECK(reloading->stats().reloads == 3);
+    CHECK(reloading->pipeline(*watched) != third);
+
     // Shaders cooked from other sources than this build's are refused, and refused only here:
     // compiling from source (dev builds, hot reload) doesn't look at what's cooked.
     REQUIRE(de::asset::write_shader_stamp(*vfs, de::shader::built_source_hash() + 1).ok());
@@ -1483,7 +1541,7 @@ TEST_CASE("a cook stamps the shader sources it read, and --check reports cooked 
     constexpr std::string_view kEdited = "[shader(\"compute\")] [numthreads(2, 1, 1)] void compute_main() {}\n";
     constexpr std::string_view kBroken = "[shader(\"compute\")] [numthreads(1, 1, 1)] void compute_main() { nope }\n";
     constexpr std::string_view kStale = "stale";
-    const Sandbox sandbox;
+    Sandbox sandbox;
     Vfs vfs = cooker_vfs(sandbox);
     de::core::JobSystem jobs({.worker_count = 1});
     auto compiler = de::shader::ShaderCompiler::create(vfs, {.debug_info = false, .checks = false});
@@ -1580,9 +1638,68 @@ TEST_CASE("a cook stamps the shader sources it read, and --check reports cooked 
     sandbox.add_game_file("shader_sources.hash", "garbled");
     checked = check();
     CHECK(has_message(checked, "shaders", "re-run the cooker"));
-    // Cooking heals both, with every module up to date.
+    // Cooking heals both.
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(check().ok());
+
+    // A first cook killed halfway, or a state file lost: what tells is the cooked files.
+    REQUIRE(vfs.remove_file(kShaderStampPath).ok());
+    REQUIRE(vfs.remove_file(de::cooker::CookState::kPath).ok());
+    checked = check();
+    CHECK(has_message(checked, "shaders", kStale));
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(check().ok());
+
+    // A shader saved during the cook: what's cooked may be from either side, so no stamp, and a
+    // failed cook. The next one cooks every module, trusting no record of this one.
+    de::cooker::CookOptions saving{.content = false};
+    saving.before_shader_stamp = [](void* context) {
+        write_src(*static_cast<const Sandbox*>(context), "shaders/library.slang", "float helper(); // saved\n");
+    };
+    saving.before_shader_stamp_context = &sandbox;
+    const CookReport saved = de::cooker::cook(vfs, jobs, &*compiler, saving);
+    CHECK_FALSE(saved.ok());
+    CHECK(has_message(saved, "shaders", "changed during the cook"));
+    CHECK_FALSE(vfs.exists(kShaderStampPath));
+    CHECK_FALSE(de::shader::check_cooked_shaders(vfs, sources()).ok());
     again = cook(&*compiler);
-    CHECK(again.stats.cooked == 0);
+    CHECK(again.ok());
+    CHECK(again.stats.cooked == 2);
+    CHECK(again.stats.up_to_date == 0);
+    CHECK(*read_shader_stamp(vfs) == sources());
+
+    // The old stamp can't be removed (here, a folder has its name): it would outlive a partial
+    // cook, so the shaders aren't touched, and the cook failed.
+    const de::asset::CookedPath one = cooked_path(shader_asset_id("one"), AssetType::Shader);
+    const std::string before_stuck = read_text(vfs, one.c_str());
+    REQUIRE(vfs.remove_file(kShaderStampPath).ok());
+    sandbox.add_game_file("shader_sources.hash/in_the_way", "x");
+    write_src(sandbox, "shaders/one.slang", kModule);
+    const CookReport stuck = cook(&*compiler);
+    CHECK_FALSE(stuck.ok());
+    CHECK(has_message(stuck, "", "could not be removed"));
+    CHECK(stuck.stats.cooked == 0);
+    CHECK(stuck.stats.removed == 0);
+    CHECK(read_text(vfs, one.c_str()) == before_stuck);
+    de::platform::PathString in_the_way = sandbox.game();
+    REQUIRE(in_the_way.append("/shader_sources.hash"));
+    REQUIRE(de::platform::delete_tree(in_the_way.c_str()).ok());
+    REQUIRE(cook(&*compiler).ok());
+    CHECK(read_text(vfs, one.c_str()) != before_stuck);
+    CHECK(check().ok());
+
+    // A module that can't be cooked for its name is in the hash but not in game:/: no stamp. Other
+    // files in the tree aren't modules, and say nothing.
+    constexpr std::string_view kLongName =
+        "shaders/a_name_longer_than_any_module_can_have_for_the_shader_library_to_hold.slang";
+    write_src(sandbox, kLongName, kModule);
+    const CookReport too_long = cook(&*compiler);
+    CHECK(has_message(too_long, kLongName, "longer than"));
+    CHECK_FALSE(vfs.exists(kShaderStampPath));
+    remove_src(sandbox, kLongName);
+    write_src(sandbox, "shaders/notes.md", "notes");
+    const CookReport notes = cook(&*compiler);
+    CHECK(notes.ok());
     CHECK(check().ok());
 }
 

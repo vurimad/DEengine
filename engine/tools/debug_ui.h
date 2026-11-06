@@ -28,14 +28,14 @@ struct DebugUiState;
 
 // The debug UI of a running engine: the ImGui context, its platform side and its renderer, made
 // together and torn down together in the right order (renderer, platform, context) when it goes.
-// Without a shader library there is no renderer, and no UI frames are built.
+// Without a renderer (it couldn't be made) no UI frames are built.
 //
 //     if (ui.begin_frame(window, dt)) { ...ImGui windows...; ui.end_frame(); }   // before uploader.record()
 //     ...
 //     ui.add_pass(graph, backbuffer, format);
 class DebugUi {
 public:
-    static DebugUi create(platform::Window& window, rhi::Device& device, shader::ShaderLibrary* shaders,
+    static DebugUi create(platform::Window& window, rhi::Device& device, shader::ShaderLibrary& shaders,
                           rhi::Uploader& uploader);
 
     ~DebugUi();

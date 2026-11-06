@@ -76,7 +76,7 @@ struct Engine {
     rhi::Device& device;
     rhi::Uploader& uploader;
     render::RenderGraph& graph;
-    shader::ShaderLibrary* shaders; // null when no shaders could be loaded (the window is cleared)
+    shader::ShaderLibrary& shaders;
     asset::AssetRegistry& assets;
     world::World& world;
     render::GpuAssets& gpu_assets;
