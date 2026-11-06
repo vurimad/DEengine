@@ -110,25 +110,25 @@ TEST_CASE("far from the origin, positions keep sub-millimeter precision, and so 
     world->advance(1.0 / 60.0);
     const de::world::RenderFrame& frame = world->render_frame();
     REQUIRE(frame.camera.valid);
-    CHECK(frame.origin_moves == 1);
     // The origin snapped to its grid near the camera; everything is small and exact relative to it.
     CHECK(std::fabs(far.x - frame.origin.x) <= de::world::kRenderOriginStep);
     CHECK(std::fmod(frame.origin.x, de::world::kRenderOriginStep) == 0.0);
     REQUIRE(frame.instances.size() == 1);
-    const float rock_x = frame.instances[0].transform[3];
+    const float rock_x = frame.instances[0].transform.position_m(0, frame.origin);
     const float eye_x = frame.camera.transform[3];
-    CHECK(near(static_cast<double>(rock_x - eye_x), 0.001, 1e-5)); // 1 mm apart, seen as 1 mm apart
+    CHECK(near(static_cast<double>(rock_x - eye_x), 0.001, 1e-4)); // 1 mm apart, seen as 1 mm apart
 
-    // The camera moves a little: the origin stays (nothing to re-upload).
+    // The camera moves a little: the origin stays.
+    const double origin_x = frame.origin.x;
     eye.set(Transform{.position = far + DVec3(500.0, 0.0, 0.0)});
     world->advance(1.0 / 60.0);
     world->advance(1.0 / 60.0);
-    CHECK(frame.origin_moves == 1);
+    CHECK(frame.origin.x == origin_x);
     // A long way: the origin follows, once.
     eye.set(Transform{.position = far + DVec3(5000.0, 0.0, 0.0)});
     world->advance(1.0 / 60.0);
     world->advance(1.0 / 60.0);
-    CHECK(frame.origin_moves == 2);
+    CHECK(frame.origin.x != origin_x);
 }
 
 TEST_CASE("render extraction: interpolated instances and the active camera, nothing else") {
@@ -145,16 +145,16 @@ TEST_CASE("render extraction: interpolated instances and the active camera, noth
     REQUIRE(frame.instances.size() == 1);
     const de::world::RenderInstance& instance = frame.instances[0];
     CHECK(instance.mesh.index == 3);
-    CHECK(instance.transform[0] == 2.0f); // scale x on the diagonal
-    CHECK(instance.transform[3] == 1.0f); // translation x
-    CHECK(instance.transform[7] == 2.0f);
-    CHECK(instance.transform[11] == 3.0f);
+    CHECK(instance.transform.rows[0].linear[0] == 2.0f); // scale x on the diagonal
+    CHECK(instance.transform.position_m(0) == 1.0f);     // translation x
+    CHECK(instance.transform.position_m(1) == 2.0f);
+    CHECK(instance.transform.position_m(2) == 3.0f);
 
     // Moving: shown between the last two ticks.
     a.set(Transform{.position = {11.0, 2.0, 3.0}, .scale = {2.0f, 2.0f, 2.0f}});
     world->advance(1.5 / 60.0); // one tick, half a tick left over
     CHECK(near(world->alpha(), 0.5, 1e-3));
-    CHECK(near(frame.instances[0].transform[3], 6.0, 1e-2)); // halfway from 1 to 11
+    CHECK(near(frame.instances[0].transform.position_m(0), 6.0, 1e-2)); // halfway from 1 to 11
 }
 
 namespace {
@@ -225,12 +225,13 @@ TEST_CASE("render extraction: what moves is sent every frame, and once more when
     world->advance(kTick * 1.25); // a tick, and a quarter left over
     REQUIRE(sent_for(frame, mover_slot) != nullptr);
     CHECK(sent_rows(frame) == 1);
-    const float first_x = sent_for(frame, mover_slot)->transform[3];
+    const float first_x = sent_for(frame, mover_slot)->transform.position_m(0);
     world->advance(kTick * 0.25); // no tick, just further between the same two
     REQUIRE(sent_for(frame, mover_slot) != nullptr);
     CHECK(sent_rows(frame) == 1);
-    CHECK(sent_for(frame, mover_slot)->transform[3] > first_x);
-    CHECK(sent_for(frame, mover_slot)->transform[3] != sent_for(frame, mover_slot)->previous_transform[3]);
+    CHECK(sent_for(frame, mover_slot)->transform.position_m(0) > first_x);
+    CHECK(sent_for(frame, mover_slot)->transform.position_m(0) !=
+          sent_for(frame, mover_slot)->previous_transform.position_m(0));
 
     // It stops, and stays still for the next tick: one last row, whose motion is none, and then nothing.
     world->advance(kTick);
@@ -242,7 +243,7 @@ TEST_CASE("render extraction: what moves is sent every frame, and once more when
             if (sent == nullptr) {
                 return false;
             }
-            if (sent->transform[3] == sent->previous_transform[3]) {
+            if (sent->transform.position_m(0) == sent->previous_transform.position_m(0)) {
                 return true;
             }
         }
@@ -295,9 +296,9 @@ TEST_CASE("render extraction: a mover's last row has no motion in it") {
     for (int i = 0; i < 12; ++i) {
         world->advance(kTick);
         if (const de::world::RenderInstance* sent = sent_for(frame, slot); sent != nullptr) {
-            moved = moved || sent->transform[3] != sent->previous_transform[3];
-            last_x = sent->transform[3];
-            last_previous_x = sent->previous_transform[3];
+            moved = moved || sent->transform.position_m(0) != sent->previous_transform.position_m(0);
+            last_x = sent->transform.position_m(0);
+            last_previous_x = sent->previous_transform.position_m(0);
         }
     }
     CHECK(moved);
@@ -321,8 +322,8 @@ TEST_CASE("render extraction: a static entity placed somewhere new is sent") {
     de::world::place(rock, Transform{.position = {2.0, 0.0, 0.0}});
     world->advance(kTick);
     REQUIRE(sent_for(frame, slot) != nullptr);
-    CHECK(sent_for(frame, slot)->transform[3] == 2.0f);
-    CHECK(sent_for(frame, slot)->previous_transform[3] == 2.0f);
+    CHECK(sent_for(frame, slot)->transform.position_m(0) == 2.0f);
+    CHECK(sent_for(frame, slot)->previous_transform.position_m(0) == 2.0f);
 }
 
 TEST_CASE("render extraction: a new mesh on an entity is sent") {
@@ -444,7 +445,7 @@ TEST_CASE("render extraction: slots come and go with entities and their meshes")
     CHECK(sent_for(frame, b.get<de::world::RenderSlot>().slot) != nullptr);
 }
 
-TEST_CASE("render extraction: all of them, when the render origin moves or the renderer asks") {
+TEST_CASE("render extraction: all of them when the renderer asks, and none when the render origin moves") {
     auto world = World::create();
     REQUIRE(world.ok());
     const flecs::world& ecs = world->ecs();
@@ -480,18 +481,69 @@ TEST_CASE("render extraction: all of them, when the render origin moves or the r
     world->advance(kTick);
     CHECK(frame.instances.empty());
 
-    // The origin moves: every row is relative to it, so every row is sent, once.
-    const uint64_t moves = frame.origin_moves;
+    // The origin moves: no row holds it, so none is sent, and what's sent later is where it is in the world.
+    const double origin_x = frame.origin.x;
     de::world::place(eye, Transform{.position = {5000.0, 0.0, 10.0}});
-    for (int i = 0; i < 4 && frame.origin_moves == moves; ++i) {
+    for (int i = 0; i < 4 && frame.origin.x == origin_x; ++i) {
         world->advance(kTick);
     }
-    REQUIRE(frame.origin_moves == moves + 1);
-    CHECK(frame.all_instances);
-    CHECK(sent_rows(frame) == kCount);
-    world->advance(kTick);
+    REQUIRE(frame.origin.x != origin_x);
     CHECK_FALSE(frame.all_instances);
     CHECK(frame.instances.empty());
+    world->resync_render_instances();
+    world->advance(kTick);
+    REQUIRE(sent_rows(frame) == kCount);
+    CHECK(frame.instances[3].transform.rows[0].position_steps == de::world::render_position_steps(3.0));
+    CHECK(frame.instances[3].transform.position_m(0, frame.origin) == doctest::Approx(3.0 - frame.origin.x));
+}
+
+TEST_CASE("an instance's position wraps, and is right near the origin wherever that is in the world") {
+    // Past the 32 bits' range, and past it again by a different amount.
+    const DVec3 origin{10'240'000.0, -7'168'000.0, 1'024.0};
+    const DVec3 place = origin + DVec3(100.25, -2000.5, 0.0);
+    de::world::RenderTransform transform;
+    transform.set_position_m(0, place.x);
+    transform.set_position_m(1, place.y);
+    transform.set_position_m(2, place.z);
+    CHECK(transform.position_m(0, origin) == 100.25f);
+    CHECK(transform.position_m(1, origin) == -2000.5f);
+    CHECK(transform.position_m(2, origin) == 0.0f);
+    // The steps are as fine as a float at 1 km, and a move of less than half a step rounds away.
+    transform.set_position_m(2, origin.z + 1.0 / de::world::kRenderStepsPerM);
+    CHECK(transform.position_m(2, origin) == static_cast<float>(1.0 / de::world::kRenderStepsPerM));
+    transform.set_position_m(2, origin.z + 0.4 / de::world::kRenderStepsPerM);
+    CHECK(transform.position_m(2, origin) == 0.0f);
+    // It rounds either way, on either side of the world's zero.
+    CHECK(de::world::render_position_steps(0.6 / de::world::kRenderStepsPerM) == 1U);
+    CHECK(de::world::render_position_steps(-0.6 / de::world::kRenderStepsPerM) == UINT32_MAX);
+    CHECK(de::world::render_position_steps(-0.4 / de::world::kRenderStepsPerM) == 0U);
+}
+
+TEST_CASE("render extraction: says when something it sends is too far from the origin to draw in its place") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    constexpr double kFarOut = 1'000'000.0;
+    const flecs::entity near_it = ecs.entity().set(MeshInstance{});
+    de::world::place(near_it, Transform{.position = {kFarOut + de::world::kRenderReachM - 2000.0, 0.0, 0.0}});
+    const flecs::entity eye = ecs.entity().set(Camera{});
+    de::world::place(eye, Transform{.position = {kFarOut, 0.0, 0.0}});
+    ecs.set(de::world::ActiveCamera{.entity = eye.id()});
+    world->advance(kTick);
+    const de::world::RenderFrame& frame = world->render_frame();
+    REQUIRE(sent_rows(frame) == 1);
+    CHECK_FALSE(frame.instance_out_of_reach); // in reach, though a long way from the world's zero
+
+    const flecs::entity left_behind = ecs.entity().set(MeshInstance{});
+    de::world::place(left_behind, Transform{.position = {0.0, 0.0, 0.0}});
+    world->advance(kTick);
+    CHECK(frame.instance_out_of_reach);
+    // It says so for the frame that sent it.
+    for (int i = 0; i < 4; ++i) {
+        world->advance(kTick);
+    }
+    CHECK(frame.instances.empty());
+    CHECK_FALSE(frame.instance_out_of_reach);
 }
 
 TEST_CASE("render extraction: fog volumes, relative to the render origin, and the shape of what's placed") {
@@ -832,7 +884,7 @@ TEST_CASE("extraction covers many small tables at once, each entity exactly once
     int misplaced = 0;
     for (const de::world::RenderInstance& instance : instances) {
         ++seen[instance.mesh.index];
-        misplaced += instance.transform[3] == static_cast<float>(instance.mesh.index) ? 0 : 1;
+        misplaced += instance.transform.position_m(0) == static_cast<float>(instance.mesh.index) ? 0 : 1;
     }
     CHECK(misplaced == 0);
     CHECK(std::count(seen.begin(), seen.end(), 1) == static_cast<std::ptrdiff_t>(next));

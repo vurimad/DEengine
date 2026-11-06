@@ -25,12 +25,43 @@ public struct SceneFrame
     public float4 previous_view_proj[4]; // rows: last frame's camera, relative to this frame's render origin
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
     public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA, zw: its offset in NDC
+    public uint4 render_origin_steps;      // xyz: the origin, as an instance's position is kept
 };
 
 public static const uint kCascadeCount = 4;
 
-// An instance in the frame's buffer: three rows of its transform, then three of last frame's.
-public static const uint kInstanceRows = 6;
+// One row of where an instance is. The position is the world's, in whole kMetersPerRenderStep (0.06 mm), and holds no
+// render origin, so the origin can move with nothing sent. It wraps at 32 bits, and so does taking the origin off it,
+// so the world has no limit: only what's drawn has to be within 131 km of the origin. Matches world::RenderTransform.
+public struct InstanceRow
+{
+    public float3 linear; // rotation and scale
+    public uint position_steps;
+};
+
+public struct InstanceTransform
+{
+    public InstanceRow row0;
+    public InstanceRow row1;
+    public InstanceRow row2;
+};
+
+public static const float kMetersPerRenderStep = 1.0 / 16384.0;
+
+// A point in the instance's own space, relative to the render origin.
+public float3 instance_point(InstanceTransform transform, uint3 origin_steps, float3 local)
+{
+    const uint3 position_steps = uint3(transform.row0.position_steps, transform.row1.position_steps, transform.row2.position_steps);
+    return float3(dot(transform.row0.linear, local), dot(transform.row1.linear, local), dot(transform.row2.linear, local))
+           + float3(int3(position_steps - origin_steps)) * kMetersPerRenderStep;
+}
+
+// An instance as the GPU keeps it between frames: where it is, and where it was last frame.
+public struct GpuInstance
+{
+    public InstanceTransform transform;
+    public InstanceTransform previous_transform;
+};
 
 // What one draw of a mesh part needs beyond its place in the geometry pool. A draw's first instance is
 // the index of its first record, so a draw of N instances reads N records: SV_VulkanInstanceID finds it.
@@ -48,10 +79,9 @@ public struct GpuMeshInfo
 {
     public float3 center; // of its bounding sphere, in object space
     public float radius;
-    public uint vertex_offset; // its first vertex in the geometry pool
-    public uint first_lod;     // in the LOD table
+    public uint first_lod; // in the LOD table
     public uint lod_count;
-    public uint padding;
+    public uint2 padding;
 };
 
 public struct GpuMeshLod
@@ -66,23 +96,48 @@ public struct GpuMeshPart
     public uint first_index; // in the geometry pool
     public uint index_count;
     public uint material;
+    public uint vertex_offset; // its mesh's first vertex in the geometry pool
 };
 
 public static const uint kCullViewCount = 1 + kCascadeCount; // the camera, then each cascade
 public static const uint kNoMesh = 0xffffffffu;
 
+// Draws of one part in one group merge into one instanced draw. The camera's plain draws, what's fading, and each cascade
+// are a group each.
+public static const uint kDrawKinds = 4;
+public static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
+public static const uint kCullGroups = 2 + kCascadeCount;
+public static const uint kPartLost = 0xffffffffu; // in place of where a part's records start: no room for it
+
+// Which draw list a group's part lands in. The camera's groups have a list for every pipeline state ([masked][double-sided]);
+// a cascade's casters differ only by the alpha test. As in scene_renderer.cpp.
+public uint draw_list_of(uint group, uint material_flags)
+{
+    const uint masked = (material_flags & kMaterialMasked) != 0 ? 1u : 0u;
+    const uint double_sided = (material_flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
+    return group < 2 ? group * kDrawKinds + masked * 2 + double_sided : 2 * kDrawKinds + 2 * (group - 2) + masked;
+}
+
+// What the draw assignment counts, after a count of draw slots per list, which a counted draw reads. What's drawn is
+// counted, not what's lost.
+public static const uint kCountTriangles = kDrawListCount; // for the camera, then for the cascades
+public static const uint kCountRecordsUsed = kDrawListCount + 2;
+public static const uint kCountRecordsLost = kDrawListCount + 3;
+public static const uint kCountDraws = kDrawListCount + 4; // for the camera, then for the cascades
+public static const uint kCountRecordsPerList = kDrawListCount + 6;
+
 public struct GpuCullView
 {
-    public float4 planes[6]; // inside: dot(xyz, p) + w >= 0, in render-origin space
+    public float4 planes[12]; // inside: dot(xyz, p) + w >= 0, in render-origin space
     public uint plane_count;
-    public uint first_list;
-    public uint lists_by_kind; // a list per draw kind, or else one for opaque and one for masked
     public uint lod_perspective; // a LOD's error shrinks with depth, or else it doesn't
+    public uint view_padding[2];
     public float4 depth_plane;   // dot(xyz, p) + w is the depth in front of the eye, in render-origin space
     public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
                                  // be. Below 0: LOD 0 everywhere
     public float lod_fade_end;   // that error (where it's 1, a LOD comes in), at which it has taken over. 1: no fade
-    public float padding[2];
+    public float min_radius_m;   // anything smaller doesn't draw here
+    public float padding;
 };
 
 public struct GpuDrawList

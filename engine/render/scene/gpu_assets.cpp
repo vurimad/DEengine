@@ -122,6 +122,8 @@ struct GpuAssetsState {
     uint64_t part_table_address = 0;
     core::RangeAllocator lod_ranges;
     core::RangeAllocator part_ranges;
+    uint32_t part_table_used = 0;
+    uint32_t part_table_size = 0;
     core::Array<uint32_t> free_mesh_slots{render_heap()};
     core::HashMap<uint64_t, uint32_t> mesh_slots{render_heap()}; // by the handle's key
     core::Array<GpuMeshKinds> slot_kinds{render_heap()};
@@ -558,6 +560,7 @@ struct GpuAssetsState {
                        .first_lod = lod_ranges.allocate(asset->lods.count),
                        .lod_count = asset->lods.count};
         entry.gpu.vertex_offset = static_cast<uint32_t>(entry.place.first_vertex);
+        part_table_used = std::max(part_table_used, static_cast<uint32_t>(entry.place.first_part + parts_total));
         entry.gpu.table_slot = take_mesh_slot(handle);
         std::memcpy(entry.gpu.bounds_min, asset->bounds.min, sizeof(entry.gpu.bounds_min));
         std::memcpy(entry.gpu.bounds_max, asset->bounds.max, sizeof(entry.gpu.bounds_max));
@@ -570,7 +573,6 @@ struct GpuAssetsState {
         pending_meshes.push(key);
 
         entry.info = {.radius_m = asset->bounds.radius,
-                      .vertex_offset = entry.gpu.vertex_offset,
                       .first_lod = static_cast<uint32_t>(entry.place.first_lod),
                       .lod_count = static_cast<uint32_t>(entry.lods.size())};
         std::memcpy(entry.info.center, asset->bounds.center, sizeof(entry.info.center));
@@ -645,7 +647,8 @@ struct GpuAssetsState {
                     const GpuMeshPart resolved{.first_index =
                                                    static_cast<uint32_t>(entry.place.first_index) + part.first_index,
                                                .index_count = part.index_count,
-                                               .material = slot};
+                                               .material = slot,
+                                               .vertex_offset = static_cast<uint32_t>(entry.place.first_vertex)};
                     if (count < resolved_before) {
                         changed = changed || entry.parts[count].material != slot;
                         entry.parts[count] = resolved;
@@ -834,6 +837,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
     }
     state->part_table = *part_table;
     state->part_table_address = desc.device->buffer_address(*part_table);
+    state->part_table_size = desc.max_parts;
     for (uint32_t slot = desc.max_meshes; slot > 0; --slot) {
         state->free_mesh_slots.push(slot - 1); // handed out from the back: lowest first
     }
@@ -1014,6 +1018,14 @@ uint64_t GpuAssets::lod_table_address() const {
 
 uint64_t GpuAssets::part_table_address() const {
     return state_->part_table_address;
+}
+
+uint32_t GpuAssets::part_table_used() const {
+    return state_->part_table_used;
+}
+
+uint32_t GpuAssets::part_table_size() const {
+    return state_->part_table_size;
 }
 
 uint64_t GpuAssets::pool_vertex_address() const {

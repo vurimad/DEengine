@@ -1,39 +1,30 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
-// bounding sphere. What's in a view adds the parts of its mesh's coarsest LOD that's good enough there to
-// that view's draw lists: a record and draw arguments per part, and a count the draw pass reads
-// (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the parts of both, to
-// lists of their own. The order within a list depends on the threads: nothing here may rely on it.
+// bounding sphere: a cascade's view is what can shadow something it lights. What's in a view uses the parts of its
+// mesh's coarsest LOD that's good enough there. While a LOD takes over from the one before, it uses the parts of both,
+// in a group of their own.
+//
+// It runs twice around scene.cull_assign, so everything of one part in one group is one instanced draw: first it counts
+// them, then that gives each its draw and where its records go, and then it writes those records. Both runs have to
+// find the same parts. The order within a draw depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
-// Matches rhi::DrawIndexedIndirectArgs.
-struct DrawIndexedArgs
-{
-    uint index_count;
-    uint instance_count;
-    uint first_index;
-    int vertex_offset;
-    uint first_instance;
-};
-
-// Lists and views, as in scene_renderer.cpp.
-static const uint kDrawKinds = 4;
-static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
-
 struct CullPush
 {
-    float4* instances;     // kInstanceRows per slot, staying between frames
-    uint* instance_meshes; // per slot, its slot in the mesh table, or kNoMesh
+    SceneFrame* frame;
+    GpuInstance* instances; // per slot, staying between frames
+    uint* instance_meshes;  // per slot, its slot in the mesh table, or kNoMesh
     GpuMeshInfo* meshes;
     GpuMeshLod* lods;
     GpuMeshPart* parts;
-    GpuMaterial* materials;
     GpuCullView* views;
-    GpuDrawList* lists;
-    DrawIndexedArgs* args; // by slot, as a draw's first instance
-    GpuDraw* records;      // by slot
-    uint* counts;          // per list, then the triangles kept for the camera and for the cascades
+    GpuDraw* records;
+    uint* part_keys;     // per group and part: how many, and then the next of its records to write. 0 between frames
+    uint* part_used;     // the keys in use this frame
+    uint* part_dispatch; // the dispatch over them: first of all, how many there are
     uint instance_count;
+    uint part_count;
+    uint writing; // 0: count, 1: write the records
 };
 
 [[vk::push_constant]]
@@ -102,43 +93,36 @@ LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radiu
     return pick;
 }
 
-// A LOD's parts into the view's lists, and how many triangles they are. fade is as in GpuDraw.
-uint add_parts(GpuCullView* view, GpuMeshInfo mesh, GpuMeshLod lod, uint instance, float fade)
+// A LOD's parts, counted or written. fade is as in GpuDraw.
+void add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
 {
-    uint triangles = 0;
+    const uint group = view_index == 0 ? (fade != 0.0 ? 1u : 0u) : 1 + view_index;
     for (uint p = 0; p < lod.part_count; ++p)
     {
-        const GpuMeshPart part = push.parts[lod.first_part + p];
-        const uint flags = push.materials[part.material].flags;
-        const uint masked = (flags & kMaterialMasked) != 0 ? 1u : 0u;
-        const uint double_sided = (flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
-        // A view with every pipeline state has a list per kind ([masked][double-sided]), and again for what's fading; a
-        // cascade's casters differ only by the alpha test.
-        const uint kind = masked * 2 + double_sided + (fade != 0.0 ? kDrawKinds : 0u);
-        const uint list = view.first_list + (view.lists_by_kind != 0 ? kind : masked);
-        uint index;
-        InterlockedAdd(push.counts[list], 1, index);
-        const GpuDrawList draws = push.lists[list];
-        if (index >= draws.capacity) // a material changed kind, or a mesh is on its way out
+        const uint part_index = lod.first_part + p;
+        const uint key = group * push.part_count + part_index;
+        if (push.writing == 0)
         {
-            continue;
+            uint before;
+            InterlockedAdd(push.part_keys[key], 1, before);
+            if (before == 0)
+            {
+                uint used;
+                InterlockedAdd(push.part_dispatch[0], 1, used);
+                push.part_used[used] = key;
+            }
         }
-        const uint slot = draws.first_slot + index;
-        DrawIndexedArgs args;
-        args.index_count = part.index_count;
-        args.instance_count = 1;
-        args.first_index = part.first_index;
-        args.vertex_offset = int(mesh.vertex_offset);
-        args.first_instance = slot;
-        push.args[slot] = args;
-        GpuDraw record;
-        record.instance = instance;
-        record.material = part.material;
-        record.fade = fade;
-        push.records[slot] = record;
-        triangles += part.index_count / 3;
+        else if (push.part_keys[key] != kPartLost)
+        {
+            uint slot;
+            InterlockedAdd(push.part_keys[key], 1, slot);
+            GpuDraw record;
+            record.instance = instance;
+            record.material = push.parts[part_index].material;
+            record.fade = fade;
+            push.records[slot] = record;
+        }
     }
-    return triangles;
 }
 
 [shader("compute")]
@@ -156,20 +140,19 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     GpuMeshInfo mesh;
     mesh.center = float3(0.0);
     mesh.radius = 0.0;
-    mesh.vertex_offset = 0;
     mesh.first_lod = 0;
     mesh.lod_count = 0;
-    mesh.padding = 0;
+    mesh.padding = uint2(0);
     if (mesh_slot != kNoMesh)
     {
         mesh = push.meshes[mesh_slot];
     }
-    const float4 row0 = push.instances[instance * kInstanceRows + 0];
-    const float4 row1 = push.instances[instance * kInstanceRows + 1];
-    const float4 row2 = push.instances[instance * kInstanceRows + 2];
-    const float4 local = float4(mesh.center, 1.0);
-    const float3 center = float3(dot(row0, local), dot(row1, local), dot(row2, local));
+    const InstanceTransform transform = push.instances[instance].transform;
+    const float3 center = instance_point(transform, push.frame.render_origin_steps.xyz, mesh.center);
     // The longest axis: exact for any rotation and scale, a little short only for a transform that shears.
+    const float3 row0 = transform.row0.linear;
+    const float3 row1 = transform.row1.linear;
+    const float3 row2 = transform.row2.linear;
     const float3 axis0 = float3(row0.x, row1.x, row2.x);
     const float3 axis1 = float3(row0.y, row1.y, row2.y);
     const float3 axis2 = float3(row0.z, row1.z, row2.z);
@@ -179,18 +162,16 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     for (uint v = 0; v < kCullViewCount; ++v)
     {
         GpuCullView* view = push.views + v;
-        if (mesh.lod_count == 0 || !in_view(view, center, radius))
+        if (mesh.lod_count == 0 || radius < view.min_radius_m || !in_view(view, center, radius))
         {
             continue;
         }
         const LodPick pick = pick_lod(view, mesh, center, radius, scale);
         const bool fading = pick.fade < 1.0;
-        uint triangles = add_parts(view, mesh, pick.lod, instance, fading ? pick.fade : 0.0);
+        add_parts(v, pick.lod, instance, fading ? pick.fade : 0.0);
         if (fading)
         {
-            triangles += add_parts(view, mesh, pick.finer, instance, -pick.fade);
+            add_parts(v, pick.finer, instance, -pick.fade);
         }
-        uint ignored;
-        InterlockedAdd(push.counts[kDrawListCount + (v == 0 ? 0u : 1u)], triangles, ignored);
     }
 }
