@@ -42,6 +42,7 @@ namespace de::app {
 //   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
 //   --lod-error-pixels X  how far a LOD may lie from LOD 0 (default 1); 0 draws LOD 0 everywhere
+//   --lod-fade X     how long LODs take to fade into each other, as a share of a LOD's error (default 0.2); 0 cuts
 //   --show-sticks    dev builds: deadzone off, raw stick values logged twice a second (drift)
 struct FrameworkArgs {
     int argc = 0;
@@ -51,6 +52,7 @@ struct FrameworkArgs {
     const char* src_dir = nullptr;       // null: this repository, in dev builds
     float deadzone = -1.0f;              // below 0: the default
     float lod_error_pixels = 1.0f;       // --lod-error-pixels: 0 draws LOD 0 everywhere, to compare with
+    float lod_fade = 0.2f;               // --lod-fade: 0 cuts between LODs, to compare with
     uint32_t window_width_points = 1600; // --window 2560x1440
     uint32_t window_height_points = 900;
     bool fullscreen = false; // --fullscreen: the display's own size, whatever the window's

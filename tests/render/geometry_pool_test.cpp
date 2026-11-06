@@ -112,6 +112,68 @@ void put_grid(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId material, f
     put_mesh(vfs, model, mesh_id, material, lod_count);
 }
 
+// A grid like put_grid, with exactly these LODs: each draws in one of two materials, so a picture shows which LOD went
+// where, and has this error. The cooker can't be asked for that, so its file is changed afterward.
+struct ColoredLod {
+    uint32_t material = 0; // 0 or 1
+    float error_m = 0.0f;
+};
+void put_colored_lods(const de::platform::Vfs& vfs, AssetId mesh_id, AssetId first, AssetId second,
+                      std::initializer_list<ColoredLod> lods) {
+    constexpr uint32_t kCells = 32;
+    de::cooker::ModelData model;
+    for (uint32_t material = 0; material < 2; ++material) {
+        de::cooker::ModelPrimitive& primitive = model.primitives.emplace();
+        primitive.material = material;
+        static_cast<void>(model.materials.emplace());
+        for (uint32_t y = 0; y <= kCells; ++y) {
+            for (uint32_t x = 0; x <= kCells; ++x) {
+                de::cooker::ModelVertex& vertex = primitive.vertices.emplace();
+                vertex.position[0] = (static_cast<float>(x) / kCells * 2.0f) - 1.0f;
+                vertex.position[1] = (static_cast<float>(y) / kCells * 2.0f) - 1.0f;
+                // Apart by a little: where parts touch, the cooker keeps their vertices where they are.
+                vertex.position[2] =
+                    (0.02f * std::sin(vertex.position[0] * 7.0f) * std::sin(vertex.position[1] * 5.0f)) +
+                    (static_cast<float>(material) * 0.001f);
+                vertex.normal[1] = 0.0f;
+                vertex.normal[2] = 1.0f;
+            }
+        }
+        for (uint32_t y = 0; y < kCells; ++y) {
+            for (uint32_t x = 0; x < kCells; ++x) {
+                const uint32_t a = (y * (kCells + 1)) + x;
+                const uint32_t b = a + kCells + 1;
+                for (const uint32_t index : {a, a + 1, b + 1, a, b + 1, b}) {
+                    primitive.indices.push(index);
+                }
+            }
+        }
+    }
+    de::cooker::Diagnostics diagnostics;
+    const AssetId materials[] = {first, second};
+    auto mesh = de::cooker::cook_mesh(model, materials, {.lod_count = 8}, mesh_id, "test", diagnostics);
+    REQUIRE(mesh.ok());
+    auto* const asset = reinterpret_cast<MeshAsset*>(mesh->data());
+    REQUIRE(asset->lods.count >= lods.size());
+    auto* const cooked_lods = reinterpret_cast<de::asset::MeshLod*>(mesh->data() + asset->lods.offset);
+    const auto* const parts = reinterpret_cast<const de::asset::MeshPart*>(mesh->data() + asset->parts.offset);
+    uint32_t lod = 0;
+    for (const ColoredLod& wanted : lods) {
+        de::asset::MeshLod& cooked = cooked_lods[lod++];
+        cooked.error = wanted.error_m;
+        uint32_t found = cooked.part_count;
+        for (uint32_t part = 0; part < cooked.part_count; ++part) {
+            found = parts[cooked.first_part + part].material_slot == wanted.material ? part : found;
+        }
+        REQUIRE(found < cooked.part_count);
+        cooked.first_part += found;
+        cooked.part_count = 1;
+    }
+    asset->lods.count = lod;
+    asset->header.content_hash = de::asset::content_hash(mesh->span());
+    REQUIRE(vfs.write_file(de::asset::cooked_path(mesh_id, AssetType::Mesh).c_str(), mesh->span()).ok());
+}
+
 void put_material(const de::platform::Vfs& vfs, AssetId id, float red, float green) {
     de::cooker::MaterialBuild material;
     material.set_param(de::asset::material::kBaseColor, red, green, 0.0f, 1.0f);
@@ -174,7 +236,7 @@ struct PoolScene {
     void submit(std::initializer_list<AssetHandle> meshes) const { submit(frame_of(meshes)); }
 
     void submit(const de::world::RenderFrame& frame, const de::render::SceneLighting& lighting = {},
-                de::render::SceneView view = de::render::SceneView::BaseColor) const {
+                de::render::SceneView view = de::render::SceneView::BaseColor, bool taa = false) const {
         assets.update();
         assets.wait_all();
         gpu_assets.update();
@@ -183,7 +245,7 @@ struct PoolScene {
         graph.begin(kSize, kSize);
         const de::render::GraphTexture color =
             graph.import_texture({.texture = target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
-        renderer.add_passes(graph, color, de::rhi::Format::RGBA8Unorm, frame, lighting, view);
+        renderer.add_passes(graph, color, de::rhi::Format::RGBA8Unorm, frame, lighting, view, taa);
         graph.execute();
         device.end_frame();
     }
@@ -1558,6 +1620,7 @@ TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
         const GpuMesh* mesh = scene.gpu_assets.mesh(grid);
         REQUIRE(mesh != nullptr);
         REQUIRE(mesh->lods.size() >= 3);
+        scene.renderer.set_lod_fade(0.0f); // where a LOD comes in; just past that, the fade would draw both
         const auto triangles = [&](size_t lod) { return mesh->lod_parts(lod)[0].index_count / 3; };
         for (size_t lod = 1; lod < mesh->lods.size(); ++lod) {
             CHECK(mesh->lods[lod].error_m > mesh->lods[lod - 1].error_m);
@@ -1685,6 +1748,337 @@ TEST_CASE("a picked LOD stays within a pixel of LOD 0 on screen") {
         const auto coarse = outline(4.0f, 100.0f, coarse_triangles);
         CHECK(coarse_triangles < exact_triangles);
         CHECK(worst_difference(exact, coarse) > 2);
+    });
+}
+
+namespace {
+
+// What fades are tested with: a grid at this share of the error limit, seen head on, and a look at the middle of it.
+struct FadeView {
+    const PoolScene& scene;
+    AssetHandle grid;
+    float error_m;
+
+    struct Pixels {
+        uint32_t first = 0;  // of the first material: red
+        uint32_t second = 0; // green
+        uint32_t other = 0;
+    };
+    static constexpr uint32_t kHalf = 12;
+    static constexpr uint32_t kBox = ((2 * kHalf) + 1) * ((2 * kHalf) + 1);
+
+    // A LOD of error_m is at that share of the limit, with the default pixel of error.
+    de::world::RenderFrame frame_at(float share) const {
+        const GpuMesh* const mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        const float pixels_per_radian = static_cast<float>(kSize) / (2.0f * std::tan(0.5f));
+        const float distance = (error_m * pixels_per_radian / share) + mesh->bounds_radius_m;
+        de::world::RenderFrame frame = PoolScene::frame_of({grid});
+        const float transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3.0f - distance};
+        std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+        std::memcpy(frame.instances[0].previous_transform, transform, sizeof(transform)); // it isn't moving
+        return frame;
+    }
+
+    Pixels look_at(float share) const {
+        scene.submit_for_stats(frame_at(share));
+        return count(de::test::read_texture(scene.device, scene.target));
+    }
+
+    static Pixels count(const de::core::Array<std::byte>& pixels) {
+        Pixels counts;
+        for (uint32_t y = kMiddle - kHalf; y <= kMiddle + kHalf; ++y) {
+            for (uint32_t x = kMiddle - kHalf; x <= kMiddle + kHalf; ++x) {
+                const uint8_t* pixel = texel(pixels, x, y);
+                if (pixel[0] > 200 && pixel[1] < 50) {
+                    ++counts.first;
+                } else if (pixel[1] > 200 && pixel[0] < 50) {
+                    ++counts.second;
+                } else {
+                    ++counts.other;
+                }
+            }
+        }
+        return counts;
+    }
+};
+
+constexpr PoolOptions kFadeOptions{.pool_vertices = 16384, .pool_indices = 131072};
+constexpr float kFadeError = 0.02f; // about 2.6 m away at the limit, which fills the box
+
+} // namespace
+
+TEST_CASE("a LOD fading in has its share of the pixels, and the one it takes over from has all the rest") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        const auto stats = [&] { return scene.renderer.stats(); };
+
+        // Short of the limit, only the finer. Past the end of the fade, only the coarser.
+        auto seen = view.look_at(1.05f);
+        CHECK(seen.first == FadeView::kBox);
+        CHECK(stats().visible_draws == 1);
+        CHECK(stats().visible_fading_draws == 0);
+        seen = view.look_at(0.75f);
+        CHECK(seen.second == FadeView::kBox);
+        CHECK(stats().visible_draws == 1);
+        CHECK(stats().visible_fading_draws == 0);
+
+        // On the way, both, with the coarser's share growing, and each pixel given to exactly one.
+        const GpuMesh* const mesh = scene.gpu_assets.mesh(grid);
+        const uint32_t triangles = (mesh->lod_parts(0)[0].index_count / 3) + (mesh->lod_parts(1)[0].index_count / 3);
+        for (const float fade : {0.1f, 0.25f, 0.5f, 0.75f, 0.9f}) {
+            CAPTURE(fade);
+            seen = view.look_at(1.0f - (0.2f * fade));
+            CHECK(seen.other == 0);
+            CHECK(seen.first + seen.second == FadeView::kBox);
+            CHECK(static_cast<float>(seen.second) / FadeView::kBox == doctest::Approx(fade).epsilon(0.08));
+            CHECK(stats().visible_draws == 2);
+            CHECK(stats().visible_fading_draws == 2);
+            CHECK(stats().visible_triangles == triangles);
+        }
+
+        // With no fade it cuts where a fade starts, and draws one.
+        scene.renderer.set_lod_fade(0.0f);
+        seen = view.look_at(1.02f);
+        CHECK(seen.first == FadeView::kBox);
+        seen = view.look_at(0.98f);
+        CHECK(seen.second == FadeView::kBox);
+        CHECK(stats().visible_draws == 1);
+        CHECK(stats().visible_fading_draws == 0);
+        // With a longer one, it's still on the way where the default has finished.
+        scene.renderer.set_lod_fade(0.5f);
+        seen = view.look_at(0.75f);
+        CHECK(seen.other == 0);
+        CHECK(static_cast<float>(seen.second) / FadeView::kBox == doctest::Approx(0.5f).epsilon(0.08));
+        scene.renderer.set_lod_fade(0.2f);
+
+        // LOD 0 forced: no fade, though it's in the middle of one.
+        scene.renderer.set_lod_error_pixels(0.0f);
+        seen = view.look_at(0.9f);
+        CHECK(seen.first == FadeView::kBox);
+        CHECK(stats().visible_draws == 1);
+        CHECK(stats().visible_fading_draws == 0);
+    });
+}
+
+TEST_CASE("LOD 0 has nothing to fade from, whatever its error says") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        // One LOD, so no room in the fading lists: a fade would lose it.
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        const auto seen = view.look_at(0.9f);
+        CHECK(seen.first == FadeView::kBox);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        CHECK(scene.renderer.stats().visible_fading_draws == 0);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+    });
+}
+
+TEST_CASE("a fade between LODs moves with TAA's samples, so the history blends it") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        de::world::RenderFrame frame = view.frame_at(0.9f); // half way
+        // A camera that was here last frame too: without that, this is a cut, and TAA has no history.
+        std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
+        frame.camera.previous_vertical_fov_rad = frame.camera.vertical_fov_rad;
+        frame.camera.previous_near_m = frame.camera.near_m;
+        frame.camera.previous_valid = true;
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        // How far the middle's pixels are from each other in red, as a standard deviation.
+        const auto spread = [&](bool taa) {
+            // Long enough for the history to settle.
+            for (uint32_t i = 0; i < (taa ? 48U : 1U); ++i) {
+                ++frame.number;
+                scene.submit(frame, light, de::render::SceneView::Lit, taa);
+            }
+            const auto pixels = de::test::read_texture(scene.device, scene.target);
+            float total = 0.0f;
+            float squares = 0.0f;
+            for (uint32_t y = kMiddle - FadeView::kHalf; y <= kMiddle + FadeView::kHalf; ++y) {
+                for (uint32_t x = kMiddle - FadeView::kHalf; x <= kMiddle + FadeView::kHalf; ++x) {
+                    const auto red = static_cast<float>(texel(pixels, x, y)[0]);
+                    total += red;
+                    squares += red * red;
+                }
+            }
+            const float mean = total / FadeView::kBox;
+            return std::sqrt(std::max((squares / FadeView::kBox) - (mean * mean), 0.0f));
+        };
+        const float without = spread(false);
+        const float with = spread(true);
+        CHECK(without > 50.0f); // red pixels and green ones
+        // About a tenth, from two colors as far apart as they go, and a frame's own share is 8%.
+        CHECK(with < without / 4.0f);
+    });
+}
+
+TEST_CASE("a fade is over before the next LOD starts to come in, however near it is") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        constexpr float kNext = 1.05f;
+        put_colored_lods(
+            scene.vfs, kGrid, kRed, kGreen,
+            {{.material = 0}, {.material = 1, .error_m = kFadeError}, {.material = 0, .error_m = kFadeError * kNext}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        // The next comes in at 1 / 1.05 = 0.952 of this one's limit. Just before, this one has nearly all of it.
+        auto seen = view.look_at(0.96f);
+        CHECK(static_cast<float>(seen.second) / FadeView::kBox > 0.7f);
+        // And just after it does, still nearly all, not less than it had.
+        seen = view.look_at(0.945f);
+        CHECK(static_cast<float>(seen.second) / FadeView::kBox > 0.85f);
+    });
+}
+
+TEST_CASE("a fade passes over a LOD with no more error than the one before it") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(
+            scene.vfs, kGrid, kRed, kGreen,
+            {{.material = 0}, {.material = 1, .error_m = kFadeError}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        // The middle one would never be seen alone, so what it takes over from is LOD 0.
+        const auto seen = view.look_at(0.9f);
+        CHECK(seen.other == 0);
+        CHECK(static_cast<float>(seen.first) / FadeView::kBox == doctest::Approx(0.5f).epsilon(0.08));
+    });
+}
+
+TEST_CASE("what's fading keeps its alpha test and which sides it shows") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        using de::asset::AlphaMode;
+        using de::asset::MaterialFlags;
+        constexpr AssetId kCutOut = AssetId::from_value(0x76);
+        constexpr AssetId kTwoSided = AssetId::from_value(0x77);
+        const auto put = [&](AssetId id, AlphaMode mode, MaterialFlags flags, float red, float green, float alpha) {
+            de::cooker::MaterialBuild build;
+            build.alpha_mode = mode;
+            build.flags = flags;
+            build.set_param(de::asset::material::kBaseColor, red, green, 0.0f, alpha);
+            const auto material = de::cooker::cook_material(build, id);
+            REQUIRE(
+                scene.vfs.write_file(de::asset::cooked_path(id, AssetType::Material).c_str(), material.span()).ok());
+        };
+        put(kCutOut, AlphaMode::Masked, MaterialFlags::None, 1.0f, 0.0f, 0.0f);
+        put(kTwoSided, AlphaMode::Opaque, MaterialFlags::DoubleSided, 0.0f, 1.0f, 1.0f);
+
+        // LOD 0 entirely cut out, LOD 1 not: only LOD 1's share shows, and nothing red.
+        put_colored_lods(scene.vfs, kGrid, kCutOut, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle masked = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView masked_view{.scene = scene, .grid = masked, .error_m = kFadeError};
+        auto seen = masked_view.look_at(0.9f);
+        CHECK(seen.first == 0);
+        CHECK(static_cast<float>(seen.second) / FadeView::kBox == doctest::Approx(0.5f).epsilon(0.08));
+        CHECK(scene.renderer.stats().visible_fading_draws == 2);
+
+        // A masked material that isn't cut out gets its share, as any other does.
+        constexpr AssetId kShown = AssetId::from_value(0x79);
+        constexpr AssetId kShownMesh = AssetId::from_value(0x7a);
+        put(kShown, AlphaMode::Masked, MaterialFlags::None, 1.0f, 0.0f, 1.0f);
+        // It's the coarser, and in front: drawn without its share, it would cover everything.
+        put_colored_lods(scene.vfs, kShownMesh, kGreen, kShown,
+                         {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle shown = scene.load(kShownMesh);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView shown_view{.scene = scene, .grid = shown, .error_m = kFadeError};
+        seen = shown_view.look_at(0.9f);
+        CHECK(seen.other == 0);
+        CHECK(static_cast<float>(seen.first) / FadeView::kBox == doctest::Approx(0.5f).epsilon(0.08));
+
+        // From behind, a double-sided LOD shows and a single-sided one doesn't.
+        constexpr AssetId kBoth = AssetId::from_value(0x78);
+        put_colored_lods(scene.vfs, kBoth, kRed, kTwoSided, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle both = scene.load(kBoth);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView both_view{.scene = scene, .grid = both, .error_m = kFadeError};
+        de::world::RenderFrame frame = both_view.frame_at(0.9f);
+        // Half a turn about Y.
+        frame.instances[0].transform[0] = -1.0f;
+        frame.instances[0].transform[10] = -1.0f;
+        scene.submit_for_stats(frame);
+        seen = FadeView::count(de::test::read_texture(scene.device, scene.target));
+        CHECK(seen.first == 0);
+        CHECK(static_cast<float>(seen.second) / FadeView::kBox == doctest::Approx(0.5f).epsilon(0.08));
+    });
+}
+
+TEST_CASE("every instance can be fading at once, and a mesh with one LOD needs no room for that") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle grid = scene.load(kGrid);
+        const AssetHandle square = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+
+        scene.submit_for_stats(PoolScene::frame_of({square}));
+        const uint32_t calls_one_lod = scene.renderer.stats().indirect_calls;
+        CHECK(scene.renderer.stats().visible_fading_draws == 0);
+
+        de::world::RenderFrame frame = view.frame_at(0.9f);
+        const de::world::RenderInstance first = frame.instances[0];
+        constexpr uint32_t kCount = 16;
+        for (uint32_t i = 1; i < kCount; ++i) {
+            frame.instances.push(first);
+        }
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == 2 * kCount);
+        CHECK(scene.renderer.stats().visible_fading_draws == 2 * kCount);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        CHECK(scene.renderer.stats().indirect_calls > calls_one_lod);
+        // With no fades, no room for them.
+        scene.renderer.set_lod_fade(0.0f);
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().indirect_calls == calls_one_lod);
+    });
+}
+
+TEST_CASE("shadow cascades cut between LODs while the camera fades") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        const GpuMesh* const mesh = scene.gpu_assets.mesh(grid);
+        REQUIRE(mesh != nullptr);
+        const uint32_t lod0 = mesh->lod_parts(0)[0].index_count / 3;
+        const uint32_t lod1 = mesh->lod_parts(1)[0].index_count / 3;
+        const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        // Cascades of many sizes, so each passes through the sizes where this LOD would be fading in it. A cascade has
+        // room for one LOD of it, and takes no more.
+        de::render::SceneLighting shadowed = light;
+        for (int step = 0; step < 29; ++step) {
+            const float distance_m = 2.0f * std::pow(1.2f, static_cast<float>(step)); // up to about 400 m
+            CAPTURE(distance_m);
+            shadowed.shadows = {.distance_m = distance_m, .split_lambda = 0.0f};
+            scene.submit_for_stats(view.frame_at(0.9f), shadowed, de::render::SceneView::ShadowMask);
+            const de::render::SceneRendererStats stats = scene.renderer.stats();
+            CHECK(stats.visible_fading_draws == 2);
+            CHECK(stats.visible_shadow_draws > 0);
+            CHECK(stats.draws_lost == 0);
+            CHECK(stats.visible_shadow_triangles >= stats.visible_shadow_draws * std::min(lod0, lod1));
+            CHECK(stats.visible_shadow_triangles <= stats.visible_shadow_draws * std::max(lod0, lod1));
+        }
     });
 }
 

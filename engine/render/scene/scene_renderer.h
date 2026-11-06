@@ -108,11 +108,14 @@ struct SceneRendererStats {
     uint32_t instance_updates = 0;    // this frame, what changed
     uint32_t drawn = 0;               // with their mesh on the GPU
     uint32_t draws = 0;               // parts to cull for the G-buffer (one per instance's mesh part)
+                                      // A fading instance draws two LODs, so visible_draws can pass this.
     uint32_t shadow_draws = 0;        // and for the shadow cascades
     uint32_t indirect_calls = 0;      // what the CPU records for all of them
     // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.
     uint32_t visible_draws = 0;
+    uint32_t visible_fading_draws = 0; // of those, what's fading between LODs: both LODs of each
     uint32_t visible_shadow_draws = 0;
+    uint32_t draws_lost = 0; // past the end of a list, which has room for all that should land in it, so normally 0
     uint32_t visible_triangles = 0;
     uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
@@ -169,6 +172,11 @@ public:
     // How far a LOD may lie from LOD 0 where it's picked: this many pixels on screen, and shadow map texels in a
     // cascade. 0 draws LOD 0 everywhere, to compare with.
     void set_lod_error_pixels(float pixels);
+
+    // How long the camera's LODs take to fade into each other: a LOD comes in when its error reaches that limit, and
+    // has taken over when its error has fallen by this share of it, or sooner if the next is near. An object draws
+    // twice meanwhile. 0 cuts between them; shadow cascades always do.
+    void set_lod_fade(float share);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).

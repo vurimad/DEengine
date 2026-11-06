@@ -1,8 +1,8 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
 // bounding sphere. What's in a view adds the parts of its mesh's coarsest LOD that's good enough there to
 // that view's draw lists: a record and draw arguments per part, and a count the draw pass reads
-// (scene_renderer.cpp, GpuDrawList). The order within a list depends on the threads: nothing here may
-// rely on it.
+// (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the parts of both, to
+// lists of their own. The order within a list depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
@@ -17,7 +17,8 @@ struct DrawIndexedArgs
 };
 
 // Lists and views, as in scene_renderer.cpp.
-static const uint kDrawListCount = 4 + 2 * kCascadeCount;
+static const uint kDrawKinds = 4;
+static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
 
 struct CullPush
 {
@@ -50,14 +51,26 @@ bool in_view(GpuCullView* view, float3 center, float radius)
     return true;
 }
 
+struct LodPick
+{
+    GpuMeshLod lod;
+    GpuMeshLod finer; // what it's taking over from, drawn too while fade is below 1
+    float fade;       // the share of pixels that are lod's. Above 0: a part with no pixels would look like no fade
+};
+
 // The coarsest LOD whose error is at most a pixel (or shadow map texel) in this view, from the sphere's nearest depth:
 // what's on screen scales with depth, not distance, so a mesh in a corner gets what it would get in the middle.
-GpuMeshLod pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radius, float scale)
+// The fade comes from the error alone, so it needs no history: a LOD comes in at the limit, where it's still good enough,
+// and finishes as its error falls to lod_fade_end. It's complete before the next LOD can start.
+LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radius, float scale)
 {
-    GpuMeshLod picked = push.lods[mesh.first_lod];
+    LodPick pick;
+    pick.lod = push.lods[mesh.first_lod];
+    pick.finer = pick.lod;
+    pick.fade = 1.0;
     if (view.lod_scale < 0.0)
     {
-        return picked;
+        return pick;
     }
     float error_scale = scale * view.lod_scale;
     if (view.lod_perspective != 0)
@@ -65,16 +78,67 @@ GpuMeshLod pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float ra
         // At the sphere itself or inside it, no error is small enough.
         error_scale /= max(dot(view.depth_plane.xyz, center) + view.depth_plane.w - radius, 1e-4);
     }
+    float fade_end = view.lod_fade_end;
+    bool has_finer = false; // LOD 0 has nothing to fade from, whatever its error says
     for (uint l = 1; l < mesh.lod_count; ++l)
     {
         const GpuMeshLod coarser = push.lods[mesh.first_lod + l];
         if (coarser.error_m * error_scale > 1.0)
         {
+            fade_end = max(fade_end, pick.lod.error_m / coarser.error_m);
             break;
         }
-        picked = coarser;
+        if (coarser.error_m > pick.lod.error_m) // of two with the same error, the first is never seen alone
+        {
+            pick.finer = pick.lod;
+            has_finer = true;
+        }
+        pick.lod = coarser;
     }
-    return picked;
+    if (has_finer && fade_end < 1.0)
+    {
+        pick.fade = clamp((1.0 - pick.lod.error_m * error_scale) / (1.0 - fade_end), 1e-4, 1.0);
+    }
+    return pick;
+}
+
+// A LOD's parts into the view's lists, and how many triangles they are. fade is as in GpuDraw.
+uint add_parts(GpuCullView* view, GpuMeshInfo mesh, GpuMeshLod lod, uint instance, float fade)
+{
+    uint triangles = 0;
+    for (uint p = 0; p < lod.part_count; ++p)
+    {
+        const GpuMeshPart part = push.parts[lod.first_part + p];
+        const uint flags = push.materials[part.material].flags;
+        const uint masked = (flags & kMaterialMasked) != 0 ? 1u : 0u;
+        const uint double_sided = (flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
+        // A view with every pipeline state has a list per kind ([masked][double-sided]), and again for what's fading; a
+        // cascade's casters differ only by the alpha test.
+        const uint kind = masked * 2 + double_sided + (fade != 0.0 ? kDrawKinds : 0u);
+        const uint list = view.first_list + (view.lists_by_kind != 0 ? kind : masked);
+        uint index;
+        InterlockedAdd(push.counts[list], 1, index);
+        const GpuDrawList draws = push.lists[list];
+        if (index >= draws.capacity) // a material changed kind, or a mesh is on its way out
+        {
+            continue;
+        }
+        const uint slot = draws.first_slot + index;
+        DrawIndexedArgs args;
+        args.index_count = part.index_count;
+        args.instance_count = 1;
+        args.first_index = part.first_index;
+        args.vertex_offset = int(mesh.vertex_offset);
+        args.first_instance = slot;
+        push.args[slot] = args;
+        GpuDraw record;
+        record.instance = instance;
+        record.material = part.material;
+        record.fade = fade;
+        push.records[slot] = record;
+        triangles += part.index_count / 3;
+    }
+    return triangles;
 }
 
 [shader("compute")]
@@ -119,37 +183,12 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         {
             continue;
         }
-        const GpuMeshLod lod = pick_lod(view, mesh, center, radius, scale);
-        uint triangles = 0;
-        for (uint p = 0; p < lod.part_count; ++p)
+        const LodPick pick = pick_lod(view, mesh, center, radius, scale);
+        const bool fading = pick.fade < 1.0;
+        uint triangles = add_parts(view, mesh, pick.lod, instance, fading ? pick.fade : 0.0);
+        if (fading)
         {
-            const GpuMeshPart part = push.parts[lod.first_part + p];
-            const uint flags = push.materials[part.material].flags;
-            const uint masked = (flags & kMaterialMasked) != 0 ? 1u : 0u;
-            const uint double_sided = (flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
-            // A view with every pipeline state has a list per kind ([masked][double-sided]); a cascade's casters
-            // differ only by the alpha test.
-            const uint list = view.first_list + (view.lists_by_kind != 0 ? masked * 2 + double_sided : masked);
-            uint index;
-            InterlockedAdd(push.counts[list], 1, index);
-            const GpuDrawList draws = push.lists[list];
-            if (index >= draws.capacity) // a material changed kind, or a mesh is on its way out
-            {
-                continue;
-            }
-            const uint slot = draws.first_slot + index;
-            DrawIndexedArgs args;
-            args.index_count = part.index_count;
-            args.instance_count = 1;
-            args.first_index = part.first_index;
-            args.vertex_offset = int(mesh.vertex_offset);
-            args.first_instance = slot;
-            push.args[slot] = args;
-            GpuDraw record;
-            record.instance = instance;
-            record.material = part.material;
-            push.records[slot] = record;
-            triangles += part.index_count / 3;
+            triangles += add_parts(view, mesh, pick.finer, instance, -pick.fade);
         }
         uint ignored;
         InterlockedAdd(push.counts[kDrawListCount + (v == 0 ? 0u : 1u)], triangles, ignored);

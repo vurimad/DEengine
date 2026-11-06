@@ -79,8 +79,9 @@ struct ShadowCasterPush {
 struct GpuDraw {
     uint32_t instance = 0;
     uint32_t material = 0;
+    float fade = 0.0f;
 };
-static_assert(sizeof(GpuDraw) == 8);
+static_assert(sizeof(GpuDraw) == 12);
 
 // Matches ShadowMaskPush in shaders/scene/shadow_mask.slang.
 struct ShadowMaskPush {
@@ -229,9 +230,9 @@ constexpr bool is_masked(uint32_t kind) {
 constexpr bool is_double_sided(uint32_t kind) {
     return (kind & 1U) != 0;
 }
-// The draw lists the GPU cull fills: a list per kind for the camera, then opaque and masked for each cascade, whose
-// casters differ only by the alpha test.
-constexpr uint32_t kCameraListCount = kDrawKindCount;
+// The draw lists the GPU cull fills: a list per kind for the camera, again for what's fading between LODs, then opaque
+// and masked for each cascade, whose casters differ only by the alpha test.
+constexpr uint32_t kCameraListCount = 2 * kDrawKindCount;
 constexpr uint32_t kDrawListCount = kCameraListCount + 2 * kShadowCascadeCount;
 
 constexpr uint32_t cascade_list(uint32_t cascade, bool masked) {
@@ -247,7 +248,8 @@ struct GpuCullView {
     uint32_t lod_perspective = 0;
     float depth_plane[4] = {};
     float lod_scale = 0.0f;
-    float padding_end[3] = {};
+    float lod_fade_end = 1.0f;
+    float padding_end[2] = {};
 };
 static_assert(sizeof(GpuCullView) == 144);
 
@@ -354,6 +356,8 @@ struct SceneRendererState {
     // ones with the alpha test; double-sided ones turn culling off (dynamic state).
     shader::ProgramHandle gbuffer_opaque;
     shader::ProgramHandle gbuffer_masked;
+    shader::ProgramHandle gbuffer_opaque_fading;
+    shader::ProgramHandle gbuffer_masked_fading;
     shader::ProgramHandle deferred_light;
     shader::ProgramHandle tonemap;
     shader::ProgramHandle shadow_caster_opaque; // depth only
@@ -392,7 +396,9 @@ struct SceneRendererState {
     bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
     bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
     bool warned_draw_limit = false;
+    bool warned_draws_lost = false;
     float lod_error_pixels = 1.0f;
+    float lod_fade = 0.2f;
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -425,8 +431,9 @@ struct SceneRendererState {
 
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
-             {gbuffer_opaque, gbuffer_masked, deferred_light, tonemap, shadow_caster_opaque, shadow_caster_masked,
-              shadow_mask, fog_program, fog_inject, fog_integrate, cull, instance_update, taa_program}) {
+             {gbuffer_opaque, gbuffer_masked, gbuffer_opaque_fading, gbuffer_masked_fading, deferred_light, tonemap,
+              shadow_caster_opaque, shadow_caster_masked, shadow_mask, fog_program, fog_inject, fog_integrate, cull,
+              instance_update, taa_program}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -540,6 +547,10 @@ struct SceneRendererState {
         gbuffer_opaque = make("scene.gbuffer", gbuffer, "fragment_opaque");
         gbuffer.debug_name = "gbuffer (masked)";
         gbuffer_masked = make("scene.gbuffer", gbuffer, "fragment_masked");
+        gbuffer.debug_name = "gbuffer (fading)";
+        gbuffer_opaque_fading = make("scene.gbuffer", gbuffer, "fragment_opaque_fading");
+        gbuffer.debug_name = "gbuffer (masked, fading)";
+        gbuffer_masked_fading = make("scene.gbuffer", gbuffer, "fragment_masked_fading");
 
         rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
         light.color_formats[0] = kHdrFormat;
@@ -605,6 +616,15 @@ struct SceneRendererState {
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
             const uint32_t kept = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
             (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
+            stats.draws_lost += counts[list] - kept;
+            if (counts[list] > kept && !warned_draws_lost) {
+                DE_LOG_WARN("render", "draw list %u lost %u draws: a material changing kind can do this for a frame",
+                            list, counts[list] - kept);
+                warned_draws_lost = true;
+            }
+            if (list >= kDrawKindCount && list < kCameraListCount) {
+                stats.visible_fading_draws += kept;
+            }
         }
         stats.visible_triangles = counts[kDrawListCount];
         stats.visible_shadow_triangles = counts[kDrawListCount + 1];
@@ -849,7 +869,8 @@ struct SceneRendererState {
                     .lists_by_kind = 1,
                     .lod_perspective = 1,
                     .lod_scale = lod_scale_for(static_cast<float>(height) /
-                                               (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f)))};
+                                               (2.0f * std::tan(frame.camera.vertical_fov_rad * 0.5f))),
+                    .lod_fade_end = 1.0f - lod_fade};
         // Depth along where it looks, its -Z axis. A camera's transform may scale.
         const float* const camera = frame.camera.transform;
         const float look[3] = {-camera[2], -camera[6], -camera[10]};
@@ -879,6 +900,7 @@ struct SceneRendererState {
         write_instance_updates(mapped, frame, plan);
         // What the instances can draw, from how many there are of each mesh.
         uint64_t kind_parts[kDrawKindCount] = {};
+        uint64_t fading_parts[kDrawKindCount] = {};
         const std::span<const GpuMeshKinds> kinds = gpu_assets->mesh_kinds();
         for (size_t mesh = 0; mesh < used_mesh_slots; ++mesh) {
             const uint32_t count = mesh_instances[mesh];
@@ -888,6 +910,9 @@ struct SceneRendererState {
             bool drawable = false;
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
                 kind_parts[kind] += uint64_t{count} * kinds[mesh].parts[kind];
+                // Two LODs at once, each with at most that many.
+                fading_parts[kind] +=
+                    kinds[mesh].has_lods && lod_fade > 0.0f ? uint64_t{2} * count * kinds[mesh].parts[kind] : 0;
                 drawable = drawable || kinds[mesh].parts[kind] > 0;
             }
             plan.drawn += drawable ? count : 0;
@@ -912,6 +937,9 @@ struct SceneRendererState {
         for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
             add_list(kind, kind_parts[kind]);
             plan.draws += static_cast<uint32_t>(kind_parts[kind]);
+        }
+        for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
+            add_list(kDrawKindCount + kind, fading_parts[kind]);
         }
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             add_list(cascade_list(c, false), kind_parts[0] + kind_parts[1]);
@@ -1271,6 +1299,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.last_frame_number = frame.number;
     const rhi::PipelineHandle gbuffer_opaque = state.shaders->pipeline(state.gbuffer_opaque);
     const rhi::PipelineHandle gbuffer_masked = state.shaders->pipeline(state.gbuffer_masked);
+    const rhi::PipelineHandle gbuffer_opaque_fading = state.shaders->pipeline(state.gbuffer_opaque_fading);
+    const rhi::PipelineHandle gbuffer_masked_fading = state.shaders->pipeline(state.gbuffer_masked_fading);
     const rhi::PipelineHandle light = state.shaders->pipeline(state.deferred_light);
     const rhi::PipelineHandle tonemap = state.shaders->pipeline(state.tonemap);
     const rhi::PipelineHandle caster_opaque = state.shaders->pipeline(state.shadow_caster_opaque);
@@ -1321,7 +1351,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     CullPlan plan;
     const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, plan, frame, lighting, froxel_reach,
                                                                       taa_on ? state.taa_sample : 0, width, height);
-    const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() && light.is_valid() &&
+    const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() &&
+                       gbuffer_opaque_fading.is_valid() && gbuffer_masked_fading.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
                        cull.is_valid() && instance_update.is_valid();
     if (!ready) {
@@ -1572,6 +1603,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         Targets targets;
         rhi::PipelineHandle opaque;
         rhi::PipelineHandle masked;
+        rhi::PipelineHandle opaque_fading;
+        rhi::PipelineHandle masked_fading;
         uint64_t frame_address = 0;
         GraphBuffer draws;
         GraphBuffer counts;
@@ -1584,6 +1617,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .targets = {},
                     .opaque = gbuffer_opaque,
                     .masked = gbuffer_masked,
+                    .opaque_fading = gbuffer_opaque_fading,
+                    .masked_fading = gbuffer_masked_fading,
                     .frame_address = frame_address,
                     .draws = draw_lists,
                     .counts = draw_counts,
@@ -1625,16 +1660,21 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                             data.plan.records_offset(),
                                    .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
             context.list.push_constants(push);
-            for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
-                if (data.plan.lists[kind].capacity == 0) {
+            // What's fading goes last: it has no early depth test, so everything else helps it.
+            for (uint32_t list = 0; list < kCameraListCount; ++list) {
+                if (data.plan.lists[list].capacity == 0) {
                     continue;
                 }
-                context.list.bind_pipeline(is_masked(kind) ? data.masked : data.opaque); // culls back faces
+                const uint32_t kind = list % kDrawKindCount;
+                const bool fading = list >= kDrawKindCount;
+                const rhi::PipelineHandle masked = fading ? data.masked_fading : data.masked;
+                const rhi::PipelineHandle opaque = fading ? data.opaque_fading : data.opaque;
+                context.list.bind_pipeline(is_masked(kind) ? masked : opaque); // culls back faces
                 if (is_double_sided(kind)) {
                     context.list.set_cull_mode(rhi::CullMode::None);
                 }
                 renderer.draw_list(context.list, context.buffer(data.draws), context.buffer(data.counts), data.plan,
-                                   kind);
+                                   list);
             }
             context.list.end_rendering();
         });
@@ -1973,6 +2013,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
 
 void SceneRenderer::set_lod_error_pixels(float pixels) {
     state_->lod_error_pixels = pixels;
+}
+
+void SceneRenderer::set_lod_fade(float share) {
+    state_->lod_fade = share;
 }
 
 bool SceneRenderer::instances_stale() const {

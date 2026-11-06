@@ -610,7 +610,7 @@ struct GpuAssetsState {
 
     // The most parts of each kind in any LOD, which the cull may pick for any view: what sizes the draw lists.
     static void count_kinds(MeshEntry& entry, const core::Array<GpuMaterial>& materials_now) {
-        entry.gpu.kinds = {};
+        entry.gpu.kinds = {.has_lods = entry.lods.size() > 1};
         for (size_t lod = 0; lod < entry.lods.size(); ++lod) {
             uint32_t kinds[kDrawKindCount] = {};
             for (const GpuMeshPart& part : entry.gpu.lod_parts(lod)) {
