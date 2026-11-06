@@ -2740,3 +2740,39 @@ TEST_CASE("a frozen cull picks the casters, and shadows still go through the liv
         CHECK(pixels_apart(live, de::test::read_texture(scene.device, scene.target)) == 0);
     });
 }
+
+TEST_CASE(
+    "a cull held frozen stays, and one frozen anew over frames that drew nothing takes the next drawn frame's views") {
+    with_pool({}, [](const PoolScene& scene) {
+        const FreezeScene assets(scene);
+        const de::render::SceneLighting light = freeze_light();
+        de::world::RenderFrame frame = assets.frame_at(de::DVec3(0.0), {500.0, 0.0, 0.0});
+        const auto kept = [&] {
+            scene.submit_for_stats(frame, light);
+            return scene.renderer.stats().visible_triangles;
+        };
+
+        // The framework says so every frame, drawn or not: that isn't freezing again.
+        scene.renderer.set_cull_frozen(true);
+        CHECK(kept() == 2);
+        put_camera(frame, 500.0f, 0.0f, 3.0f);
+        for (int i = 0; i < 3; ++i) {
+            scene.renderer.set_cull_frozen(true);
+            scene.empty_frame();
+        }
+        scene.renderer.set_cull_frozen(true);
+        CHECK(kept() == 2);
+
+        // Minimized, it's off for a frame and on again. Nothing was drawn meanwhile, and it's a new freeze all the
+        // same.
+        scene.renderer.set_cull_frozen(false);
+        scene.empty_frame();
+        scene.renderer.set_cull_frozen(true);
+        scene.empty_frame();
+        CHECK(kept() == 4);
+        CHECK(is_green(de::test::read_texture(scene.device, scene.target), kLeft));
+        put_camera(frame, 0.0f, 0.0f, 3.0f);
+        CHECK(kept() == 4);
+        CHECK_FALSE(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
+    });
+}

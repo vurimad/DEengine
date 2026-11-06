@@ -89,8 +89,10 @@ struct Engine {
     // What each frame draws, as the application sets it.
     render::SceneLighting lighting;
     render::SceneView view = render::SceneView::Lit;
-    bool taa = false;         // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+    bool taa = false; // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+#if DE_BUILD_DEV
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
+#endif
 };
 
 // A value from settings text like config/engine.settings (Engine::settings): one setting a line, a

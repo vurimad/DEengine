@@ -262,6 +262,35 @@ TEST_CASE("the stats panel draws whatever the frame's numbers are") {
     CHECK(ImGui::GetDrawData()->TotalVtxCount > 0);
 }
 
+TEST_CASE("the stats panel says when the cull is frozen, and what it kept for the shadows") {
+    const ImGuiScope imgui;
+    ImGui::GetIO().DisplaySize = ImVec2(1280.0f, 720.0f); // what's outside the display isn't drawn
+    ImGui::GetIO().Fonts->Build();
+    // What's on screen is more glyphs, or fewer: a panel's own numbers are the same each time but for these.
+    const auto vertices = [](bool frozen, uint32_t shadow_draws, uint32_t shadow_triangles) {
+        de::tools::StatsPanel panel;
+        panel.record({.frame_ms = 8.0f,
+                      .cull_frozen = frozen,
+                      .visible_shadow_draws = shadow_draws,
+                      .visible_shadow_triangles = shadow_triangles});
+        bool open = true;
+        for (int frame = 0; frame < 2; ++frame) { // a new window is hidden on its first frame, while it sizes itself
+            ImGui::NewFrame();
+            panel.draw(&open);
+            ImGui::Render();
+        }
+        return ImGui::GetDrawData()->TotalVtxCount;
+    };
+    const int settling = vertices(false, 0, 0); // the window's first use sizes it
+    CHECK(settling > 0);
+    const int live = vertices(false, 1, 1);
+    CHECK(vertices(false, 123456, 123456) == live); // live, they're not shown
+    const int frozen_few = vertices(true, 1, 1);
+    CHECK(frozen_few > live);
+    CHECK(vertices(true, 123456, 1) > frozen_few);
+    CHECK(vertices(true, 1, 123456) > frozen_few);
+}
+
 TEST_CASE("late frames are found whatever the frame rate, a rhythm or a hitch") {
     const float steady[] = {4.2f, 4.1f, 4.2f, 4.1f, 4.2f, 4.1f};
     CHECK(de::tools::late_frames(steady) == 0);

@@ -31,6 +31,9 @@ struct FrameStats {
     bool has_camera = false; // the active camera's place, to come back to a spot
     DVec3 camera_position{0.0};
     Quat camera_rotation{1.0f, 0.0f, 0.0f, 0.0f};
+    bool cull_frozen = false; // SceneRenderer::set_cull_frozen: said in the panel, with what shadows can be judged by
+    uint32_t visible_shadow_draws = 0;
+    uint32_t visible_shadow_triangles = 0;
 };
 
 // The frame stats panel (M0a): frame time and its history, heap allocations per frame, GPU memory

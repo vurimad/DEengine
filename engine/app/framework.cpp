@@ -327,8 +327,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit,
-                  .taa = setting(as_text(settings), "taa") == "on",
-                  .freeze_cull = false};
+                  .taa = setting(as_text(settings), "taa") == "on"};
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
@@ -403,6 +402,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 static_cast<double>(input.state(sticks[1]).value), static_cast<double>(input.state(sticks[2]).value),
                 static_cast<double>(input.state(sticks[3]).value));
         }
+        // Whether or not this frame draws: a minimized frame's toggle counts too, as it does for the application.
+        if (scene_renderer) {
+            scene_renderer->set_cull_frozen(engine.freeze_cull);
+        }
+        DE_PROFILE_PLOT("cull frozen", static_cast<int64_t>(engine.freeze_cull ? 1 : 0));
         // The debug UI's frame; its textures go to the uploader before record().
         if (debug_ui.begin_frame(*window, static_cast<float>(measured_s))) {
             if (show_stats) {
@@ -423,7 +427,6 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                                                                      .final_state = rhi::ResourceState::Present,
                                                                      .discard = true});
             if (scene_renderer) {
-                scene_renderer->set_cull_frozen(engine.freeze_cull);
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
                                            engine.lighting, engine.view, engine.taa);
                 if (scene_renderer->instances_stale()) {
@@ -486,6 +489,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             active_camera != nullptr && active_camera->entity != 0 && ecs.is_alive(active_camera->entity)
                 ? ecs.entity(active_camera->entity).try_get<world::WorldTransform>()
                 : nullptr;
+        const render::SceneRendererStats cull_stats =
+            scene_renderer ? scene_renderer->stats() : render::SceneRendererStats{};
         stats_panel.record(
             {.frame_ms = static_cast<float>(measured_s * 1000.0),
              .heap_allocations = allocations,
@@ -497,7 +502,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
              .gpu_frame_ms = graph->gpu_frame_ms(),
              .has_camera = camera_place != nullptr,
              .camera_position = camera_place != nullptr ? camera_place->position : DVec3(0.0),
-             .camera_rotation = camera_place != nullptr ? camera_place->rotation : Quat(1.0f, 0.0f, 0.0f, 0.0f)});
+             .camera_rotation = camera_place != nullptr ? camera_place->rotation : Quat(1.0f, 0.0f, 0.0f, 0.0f),
+             .cull_frozen = engine.freeze_cull,
+             .visible_shadow_draws = cull_stats.visible_shadow_draws,
+             .visible_shadow_triangles = cull_stats.visible_shadow_triangles});
 #endif
         DE_PROFILE_FRAME();
         ++frame;

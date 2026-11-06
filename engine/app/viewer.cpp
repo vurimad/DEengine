@@ -52,6 +52,9 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     toggle_taa_ = engine.input.add_action("debug.toggle_taa"_sid, platform::ActionKind::Button);
     freeze_cull_ = engine.input.add_action("debug.freeze_cull"_sid, platform::ActionKind::Button);
     engine.freeze_cull = has_flag(args, "--freeze-cull");
+    if (engine.freeze_cull) {
+        DE_LOG_INFO("render", "cull frozen at the first frame's camera (--freeze-cull; F4 to go live)");
+    }
 #endif
     return true;
 }
