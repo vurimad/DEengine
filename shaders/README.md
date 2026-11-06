@@ -8,7 +8,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | --- | --- |
 | `scene/scene_common.slang` | What the scene passes share: frame constants, vertex and material layouts, G-buffer packing |
 | `scene/shadow_caster.slang` | The sun's shadow casters: depth into one cascade's tile of the shadow atlas, alpha-tested for masked materials |
-| `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test) |
+| `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test), and `fragment_opaque_fading` and `fragment_masked_fading` for what's fading between LODs |
 | `scene/shadow_mask.slang` | The sun's shadow mask: the cascades resolved per pixel, with a contact-hardening filter |
 | `scene/deferred_light.slang` | Deferred lighting: the sun (GGX, Lambert, wrap and backlight for translucency) through the shadow mask, hemisphere ambient, the sky |
 | `scene/fog_inject.slang`, `scene/fog_integrate.slang` | The froxel grid (compute): each froxel's extinction and light, with fog volumes, the sun's shadows and last frame's light at the same place; then each column integrated front to back |

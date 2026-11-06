@@ -108,6 +108,7 @@ struct SceneRendererStats {
     uint32_t instance_updates = 0;    // this frame, what changed
     uint32_t drawn = 0;               // with their mesh on the GPU
     uint32_t draws = 0;               // parts to cull for the G-buffer (one per instance's mesh part)
+                                      // A fading instance draws two LODs, so visible_draws can pass this.
     uint32_t shadow_draws = 0;        // and for the shadow cascades
     uint32_t indirect_calls = 0;      // what the CPU records for all of them
     // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.

@@ -1,9 +1,8 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
 // bounding sphere. What's in a view adds the parts of its mesh's coarsest LOD that's good enough there to
 // that view's draw lists: a record and draw arguments per part, and a count the draw pass reads
-// While a LOD takes over from the one before, it adds the parts of both, to lists of their own.
-// (scene_renderer.cpp, GpuDrawList). The order within a list depends on the threads: nothing here may
-// rely on it.
+// (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the parts of both, to
+// lists of their own. The order within a list depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
@@ -52,8 +51,6 @@ bool in_view(GpuCullView* view, float3 center, float radius)
     return true;
 }
 
-// The coarsest LOD whose error is at most a pixel (or shadow map texel) in this view, from the sphere's nearest depth:
-// what's on screen scales with depth, not distance, so a mesh in a corner gets what it would get in the middle.
 struct LodPick
 {
     GpuMeshLod lod;
@@ -61,6 +58,8 @@ struct LodPick
     float fade;       // the share of pixels that are lod's. Above 0: a part with no pixels would look like no fade
 };
 
+// The coarsest LOD whose error is at most a pixel (or shadow map texel) in this view, from the sphere's nearest depth:
+// what's on screen scales with depth, not distance, so a mesh in a corner gets what it would get in the middle.
 // The fade comes from the error alone, so it needs no history: a LOD comes in at the limit, where it's still good enough,
 // and finishes as its error falls to lod_fade_end. It's complete before the next LOD can start.
 LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radius, float scale)
@@ -80,6 +79,7 @@ LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radiu
         error_scale /= max(dot(view.depth_plane.xyz, center) + view.depth_plane.w - radius, 1e-4);
     }
     float fade_end = view.lod_fade_end;
+    bool has_finer = false; // LOD 0 has nothing to fade from, whatever its error says
     for (uint l = 1; l < mesh.lod_count; ++l)
     {
         const GpuMeshLod coarser = push.lods[mesh.first_lod + l];
@@ -91,10 +91,11 @@ LodPick pick_lod(GpuCullView* view, GpuMeshInfo mesh, float3 center, float radiu
         if (coarser.error_m > pick.lod.error_m) // of two with the same error, the first is never seen alone
         {
             pick.finer = pick.lod;
+            has_finer = true;
         }
         pick.lod = coarser;
     }
-    if (fade_end < 1.0)
+    if (has_finer && fade_end < 1.0)
     {
         pick.fade = clamp((1.0 - pick.lod.error_m * error_scale) / (1.0 - fade_end), 1e-4, 1.0);
     }

@@ -74,8 +74,7 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
 // evenly over the frames at each pixel, so the history blends it.
 bool faded_out(float fade, float2 pixel)
 {
-    const float noise = 52.9829189 * frac(dot(floor(pixel), float2(0.06711056, 0.00583715)));
-    const float dither = frac(noise + 0.61803399 * push.frame.taa_params.y);
+    const float dither = frac(gradient_noise(floor(pixel)) + 0.61803399 * push.frame.taa_params.y);
     return fade > 0.0 ? dither >= fade : dither < -fade;
 }
 

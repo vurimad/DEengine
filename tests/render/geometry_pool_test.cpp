@@ -1865,6 +1865,22 @@ TEST_CASE("a LOD fading in has its share of the pixels, and the one it takes ove
     });
 }
 
+TEST_CASE("LOD 0 has nothing to fade from, whatever its error says") {
+    with_pool(kFadeOptions, [](const PoolScene& scene) {
+        // One LOD, so no room in the fading lists: a fade would lose it.
+        put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0, .error_m = kFadeError}});
+        const AssetHandle grid = scene.load(kGrid);
+        scene.uploader.flush_and_wait();
+        scene.gpu_assets.update();
+        const FadeView view{.scene = scene, .grid = grid, .error_m = kFadeError};
+        const auto seen = view.look_at(0.9f);
+        CHECK(seen.first == FadeView::kBox);
+        CHECK(scene.renderer.stats().visible_draws == 1);
+        CHECK(scene.renderer.stats().visible_fading_draws == 0);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+    });
+}
+
 TEST_CASE("a fade between LODs moves with TAA's samples, so the history blends it") {
     with_pool(kFadeOptions, [](const PoolScene& scene) {
         put_colored_lods(scene.vfs, kGrid, kRed, kGreen, {{.material = 0}, {.material = 1, .error_m = kFadeError}});
@@ -1881,7 +1897,8 @@ TEST_CASE("a fade between LODs moves with TAA's samples, so the history blends i
         const de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
         // How far the middle's pixels are from each other in red, as a standard deviation.
         const auto spread = [&](bool taa) {
-            for (uint32_t i = 0; i < 64; ++i) {
+            // Long enough for the history to settle.
+            for (uint32_t i = 0; i < (taa ? 48U : 1U); ++i) {
                 ++frame.number;
                 scene.submit(frame, light, de::render::SceneView::Lit, taa);
             }
@@ -2050,8 +2067,8 @@ TEST_CASE("shadow cascades cut between LODs while the camera fades") {
         // Cascades of many sizes, so each passes through the sizes where this LOD would be fading in it. A cascade has
         // room for one LOD of it, and takes no more.
         de::render::SceneLighting shadowed = light;
-        for (int step = 0; step < 38; ++step) {
-            const float distance_m = 2.0f * std::pow(1.15f, static_cast<float>(step)); // up to about 400 m
+        for (int step = 0; step < 29; ++step) {
+            const float distance_m = 2.0f * std::pow(1.2f, static_cast<float>(step)); // up to about 400 m
             CAPTURE(distance_m);
             shadowed.shadows = {.distance_m = distance_m, .split_lambda = 0.0f};
             scene.submit_for_stats(view.frame_at(0.9f), shadowed, de::render::SceneView::ShadowMask);

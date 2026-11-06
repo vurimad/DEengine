@@ -396,6 +396,7 @@ struct SceneRendererState {
     bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
     bool cull_readback_used[rhi::kFramesInFlight] = {}; // copied to before: the graph has to order this copy after it
     bool warned_draw_limit = false;
+    bool warned_draws_lost = false;
     float lod_error_pixels = 1.0f;
     float lod_fade = 0.2f;
     SceneShadows shadows; // this frame's, within limits
@@ -616,6 +617,11 @@ struct SceneRendererState {
             const uint32_t kept = std::min(counts[list], cull_readback_plan[slot].lists[list].capacity);
             (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += kept;
             stats.draws_lost += counts[list] - kept;
+            if (counts[list] > kept && !warned_draws_lost) {
+                DE_LOG_WARN("render", "draw list %u lost %u draws: a material changing kind can do this for a frame",
+                            list, counts[list] - kept);
+                warned_draws_lost = true;
+            }
             if (list >= kDrawKindCount && list < kCameraListCount) {
                 stats.visible_fading_draws += kept;
             }

@@ -506,9 +506,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     DE_LOG_INFO(
         "render",
         "gpu assets: %u meshes, %u textures, %u materials, %llu bytes; last frame had %u of %u instances on the GPU, "
-        "%u of %u draws visible",
+        "%u draws for %u parts, %u of them fading between LODs",
         gpu_stats.meshes, gpu_stats.textures, gpu_stats.materials, static_cast<unsigned long long>(gpu_stats.bytes),
-        scene_stats.drawn, scene_stats.instances, scene_stats.visible_draws, scene_stats.draws);
+        scene_stats.drawn, scene_stats.instances, scene_stats.visible_draws, scene_stats.draws,
+        scene_stats.visible_fading_draws);
     if (gpu_stats.meshes_dropped > 0) {
         DE_LOG_WARN("render", "%u meshes didn't fit in the geometry pool", gpu_stats.meshes_dropped);
     }
