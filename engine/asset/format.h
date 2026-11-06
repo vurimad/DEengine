@@ -24,6 +24,8 @@ enum class AssetType : uint16_t {
     Cell = 5,        // .decell
     World = 6,       // .deworld
     Environment = 7, // .deenv
+    Terrain = 8,        // .deterrain
+    TerrainHeights = 9, // .deheights: never loaded whole, read a block at a time
 };
 
 // ".demesh"; "" for Unknown.

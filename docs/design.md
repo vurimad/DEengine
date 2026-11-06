@@ -38,7 +38,7 @@ The engine is designed for a full Elden Ring-scale world: at least 16 x 16 km of
 | Area | First playable | Vertical slice | Later |
 | --- | --- | --- | --- |
 | World | Streamed terrain tiles around the player | 2 x 2 km world, cells + dungeon interior, no loading screens | Multiple regions, underground maps |
-| Terrain | Heightfield clipmap, splat materials | Virtual texturing, sculpt + paint in editor, holes for caves | Runtime deformation, snow/mud trails |
+| Terrain | Streamed heightfield quadtree, splat materials | Virtual texturing, sculpt + paint in editor, holes for caves | Runtime deformation, snow/mud trails |
 | Vegetation | GPU-instanced grass on a patch | GPU-driven indirect grass fields, trees with LOD and impostors, wind | Interactive bending, destructible foliage |
 | Rendering | Deferred PBR, sun shadows | Render graph, GPU culling, cascades + local shadows, volumetrics, sky, SSR, TAA | GI probes or DDGI, upscalers |
 | VFX | GPU particles | Data-driven emitters, decals, trails, weather, spell and blood effects | Fluid/smoke sims, mesh particles at scale |
@@ -549,13 +549,13 @@ The simulation stays at a fixed 60 Hz tick; the renderer interpolates transforms
 
 ## Terrain & vegetation
 
-Terrain is a first-class system, not a mesh: a streamed heightfield rendered with GPU-driven clipmaps, shaded through a virtual texture, and covered by GPU-generated grass and foliage.
+Terrain is a first-class system, not a mesh: a streamed heightfield rendered as a GPU-driven quadtree, shaded through a virtual texture, and covered by GPU-generated grass and foliage.
 
 **Heightfield and streaming.**
 
-- World split into terrain tiles (e.g. 256 m, 1 m height resolution, 16-bit heights) cooked into a mip pyramid.
-- Geometry clipmap rings around the camera, rendered as instanced patches; LOD morphing between rings removes cracks and popping.
-- Tiles stream by distance with the world cells; far tiles keep only low mips.
+- A map is any size, read from its source; the engine must carry at least 16 x 16 km. It's cooked into a pyramid of nodes of 129 x 129 samples plus a border, 16-bit, with a fixed height step per level and a whole-number base per node, so neighbours on a level share edges to the bit. The coarsest nodes are 2,048 m across at 16 m spacing, and each level halves that. The first map comes at 2 m. The aim is 1 m everywhere and 0.5 m where authored, refined by the cooker.
+- A GPU-driven quadtree: a compute pass walks a flat table of patches (32 x 32 squares, 4 x 4 to a node), and each one decides for itself from the camera's distance, its own height bounds and what's loaded. It's the same choice for the camera and every shadow cascade, so they agree on the ground. Vertices morph toward the coarser level before a swap so nothing pops, and skirts cover what morphing can't: a neighbour two levels away while its data loads, and the edge of the map.
+- Terrain streams from the first version, on its own rings around the camera, not with the world cells: terrain never holds up a cell, and land needs no cell. Heights live in a file read a block at a time. The coarsest level is always loaded. A patch splits only once its children are on the GPU, so what's drawn is always a whole, valid surface, whatever has arrived.
 - Holes mask for cave entrances and dungeon openings; meshes (cliffs, rocks) blend into terrain with height-based blending.
 
 **Materials and texturing.**
@@ -1172,7 +1172,7 @@ Decisions so far:
 | 2026-10-31 | Deferred, GPU-driven, bindless renderer on Vulkan 1.3 | Material variety, many lights, decals, scale |
 | 2026-10-31 | Render graph with transient resource aliasing | Easy passes, automatic barriers, VRAM reuse |
 | 2026-10-31 | Lua as first-class scripting; heavy logic stays in C++ | Fast iteration without per-frame cost |
-| 2026-10-31 | Terrain clipmaps + GPU-driven indirect grass | Huge fields at low CPU cost |
+| 2026-10-31 | Terrain clipmaps + GPU-driven indirect grass (terrain superseded on 2026-11-06: quadtree, below) | Huge fields at low CPU cost |
 | 2026-10-31 | AI-friendly: text sources, command API, MCP server | AI and humans use the same doors |
 | 2026-10-31 | Elden Ring shaders used as reference only (superseded on 2026-11-03: studied in full, below) | Own implementations, clean IP |
 | 2026-10-31 | 120 FPS target for the full game; 60 Hz fixed simulation with interpolation | Smooth, responsive feel; deterministic frame data |
@@ -1213,3 +1213,5 @@ Decisions so far:
 | 2026-11-05 | Fog volumes stay in the froxel grid: 3 points through the ray's span inside each volume for extinction, and the fog pass takes the share of a slice really in front of a pixel's surface; noise and shape next, a per-pixel raymarch only if that isn't enough | Backing away from a mist bank on the ground, at about 94 m, the wave measured 7.9%; with this 2.6%, as low as mist off the ground (2.7%): what's left is the grid's. More slices cost more and helped less (128: 4.7%). Elden Ring's grid path reads one filtered sample at the pixel's depth; its mist also has moving noise and a raymarched path |
 | 2026-11-06 | One hash of all shader sources decides whether cooked shaders fit an engine, compared at startup; any edit counts, comments too, line endings don't. The build gets it from a small tool running the cooker's own code | Layouts shared with C++ are matched by hand and reached through pointers, so a mismatch was a GPU crash (`VK_ERROR_DEVICE_LOST`) in ship builds, which load cooked shaders. A hash per module would need the build to know each one's imports; asking for a cook after a comment edit costs a few seconds, a crash costs far more. The stamp comes from the sources the cooker read, not the cooker's own build, which may be older |
 | 2026-11-06 | LODs crossfade by a screen-space dither, from the error alone: a LOD comes in at the error limit and takes over within a share of it; a separate list and pipeline for what's fading; shadows keep cuts for now | The user requires a fade ("fade is a MUST"). No state per instance, so still instances cost the CPU nothing and the fade works on the GPU cull as it stands. Fading draws twice and loses early depth only where it happens. Alpha blending would need sorting, and time-based fades need history per object per view |
+| 2026-11-06 | Terrain is a GPU-driven quadtree with morphing and skirts, not clipmap rings; streaming is in from the first version (the user's call), on its own rings; a map's size comes from the map, with 16 x 16 km the least the engine must carry | Clipmap detail ignores height above the ground and spends the same on flat land and mountains, and Far Cry 5 shipped this shape. Untested here: morphing with skirts, and what it costs on our GPU |
+| 2026-11-06 | Terrain starts before the M0b gate is met (editor, Lua, headless): a deliberate departure, on the user's word. Screenshot and camera flags stand in for agent eyes until then | The look target needs real land to judge, and the rest of the gate doesn't block it |
