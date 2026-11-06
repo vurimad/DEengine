@@ -11,6 +11,7 @@
 #include "core/string_id.h"
 #include "core/text.h"
 #include "core/version.h"
+#include "physics/physics.h"
 #include "platform/events.h"
 #include "platform/input.h"
 #include "platform/platform.h"
@@ -290,11 +291,14 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_ERROR("asset", "%s", assets.error().message);
         return EXIT_FAILURE;
     }
+    // Before the world: the world's last entities let go of their bodies as it goes down.
+    physics::Physics physics({.jobs = &jobs});
     auto world = world::World::create({.jobs = &jobs, .assets = &*assets});
     if (!world) {
         DE_LOG_ERROR("world", "%s", world.error().message);
         return EXIT_FAILURE;
     }
+    physics.add_to_world(*world);
     auto gpu_assets = render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
     if (!gpu_assets) {
         DE_LOG_ERROR("render", "gpu assets: %s", gpu_assets.error().message);
@@ -341,6 +345,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .shaders = *shaders,
                   .assets = *assets,
                   .world = *world,
+                  .physics = physics,
                   .gpu_assets = *gpu_assets,
                   .settings = as_text(settings),
                   .lighting = {},

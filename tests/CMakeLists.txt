@@ -48,6 +48,7 @@ add_executable(de_tests
     render/scene_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
+    physics/physics_test.cpp
     world/scene_test.cpp
     world/world_test.cpp
     support/gpu.h

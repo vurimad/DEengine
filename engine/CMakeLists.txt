@@ -6,6 +6,7 @@ add_subdirectory(asset)
 add_subdirectory(render)
 add_subdirectory(tools)
 add_subdirectory(world)
+add_subdirectory(physics)
 add_subdirectory(app)
 
 # The one engine executable: game, editor (--editor) and headless (--headless) are modes of it.
