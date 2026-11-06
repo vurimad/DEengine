@@ -74,6 +74,12 @@ TEST_CASE("the working directory is known, in forward slashes") {
     CHECK_FALSE(folder->view().ends_with('/'));
 }
 
+TEST_CASE("test sandboxes each get a folder of their own") {
+    const Sandbox first;
+    const Sandbox second;
+    CHECK(first.game().view() != second.game().view());
+}
+
 TEST_CASE("paths follow the rules: mount prefix, lowercase, forward slashes, no dot segments") {
     const QuietLog quiet;
     const Sandbox sandbox;

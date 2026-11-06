@@ -1,4 +1,5 @@
 #include "core/job_system.h"
+#include "platform/time.h"
 #include "render/rhi/device.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
