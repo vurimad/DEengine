@@ -91,7 +91,8 @@ void trace_hook(const char* format, ...) {
 #ifdef JPH_ENABLE_ASSERTS
 bool assert_hook(const char* expression, const char* message, const char* file, JPH::uint line) {
     DE_LOG_ERROR("physics", "Jolt: %s (%s), %s:%u", expression, message != nullptr ? message : "", file, line);
-    return true; // stop here
+    DE_ASSERT_MSG(false, "a Jolt assertion failed");
+    return true;
 }
 #endif
 
@@ -132,7 +133,7 @@ public:
     explicit CoreJobSystem(core::JobSystem& jobs) : JobSystemWithBarrier(JPH::cMaxPhysicsBarriers), jobs_(jobs) {
         free_jobs_.Init(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsJobs);
     }
-    ~CoreJobSystem() override = default;
+    ~CoreJobSystem() override { drain(); }
     CoreJobSystem(const CoreJobSystem&) = delete;
     CoreJobSystem& operator=(const CoreJobSystem&) = delete;
     CoreJobSystem(CoreJobSystem&&) = delete;
@@ -140,12 +141,16 @@ public:
 
     int GetMaxConcurrency() const override { return static_cast<int>(jobs_.thread_count()); }
 
+    // A step's barrier runs jobs on the thread that waits for them, so one can end with what it ran still queued here,
+    // each holding its reference to a job. A step ends with this: they're quick, as there's nothing left in them to do.
+    void drain() { jobs_.wait(pending_); }
+
     JobHandle CreateJob(const char* name, JPH::ColorArg color, const JobFunction& function,
                         JPH::uint32 dependencies) override {
         JPH::uint32 index = 0;
         do {
             index = free_jobs_.ConstructObject(name, color, this, function, dependencies);
-        } while (index == FreeJobs::cInvalidObjectIndex); // all in use: others finish, as this thread can't help here
+        } while (index == FreeJobs::cInvalidObjectIndex); // all in use within a step: workers are finishing them
         Job* const job = &free_jobs_.Get(index);
         JobHandle handle(job); // keeps it from going before this returns
         if (dependencies == 0) {
@@ -157,7 +162,7 @@ public:
 protected:
     void QueueJob(Job* job) override {
         job->AddRef();
-        jobs_.submit(core::Job{.entry = &run_job, .context = job, .counter = nullptr, .name = "physics"});
+        jobs_.submit(core::Job{.entry = &run_job, .context = job, .counter = &pending_, .name = "physics"});
     }
 
     // In one go, so one wake-up does for them all.
@@ -168,7 +173,7 @@ protected:
             for (JPH::uint i = 0; i < chunk; ++i) {
                 jobs[first + i]->AddRef();
                 batch[i] =
-                    core::Job{.entry = &run_job, .context = jobs[first + i], .counter = nullptr, .name = "physics"};
+                    core::Job{.entry = &run_job, .context = jobs[first + i], .counter = &pending_, .name = "physics"};
             }
             jobs_.submit(std::span<const core::Job>(batch, chunk));
             first += chunk;
@@ -187,6 +192,7 @@ private:
     }
 
     core::JobSystem& jobs_;
+    core::JobCounter pending_;
     FreeJobs free_jobs_;
 };
 
@@ -309,12 +315,6 @@ private:
     flecs::entity_t entity_;
 };
 
-// A shape's kind and size, in whole millimeters, which is what bodies share one by.
-struct ShapeSize {
-    uint32_t kind = 0;
-    int32_t size[3] = {};
-    bool operator==(const ShapeSize&) const = default;
-};
 constexpr uint32_t kCharacterShape = 100; // beside ShapeKind's
 
 int32_t to_mm(float meters) {
@@ -325,19 +325,22 @@ float to_m(int32_t millimeters) {
     return static_cast<float>(static_cast<double>(millimeters) / 1000.0);
 }
 
-uint64_t hash_of(const ShapeSize& size) {
-    uint64_t hash = 0xcbf29ce484222325ULL;
-    const auto mix = [&hash](uint64_t word) {
-        hash ^= word;
-        hash *= 0x100000001b3ULL;
-        hash ^= hash >> 29U;
-    };
-    mix(size.kind);
-    for (const int32_t axis : size.size) {
-        mix(static_cast<uint32_t>(axis));
+// A shape's kind and size, in whole millimeters, which is what bodies share one by.
+struct ShapeSize {
+    uint32_t kind = 0;
+    int32_t size[3] = {};
+    bool operator==(const ShapeSize&) const = default;
+};
+
+struct ShapeSizeHash {
+    uint64_t operator()(const ShapeSize& size) const {
+        uint64_t hash = core::mix64(size.kind);
+        for (const int32_t axis : size.size) {
+            hash = core::mix64(hash ^ static_cast<uint32_t>(axis));
+        }
+        return hash;
     }
-    return hash;
-}
+};
 
 ShapeSize size_of(const Collider& collider, const Vec3& scale) {
     const Vec3 size = glm::abs(scale);
@@ -363,7 +366,7 @@ JPH::ShapeSettings::ShapeResult make_shape(const ShapeSize& size) {
     if (size.kind == kCharacterShape) {
         const float radius = to_m(size.size[0]);
         const float half_height = to_m(size.size[1]);
-        // With its origin at its feet.
+        // With its origin at its feet. Jolt's own new, which goes through the MemoryTag::Physics hooks above.
         return JPH::RotatedTranslatedShapeSettings(JPH::Vec3(0.0f, half_height + radius, 0.0f), JPH::Quat::sIdentity(),
                                                    new JPH::CapsuleShape(half_height, radius))
             .Create();
@@ -384,7 +387,7 @@ JPH::ShapeSettings::ShapeResult make_shape(const ShapeSize& size) {
 // ---- What the world holds
 // ---------------------------------------------------------------------------------------------
 
-// An entity's body, with what it last wrote to or read from its Transform, which tells a place() from its own motion.
+// An entity's body. A kinematic one keeps the pose it was last sent to, to know when it's told to go elsewhere.
 struct BodyHandle {
     JPH::uint32 id = JPH::BodyID::cInvalidBodyID;
     DVec3 position{0.0};
@@ -400,6 +403,69 @@ struct CharacterHandle {
     DVec3 position{0.0};
 };
 
+// What a body's pose may differ from its Transform by and still be its own: what comes back from Jolt isn't always the
+// same bits (it keeps a body by its center of mass, and normalizes rotations). Smaller moves than this aren't place()s.
+bool same_pose(const JPH::Body& body, const Transform& transform) {
+    const DVec3 apart = to_dvec3(body.GetPosition()) - transform.position;
+    constexpr double kSamePosition = 1e-6;
+    if (glm::dot(apart, apart) > kSamePosition * kSamePosition) {
+        return false;
+    }
+    constexpr float kSameRotation = 0.999999f;
+    return std::abs(glm::dot(to_quat(body.GetRotation()), glm::normalize(transform.rotation))) >= kSameRotation;
+}
+
+// Where an entity is in the world, by now. A new one's WorldTransform isn't filled in until the end of its first tick.
+WorldTransform world_place(flecs::entity entity, const Transform& transform) {
+    const flecs::entity parent = entity.parent();
+    const auto* const parent_world = parent.is_valid() ? parent.try_get<WorldTransform>() : nullptr;
+    if (parent_world != nullptr) {
+        return world::compose(*parent_world, transform);
+    }
+    return {.position = transform.position, .rotation = transform.rotation, .scale = transform.scale};
+}
+
+// What falls asleep during a step, which is no longer among the active bodies when it ends but moved in it. Set only
+// during a step, and from any of its threads. A body does that once in a step at most, so there's room for all of them.
+class FellAsleep final : public JPH::BodyActivationListener {
+public:
+    void reset(uint32_t max_bodies) {
+        ids_.resize(max_bodies);
+        count_.store(0, std::memory_order_relaxed);
+    }
+    void OnBodyActivated(const JPH::BodyID&, JPH::uint64) override {}
+    void OnBodyDeactivated(const JPH::BodyID& id, JPH::uint64) override {
+        ids_[count_.fetch_add(1, std::memory_order_relaxed)] = id;
+    }
+    uint32_t count() const { return count_.load(std::memory_order_relaxed); }
+    const JPH::BodyID* ids() const { return ids_.data(); }
+
+private:
+    JPH::Array<JPH::BodyID> ids_;
+    std::atomic<uint32_t> count_{0};
+};
+
+// What's waiting for its handle: made while a query ran, which is no time to change a table.
+struct NewBody {
+    flecs::entity_t entity = 0;
+    JPH::uint32 id = JPH::BodyID::cInvalidBodyID;
+    DVec3 position{0.0};
+    Quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+    BodyKind kind = BodyKind::Static;
+};
+
+struct NewCharacter {
+    flecs::entity_t entity = 0;
+    JPH::CharacterVirtual* character = nullptr;
+    DVec3 position{0.0};
+};
+
+// A row of what a step moved.
+struct WrittenRow {
+    const ecs_record_t* record = nullptr;
+    flecs::entity_t entity = 0;
+};
+
 } // namespace
 
 struct Physics::State {
@@ -408,6 +474,7 @@ struct Physics::State {
         system.Init(desc.max_bodies, 0, desc.max_body_pairs, desc.max_contact_constraints, broad_phase_layers,
                     object_vs_broad_phase, object_vs_object);
         system.SetGravity(to_jolt(desc.gravity_mps2));
+        fell_asleep.reset(desc.max_bodies);
         if (desc.jobs != nullptr && desc.jobs->worker_count() > 0) {
             jobs = ::new (allocate_job_system(sizeof(CoreJobSystem))) CoreJobSystem(*desc.jobs);
         } else {
@@ -432,11 +499,11 @@ struct Physics::State {
     static void* allocate_job_system(size_t size) { return JPH::AlignedAllocate(size, JPH_CACHE_LINE_SIZE); }
 
     const JPH::Shape* shape_for(const ShapeSize& size);
-    void create_bodies(flecs::iter& it);
-    void create_characters(flecs::iter& it);
+    void create_bodies(const flecs::world& world);
+    void create_characters(const flecs::world& world);
     void follow_transforms(float tick_s);
     void update_characters(float tick_s);
-    void write_transforms();
+    void write_transforms(const flecs::world& world);
     void step(flecs::iter& it);
 
     BroadPhaseLayers broad_phase_layers;
@@ -453,22 +520,25 @@ struct Physics::State {
     JPH::EPhysicsUpdateError warned_errors = JPH::EPhysicsUpdateError::None;
 
     // Every shape made, by size, and the references that keep them.
-    struct SharedShape {
-        ShapeSize size;
-        const JPH::Shape* shape = nullptr;
-    };
-    core::HashMap<uint64_t, SharedShape> shapes_by_size{core::heap_allocator(MemoryTag::Physics)};
+    core::HashMap<ShapeSize, const JPH::Shape*, ShapeSizeHash> shapes_by_size{core::heap_allocator(MemoryTag::Physics)};
     JPH::Array<JPH::RefConst<JPH::Shape>> shapes;
-    // What's being added this tick, kept so it doesn't allocate each time.
+    // What a tick works through, kept so it doesn't allocate each time.
     JPH::Array<JPH::BodyID> new_still;
     JPH::Array<JPH::BodyID> new_moving;
+    JPH::Array<NewBody> new_bodies;
+    JPH::Array<NewCharacter> new_characters;
+    JPH::Array<WrittenRow> written_rows;
+    JPH::Array<const ecs_table_t*> written_tables;
+    FellAsleep fell_asleep;
+    ecs_id_t transform_id = 0;
+    uint32_t transforms_written = 0;
+    uint32_t transforms_compared = 0;
 
     // Named, so the world owns them. It goes first, and a query's destructor reads it, so they're never destroyed here.
     struct Queries {
-        flecs::query<const Collider, const RigidBody, const WorldTransform> new_bodies;
-        flecs::query<CharacterController, const WorldTransform> new_characters;
-        flecs::query<const Transform, BodyHandle> placed_bodies;
-        flecs::query<Transform, BodyHandle> dynamic_bodies;
+        flecs::query<const Collider, const RigidBody, const Transform> new_bodies;
+        flecs::query<CharacterController, const Transform> new_characters;
+        flecs::query<const Transform, const BodyHandle> placed_bodies;
         flecs::query<const Transform, BodyHandle> kinematic_bodies;
         flecs::query<CharacterController, Transform, CharacterHandle> characters;
     };
@@ -478,9 +548,8 @@ struct Physics::State {
 
 // One shape for all of a size. Null, and said so, if Jolt won't have it.
 const JPH::Shape* Physics::State::shape_for(const ShapeSize& size) {
-    const uint64_t key = hash_of(size);
-    if (const SharedShape* const shared = shapes_by_size.find(key); shared != nullptr && shared->size == size) {
-        return shared->shape;
+    if (const JPH::Shape* const* const shared = shapes_by_size.find(size); shared != nullptr) {
+        return *shared;
     }
     const JPH::ShapeSettings::ShapeResult result = make_shape(size);
     if (result.HasError()) {
@@ -488,64 +557,57 @@ const JPH::Shape* Physics::State::shape_for(const ShapeSize& size) {
         return nullptr;
     }
     const JPH::RefConst<JPH::Shape>& kept = shapes.emplace_back(result.Get());
-    // Two sizes with one hash: the second is simply not shared.
-    if (shapes_by_size.find(key) == nullptr) {
-        shapes_by_size.set(key, SharedShape{.size = size, .shape = kept.GetPtr()});
-    }
+    shapes_by_size.set(size, kept.GetPtr());
     return kept.GetPtr();
 }
 
-void Physics::State::create_bodies(flecs::iter& it) {
+void Physics::State::create_bodies(const flecs::world& world) {
     JPH::BodyInterface& bodies = system.GetBodyInterfaceNoLock();
-    queries().new_bodies.each(
-        [&](flecs::entity entity, const Collider& collider, const RigidBody& body, const WorldTransform& place) {
-            const JPH::Shape* const shape = shape_for(size_of(collider, place.scale));
-            if (shape == nullptr) {
-                entity.mut(it).set(BodyHandle{}); // said so once: it won't be asked again
-                return;
+    queries().new_bodies.each([&](flecs::entity entity, const Collider& collider, const RigidBody& body,
+                                  const Transform& transform) {
+        const WorldTransform place = world_place(entity, transform);
+        NewBody made{.entity = entity.id(), .position = place.position, .rotation = place.rotation, .kind = body.kind};
+        const JPH::Shape* const shape = shape_for(size_of(collider, place.scale));
+        if (shape == nullptr) {
+            new_bodies.push_back(made); // said so once: it won't be asked again
+            return;
+        }
+        const bool moves = body.kind != BodyKind::Static;
+        const JPH::EMotionType motion = body.kind == BodyKind::Static      ? JPH::EMotionType::Static
+                                        : body.kind == BodyKind::Kinematic ? JPH::EMotionType::Kinematic
+                                                                           : JPH::EMotionType::Dynamic;
+        JPH::ObjectLayer layer = object_layer::kMoving;
+        if (!moves) {
+            constexpr float kBigM = 1000.0f;
+            const JPH::Vec3 extent = shape->GetLocalBounds().GetSize();
+            layer = extent.ReduceMax() >= kBigM ? object_layer::kStaticBig : object_layer::kStatic;
+        } else if (body.debris && body.kind == BodyKind::Dynamic) {
+            layer = object_layer::kDebris;
+        }
+        JPH::BodyCreationSettings settings(shape, to_jolt(place.position), to_jolt(place.rotation), motion, layer);
+        settings.mFriction = body.friction;
+        settings.mRestitution = body.restitution;
+        settings.mLinearDamping = body.linear_damping;
+        settings.mAngularDamping = body.angular_damping;
+        settings.mUserData = entity.id();
+        if (body.kind == BodyKind::Dynamic && body.mass_kg > 0.0f) {
+            settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+            settings.mMassPropertiesOverride.mMass = body.mass_kg;
+        }
+        const JPH::Body* const created = bodies.CreateBody(settings);
+        if (created == nullptr) {
+            if (!warned_out_of_bodies) {
+                DE_LOG_ERROR("physics", "out of bodies (%u): the rest have none", system.GetMaxBodies());
+                warned_out_of_bodies = true;
             }
-            const bool moves = body.kind != BodyKind::Static;
-            const JPH::EMotionType motion = body.kind == BodyKind::Static      ? JPH::EMotionType::Static
-                                            : body.kind == BodyKind::Kinematic ? JPH::EMotionType::Kinematic
-                                                                               : JPH::EMotionType::Dynamic;
-            JPH::ObjectLayer layer = object_layer::kMoving;
-            if (!moves) {
-                constexpr float kBigM = 1000.0f;
-                const JPH::Vec3 extent = shape->GetLocalBounds().GetSize();
-                layer = extent.ReduceMax() >= kBigM ? object_layer::kStaticBig : object_layer::kStatic;
-            } else if (body.debris && body.kind == BodyKind::Dynamic) {
-                layer = object_layer::kDebris;
-            }
-            JPH::BodyCreationSettings settings(shape, to_jolt(place.position), to_jolt(place.rotation), motion, layer);
-            settings.mFriction = body.friction;
-            settings.mRestitution = body.restitution;
-            settings.mLinearDamping = body.linear_damping;
-            settings.mAngularDamping = body.angular_damping;
-            settings.mUserData = entity.id();
-            if (body.kind == BodyKind::Dynamic && body.mass_kg > 0.0f) {
-                settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
-                settings.mMassPropertiesOverride.mMass = body.mass_kg;
-            }
-            const JPH::Body* const created = bodies.CreateBody(settings);
-            if (created == nullptr) {
-                if (!warned_out_of_bodies) {
-                    DE_LOG_ERROR("physics", "out of bodies (%u): the rest have none", system.GetMaxBodies());
-                    warned_out_of_bodies = true;
-                }
-                entity.mut(it).set(BodyHandle{});
-                return;
-            }
-            const bool asleep = !moves || (body.kind == BodyKind::Dynamic && body.start_asleep);
-            (asleep ? new_still : new_moving).push_back(created->GetID());
-            entity.mut(it).set(BodyHandle{.id = created->GetID().GetIndexAndSequenceNumber(),
-                                          .position = place.position,
-                                          .rotation = place.rotation});
-            if (body.kind == BodyKind::Dynamic) {
-                entity.mut(it).add<DynamicBody>();
-            } else if (body.kind == BodyKind::Kinematic) {
-                entity.mut(it).add<KinematicBody>();
-            }
-        });
+            new_bodies.push_back(made);
+            return;
+        }
+        const bool asleep = !moves || (body.kind == BodyKind::Dynamic && body.start_asleep);
+        (asleep ? new_still : new_moving).push_back(created->GetID());
+        made.id = created->GetID().GetIndexAndSequenceNumber();
+        new_bodies.push_back(made);
+    });
     // Together, as adding them one by one leaves the broad phase in a poor state, and after a lot, it's rebuilt.
     const size_t added = new_still.size() + new_moving.size();
     const auto add = [&bodies](JPH::Array<JPH::BodyID>& ids, JPH::EActivation activation) {
@@ -562,11 +624,26 @@ void Physics::State::create_bodies(flecs::iter& it) {
     if (added >= kOptimizeAfter) {
         system.OptimizeBroadPhase();
     }
+    // The query's finished, and nothing's deferred in a step, so this can't be undone by a delete still waiting to
+    // happen.
+    for (const NewBody& made : new_bodies) {
+        const flecs::entity entity = world.entity(made.entity);
+        entity.set(BodyHandle{.id = made.id, .position = made.position, .rotation = made.rotation});
+        if (made.id != JPH::BodyID::cInvalidBodyID) {
+            if (made.kind == BodyKind::Dynamic) {
+                entity.add<DynamicBody>();
+            } else if (made.kind == BodyKind::Kinematic) {
+                entity.add<KinematicBody>();
+            }
+        }
+    }
+    new_bodies.clear();
 }
 
-void Physics::State::create_characters(flecs::iter& it) {
+void Physics::State::create_characters(const flecs::world& world) {
     queries().new_characters.each([&](flecs::entity entity, CharacterController& controller,
-                                      const WorldTransform& place) {
+                                      const Transform& transform) {
+        const WorldTransform place = world_place(entity, transform);
         const float radius = std::max(controller.radius_m, 1e-3f);
         const ShapeSize size{.kind = kCharacterShape,
                              .size = {to_mm(radius), to_mm(std::max(controller.height_m * 0.5f - radius, 1e-3f)), 0}};
@@ -575,16 +652,21 @@ void Physics::State::create_characters(flecs::iter& it) {
         settings.mMaxSlopeAngle = controller.max_slope_rad;
         settings.mMass = controller.mass_kg;
         settings.mUp = to_jolt(kWorldUp);
+        // Jolt's own new, which goes through the MemoryTag::Physics hooks above.
         auto* const character =
             new JPH::CharacterVirtual(&settings, to_jolt(place.position), JPH::Quat::sIdentity(), entity.id(), &system);
         character->AddRef();
-        entity.mut(it).set(CharacterHandle{.character = character, .position = place.position});
+        new_characters.push_back({.entity = entity.id(), .character = character, .position = place.position});
         ++characters;
     });
+    for (const NewCharacter& made : new_characters) {
+        world.entity(made.entity).set(CharacterHandle{.character = made.character, .position = made.position});
+    }
+    new_characters.clear();
 }
 
 // A kinematic body heads for its Transform this step. A dynamic one that's been place()d goes straight there: only
-// tables something wrote to are looked at, and they're not marked as written to by this.
+// tables something else wrote to are looked at.
 void Physics::State::follow_transforms(float tick_s) {
     JPH::BodyInterface& bodies = system.GetBodyInterfaceNoLock();
     queries().kinematic_bodies.run([&](flecs::iter& it) {
@@ -604,6 +686,8 @@ void Physics::State::follow_transforms(float tick_s) {
             }
         }
     });
+    const JPH::BodyLockInterfaceNoLock& locks = system.GetBodyLockInterfaceNoLock();
+    transforms_compared = 0;
     queries().placed_bodies.run([&](flecs::iter& it) {
         while (it.next()) {
             if (!it.changed()) {
@@ -611,17 +695,16 @@ void Physics::State::follow_transforms(float tick_s) {
                 continue;
             }
             const auto transforms = it.field<const Transform>(0);
-            const auto handles = it.field<BodyHandle>(1);
+            const auto handles = it.field<const BodyHandle>(1);
+            transforms_compared += static_cast<uint32_t>(it.count());
             for (const auto row : it) {
-                BodyHandle& handle = handles[row];
+                const JPH::BodyID id(handles[row].id);
+                const JPH::Body* const body = locks.TryGetBody(id);
                 const Transform& transform = transforms[row];
-                if (transform.position != handle.position || transform.rotation != handle.rotation) {
-                    const JPH::BodyID id(handle.id);
+                if (body != nullptr && !same_pose(*body, transform)) {
                     bodies.SetPositionAndRotation(id, to_jolt(transform.position), to_jolt(transform.rotation),
                                                   JPH::EActivation::Activate);
                     bodies.SetLinearAndAngularVelocity(id, JPH::Vec3::sZero(), JPH::Vec3::sZero());
-                    handle.position = transform.position;
-                    handle.rotation = transform.rotation;
                 }
             }
         }
@@ -676,33 +759,54 @@ void Physics::State::update_characters(float tick_s) {
     });
 }
 
-// What a step moved, across the job system: each row is one body's. A table with nothing awake in it isn't marked as
-// written to, and when all's asleep, no table is looked at.
-void Physics::State::write_transforms() {
-    if (system.GetNumActiveBodies(JPH::EBodyType::RigidBody) == 0) {
+// What a step moved, which is what's awake and what fell asleep in it, across the job system: each body is its own
+// entity's. Then each table that holds any is told once, and this query catches up with that, so it's only a place()
+// that has it looking through a table next tick.
+void Physics::State::write_transforms(const flecs::world& world) {
+    transforms_written = 0;
+    const JPH::uint active = system.GetNumActiveBodies(JPH::EBodyType::RigidBody);
+    const JPH::BodyID* const awake = system.GetActiveBodiesUnsafe(JPH::EBodyType::RigidBody);
+    const uint32_t asleep = fell_asleep.count();
+    const size_t total = size_t{active} + asleep;
+    if (total == 0) {
         return;
     }
+    written_rows.resize(total);
     const JPH::BodyLockInterfaceNoLock& locks = system.GetBodyLockInterfaceNoLock();
-    queries().dynamic_bodies.run([&](flecs::iter& it) {
+    ecs_world_t* const c_world = world.c_ptr();
+    world::for_each_row_parallel(core_jobs, total, 512, [&](size_t i) {
+        written_rows[i] = {};
+        const JPH::BodyID id = i < active ? awake[i] : fell_asleep.ids()[i - active];
+        const JPH::Body* const body = locks.TryGetBody(id);
+        if (body == nullptr || !body->IsDynamic()) {
+            return; // a kinematic body's Transform is what says where it goes
+        }
+        const auto entity = static_cast<flecs::entity_t>(body->GetUserData());
+        ecs_record_t* const record = ecs_record_find(c_world, entity);
+        auto* const transform = static_cast<Transform*>(ecs_record_ensure_id(c_world, record, transform_id));
+        if (transform != nullptr) {
+            transform->position = to_dvec3(body->GetPosition());
+            transform->rotation = to_quat(body->GetRotation());
+            written_rows[i] = {.record = record, .entity = entity};
+        }
+    });
+    written_tables.clear();
+    const ecs_table_t* last_table = nullptr; // tables are few, and rows mostly come in runs of one
+    for (const WrittenRow& row : written_rows) {
+        if (row.record == nullptr) {
+            continue;
+        }
+        ++transforms_written;
+        const ecs_table_t* const table = row.record->table;
+        if (table != last_table && std::ranges::find(written_tables, table) == written_tables.end()) {
+            written_tables.push_back(table);
+            ecs_modified_id(c_world, row.entity, transform_id);
+        }
+        last_table = table;
+    }
+    // Going through a table without skipping it is what tells a query it's seen that table's state.
+    queries().placed_bodies.run([](flecs::iter& it) {
         while (it.next()) {
-            const auto transforms = it.field<Transform>(0);
-            const auto handles = it.field<BodyHandle>(1);
-            std::atomic<bool> any_awake{false};
-            world::for_each_row_parallel(core_jobs, it.count(), 2048, [&](size_t row) {
-                BodyHandle& handle = handles[row];
-                const JPH::Body* const body = locks.TryGetBody(JPH::BodyID(handle.id));
-                if (body == nullptr || !body->IsActive()) {
-                    return;
-                }
-                handle.position = to_dvec3(body->GetPosition());
-                handle.rotation = to_quat(body->GetRotation());
-                transforms[row].position = handle.position;
-                transforms[row].rotation = handle.rotation;
-                any_awake.store(true, std::memory_order_relaxed);
-            });
-            if (!any_awake.load(std::memory_order_relaxed)) {
-                it.skip();
-            }
         }
     });
 }
@@ -710,12 +814,18 @@ void Physics::State::write_transforms() {
 void Physics::State::step(flecs::iter& it) {
     DE_PROFILE_ZONE("physics step");
     const float tick_s = it.delta_time();
-    create_bodies(it);
-    create_characters(it);
-    // Handles made above wait for the tick's end, so what's new joins in from the next tick. Its body is in this step.
+    const flecs::world world = it.world();
+    create_bodies(world);
+    create_characters(world);
     follow_transforms(tick_s);
     update_characters(tick_s);
+    fell_asleep.reset(system.GetMaxBodies());
+    system.SetBodyActivationListener(&fell_asleep);
     const JPH::EPhysicsUpdateError errors = system.Update(tick_s, 1, &temp, jobs);
+    system.SetBodyActivationListener(nullptr);
+    if (!single_threaded) {
+        static_cast<CoreJobSystem*>(jobs)->drain();
+    }
     // Once per kind of error: it would go on every tick.
     const auto new_errors = static_cast<uint32_t>(errors) & ~static_cast<uint32_t>(warned_errors);
     if (new_errors != 0) {
@@ -727,7 +837,7 @@ void Physics::State::step(flecs::iter& it) {
                                                                                                         : "");
         warned_errors = static_cast<JPH::EPhysicsUpdateError>(static_cast<uint32_t>(warned_errors) | new_errors);
     }
-    write_transforms();
+    write_transforms(world);
     DE_PROFILE_PLOT("physics bodies", static_cast<int64_t>(system.GetNumBodies()));
     DE_PROFILE_PLOT("physics active bodies",
                     static_cast<int64_t>(system.GetNumActiveBodies(JPH::EBodyType::RigidBody)));
@@ -785,29 +895,21 @@ void Physics::add_to_world(world::World& world) {
     ecs.component<KinematicBody>("de::KinematicBody");
 
     State* const state = state_;
+    state->transform_id = ecs.component<Transform>().id();
     ::new (static_cast<void*>(state->queries_storage)) State::Queries{
-        .new_bodies = ecs.query_builder<const Collider, const RigidBody, const WorldTransform>("de::physics::NewBodies")
+        .new_bodies = ecs.query_builder<const Collider, const RigidBody, const Transform>("de::physics::NewBodies")
                           .cached()
                           .without<BodyHandle>()
                           .build(),
-        .new_characters = ecs.query_builder<CharacterController, const WorldTransform>("de::physics::NewCharacters")
+        .new_characters = ecs.query_builder<CharacterController, const Transform>("de::physics::NewCharacters")
                               .cached()
                               .without<CharacterHandle>()
                               .build(),
-        // Written to itself by write_transforms: a change to its handle alone doesn't make a table "changed".
-        .placed_bodies = ecs.query_builder<const Transform, BodyHandle>("de::physics::PlacedBodies")
+        .placed_bodies = ecs.query_builder<const Transform, const BodyHandle>("de::physics::PlacedBodies")
                              .cached()
                              .with<DynamicBody>()
-                             .term_at(1)
-                             .out()
                              .detect_changes()
                              .build(),
-        .dynamic_bodies = ecs.query_builder<Transform, BodyHandle>("de::physics::DynamicBodies")
-                              .cached()
-                              .with<DynamicBody>()
-                              .term_at(0)
-                              .out()
-                              .build(),
         .kinematic_bodies = ecs.query_builder<const Transform, BodyHandle>("de::physics::KinematicBodies")
                                 .cached()
                                 .with<KinematicBody>()
@@ -816,19 +918,29 @@ void Physics::add_to_world(world::World& world) {
                           .cached()
                           .build()};
 
-    ecs.system("de::PhysicsStep").kind(world.phase(world::Phase::Physics)).run([state](flecs::iter& it) {
+    // Immediate: what earlier systems deleted is gone by now, so a body can't be made for it and never let go of. It's
+    // still deferred unless it's told not to be, and what it changes has to be done by the time it looks again.
+    ecs.system("de::PhysicsStep").kind(world.phase(world::Phase::Physics)).immediate().run([state](flecs::iter& it) {
+        const flecs::world ecs_now = it.world();
+        ecs_now.defer_suspend();
         state->step(it);
+        ecs_now.defer_resume();
     });
 
     // A body goes with its handle, and its handle with what asked for it.
-    ecs.observer<BodyHandle>("de::DestroyBody").event(flecs::OnRemove).each([state](flecs::entity, BodyHandle& handle) {
-        const JPH::BodyID id(handle.id);
-        if (!id.IsInvalid()) {
-            JPH::BodyInterface& bodies = state->system.GetBodyInterfaceNoLock();
-            bodies.RemoveBody(id);
-            bodies.DestroyBody(id);
-        }
-    });
+    ecs.observer<BodyHandle>("de::DestroyBody")
+        .event(flecs::OnRemove)
+        .each([state](flecs::entity entity, BodyHandle& handle) {
+            const JPH::BodyID id(handle.id);
+            if (!id.IsInvalid()) {
+                JPH::BodyInterface& bodies = state->system.GetBodyInterfaceNoLock();
+                bodies.RemoveBody(id);
+                bodies.DestroyBody(id);
+            }
+            // Its next body may be of another kind.
+            entity.remove<DynamicBody>();
+            entity.remove<KinematicBody>();
+        });
     ecs.observer<Collider>("de::DropBodyOfCollider").event(flecs::OnRemove).each([](flecs::entity entity, Collider&) {
         entity.remove<BodyHandle>();
     });
@@ -901,7 +1013,9 @@ PhysicsStats Physics::stats() const {
     return {.bodies = state_->system.GetNumBodies(),
             .active_bodies = state_->system.GetNumActiveBodies(JPH::EBodyType::RigidBody),
             .characters = state_->characters,
-            .shapes = static_cast<uint32_t>(state_->shapes.size())};
+            .shapes = static_cast<uint32_t>(state_->shapes.size()),
+            .transforms_written = state_->transforms_written,
+            .transforms_compared = state_->transforms_compared};
 }
 
 } // namespace de::physics

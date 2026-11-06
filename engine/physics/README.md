@@ -9,8 +9,8 @@ Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, P
 ## How it fits
 
 - **Create `Physics` before the world and call `add_to_world` once the world exists.** It steps in `Phase::Physics`, at the world's fixed tick. The world's last entities let go of their bodies as it goes down, so `Physics` has to outlive it.
-- **Components drive it.** `Collider` and `RigidBody` on an entity give it a body at the start of the next tick, from its world transform, so `place()` it first. Taking either away takes the body away. Changing either later doesn't change the body.
-- **Static bodies cost nothing per tick.** Kinematic ones head for their `Transform`, and a dynamic one writes its `Transform` while it's awake. `place()` on a dynamic body or a character teleports it. A static one stays where it was made.
+- **Components drive it.** `Collider` and `RigidBody` on an entity give it a body at the start of the next tick, from where its `Transform` says. Taking either away takes the body away. Changing either later doesn't change the body.
+- **What's asleep costs nothing per tick.** Static bodies never do. Kinematic ones head for their `Transform`, and a dynamic one writes its `Transform` while it's awake and in the step it falls asleep. Writing a `Transform` from elsewhere teleports a dynamic body or a character, by a difference of more than a micrometer, and has every row of its table looked at once. A static one stays where it was made.
 - **Characters aren't bodies.** A `CharacterController` is a Jolt `CharacterVirtual`, with its entity's position at its feet. Set `desired_velocity_mps` across the ground, which is where root motion goes. Rays and shape casts don't hit them, and combat doesn't use them: it has its own swept capsules.
 - **Jolt's types stay inside this library.** Positions are doubles at both ends.
 

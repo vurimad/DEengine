@@ -292,6 +292,141 @@ uint64_t pile_result(de::core::JobSystem* jobs) {
 
 } // namespace
 
+TEST_CASE("an entity destroyed in the tick it would get its body has none left behind") {
+    Scene scene;
+    const flecs::entity doomed = scene.box({0.0, 0.0, 10.0}, {1.0f, 1.0f, 1.0f});
+    const flecs::entity doomed_walker = scene.character({0.0, 0.0, 20.0});
+    // Before the Physics phase, in the same tick, with the delete still waiting to happen when it's the deferred kind.
+    scene.ecs().system("destroys them").kind(scene.world.phase(de::world::Phase::PreSim)).run([&](flecs::iter& it) {
+        while (it.next()) {
+        }
+        if (it.world().is_alive(doomed)) {
+            doomed.mut(it).destruct();
+            doomed_walker.mut(it).destruct();
+        }
+    });
+    scene.ticks(2);
+    CHECK(scene.physics.stats().bodies == 0);
+    CHECK(scene.physics.stats().characters == 0);
+    QueryHit hit;
+    CHECK_FALSE(scene.physics.ray_cast({0.0, 0.0, 0.0}, {0.0f, 0.0f, 1.0f}, 100.0f, hit));
+}
+
+TEST_CASE("a body made again as another kind behaves as that kind") {
+    Scene scene;
+    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+    // A platform breaks loose: it falls from then on, and its Transform doesn't send it back.
+    const flecs::entity platform = scene.box({0.0, 10.0, 0.0}, {1.0f, 0.2f, 1.0f}, BodyKind::Kinematic);
+    scene.ticks(5);
+    platform.remove<RigidBody>();
+    scene.ticks(1);
+    platform.set(RigidBody{.kind = BodyKind::Dynamic});
+    scene.ticks(60);
+    CHECK(where(platform).y < 7.0);
+
+    // A dynamic body settled as static stays there, place() or not.
+    const flecs::entity crate = scene.box({5.0, 0.5, 0.0}, {0.5f, 0.5f, 0.5f}, BodyKind::Dynamic);
+    scene.ticks(120);
+    const DVec3 settled = where(crate);
+    crate.remove<RigidBody>();
+    scene.ticks(1);
+    crate.set(RigidBody{.kind = BodyKind::Static});
+    scene.ticks(1);
+    CHECK(scene.physics.stats().active_bodies <= 1);
+    de::world::place(crate, Transform{.position = settled + DVec3(20.0, 0.0, 0.0)});
+    scene.ticks(2);
+    QueryHit hit;
+    REQUIRE(scene.physics.ray_cast(settled + DVec3(0.0, 5.0, 0.0), {0.0f, -1.0f, 0.0f}, 10.0f, hit));
+    CHECK(hit.entity == crate.id());
+
+    // A dynamic body made kinematic follows its Transform, and doesn't write it.
+    const flecs::entity lift = scene.box({-5.0, 0.5, 0.0}, {0.5f, 0.5f, 0.5f}, BodyKind::Dynamic);
+    scene.ticks(120);
+    lift.remove<RigidBody>();
+    scene.ticks(1);
+    lift.set(RigidBody{.kind = BodyKind::Kinematic});
+    lift.set(Transform{.position = {-5.0, 8.0, 0.0}});
+    scene.ticks(5);
+    CHECK(where(lift).y == 8.0);
+}
+
+TEST_CASE("an entity given only a Transform has its body where and as big as that says") {
+    Scene scene;
+    const flecs::entity box = scene.ecs().entity();
+    box.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {1.0f, 1.0f, 1.0f}});
+    box.set(RigidBody{});
+    box.set(Transform{.position = {100.0, 0.0, 0.0}, .scale = {2.0f, 2.0f, 2.0f}});
+    const flecs::entity walker = scene.ecs().entity();
+    walker.set(CharacterController{});
+    walker.set(Transform{.position = {100.0, 2.0, 0.0}});
+    scene.ticks(1);
+    QueryHit hit;
+    REQUIRE(scene.physics.ray_cast({100.0, 10.0, 0.0}, {0.0f, -1.0f, 0.0f}, 20.0f, hit));
+    CHECK(hit.entity == box.id());
+    CHECK(hit.distance_m == doctest::Approx(8.0f));
+    CHECK_FALSE(scene.physics.ray_cast({0.0, 10.0, 0.0}, {0.0f, -1.0f, 0.0f}, 20.0f, hit));
+    // It's standing on that, nowhere near the world's zero.
+    CHECK(where(walker).x == doctest::Approx(100.0));
+    scene.ticks(30);
+    CHECK(where(walker).y == doctest::Approx(2.0).epsilon(0.05));
+    CHECK(controller(walker).grounded);
+}
+
+TEST_CASE("a body's Transform ends where physics has it, through the step it falls asleep in") {
+    Scene scene;
+    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+    const flecs::entity ball = scene.sphere({1.25, 2.0, -0.75});
+    scene.ticks(300);
+    REQUIRE(scene.physics.stats().active_bodies == 0);
+    QueryHit hit;
+    REQUIRE(scene.physics.ray_cast(where(ball) + DVec3(0.0, 2.0, 0.0), {0.0f, -1.0f, 0.0f}, 3.0f, hit));
+    REQUIRE(hit.entity == ball.id());
+    // Its top, half a meter above its center, to well under what a last step of settling moves it.
+    CHECK(std::abs(hit.position.y - (where(ball).y + 0.5)) < 1e-6);
+}
+
+TEST_CASE("a few bodies awake among many asleep cost what the few do, and a place() still reaches the rest") {
+    de::core::JobSystem jobs({.worker_count = 2});
+    Scene scene(&jobs);
+    scene.box({0.0, -0.5, 0.0}, {500.0f, 0.5f, 500.0f});
+    const auto ball_at = [&](const DVec3& position, bool asleep) {
+        const flecs::entity entity = scene.ecs().entity();
+        entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+        entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = asleep});
+        de::world::place(entity, Transform{.position = position});
+        return entity;
+    };
+    constexpr int kAsleep = 3000;
+    de::core::Array<flecs::entity> sleepers{de::core::heap_allocator(de::core::MemoryTag::Physics)};
+    for (int i = 0; i < kAsleep; ++i) {
+        const int row = i / 60;
+        sleepers.push(ball_at({static_cast<double>(i % 60) * 2.0, 0.4, 20.0 + (static_cast<double>(row) * 2.0)}, true));
+    }
+    const flecs::entity falling[3] = {ball_at({-20.0, 300.0, 0.0}, false), ball_at({-24.0, 300.0, 0.0}, false),
+                                      ball_at({-28.0, 300.0, 0.0}, false)};
+    scene.ticks(2); // bodies, then the first read of the tables they're in
+    const DVec3 sleeper_was = where(sleepers[100]);
+    const double falling_was = where(falling[0]).y;
+    scene.ticks(1);
+    CHECK(scene.physics.stats().transforms_written == 3);
+    CHECK(scene.physics.stats().transforms_compared == 0); // its own writes don't look like a place()
+    scene.ticks(1);
+    CHECK(scene.physics.stats().transforms_written == 3);
+    CHECK(scene.physics.stats().transforms_compared == 0);
+    CHECK(where(falling[0]).y < falling_was);
+    CHECK(where(sleepers[100]) == sleeper_was);
+
+    // A place() on one: its table is looked through once, it goes there, and that doesn't stay the cost.
+    de::world::place(sleepers[100], Transform{.position = sleeper_was + DVec3(0.0, 50.0, 0.0)});
+    scene.ticks(1);
+    CHECK(scene.physics.stats().transforms_compared == kAsleep + 3);
+    CHECK(where(sleepers[100]).y > sleeper_was.y + 49.0);
+    CHECK(scene.physics.stats().transforms_written == 4);
+    scene.ticks(1);
+    CHECK(scene.physics.stats().transforms_compared == 0);
+    CHECK(where(sleepers[200]).y == doctest::Approx(0.4));
+}
+
 TEST_CASE("debris lands on the world, and passes through other moving things and queries") {
     Scene scene;
     const flecs::entity floor = scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
@@ -649,6 +784,27 @@ TEST_CASE("benchmark: physics at scale") {
             report("debris falling", scene, median_step_us(scene, ticks));
             scene.ticks(600);
             report("debris, long after", scene, median_step_us(scene, ticks));
+        }
+        {
+            // What a streamed world mostly is: a great many settled, and a few moving, in one table.
+            Scene scene(&jobs, desc);
+            scene.box({0.0, -0.5, 0.0}, {2000.0f, 0.5f, 2000.0f});
+            for (int i = 0; i < statics; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+                de::world::place(entity, Transform{.position = grid(i, 2.0) + DVec3(-300.0, 0.4, -100.0)});
+            }
+            scene.ticks(1);
+            report("asleep, none awake", scene, median_step_us(scene, ticks));
+            for (int i = 0; i < 100; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic});
+                de::world::place(entity, Transform{.position = {-400.0 - (static_cast<double>(i) * 2.0), 2000.0, 0.0}});
+            }
+            scene.ticks(1);
+            report("asleep, and 100 falling", scene, median_step_us(scene, ticks));
         }
     }
 }

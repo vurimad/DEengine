@@ -36,9 +36,9 @@ enum class BodyKind : uint8_t {
     Dynamic,   // gravity and contacts move it, and it writes its Transform. A root entity
 };
 
-// An entity with this and a Collider gets a body at the start of the next tick, from its world transform (so place() it
-// first), and loses it when either goes. Changing either later doesn't change the body. Bodies of the same shape and
-// size share one, so many of a kind cost little.
+// An entity with this and a Collider gets a body at the start of the next tick, from where its Transform says, and
+// loses it when either goes. Changing either later doesn't change the body. Bodies of the same shape and size share
+// one, so many of a kind cost little.
 struct RigidBody {
     BodyKind kind = BodyKind::Static;
     float mass_kg = 0.0f; // Dynamic. 0: from the shape's volume, at 1000 kg per cubic meter
@@ -87,6 +87,9 @@ struct PhysicsStats {
     uint32_t active_bodies = 0; // not asleep, and not static
     uint32_t characters = 0;
     uint32_t shapes = 0; // kept, for all the bodies that share them
+    // Last tick: dynamic bodies whose pose reached their Transform, and rows looked at for a place().
+    uint32_t transforms_written = 0;
+    uint32_t transforms_compared = 0;
 };
 
 // What's between a query and what it hit.
@@ -106,9 +109,9 @@ struct QueryHit {
 // world's fixed tick: bodies and characters come and go with their components, what's made in a tick is there for that
 // tick's step, and queries see the last step. Jolt's own types stay inside this library.
 //
-// Static bodies cost nothing per tick, and neither does anything while it's all asleep. Awake bodies are read back
-// across the job system. Tables are the unit of change, though: one body awake makes its table's other rows look
-// changed to what reads transforms, so what moves shouldn't share a table with thousands that don't.
+// Static bodies cost nothing per tick, and neither does anything asleep: a step's cost follows what's awake. Tables are
+// the unit of change, though: one body awake makes its table's other rows look changed to what reads transforms, and a
+// place() has every row of its table looked at once, so what moves shouldn't share a table with thousands that don't.
 //
 // Create this before the world and add it once the world's there: the world's last entities let go of their bodies as
 // it goes down, so this has to outlive it. Not thread-safe, and queries aren't for use during a step.
