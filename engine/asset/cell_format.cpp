@@ -36,6 +36,10 @@ core::Result<void> CellAsset::validate(std::span<const std::byte> file) const {
             (entity.mesh >= dependencies.size() || dependencies[entity.mesh].type != AssetType::Mesh)) {
             return core::fail(ErrorCode::CorruptData, "cell entity's mesh isn't one of the cell's dependencies");
         }
+        if (entity.collision != CellEntity::kNone &&
+            (entity.collision >= dependencies.size() || dependencies[entity.collision].type != AssetType::Collision)) {
+            return core::fail(ErrorCode::CorruptData, "cell entity's collision isn't one of the cell's dependencies");
+        }
         if (entity.fog_volume != CellEntity::kNone && entity.fog_volume >= fog_volumes.count) {
             return core::fail(ErrorCode::CorruptData, "cell entity's fog volume isn't in the cell");
         }

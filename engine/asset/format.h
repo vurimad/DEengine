@@ -24,6 +24,7 @@ enum class AssetType : uint16_t {
     Cell = 5,        // .decell
     World = 6,       // .deworld
     Environment = 7, // .deenv
+    Collision = 8,   // .dephys
 };
 
 // ".demesh"; "" for Unknown.

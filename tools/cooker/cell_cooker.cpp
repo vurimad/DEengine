@@ -1,5 +1,6 @@
 #include "cooker/cell_cooker.h"
 
+#include "asset/collision_format.h"
 #include "cooker/blob_writer.h"
 #include "cooker/json.h"
 #include "cooker/source_tree.h"
@@ -28,6 +29,7 @@ struct Parsed {
     bool parent_missing = false; // named a parent that isn't there (reported)
     uint32_t depth = 0;          // parents to the root
     StaticSetting static_setting = StaticSetting::Unset;
+    bool wants_collision = false;
 };
 
 // A float from a JSON number, if it fits.
@@ -89,8 +91,8 @@ private:
             return;
         }
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
-        static constexpr const char* kKeys[] = {"name",  "mesh",   "position", "rotation",  "rotation_deg",
-                                                "scale", "parent", "static",   "fog_volume"};
+        static constexpr const char* kKeys[] = {"name",  "mesh",   "position", "rotation",   "rotation_deg",
+                                                "scale", "parent", "static",   "fog_volume", "collision"};
         reader.check_keys(kKeys, "cell entity");
         Parsed& parsed = parsed_.back();
         parsed.name = reader.string("name", "");
@@ -170,6 +172,16 @@ private:
             read_fog_volume(fog, entity, label);
         }
 
+        if (reader.has("collision")) {
+            if (reader.string("collision", "mesh") != "mesh") {
+                bad("collision should be mesh");
+            } else if (!reader.has("mesh")) {
+                bad("collision needs a mesh to take its shape from");
+            } else {
+                parsed.wants_collision = true;
+            }
+        }
+
         if (reader.has("mesh")) {
             const std::string_view reference = reader.string("mesh", "");
             SourcePath mesh_path;
@@ -184,6 +196,9 @@ private:
                                    label.c_str(), static_cast<int>(reference.size()), reference.data());
             } else {
                 entity.mesh = mesh_index(*mesh);
+                if (parsed.wants_collision) {
+                    entity.collision = collision_index(*mesh);
+                }
             }
         }
     }
@@ -291,6 +306,18 @@ private:
         return static_cast<uint32_t>(build_.meshes.size() - 1);
     }
 
+    // Into build_.collisions for now: the file's dependencies have the meshes first (write_in_order).
+    uint32_t collision_index(const Source& mesh) {
+        const asset::AssetRef ref{.id = asset::collision_asset_id(mesh.id), .type = asset::AssetType::Collision};
+        for (size_t i = 0; i < build_.collisions.size(); ++i) {
+            if (build_.collisions[i] == ref) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        build_.collisions.push(ref);
+        return static_cast<uint32_t>(build_.collisions.size() - 1);
+    }
+
     // Parents by name, then each entity's depth (a loop is an error), and roots in their cell.
     void resolve_parents() {
         for (size_t i = 0; i < parsed_.size(); ++i) {
@@ -371,6 +398,10 @@ private:
                                    static_cast<int>(parsed.parent.size()), parsed.parent.data());
             }
             parsed.entity.flags = is_static ? asset::CellEntityFlags::Static : asset::CellEntityFlags::None;
+            if (parsed.wants_collision && !is_static) {
+                // Its body is static, and stays where it's made: this would go on without it.
+                diagnostics_.error(path_, "%s: collision is for what's static, and this moves", label_of(i).c_str());
+            }
         }
     }
 
@@ -386,6 +417,9 @@ private:
             CellEntity entity = parsed.entity;
             if (entity.parent != CellEntity::kNone) {
                 entity.parent = written_at[entity.parent];
+            }
+            if (entity.collision != CellEntity::kNone) {
+                entity.collision += static_cast<uint32_t>(build_.meshes.size());
             }
             entity.name_offset = static_cast<uint32_t>(build_.names.size());
             entity.name_length = static_cast<uint16_t>(parsed.name.size());
@@ -430,7 +464,12 @@ core::Array<std::byte> cook_cell(const CellBuild& build, asset::AssetId id) {
     asset.entities = writer.append(build.entities.span());
     asset.names = writer.append(build.names.span());
     asset.fog_volumes = writer.append(build.fog_volumes.span());
-    return writer.finish(asset, id, build.meshes.span());
+    core::Array<asset::AssetRef> dependencies(tools_heap());
+    dependencies.assign(build.meshes.span());
+    for (const asset::AssetRef& collision : build.collisions) {
+        dependencies.push(collision);
+    }
+    return writer.finish(asset, id, dependencies.span());
 }
 
 } // namespace de::cooker

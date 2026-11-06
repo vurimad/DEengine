@@ -1,6 +1,7 @@
 #include "cooker/cooker.h"
 
 #include "asset/cell_format.h"
+#include "asset/collision_format.h"
 #include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
@@ -8,6 +9,7 @@
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "cooker/cell_cooker.h"
+#include "cooker/collision_cooker.h"
 #include "cooker/cook_state.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
@@ -20,6 +22,7 @@
 #include "core/hash.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "physics/jolt_shapes.h"
 #include "platform/file.h"
 #include "platform/vfs.h"
 #include "render/shader/shader_asset.h"
@@ -75,8 +78,11 @@ public:
         stats_.metas_relinked = scan.metas_relinked;
         if (!options_.check_only) {
             cook_all();
-        } else if (options_.check_shaders) {
-            check_cooked_shaders();
+        } else {
+            if (options_.check_shaders) {
+                check_cooked_shaders();
+            }
+            check_cooked_collision();
         }
         CookReport report{.stats = stats_};
         report.diagnostics = diagnostics_.all();
@@ -433,10 +439,10 @@ private:
         }
     }
 
-    // Whether game:/ holds any cooked shader: its files are the answer, not the state a killed cook
-    // never saved. They lie one folder down (asset::cooked_path).
-    bool any_cooked_shader() const {
-        const std::string_view extension = asset::asset_type_extension(asset::AssetType::Shader);
+    // Whether game:/ holds any cooked file of a type: its files are the answer, not the state a killed
+    // cook never saved. They lie one folder down (asset::cooked_path).
+    bool any_cooked(asset::AssetType type) const {
+        const std::string_view extension = asset::asset_type_extension(type);
         bool found = false;
         static_cast<void>(vfs_.list("game:/", [&](const char* folder, bool folder_is_directory) {
             platform::PathString path("game:/");
@@ -462,7 +468,7 @@ private:
         }
         const core::Result<uint64_t> stamp = asset::read_shader_stamp(vfs_);
         if (!stamp && stamp.error().code == core::ErrorCode::NotFound) {
-            if (any_cooked_shader()) {
+            if (any_cooked(asset::AssetType::Shader)) {
                 diagnostics_.error("shaders", "the cooked shaders are stale: the last cook failed or stopped, or an "
                                               "older cooker made them: re-run the cooker");
             } else {
@@ -480,6 +486,76 @@ private:
 
     // --- Models ------------------------------------------------------------------------------
 
+    struct ModelSettings {
+        JsonBuilder mesh;
+        JsonBuilder texture;
+    };
+
+    ModelSettings model_settings(const Source& source) const {
+        ModelSettings settings;
+        tree_.resolve_settings(source, "mesh", settings.mesh);
+        // For its embedded images, over their usage defaults: the meta's own section only, since
+        // folder rules match file names, and this is the model's ("gas_mask.glb" isn't a mask).
+        tree_.resolve_settings(source, "texture", settings.texture, false);
+        return settings;
+    }
+
+    uint64_t model_input_hash(const Source& source, uint64_t source_hash, const ModelSettings& settings,
+                              std::span<const SourcePath> dependencies, std::span<const TextureUse> uses) {
+        Hasher hasher(source_kind_name(source.kind));
+        hasher.add(source.id.value()); // a new GUID means new IDs for everything it makes
+        hasher.add(asset::MeshAsset::kFormatVersion);
+        hasher.add(asset::MaterialAsset::kFormatVersion);
+        hasher.add(asset::TextureAsset::kFormatVersion);
+        hasher.add(asset::CollisionAsset::kFormatVersion);
+        hasher.add(physics::mesh_shape_format()); // another Jolt can't read this one's
+        hasher.add(source_hash);
+        hasher.add(std::as_bytes(settings.mesh.write(false).span()));
+        hasher.add(std::as_bytes(settings.texture.write(false).span()));
+        hash_texture_ids(hasher, uses);
+        hash_files(hasher, dependencies);
+        return hasher.value();
+    }
+
+    // --check: collision comes from a mesh and is never seen, so nothing else tells that it's old. What's cooked from a
+    // model is checked as a whole, against what a cook would hash it as now. With no collision cooked at all (CI),
+    // there's nothing stale.
+    void check_cooked_collision() {
+        const auto makes_collision = [](const CookRecord& record) {
+            return std::ranges::any_of(
+                record.outputs, [](const CookedOutput& output) { return output.type == asset::AssetType::Collision; });
+        };
+        if (!any_cooked(asset::AssetType::Collision) && std::ranges::none_of(previous_.records(), makes_collision)) {
+            return;
+        }
+        for (const Source& source : tree_.sources()) {
+            if (source.kind != SourceKind::Gltf && source.kind != SourceKind::Fbx) {
+                continue;
+            }
+            const std::string_view path = source.path.view();
+            const CookRecord* last = previous_.find(path);
+            bool current = false;
+            if (last != nullptr) {
+                const core::Result<core::Array<std::byte>> bytes = read_source(path);
+                if (bytes) {
+                    const uint64_t hash =
+                        model_input_hash(source, core::hash_bytes(bytes->data(), bytes->size()), model_settings(source),
+                                         last->dependencies.span(), last->texture_uses.span());
+                    current = unchanged(path, hash) != nullptr;
+                }
+            }
+            if (!current) {
+                diagnostics_.error(path, "its cooked collision is stale, or was never cooked: re-run the cooker");
+            }
+        }
+        for (const CookRecord& record : previous_.records()) {
+            if (makes_collision(record) && tree_.find(record.path.view()) == nullptr) {
+                diagnostics_.error(record.path.view(),
+                                   "its source is gone, but not what was cooked from it: re-run the cooker");
+            }
+        }
+    }
+
     void cook_model(const Source& source) {
         const std::string_view path = source.path.view();
         const core::Result<core::Array<std::byte>> bytes = read_source(path);
@@ -487,25 +563,12 @@ private:
             failed(path);
             return;
         }
-        JsonBuilder mesh_json;
-        tree_.resolve_settings(source, "mesh", mesh_json);
-        // For its embedded images, over their usage defaults: the meta's own section only, since
-        // folder rules match file names, and this is the model's ("gas_mask.glb" isn't a mask).
-        JsonBuilder texture_json;
-        tree_.resolve_settings(source, "texture", texture_json, false);
+        const ModelSettings settings = model_settings(source);
+        const JsonBuilder& mesh_json = settings.mesh;
+        const JsonBuilder& texture_json = settings.texture;
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
         const auto input_hash = [&](std::span<const SourcePath> dependencies, std::span<const TextureUse> uses) {
-            Hasher hasher(source_kind_name(source.kind));
-            hasher.add(source.id.value()); // a new GUID means new IDs for everything it makes
-            hasher.add(asset::MeshAsset::kFormatVersion);
-            hasher.add(asset::MaterialAsset::kFormatVersion);
-            hasher.add(asset::TextureAsset::kFormatVersion);
-            hasher.add(source_hash);
-            hasher.add(std::as_bytes(mesh_json.write(false).span()));
-            hasher.add(std::as_bytes(texture_json.write(false).span()));
-            hash_texture_ids(hasher, uses);
-            hash_files(hasher, dependencies);
-            return hasher.value();
+            return model_input_hash(source, source_hash, settings, dependencies, uses);
         };
         if (const CookRecord* last = previous_.find(path); last != nullptr) {
             if (const CookRecord* same =
@@ -572,6 +635,15 @@ private:
             mesh = core::fail(core::ErrorCode::InvalidArgument, "the model has errors"); // reported above
         }
         if (!mesh || !write(record, source.id, asset::AssetType::Mesh, *mesh)) {
+            failed(path, &record);
+            return;
+        }
+        // No collision for a mesh Jolt can't make a shape of is a warning, and it's still there to draw.
+        const asset::AssetId collision_id = asset::collision_asset_id(source.id);
+        const core::Result<core::Array<std::byte>> collision =
+            cook_collision(mesh->span(), mesh_settings, collision_id, path, diagnostics_);
+        if (diagnostics_.error_count() != errors_before ||
+            (collision && !write(record, collision_id, asset::AssetType::Collision, *collision))) {
             failed(path, &record);
             return;
         }

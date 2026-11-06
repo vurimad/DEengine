@@ -22,6 +22,8 @@ const char* asset_type_extension(AssetType type) {
         return ".deworld";
     case AssetType::Environment:
         return ".deenv";
+    case AssetType::Collision:
+        return ".dephys";
     case AssetType::Unknown:
         break;
     }
@@ -44,6 +46,8 @@ const char* asset_type_name(AssetType type) {
         return "world";
     case AssetType::Environment:
         return "environment";
+    case AssetType::Collision:
+        return "collision";
     case AssetType::Unknown:
         break;
     }

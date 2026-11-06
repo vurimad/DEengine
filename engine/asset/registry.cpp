@@ -1,6 +1,7 @@
 #include "asset/registry.h"
 
 #include "asset/cell_format.h"
+#include "asset/collision_format.h"
 #include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
@@ -70,6 +71,8 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<WorldAsset>(file));
     case AssetType::Environment:
         return checked(load_in_place<EnvironmentAsset>(file));
+    case AssetType::Collision:
+        return checked(load_in_place<CollisionAsset>(file));
     case AssetType::Unknown:
         break;
     }

@@ -1,11 +1,15 @@
 #include "physics/physics.h"
 
+#include "asset/collision_format.h"
+#include "asset/registry.h"
 #include "core/allocator.h"
 #include "core/assert.h"
 #include "core/hash_map.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/profile.h"
+#include "physics/jolt_shapes.h"
+#include "world/cell.h"
 #include "world/transform.h"
 #include "world/world.h"
 
@@ -13,10 +17,10 @@
 // clang-format off
 #include <Jolt/Jolt.h>
 
-#include <Jolt/Core/Factory.h>
 #include <Jolt/Core/FixedSizeFreeList.h>
 #include <Jolt/Core/JobSystemSingleThreaded.h>
 #include <Jolt/Core/JobSystemWithBarrier.h>
+#include <Jolt/Core/StreamIn.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
@@ -27,17 +31,17 @@
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
 #include <Jolt/Physics/PhysicsSystem.h>
-#include <Jolt/RegisterTypes.h>
 // clang-format on
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
-#include <cstdarg>
-#include <cstdio>
+#include <cstring>
 #include <new>
 #include <span>
 
@@ -48,82 +52,6 @@ namespace {
 using core::MemoryTag;
 using world::Transform;
 using world::WorldTransform;
-
-// ---- Jolt's memory, logs and asserts ------------------------------------------------------------------------------
-
-void* allocate_hook(size_t size) {
-    return core::tagged_malloc(MemoryTag::Physics, size);
-}
-
-void* reallocate_hook(void* block, [[maybe_unused]] size_t old_size, size_t new_size) {
-    return core::tagged_realloc(MemoryTag::Physics, block, new_size);
-}
-
-void free_hook(void* block) {
-    core::tagged_free(MemoryTag::Physics, block);
-}
-
-// Over-aligned, with where the block really starts kept just before what's handed out.
-void* aligned_allocate_hook(size_t size, size_t alignment) {
-    const size_t needed = size + alignment + sizeof(void*);
-    auto* const block = static_cast<std::byte*>(core::tagged_malloc(MemoryTag::Physics, needed));
-    auto* const aligned = block + sizeof(void*) + core::alignment_padding(block + sizeof(void*), alignment);
-    reinterpret_cast<void**>(aligned)[-1] = block;
-    return aligned;
-}
-
-void aligned_free_hook(void* block) {
-    if (block != nullptr) {
-        core::tagged_free(MemoryTag::Physics, static_cast<void**>(block)[-1]);
-    }
-}
-
-// NOLINTNEXTLINE(modernize-avoid-variadic-functions,cert-dcl50-cpp): the shape Jolt's hook has
-void trace_hook(const char* format, ...) {
-    char line[512];
-    va_list args;
-    va_start(args, format);
-    std::vsnprintf(line, sizeof(line), format, args);
-    va_end(args);
-    DE_LOG_INFO("physics", "%s", line);
-}
-
-#ifdef JPH_ENABLE_ASSERTS
-bool assert_hook(const char* expression, const char* message, const char* file, JPH::uint line) {
-    DE_LOG_ERROR("physics", "Jolt: %s (%s), %s:%u", expression, message != nullptr ? message : "", file, line);
-    return true; // stop here
-}
-#endif
-
-// Jolt's global setup, while any Physics exists. Physics objects are made and destroyed on one thread.
-int jolt_users = 0;
-alignas(JPH::Factory) std::byte factory_storage[sizeof(JPH::Factory)];
-
-void acquire_jolt() {
-    if (jolt_users++ > 0) {
-        return;
-    }
-    JPH::Allocate = allocate_hook;
-    JPH::Reallocate = reallocate_hook;
-    JPH::Free = free_hook;
-    JPH::AlignedAllocate = aligned_allocate_hook;
-    JPH::AlignedFree = aligned_free_hook;
-    JPH::Trace = trace_hook;
-#ifdef JPH_ENABLE_ASSERTS
-    JPH::AssertFailed = assert_hook;
-#endif
-    JPH::Factory::sInstance = ::new (static_cast<void*>(factory_storage)) JPH::Factory();
-    JPH::RegisterTypes();
-}
-
-void release_jolt() {
-    if (--jolt_users > 0) {
-        return;
-    }
-    JPH::UnregisterTypes();
-    JPH::Factory::sInstance->~Factory();
-    JPH::Factory::sInstance = nullptr;
-}
 
 // ---- Jolt's jobs, on ours -------------------------------------------------------------------------------------------
 
@@ -381,6 +309,54 @@ JPH::ShapeSettings::ShapeResult make_shape(const ShapeSize& size) {
     return {};
 }
 
+// ---- Mesh shapes, from the cooker's bytes
+// -----------------------------------------------------------------------------
+
+// Jolt's own stream goes through iostreams, which the engine doesn't use.
+class BytesIn final : public JPH::StreamIn {
+public:
+    explicit BytesIn(std::span<const std::byte> bytes) : bytes_(bytes) {}
+    void ReadBytes(void* out, size_t count) override {
+        if (count > bytes_.size() - at_) {
+            std::memset(out, 0, count);
+            failed_ = true;
+            return;
+        }
+        std::memcpy(out, bytes_.data() + at_, count);
+        at_ += count;
+    }
+    bool IsEOF() const override { return failed_; }
+    bool IsFailed() const override { return failed_; }
+
+private:
+    std::span<const std::byte> bytes_;
+    size_t at_ = 0;
+    bool failed_ = false;
+};
+
+uint64_t key_of(asset::AssetHandle handle) {
+    return (uint64_t{handle.index} << 32U) | handle.generation;
+}
+
+// An instance's scale, exactly: nearly the same two are two wrappers, which are small.
+struct ScaleBits {
+    uint32_t axis[3] = {};
+    bool operator==(const ScaleBits&) const = default;
+};
+
+struct ScaleHash {
+    uint64_t operator()(const ScaleBits& scale) const {
+        return core::mix64((uint64_t{scale.axis[0]} << 32U) ^
+                           core::mix64((uint64_t{scale.axis[1]} << 32U) | scale.axis[2]));
+    }
+};
+
+// A mesh's shape, and what's made to scale it. Bodies hold references of their own, so this can go before they do.
+struct RestoredMesh {
+    JPH::RefConst<JPH::Shape> shape;
+    core::HashMap<ScaleBits, JPH::RefConst<JPH::Shape>, ScaleHash> scaled{core::heap_allocator(MemoryTag::Physics)};
+};
+
 // ---- What the world holds
 // ---------------------------------------------------------------------------------------------
 
@@ -404,7 +380,7 @@ struct CharacterHandle {
 
 struct Physics::State {
     explicit State(const PhysicsDesc& desc)
-        : temp(desc.temp_memory_bytes), gravity(desc.gravity_mps2), core_jobs(desc.jobs) {
+        : temp(desc.temp_memory_bytes), gravity(desc.gravity_mps2), core_jobs(desc.jobs), assets(desc.assets) {
         system.Init(desc.max_bodies, 0, desc.max_body_pairs, desc.max_contact_constraints, broad_phase_layers,
                     object_vs_broad_phase, object_vs_object);
         system.SetGravity(to_jolt(desc.gravity_mps2));
@@ -432,6 +408,13 @@ struct Physics::State {
     static void* allocate_job_system(size_t size) { return JPH::AlignedAllocate(size, JPH_CACHE_LINE_SIZE); }
 
     const JPH::Shape* shape_for(const ShapeSize& size);
+    const JPH::Shape* restore_mesh(asset::AssetHandle handle, uint64_t key);
+    const JPH::Shape* mesh_shape_for(asset::AssetHandle handle, const Vec3& scale, bool& waiting);
+    void refuse_mesh(uint64_t key, asset::AssetHandle handle, const char* why);
+    void on_asset(const asset::AssetNotice& notice);
+    void refresh_changed_meshes(flecs::iter& it);
+    void create_body(flecs::iter& it, flecs::entity entity, const JPH::Shape* shape, const RigidBody& body,
+                     const WorldTransform& place);
     void create_bodies(flecs::iter& it);
     void create_characters(flecs::iter& it);
     void follow_transforms(float tick_s);
@@ -459,6 +442,14 @@ struct Physics::State {
     };
     core::HashMap<uint64_t, SharedShape> shapes_by_size{core::heap_allocator(MemoryTag::Physics)};
     JPH::Array<JPH::RefConst<JPH::Shape>> shapes;
+    // Meshes' shapes, while their assets are loaded, by the asset's handle.
+    asset::AssetRegistry* assets = nullptr;
+    core::HashMap<uint64_t, RestoredMesh> meshes{core::heap_allocator(MemoryTag::Physics)};
+    uint32_t mesh_shapes = 0;
+    // Assets that can't be used, each logged once. Their bodies wait for a reload.
+    core::HashMap<uint64_t, uint8_t> refused_meshes{core::heap_allocator(MemoryTag::Physics)};
+    // What was loaded again since the last step, so what's made from it is made again.
+    core::Array<uint64_t> changed_meshes{core::heap_allocator(MemoryTag::Physics)};
     // What's being added this tick, kept so it doesn't allocate each time.
     JPH::Array<JPH::BodyID> new_still;
     JPH::Array<JPH::BodyID> new_moving;
@@ -466,6 +457,8 @@ struct Physics::State {
     // Named, so the world owns them. It goes first, and a query's destructor reads it, so they're never destroyed here.
     struct Queries {
         flecs::query<const Collider, const RigidBody, const WorldTransform> new_bodies;
+        flecs::query<const world::MeshCollider, const WorldTransform> new_mesh_bodies;
+        flecs::query<const world::MeshCollider> mesh_bodies;
         flecs::query<CharacterController, const WorldTransform> new_characters;
         flecs::query<const Transform, BodyHandle> placed_bodies;
         flecs::query<Transform, BodyHandle> dynamic_bodies;
@@ -495,6 +488,158 @@ const JPH::Shape* Physics::State::shape_for(const ShapeSize& size) {
     return kept.GetPtr();
 }
 
+void Physics::State::refuse_mesh(uint64_t key, asset::AssetHandle handle, const char* why) {
+    if (!refused_meshes.contains(key)) {
+        refused_meshes.set(key, 1);
+        const asset::AssetRef ref = assets != nullptr ? assets->asset(handle) : asset::AssetRef{};
+        DE_LOG_ERROR("physics", "collision %s has no bodies: %s", asset::format_asset_id(ref.id).c_str(), why);
+    }
+}
+
+// The asset's bytes made into a shape, kept for as long as the asset is. Null, and said so once, if they can't be used.
+const JPH::Shape* Physics::State::restore_mesh(asset::AssetHandle handle, uint64_t key) {
+    const auto* const collision = assets->get<asset::CollisionAsset>(handle);
+    if (collision == nullptr) {
+        refuse_mesh(key, handle, "it isn't collision");
+        return nullptr;
+    }
+    // Before Jolt reads a thing: it believes the lengths it finds.
+    if (!asset::verify_content_hash(assets->file(handle))) {
+        refuse_mesh(key, handle, "its file is corrupt");
+        return nullptr;
+    }
+    if (collision->shape_format != mesh_shape_format()) {
+        refuse_mesh(key, handle, "another build of Jolt wrote it: cook it again");
+        return nullptr;
+    }
+    BytesIn stream(collision->shape.get(collision));
+    const JPH::Shape::ShapeResult restored = JPH::Shape::sRestoreFromBinaryState(stream);
+    if (stream.IsFailed() || restored.HasError()) {
+        refuse_mesh(key, handle, stream.IsFailed() ? "its shape ends early" : restored.GetError().c_str());
+        return nullptr;
+    }
+    RestoredMesh& mesh = meshes.find_or_insert(key);
+    mesh.shape = restored.Get();
+    ++mesh_shapes;
+    return mesh.shape.GetPtr();
+}
+
+// The one shape all of an asset's bodies of this scale share, or null: waiting says if that's because it isn't loaded
+// yet, which asks again next tick, and otherwise it's been said why and won't be asked again.
+const JPH::Shape* Physics::State::mesh_shape_for(asset::AssetHandle handle, const Vec3& scale, bool& waiting) {
+    const uint64_t key = key_of(handle);
+    const JPH::Shape* unscaled = nullptr;
+    if (RestoredMesh* const known = meshes.find(key); known != nullptr) {
+        unscaled = known->shape.GetPtr();
+    } else {
+        const asset::AssetState state = assets != nullptr ? assets->state(handle) : asset::AssetState::Failed;
+        waiting = state == asset::AssetState::Loading;
+        if (waiting) {
+            return nullptr;
+        }
+        if (state == asset::AssetState::Failed) {
+            refuse_mesh(key, handle, assets != nullptr ? "it failed to load" : "physics has no asset registry");
+            return nullptr;
+        }
+        unscaled = restore_mesh(handle, key);
+        if (unscaled == nullptr) {
+            return nullptr;
+        }
+    }
+    if (scale == Vec3(1.0f)) {
+        return unscaled;
+    }
+    if (scale.x == 0.0f || scale.y == 0.0f || scale.z == 0.0f) {
+        DE_LOG_ERROR("physics", "a mesh collider with a scale of 0 has no body");
+        return nullptr;
+    }
+    RestoredMesh& mesh = *meshes.find(key);
+    const ScaleBits bits{
+        .axis = {std::bit_cast<uint32_t>(scale.x), std::bit_cast<uint32_t>(scale.y), std::bit_cast<uint32_t>(scale.z)}};
+    if (const JPH::RefConst<JPH::Shape>* const known = mesh.scaled.find(bits); known != nullptr) {
+        return known->GetPtr();
+    }
+    ++mesh_shapes;
+    return mesh.scaled.set(bits, new JPH::ScaledShape(unscaled, to_jolt(scale))).GetPtr();
+}
+
+void Physics::State::on_asset(const asset::AssetNotice& notice) {
+    if (notice.asset.type != asset::AssetType::Collision) {
+        return;
+    }
+    const uint64_t key = key_of(notice.handle);
+    const bool was_refused = refused_meshes.contains(key);
+    const bool loaded_again =
+        notice.event == asset::AssetEvent::Reloaded || (notice.event == asset::AssetEvent::Ready && was_refused);
+    if (loaded_again || notice.event == asset::AssetEvent::Unloaded) {
+        if (const RestoredMesh* const mesh = meshes.find(key); mesh != nullptr) {
+            mesh_shapes -= 1U + static_cast<uint32_t>(mesh->scaled.size());
+            meshes.remove(key);
+        }
+        refused_meshes.remove(key);
+    }
+    if (loaded_again) {
+        changed_meshes.push(key);
+    }
+}
+
+// What was made from an asset that's been loaded again goes, and comes back next tick, from the new one.
+void Physics::State::refresh_changed_meshes(flecs::iter& it) {
+    if (changed_meshes.empty()) {
+        return;
+    }
+    queries().mesh_bodies.each([&](flecs::entity entity, const world::MeshCollider& collider) {
+        if (std::ranges::find(changed_meshes, key_of(collider.collision)) != changed_meshes.end()) {
+            entity.mut(it).remove<BodyHandle>();
+        }
+    });
+    changed_meshes.clear();
+}
+
+void Physics::State::create_body(flecs::iter& it, flecs::entity entity, const JPH::Shape* shape, const RigidBody& body,
+                                 const WorldTransform& place) {
+    const bool moves = body.kind != BodyKind::Static;
+    const JPH::EMotionType motion = body.kind == BodyKind::Static      ? JPH::EMotionType::Static
+                                    : body.kind == BodyKind::Kinematic ? JPH::EMotionType::Kinematic
+                                                                       : JPH::EMotionType::Dynamic;
+    JPH::ObjectLayer layer = object_layer::kMoving;
+    if (!moves) {
+        constexpr float kBigM = 1000.0f;
+        const JPH::Vec3 extent = shape->GetLocalBounds().GetSize();
+        layer = extent.ReduceMax() >= kBigM ? object_layer::kStaticBig : object_layer::kStatic;
+    } else if (body.debris && body.kind == BodyKind::Dynamic) {
+        layer = object_layer::kDebris;
+    }
+    JPH::BodyCreationSettings settings(shape, to_jolt(place.position), to_jolt(place.rotation), motion, layer);
+    settings.mFriction = body.friction;
+    settings.mRestitution = body.restitution;
+    settings.mLinearDamping = body.linear_damping;
+    settings.mAngularDamping = body.angular_damping;
+    settings.mUserData = entity.id();
+    if (body.kind == BodyKind::Dynamic && body.mass_kg > 0.0f) {
+        settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
+        settings.mMassPropertiesOverride.mMass = body.mass_kg;
+    }
+    const JPH::Body* const created = system.GetBodyInterfaceNoLock().CreateBody(settings);
+    if (created == nullptr) {
+        if (!warned_out_of_bodies) {
+            DE_LOG_ERROR("physics", "out of bodies (%u): the rest have none", system.GetMaxBodies());
+            warned_out_of_bodies = true;
+        }
+        entity.mut(it).set(BodyHandle{});
+        return;
+    }
+    const bool asleep = !moves || (body.kind == BodyKind::Dynamic && body.start_asleep);
+    (asleep ? new_still : new_moving).push_back(created->GetID());
+    entity.mut(it).set(BodyHandle{
+        .id = created->GetID().GetIndexAndSequenceNumber(), .position = place.position, .rotation = place.rotation});
+    if (body.kind == BodyKind::Dynamic) {
+        entity.mut(it).add<DynamicBody>();
+    } else if (body.kind == BodyKind::Kinematic) {
+        entity.mut(it).add<KinematicBody>();
+    }
+}
+
 void Physics::State::create_bodies(flecs::iter& it) {
     JPH::BodyInterface& bodies = system.GetBodyInterfaceNoLock();
     queries().new_bodies.each(
@@ -504,46 +649,18 @@ void Physics::State::create_bodies(flecs::iter& it) {
                 entity.mut(it).set(BodyHandle{}); // said so once: it won't be asked again
                 return;
             }
-            const bool moves = body.kind != BodyKind::Static;
-            const JPH::EMotionType motion = body.kind == BodyKind::Static      ? JPH::EMotionType::Static
-                                            : body.kind == BodyKind::Kinematic ? JPH::EMotionType::Kinematic
-                                                                               : JPH::EMotionType::Dynamic;
-            JPH::ObjectLayer layer = object_layer::kMoving;
-            if (!moves) {
-                constexpr float kBigM = 1000.0f;
-                const JPH::Vec3 extent = shape->GetLocalBounds().GetSize();
-                layer = extent.ReduceMax() >= kBigM ? object_layer::kStaticBig : object_layer::kStatic;
-            } else if (body.debris && body.kind == BodyKind::Dynamic) {
-                layer = object_layer::kDebris;
-            }
-            JPH::BodyCreationSettings settings(shape, to_jolt(place.position), to_jolt(place.rotation), motion, layer);
-            settings.mFriction = body.friction;
-            settings.mRestitution = body.restitution;
-            settings.mLinearDamping = body.linear_damping;
-            settings.mAngularDamping = body.angular_damping;
-            settings.mUserData = entity.id();
-            if (body.kind == BodyKind::Dynamic && body.mass_kg > 0.0f) {
-                settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
-                settings.mMassPropertiesOverride.mMass = body.mass_kg;
-            }
-            const JPH::Body* const created = bodies.CreateBody(settings);
-            if (created == nullptr) {
-                if (!warned_out_of_bodies) {
-                    DE_LOG_ERROR("physics", "out of bodies (%u): the rest have none", system.GetMaxBodies());
-                    warned_out_of_bodies = true;
-                }
+            create_body(it, entity, shape, body, place);
+        });
+    uint32_t added_mesh_bodies = 0;
+    queries().new_mesh_bodies.each(
+        [&](flecs::entity entity, const world::MeshCollider& collider, const WorldTransform& place) {
+            bool waiting = false;
+            const JPH::Shape* const shape = mesh_shape_for(collider.collision, place.scale, waiting);
+            if (shape != nullptr) {
+                create_body(it, entity, shape, RigidBody{}, place);
+                ++added_mesh_bodies;
+            } else if (!waiting) {
                 entity.mut(it).set(BodyHandle{});
-                return;
-            }
-            const bool asleep = !moves || (body.kind == BodyKind::Dynamic && body.start_asleep);
-            (asleep ? new_still : new_moving).push_back(created->GetID());
-            entity.mut(it).set(BodyHandle{.id = created->GetID().GetIndexAndSequenceNumber(),
-                                          .position = place.position,
-                                          .rotation = place.rotation});
-            if (body.kind == BodyKind::Dynamic) {
-                entity.mut(it).add<DynamicBody>();
-            } else if (body.kind == BodyKind::Kinematic) {
-                entity.mut(it).add<KinematicBody>();
             }
         });
     // Together, as adding them one by one leaves the broad phase in a poor state, and after a lot, it's rebuilt.
@@ -561,6 +678,10 @@ void Physics::State::create_bodies(flecs::iter& it) {
     constexpr size_t kOptimizeAfter = 1024;
     if (added >= kOptimizeAfter) {
         system.OptimizeBroadPhase();
+    }
+    if (added_mesh_bodies > 0) {
+        DE_LOG_INFO("physics", "%u bodies from meshes: %u bodies, %u shapes in all", added_mesh_bodies,
+                    system.GetNumBodies(), static_cast<uint32_t>(shapes.size()) + mesh_shapes);
     }
 }
 
@@ -710,6 +831,7 @@ void Physics::State::write_transforms() {
 void Physics::State::step(flecs::iter& it) {
     DE_PROFILE_ZONE("physics step");
     const float tick_s = it.delta_time();
+    refresh_changed_meshes(it);
     create_bodies(it);
     create_characters(it);
     // Handles made above wait for the tick's end, so what's new joins in from the next tick. Its body is in this step.
@@ -737,9 +859,20 @@ Physics::Physics(const PhysicsDesc& desc) {
     acquire_jolt();
     core::Allocator& heap = core::heap_allocator(MemoryTag::Physics);
     state_ = ::new (heap.allocate(sizeof(State), alignof(State))) State(desc);
+    if (desc.assets != nullptr) {
+        const core::Result<void> listening = desc.assets->add_listener(&Physics::on_asset, state_);
+        DE_VERIFY_MSG(listening.ok(), "physics can't listen to the asset registry: it has too many listeners");
+    }
+}
+
+void Physics::on_asset(void* state, const asset::AssetNotice& notice) {
+    static_cast<State*>(state)->on_asset(notice);
 }
 
 Physics::~Physics() {
+    if (state_->assets != nullptr) {
+        state_->assets->remove_listener(&Physics::on_asset, state_);
+    }
     state_->~State();
     core::heap_allocator(MemoryTag::Physics).deallocate(state_, sizeof(State), alignof(State));
     release_jolt();
@@ -790,6 +923,15 @@ void Physics::add_to_world(world::World& world) {
                           .cached()
                           .without<BodyHandle>()
                           .build(),
+        // A Collider beside it wins.
+        .new_mesh_bodies =
+            ecs.query_builder<const world::MeshCollider, const WorldTransform>("de::physics::NewMeshBodies")
+                .cached()
+                .without<BodyHandle>()
+                .without<Collider>()
+                .build(),
+        .mesh_bodies =
+            ecs.query_builder<const world::MeshCollider>("de::physics::MeshBodies").cached().with<BodyHandle>().build(),
         .new_characters = ecs.query_builder<CharacterController, const WorldTransform>("de::physics::NewCharacters")
                               .cached()
                               .without<CharacterHandle>()
@@ -835,6 +977,9 @@ void Physics::add_to_world(world::World& world) {
     ecs.observer<RigidBody>("de::DropBodyOfRigidBody")
         .event(flecs::OnRemove)
         .each([](flecs::entity entity, RigidBody&) { entity.remove<BodyHandle>(); });
+    ecs.observer<world::MeshCollider>("de::DropBodyOfMeshCollider")
+        .event(flecs::OnRemove)
+        .each([](flecs::entity entity, world::MeshCollider&) { entity.remove<BodyHandle>(); });
     ecs.observer<CharacterHandle>("de::DestroyCharacter")
         .event(flecs::OnRemove)
         .each([state](flecs::entity, CharacterHandle& handle) {
@@ -901,7 +1046,7 @@ PhysicsStats Physics::stats() const {
     return {.bodies = state_->system.GetNumBodies(),
             .active_bodies = state_->system.GetNumActiveBodies(JPH::EBodyType::RigidBody),
             .characters = state_->characters,
-            .shapes = static_cast<uint32_t>(state_->shapes.size())};
+            .shapes = static_cast<uint32_t>(state_->shapes.size()) + state_->mesh_shapes};
 }
 
 } // namespace de::physics

@@ -11,7 +11,8 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | `mesh_format.h` | `.demesh`: 32-byte vertices, 32-bit indices, LODs, parts, material slots, bounds |
 | `texture_format.h` | `.detex`: a 2D texture with its mip chain, BCn or RGBA8 |
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
-| `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, name, flags); its meshes are its dependencies |
+| `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, collision, name, flags); its meshes and their collision are its dependencies |
+| `collision_format.h` | `.dephys`: a mesh's collision, as a Jolt shape's bytes only `engine/physics` reads, and the ID it has from its mesh's |
 | `world_format.h` | `.deworld`: a world's cells by coordinate (sorted, named but not dependencies: they stream), its start, its environment (the one dependency) |
 | `environment_format.h` | `.deenv`: sun direction and color, sky and ground ambient, shadow color, exposure, sun shadow settings (`ShadowLimits`), fog (`FogLimits`) |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |

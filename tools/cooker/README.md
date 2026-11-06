@@ -10,7 +10,7 @@ cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debu
 | --- | --- |
 | `--src DIR` | the repository root, mounted as `src:/` (default: this repository) |
 | `--out DIR` | where cooked files go, mounted as `game:/` (default: `<src>/cooked`, which the engine mounts by default) |
-| `--check` | check the source and meta trees and report stale cooked shaders, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
+| `--check` | check the source and meta trees and report stale cooked shaders and collision, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
 | `--force` | cook every source again |
 | `--no-shaders` | skip shaders (no Slang compiler needed), in `--check` too |
 | `--shader-debug`, `--shader-checks` | source-level debug info, `DE_SHADER_CHECKS=1` in cooked shaders |
@@ -26,6 +26,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `cook_state.h` | `CookState`: what the last cook made from what (`game:/cook_state.json`) |
 | `gltf_import.cpp`, `fbx_import.cpp`, `model.h` | glTF (cgltf) and FBX (ufbx) to one in-memory model |
 | `mesh_cooker.h` | `.demesh`: merged, optimized and LOD-chained with meshoptimizer |
+| `collision_cooker.h` | `.dephys`: a cooked mesh's collision, through `physics/jolt_shapes.h` |
 | `texture_cooker.h` | `.detex`: mips filtered with stb_image_resize2, then BC1/BC4/BC5 (rgbcx) or BC7 (bc7enc) |
 | `material_cooker.h` | `.demat`: from model materials and `.material` text sources |
 | `cell_cooker.h` | `.decell`: from `.cell` text sources (the format is described there) |
@@ -68,6 +69,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `lod_ratio` | triangles kept from one LOD to the next | 0.5 |
 | `lod_error` | largest error a LOD may add, relative to the mesh's size. The renderer picks a LOD only where its error stays under a pixel, so a large error costs nothing up close | 0.5 |
 | `optimize` | vertex cache, overdraw and fetch order | true |
+| `collision_triangles` | its `.dephys` is the finest LOD with at most this many triangles | 2048 |
 
 ## What a source cooks to
 
@@ -76,13 +78,24 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | Source | Cooked |
 | --- | --- |
 | Texture | a `.detex` |
-| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
+| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.dephys` (`collision`: see below), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
-| `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies |
+| `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies, and the `.dephys` of those that ask with `"collision": "mesh"` after them |
 | `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment as its dependency; cooked again when a cell it lists changes (its coordinate may have), not when the environment does |
 | `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth, the shadow and fog settings within their limits |
 | `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings and engine settings: what ship builds read) |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
+
+## Collision
+
+A `.dephys` is the binary state of a Jolt `MeshShape` (`Shape::SaveBinaryState`), made by `physics::build_mesh_shape`, so the cooker doesn't see Jolt's types or need its own copy of its setup.
+
+- **From the LOD chain,** not a simplification of its own: the finest LOD with at most `collision_triangles` triangles is the closest to what's drawn that collision can afford, and it's already there. With no LOD that small, it's the coarsest, with a warning. The default of 2048 gives 1,000 to 2,000 triangles on a prop, and a plane stays its two. On the boulder that's 1,032 of its 66,122: 16 KB, and on rays straight down 1.6 cm from the full mesh on average, 0.9 cm at the median and 12 cm at the 99th percentile, those being rays just past its outline. Its limit is there for what's walked on: a character's cost goes with the triangles under its capsule (`engine/physics/README.md`), far more than a ray's. Raise it for a big mesh that needs the detail.
+- **Welded.** LODs split vertices along uv seams and between materials, so all a LOD's parts go into one list with each position once. Jolt's smooth edges go by shared indices: every split vertex would be an open edge for things to catch on.
+- **Reproducible,** like everything: the same mesh makes the same bytes.
+- **A mesh with no triangles of any area** has no `.dephys`, with a warning: what's only drawn isn't wrong. A cell that asks for it finds out when it's loaded.
+- **Jolt's version** is in the file (`shape_format`) and in the model's input hash, so a new Jolt cooks every model again, and the engine refuses what another wrote. It isn't `JPH_VERSION_ID`, which also changes with asserts and profiling: a debug cooker's files have to work in a dev engine.
+- **`--check`** hashes each model as a cook would and compares that with the last cook: that covers its bytes, settings, buffers and GUID. A collision file gone, a model no cook has seen or one deleted are stale too. With no collision cooked at all, there's nothing to be stale.
 
 ## Rules and invariants
 
@@ -105,3 +118,4 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 - Shader permutations: modules cook with no defines; a list of permutations per module comes with the materials that need them.
 - Removing files deleted from `config/` from `game:/config/`; checking config files (`--check`).
 - Running on file change (the editor), cooking in parallel across sources, `de asset move`, and the archive packer (which has to carry `game:/shader_sources.hash` along).
+- Leaving out collision that nothing asks for; hand-made collision meshes; a material per triangle.
