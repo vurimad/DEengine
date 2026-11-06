@@ -1,8 +1,8 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
-// bounding sphere. What's in a view adds the parts of its mesh's coarsest LOD that's good enough there to
-// that view's draw lists: a record and draw arguments per part, and a count the draw pass reads
-// (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the parts of both, to
-// lists of their own. The order within a list depends on the threads: nothing here may rely on it.
+// bounding sphere: a cascade's view is what can shadow something it lights. What's in a view adds the parts of its
+// mesh's coarsest LOD that's good enough there to that view's draw lists: a record and draw arguments per part, and a
+// count the draw pass reads (scene_renderer.cpp, GpuDrawList). While a LOD takes over from the one before, it adds the
+// parts of both, to lists of their own. The order within a list depends on the threads: nothing here may rely on it.
 
 import scene.scene_common;
 
@@ -22,8 +22,9 @@ static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
 
 struct CullPush
 {
-    float4* instances;     // kInstanceRows per slot, staying between frames
-    uint* instance_meshes; // per slot, its slot in the mesh table, or kNoMesh
+    SceneFrame* frame;
+    GpuInstance* instances; // per slot, staying between frames
+    uint* instance_meshes;  // per slot, its slot in the mesh table, or kNoMesh
     GpuMeshInfo* meshes;
     GpuMeshLod* lods;
     GpuMeshPart* parts;
@@ -164,12 +165,12 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     {
         mesh = push.meshes[mesh_slot];
     }
-    const float4 row0 = push.instances[instance * kInstanceRows + 0];
-    const float4 row1 = push.instances[instance * kInstanceRows + 1];
-    const float4 row2 = push.instances[instance * kInstanceRows + 2];
-    const float4 local = float4(mesh.center, 1.0);
-    const float3 center = float3(dot(row0, local), dot(row1, local), dot(row2, local));
+    const InstanceTransform transform = push.instances[instance].transform;
+    const float3 center = instance_point(transform, push.frame.render_origin_steps.xyz, mesh.center);
     // The longest axis: exact for any rotation and scale, a little short only for a transform that shears.
+    const float3 row0 = transform.row0.linear;
+    const float3 row1 = transform.row1.linear;
+    const float3 row2 = transform.row2.linear;
     const float3 axis0 = float3(row0.x, row1.x, row2.x);
     const float3 axis1 = float3(row0.y, row1.y, row2.y);
     const float3 axis2 = float3(row0.z, row1.z, row2.z);
@@ -179,7 +180,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     for (uint v = 0; v < kCullViewCount; ++v)
     {
         GpuCullView* view = push.views + v;
-        if (mesh.lod_count == 0 || !in_view(view, center, radius))
+        if (mesh.lod_count == 0 || radius < view.min_radius_m || !in_view(view, center, radius))
         {
             continue;
         }

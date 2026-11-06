@@ -14,6 +14,7 @@
 #include "render/shader/shader_library.h"
 #include "support/gpu.h"
 #include "support/readback.h"
+#include "support/render_transform.h"
 #include "support/sandbox.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
@@ -22,11 +23,13 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include <numbers>
 #include <span>
 
 using de::asset::AssetHandle;
@@ -227,7 +230,8 @@ struct PoolScene {
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         for (const AssetHandle mesh : meshes) {
-            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+            frame.instances.push(
+                {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         }
         return frame;
     }
@@ -405,9 +409,9 @@ TEST_CASE("every draw in one indirect call reads its own instance and material")
         scene.uploader.flush_and_wait();
         // Each somewhere else, in one pipeline state: three draws in one call.
         de::world::RenderFrame frame = PoolScene::frame_of({red, green, red});
-        frame.instances[0].transform[3] = -1.0f;
-        frame.instances[1].transform[3] = 0.0f;
-        frame.instances[2].transform[3] = 1.0f;
+        frame.instances[0].transform.set_position_m(0, -1.0f);
+        frame.instances[1].transform.set_position_m(0, 0.0f);
+        frame.instances[2].transform.set_position_m(0, 1.0f);
         scene.submit(frame);
         const auto pixels = de::test::read_texture(scene.device, scene.target);
         CHECK(is_red(pixels, kLeft));
@@ -458,8 +462,8 @@ TEST_CASE("draws of every pipeline state in one frame read their own records") {
                 scene.vfs.write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span())
                     .ok());
             put_squares(scene.vfs, mesh_id, material_id, {0.0f});
-            frame.instances.push(
-                {.transform = {1, 0, 0, kind.x_m, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = scene.load(mesh_id)});
+            frame.instances.push({.transform = de::test::render_transform({1, 0, 0, kind.x_m, 0, 1, 0, 0, 0, 0, 1, 0}),
+                                  .mesh = scene.load(mesh_id)});
             ++id;
         }
         scene.uploader.flush_and_wait();
@@ -507,9 +511,14 @@ TEST_CASE("a shadow caster reads its own instance and material") {
         // so each would shadow the wall 0.5 m to its left. Both are masked, so they share a call, and their records
         // come after the wall's.
         de::world::RenderFrame frame = PoolScene::frame_of({});
-        frame.instances.push({.transform = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}, .mesh = wall});
-        frame.instances.push({.transform = {0.5f, 0, 0, 0.6f, 0, 0.5f, 0, 0.6f, 0, 0, 0.5f, 1}, .mesh = solid});
-        frame.instances.push({.transform = {0.5f, 0, 0, 0.6f, 0, 0.5f, 0, -0.6f, 0, 0, 0.5f, 1}, .mesh = thin});
+        frame.instances.push(
+            {.transform = de::test::render_transform({2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}), .mesh = wall});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 0.6f, 0, 0.5f, 0, 0.6f, 0, 0, 0.5f, 1}),
+             .mesh = solid});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 0.6f, 0, 0.5f, 0, -0.6f, 0, 0, 0.5f, 1}),
+             .mesh = thin});
         de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
         light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
         scene.submit(frame, light, de::render::SceneView::ShadowMask);
@@ -529,9 +538,9 @@ TEST_CASE("the cull keeps what's in view and drops the rest") {
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
         de::world::RenderFrame frame = PoolScene::frame_of({mesh, mesh, mesh, mesh});
-        frame.instances[1].transform[3] = -50.0f; // far to the left
-        frame.instances[2].transform[11] = 10.0f; // behind the camera, which is at z = 3
-        frame.instances[3].transform[7] = 50.0f;  // far above
+        frame.instances[1].transform.set_position_m(0, -50.0f); // far to the left
+        frame.instances[2].transform.set_position_m(2, 10.0f);  // behind the camera, which is at z = 3
+        frame.instances[3].transform.set_position_m(1, 50.0f);  // far above
         scene.submit_for_stats(frame);
         const de::render::SceneRendererStats stats = scene.renderer.stats();
         CHECK(stats.drawn == 4);
@@ -551,7 +560,7 @@ TEST_CASE("the cull keeps what only reaches into the view, by the size it's draw
         // 10 m wide, its center 6 m to the right: well out of the view (1.64 m to either side), its left edge in it.
         de::world::RenderFrame frame = PoolScene::frame_of({mesh});
         const float transform[12] = {10, 0, 0, 6, 0, 10, 0, 0, 0, 0, 10, 0};
-        std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+        frame.instances[0].transform = de::test::render_transform(transform);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == 1);
         const auto pixels = de::test::read_texture(scene.device, scene.target);
@@ -560,15 +569,15 @@ TEST_CASE("the cull keeps what only reaches into the view, by the size it's draw
 
         // The same on one axis only: its bounds grow with its longest axis, whichever that is.
         const float wide[12] = {10, 0, 0, 6, 0, 1, 0, 0, 0, 0, 1, 0};
-        std::memcpy(frame.instances[0].transform, wide, sizeof(wide));
+        frame.instances[0].transform = de::test::render_transform(wide);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == 1);
         const float tall[12] = {1, 0, 0, 0, 0, 10, 0, 6, 0, 0, 1, 0};
-        std::memcpy(frame.instances[0].transform, tall, sizeof(tall));
+        frame.instances[0].transform = de::test::render_transform(tall);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == 1);
         const float deep[12] = {1, 0, 0, 2.5f, 0, 1, 0, 0, 0, 0, 10, 0};
-        std::memcpy(frame.instances[0].transform, deep, sizeof(deep));
+        frame.instances[0].transform = de::test::render_transform(deep);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws ==
               1); // a flat square, so it isn't really: a sphere is all the cull knows
@@ -583,7 +592,7 @@ TEST_CASE("the cull finds a mesh's bounds wherever its vertices are") {
         de::world::RenderFrame frame = PoolScene::frame_of({mesh});
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == 0); // the origin is in view, the square isn't
-        frame.instances[0].transform[3] = -30.0f;
+        frame.instances[0].transform.set_position_m(0, -30.0f);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == 1); // and now it's at the origin
         CHECK(is_red(de::test::read_texture(scene.device, scene.target), kMiddle));
@@ -661,7 +670,8 @@ TEST_CASE("the cull reaches every instance") {
         de::world::RenderFrame frame = PoolScene::frame_of({});
         constexpr uint32_t kCount = 130; // two groups of 64 and a bit
         for (uint32_t i = 0; i < kCount; ++i) {
-            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+            frame.instances.push(
+                {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         }
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().visible_draws == kCount);
@@ -677,8 +687,10 @@ TEST_CASE("a caster out of the camera's view still casts its shadow") {
         // that depth, so not the square, but with the sun at (1, 0, 2) its shadow lands 1 m to its left: x = 0.1 on the
         // wall.
         de::world::RenderFrame frame = PoolScene::frame_of({});
-        frame.instances.push({.transform = {2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}, .mesh = mesh});
-        frame.instances.push({.transform = {0.5f, 0, 0, 1.1f, 0, 0.5f, 0, 0, 0, 0, 0.5f, 2}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({2, 0, 0, 0, 0, 2, 0, 0, 0, 0, 2, 0}), .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 1.1f, 0, 0.5f, 0, 0, 0, 0, 0.5f, 2}), .mesh = mesh});
         de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
         light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
         scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
@@ -689,25 +701,194 @@ TEST_CASE("a caster out of the camera's view still casts its shadow") {
     });
 }
 
+namespace {
+
+// The floor at y = -1, seen from above, and square casters scattered over it and around, some far out of view.
+de::world::RenderFrame scattered_casters(AssetHandle mesh) {
+    de::world::RenderFrame frame = PoolScene::frame_of({});
+    frame.instances.push(
+        {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, -1, 0, -100, 0, 0}), .mesh = mesh});
+    uint32_t state = 12345;
+    const auto next = [&state](float low, float high) {
+        state = (state * 1664525U) + 1013904223U;
+        return low + ((high - low) * static_cast<float>(state >> 16U) / 65536.0f);
+    };
+    for (int i = 0; i < 400; ++i) {
+        // Half of them close by, where shadows are easy to see. Tilted, so no sun finds them all edge on.
+        const float reach_m = i % 2 == 0 ? 25.0f : 70.0f;
+        const float size = next(0.2f, 1.5f);
+        const float x = next(-reach_m, reach_m);
+        const float y = next(0.0f, 12.0f);
+        const float z = next(-reach_m, reach_m);
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.71f * size, 0, 0.71f * size, x, 0.5f * size, 0.71f * size,
+                                                      -0.5f * size, y, -0.5f * size, 0.71f * size, 0.5f * size, z}),
+             .mesh = mesh});
+    }
+    return frame;
+}
+
+int pixels_apart(const de::core::Array<std::byte>& a, const de::core::Array<std::byte>& b) {
+    int apart = 0;
+    for (uint32_t y = 0; y < kSize; ++y) {
+        for (uint32_t x = 0; x < kSize; ++x) {
+            bool differs = false;
+            for (int c = 0; c < 3; ++c) {
+                differs = differs || texel(a, x, y)[c] != texel(b, x, y)[c];
+            }
+            apart += differs ? 1 : 0;
+        }
+    }
+    return apart;
+}
+
+} // namespace
+
+TEST_CASE("casters whose shadow lands out of sight are left out, and no picture changes") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        de::world::RenderFrame frame = scattered_casters(mesh);
+        // A wide spread of evenings and noons, ahead and turned, with the cascades' hand-over bands where the floor is.
+        struct Case {
+            float sun[3];
+            float turn_rad;
+        };
+        constexpr Case kCases[] = {
+            {.sun = {1, 1, 2}, .turn_rad = 0.0f},     {.sun = {-1, 0.4f, 0.1f}, .turn_rad = 0.0f},
+            {.sun = {0, 1, 0}, .turn_rad = 0.7f},     {.sun = {0.2f, 0.3f, -1}, .turn_rad = 2.0f},
+            {.sun = {1, 0.15f, 0}, .turn_rad = 4.0f}, {.sun = {-0.6f, 0.7f, 0.6f}, .turn_rad = 5.5f}};
+        for (const Case& test_case : kCases) {
+            CAPTURE(test_case.turn_rad);
+            CAPTURE(test_case.sun[0]);
+            const float c = std::cos(test_case.turn_rad);
+            const float s = std::sin(test_case.turn_rad);
+            const float camera[12] = {c, 0, s, 3 * s, 0, 1, 0, 2, -s, 0, c, 3 * c};
+            std::memcpy(frame.camera.transform, camera, sizeof(camera));
+            de::render::SceneLighting light{.sun_direction = {test_case.sun[0], test_case.sun[1], test_case.sun[2]}};
+            light.shadows = {.resolution = 512, .distance_m = 40.0f, .blend_band = 0.3f};
+            // Light shafts read the cascades too.
+            light.fog.density_per_m = 0.02f;
+            light.fog.volume_distance_m = 30.0f;
+            const auto shown = [&](de::render::SceneView view) {
+                scene.submit_for_stats(frame, light, view);
+                return de::test::read_texture(scene.device, scene.target);
+            };
+            scene.renderer.set_shadow_caster_cull(false);
+            const auto all_mask = shown(de::render::SceneView::ShadowMask);
+            const uint32_t all_draws = scene.renderer.stats().visible_shadow_draws;
+            const auto all_lit = shown(de::render::SceneView::Lit);
+            scene.renderer.set_shadow_caster_cull(true);
+            const auto some_mask = shown(de::render::SceneView::ShadowMask);
+            const uint32_t some_draws = scene.renderer.stats().visible_shadow_draws;
+            const auto some_lit = shown(de::render::SceneView::Lit);
+            CHECK(some_draws < all_draws);
+            CHECK(pixels_apart(all_mask, some_mask) == 0);
+            CHECK(pixels_apart(all_lit, some_lit) == 0);
+            // There was something to lose.
+            int shadowed = 0;
+            for (uint32_t y = 0; y < kSize; ++y) {
+                for (uint32_t x = 0; x < kSize; ++x) {
+                    shadowed += texel(some_mask, x, y)[0] < 128 ? 1 : 0;
+                }
+            }
+            CHECK(shadowed > 20);
+        }
+    });
+}
+
+TEST_CASE("a caster beside what a cascade lights stays out, though the cascade's map could hold it") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // The sun behind the camera, so its near and side faces are all swept across: only the planes along the sun,
+        // from the edges, keep this out. It's to the right of the view, inside the last cascade's sphere.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.5f, 0, 0, 25, 0, 0.5f, 0, 0, 0, 0, 0.5f, -20}), .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0.3f, 1}};
+        light.shadows = {.resolution = 512, .distance_m = 40.0f};
+        scene.renderer.set_shadow_caster_cull(false);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws >= 1);
+        scene.renderer.set_shadow_caster_cull(true);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+
+        // The same thing in front of the view casts as it always did.
+        frame.instances[0].transform.set_position_m(0, 0.0);
+        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+        CHECK(scene.renderer.stats().visible_shadow_draws >= 1);
+    });
+}
+
+TEST_CASE("a caster too small for a cascade's texels stays out of it, and in the finer ones") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // Where two cascades meet, so it's in both: even splits of 8 m, 2 m apart, and it's 2 m ahead of the eye.
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        constexpr float kSizeM = 0.1f;
+        frame.instances.push(
+            {.transform = de::test::render_transform({kSizeM, 0, 0, 0, 0, kSizeM, 0, 0, 0, 0, kSizeM, 1}),
+             .mesh = mesh});
+        de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+        de::render::ShadowCascade cascades[de::render::kShadowCascadeCount];
+        const float sun[3] = {0, 0, 1};
+        de::render::fit_shadow_cascades(frame.camera.transform, de::DVec3(0.0), 1.0f, 0.1f, 1.0f, sun, light.shadows,
+                                        cascades);
+        REQUIRE(cascades[1].texel_m > cascades[0].texel_m);
+
+        const auto drawn = [&](float min_texels) {
+            scene.renderer.set_shadow_min_texels(min_texels);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            return scene.renderer.stats().visible_shadow_draws;
+        };
+        const uint32_t all = drawn(0.0f);
+        REQUIRE(all >= 2);
+        CHECK(drawn(1e6f) == 0);
+        // Its bounding sphere: half a diagonal of the square, whose mesh is 1 m wide.
+        const float diameter_m = kSizeM * std::numbers::sqrt2_v<float>;
+        const float between = diameter_m / std::sqrt(cascades[0].texel_m * cascades[1].texel_m);
+        const uint32_t finer_only = drawn(between);
+        CHECK(finer_only >= 1);
+        CHECK(finer_only < all);
+        CHECK(drawn(0.99f * diameter_m / cascades[0].texel_m) >= 1);
+        CHECK(drawn(1.01f * diameter_m / cascades[0].texel_m) == 0);
+    });
+}
+
 TEST_CASE("a cascade drops casters past either end of its depth") {
     with_pool({}, [](const PoolScene& scene) {
         put_squares(scene.vfs, kCenter, kRed, {0.0f});
         const AssetHandle mesh = scene.load(kCenter);
         scene.uploader.flush_and_wait();
-        de::world::RenderFrame frame = PoolScene::frame_of({mesh});
-        de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
-        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
-        CHECK(in_reach > 0);
-        // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
-        frame.instances[0].transform[11] = 5000.0f;
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
-        // And past the far end of every cascade.
-        frame.instances[0].transform[11] = -5000.0f;
-        scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
-        CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        // With the cull, and with all a map could hold, which is what the cull's pictures are compared with.
+        for (const bool cull : {true, false}) {
+            CAPTURE(cull);
+            scene.renderer.set_shadow_caster_cull(cull);
+            de::world::RenderFrame frame = PoolScene::frame_of({mesh});
+            de::render::SceneLighting light{.sun_direction = {0, 0, 1}}; // straight behind the camera
+            light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            const uint32_t in_reach = scene.renderer.stats().visible_shadow_draws;
+            CHECK(in_reach > 0);
+            // Well past how far toward the sun a cascade reaches (200 m at most), straight up the sun's direction.
+            frame.instances[0].transform.set_position_m(2, 5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+            // And past the far end of every cascade.
+            frame.instances[0].transform.set_position_m(2, -5000.0f);
+            scene.submit_for_stats(frame, light, de::render::SceneView::ShadowMask);
+            CHECK(scene.renderer.stats().visible_shadow_draws == 0);
+        }
     });
 }
 
@@ -796,8 +977,8 @@ namespace {
 
 // An instance for a slot, x meters along.
 de::world::RenderInstance instance_at(AssetHandle mesh, uint32_t slot, float x_m) {
-    return {.transform = {1, 0, 0, x_m, 0, 1, 0, 0, 0, 0, 1, 0},
-            .previous_transform = {1, 0, 0, x_m, 0, 1, 0, 0, 0, 0, 1, 0},
+    return {.transform = de::test::render_transform({1, 0, 0, x_m, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .previous_transform = de::test::render_transform({1, 0, 0, x_m, 0, 1, 0, 0, 0, 0, 1, 0}),
             .mesh = mesh,
             .slot = slot};
 }
@@ -845,6 +1026,88 @@ TEST_CASE("instances stay on the GPU until something about them changes") {
         CHECK(is_red(pixels, kLeft));
         CHECK(is_green(pixels, kMiddle));
         CHECK_FALSE(is_green(pixels, kRight));
+    });
+}
+
+TEST_CASE("the render origin moves with nothing sent, and every pass still finds the instances") {
+    with_pool({}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle red = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+
+        // 10,000 km out, where a float couldn't hold a place: a 2 m wall, and a square casting a shadow on it. The same
+        // layout as the shadow caster test above.
+        const de::DVec3 world{10'240'000.0, 0.0, 0.0};
+        const auto at_world = [&](uint32_t slot, float scale, double x, double y, double z) {
+            de::world::RenderInstance instance;
+            const float matrix[12] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 0};
+            instance.transform = de::test::render_transform(matrix);
+            instance.transform.set_position_m(0, world.x + x);
+            instance.transform.set_position_m(1, world.y + y);
+            instance.transform.set_position_m(2, world.z + z);
+            instance.previous_transform = instance.transform;
+            instance.mesh = red;
+            instance.slot = slot;
+            return instance;
+        };
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        frame.origin = world;
+        frame.camera.previous_valid = true;
+        std::memcpy(frame.camera.previous_transform, frame.camera.transform, sizeof(frame.camera.transform));
+        frame.slot_count = 2;
+        frame.instances.push(at_world(0, 2.0f, 0.0, 0.0, 0.0));
+        frame.instances.push(at_world(1, 0.5f, 0.6, 0.6, 1.0));
+        de::render::SceneLighting light{.sun_direction = {1, 0, 2}};
+        light.shadows = {.resolution = 512, .distance_m = 8.0f, .split_lambda = 0.0f};
+
+        const auto pictures = [&] {
+            std::array<de::core::Array<std::byte>, 3> out;
+            const de::render::SceneView views[3] = {de::render::SceneView::BaseColor, de::render::SceneView::ShadowMask,
+                                                    de::render::SceneView::Motion};
+            for (size_t v = 0; v < 3; ++v) {
+                scene.submit_for_stats(frame, light, views[v]);
+                frame.instances.clear(); // sent once
+                out[v] = de::test::read_texture(scene.device, scene.target);
+            }
+            return out;
+        };
+        // The debug view of motion: grey is none. Nothing here moved, so a wrong pose a frame ago is all that could
+        // show.
+        const auto no_motion = [](const de::core::Array<std::byte>& motion) {
+            const uint8_t* const center = texel(motion, kMiddle, kMiddle);
+            return std::abs(int{center[0]} - 127) <= 3 && std::abs(int{center[1]} - 127) <= 3;
+        };
+        const auto here = pictures();
+        CHECK(no_motion(here[2]));
+        CHECK(scene.renderer.stats().instance_updates == 0);
+        CHECK(scene.renderer.stats().visible_draws == 2);
+        CHECK(is_red(here[0], kMiddle));
+        CHECK(texel(here[1], kMiddle + 2, kMiddle - 12)[0] < 40); // the shadow
+        CHECK(texel(here[1], kMiddle - 12, kMiddle)[0] > 215);    // lit
+
+        // The origin moves a step along x: only what's relative to it changes, and nothing's sent.
+        constexpr double kMoved = de::world::kRenderOriginStep;
+        frame.origin.x -= kMoved;
+        frame.camera.transform[3] = static_cast<float>(kMoved);
+        frame.camera.previous_transform[3] = static_cast<float>(kMoved);
+        const auto there = pictures();
+        CHECK(scene.renderer.stats().instance_updates == 0);
+        CHECK(scene.renderer.stats().visible_draws == 2);
+        CHECK(texel(there[1], kMiddle + 2, kMiddle - 12)[0] < 40);
+        CHECK(no_motion(there[2]));
+        for (size_t v = 0; v < 3; ++v) {
+            int differs = 0;
+            for (uint32_t y = 0; y < kSize; ++y) {
+                for (uint32_t x = 0; x < kSize; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        differs += std::abs(int{texel(here[v], x, y)[c]} - int{texel(there[v], x, y)[c]}) > 8 ? 1 : 0;
+                    }
+                }
+            }
+            CAPTURE(v);
+            // A float's rounding can tip a pixel on a shadow's edge: one on CI's software GPU, none on this machine's.
+            CHECK(differs <= (v == 1 ? 12 : 0));
+        }
     });
 }
 
@@ -1433,8 +1696,8 @@ TEST_CASE("a mesh that doesn't fit in the pool is left out, whichever buffer is 
         // What's in the pool draws; what isn't is skipped, wherever it stands. The third has room for what the second
         // would add if it took some other mesh's place, as it's out of view.
         de::world::RenderFrame frame = PoolScene::frame_of({center, sides, center});
-        frame.instances[1].transform[3] = 1.0f;
-        frame.instances[2].transform[3] = 50.0f;
+        frame.instances[1].transform.set_position_m(0, 1.0f);
+        frame.instances[2].transform.set_position_m(0, 50.0f);
         scene.submit_for_stats(frame);
         CHECK(scene.renderer.stats().draws == 2);
         CHECK(scene.renderer.stats().visible_draws == 1);
@@ -1634,7 +1897,7 @@ TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
         const auto kept_at = [&](float distance, float scale) {
             de::world::RenderFrame frame = PoolScene::frame_of({grid});
             const float transform[12] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, 3.0f - distance};
-            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            frame.instances[0].transform = de::test::render_transform(transform);
             scene.submit_for_stats(frame);
             return scene.renderer.stats().visible_triangles;
         };
@@ -1657,7 +1920,7 @@ TEST_CASE("a view picks the coarsest LOD whose error it wouldn't see") {
             de::world::RenderFrame frame = PoolScene::frame_of({grid});
             const float offset = depth * 0.6f; // about 31 degrees: well in view at this aspect
             const float transform[12] = {1, 0, 0, 0, 0, 1, 0, offset, 0, 0, 1, 3.0f - depth};
-            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            frame.instances[0].transform = de::test::render_transform(transform);
             scene.submit_for_stats(frame);
             return scene.renderer.stats().visible_triangles;
         };
@@ -1686,7 +1949,7 @@ TEST_CASE("a picked LOD stays within a pixel of LOD 0 on screen") {
             scene.renderer.set_lod_error_pixels(lod_error_pixels);
             de::world::RenderFrame frame = PoolScene::frame_of({grid});
             const float transform[12] = {1, 0, 0, 0, 0, 0, 1, 0, 0, -1, 0, 3.0f - distance};
-            std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
+            frame.instances[0].transform = de::test::render_transform(transform);
             scene.submit_for_stats(frame);
             triangles = scene.renderer.stats().visible_triangles;
             const auto pixels = de::test::read_texture(scene.device, scene.target);
@@ -1775,8 +2038,8 @@ struct FadeView {
         const float distance = (error_m * pixels_per_radian / share) + mesh->bounds_radius_m;
         de::world::RenderFrame frame = PoolScene::frame_of({grid});
         const float transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3.0f - distance};
-        std::memcpy(frame.instances[0].transform, transform, sizeof(transform));
-        std::memcpy(frame.instances[0].previous_transform, transform, sizeof(transform)); // it isn't moving
+        frame.instances[0].transform = de::test::render_transform(transform);
+        frame.instances[0].previous_transform = de::test::render_transform(transform); // it isn't moving
         return frame;
     }
 
@@ -2011,8 +2274,8 @@ TEST_CASE("what's fading keeps its alpha test and which sides it shows") {
         const FadeView both_view{.scene = scene, .grid = both, .error_m = kFadeError};
         de::world::RenderFrame frame = both_view.frame_at(0.9f);
         // Half a turn about Y.
-        frame.instances[0].transform[0] = -1.0f;
-        frame.instances[0].transform[10] = -1.0f;
+        frame.instances[0].transform.rows[0].linear[0] = -1.0f;
+        frame.instances[0].transform.rows[2].linear[2] = -1.0f;
         scene.submit_for_stats(frame);
         seen = FadeView::count(de::test::read_texture(scene.device, scene.target));
         CHECK(seen.first == 0);

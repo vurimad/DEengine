@@ -147,8 +147,8 @@ TEST_CASE("each instance knows where it was a frame ago, from the same two ticks
             if (instance.slot == de::world::kSkipRenderInstance) {
                 continue;
             }
-            const float x = previous ? instance.previous_transform[3] : instance.transform[3];
-            if (want_statue == (instance.transform[3] < -50.0f)) {
+            const float x = previous ? instance.previous_transform.position_m(0) : instance.transform.position_m(0);
+            if (want_statue == (instance.transform.position_m(0) < -50.0f)) {
                 return x;
             }
         }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset/environment_format.h"
+#include "core/math.h"
 #include "core/result.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
@@ -121,20 +122,28 @@ struct SceneRendererStats {
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
 };
 
+// The most planes it takes to bound what can shadow a slice of the view.
+inline constexpr uint32_t kShadowCasterPlanes = 11;
+
 // A cascade of the sun's shadow map: where it reaches along the view, and its projection.
 struct ShadowCascade {
     float far_m = 0.0f;       // its far edge, as distance along the view
     float texel_m = 0.0f;     // a shadow texel's size
     float depth_per_m = 0.0f; // depth units per meter toward the sun
     float view_proj[16] = {}; // rows: render-origin space to the cascade's clip space
+    // What can shadow anything this cascade is read for: the part of the view it serves, its blend band and what its
+    // filter reaches included, swept toward the sun. Inside: dot(xyz, p) + w >= 0, in render-origin space.
+    float caster_planes[kShadowCasterPlanes][4] = {};
+    uint32_t caster_plane_count = 0;
 };
 
-// Fits the cascades to a camera (3x4 rows, looking down -Z) and the sun (toward it; straight up if
-// it's zero):
+// Fits the cascades to a camera (3x4 rows relative to the render origin, looking down -Z) and the sun (toward it;
+// straight up if it's zero):
 // splits between near_m and the shadow distance, a bounding sphere per slice (its size doesn't
-// change as the camera turns), centered on a texel grid (it doesn't swim as the camera moves).
-void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
-                         const float (&sun_direction)[3], const SceneShadows& shadows,
+// change as the camera turns), centered on a texel grid in the world (it doesn't swim as the camera or the origin
+// moves).
+void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float vertical_fov_rad, float near_m,
+                         float aspect, const float (&sun_direction)[3], const SceneShadows& shadows,
                          ShadowCascade (&out)[kShadowCascadeCount]);
 
 struct SceneRendererState;
@@ -177,6 +186,14 @@ public:
     // has taken over when its error has fallen by this share of it, or sooner if the next is near. An object draws
     // twice meanwhile. 0 cuts between them; shadow cascades always do.
     void set_lod_fade(float share);
+
+    // Whether a cascade leaves out casters whose shadow can't land on anything it's read for. This changes no picture:
+    // off is there to compare with.
+    void set_shadow_caster_cull(bool on);
+
+    // A caster whose bounding sphere is narrower than this many of a cascade's texels doesn't draw in it. 0: all of
+    // them.
+    void set_shadow_min_texels(float texels);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).

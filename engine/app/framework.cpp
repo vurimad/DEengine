@@ -158,6 +158,15 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
             return false;
         }
     }
+    out.shadow_caster_cull = !has_flag(out, "--no-shadow-caster-cull");
+    if (const char* min_texels = flag_value(out, "--shadow-min-texels")) {
+        char* end = nullptr;
+        out.shadow_min_texels = std::strtof(min_texels, &end);
+        if (end == min_texels || *end != '\0' || !(out.shadow_min_texels >= 0.0f)) {
+            DE_LOG_ERROR("render", "--shadow-min-texels must be a number, 0 or more");
+            return false;
+        }
+    }
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -280,6 +289,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             scene_renderer.emplace(std::move(*created));
             scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
             scene_renderer->set_lod_fade(args.lod_fade);
+            scene_renderer->set_shadow_caster_cull(args.shadow_caster_cull);
+            scene_renderer->set_shadow_min_texels(args.shadow_min_texels);
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }
