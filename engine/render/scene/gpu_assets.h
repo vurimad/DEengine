@@ -53,18 +53,18 @@ static_assert(sizeof(GpuMaterial) == 80);
 struct GpuMeshPart {
     uint32_t first_index = 0; // in the pool's index buffer
     uint32_t index_count = 0;
-    uint32_t material = 0; // index into the material table
+    uint32_t material = 0;      // index into the material table
+    uint32_t vertex_offset = 0; // its mesh's first vertex in the pool
 };
-static_assert(sizeof(GpuMeshPart) == 12);
+static_assert(sizeof(GpuMeshPart) == 16);
 
 // An entry of the mesh table, as GpuMeshInfo in shaders/scene/scene_common.slang.
 struct GpuMeshInfo {
     float center[3] = {};
     float radius_m = 0.0f;
-    uint32_t vertex_offset = 0;
     uint32_t first_lod = 0; // in the LOD table
     uint32_t lod_count = 0;
-    uint32_t padding = 0;
+    uint32_t padding[2] = {};
 };
 static_assert(sizeof(GpuMeshInfo) == 32);
 
@@ -185,6 +185,10 @@ public:
     uint64_t mesh_table_address() const;
     uint64_t lod_table_address() const;
     uint64_t part_table_address() const;
+    // How much of the part table has ever been used: every part in it is below this.
+    uint32_t part_table_used() const;
+    // How much it can hold.
+    uint32_t part_table_size() const;
     // The fog noise's bindless index (3D, fog_noise.h), or 0 until it's uploaded.
     uint32_t fog_noise_index() const;
 

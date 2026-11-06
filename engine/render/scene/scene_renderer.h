@@ -116,7 +116,10 @@ struct SceneRendererStats {
     uint32_t visible_draws = 0;
     uint32_t visible_fading_draws = 0; // of those, what's fading between LODs: both LODs of each
     uint32_t visible_shadow_draws = 0;
-    uint32_t draws_lost = 0; // past the end of a list, which has room for all that should land in it, so normally 0
+    // What those come to for the GPU: everything of one mesh part in one list is one instanced draw.
+    uint32_t merged_draws = 0;
+    uint32_t merged_shadow_draws = 0;
+    uint32_t draws_lost = 0; // visible, but with no room: a list has room for all that should land in it, so normally 0
     uint32_t visible_triangles = 0;
     uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
@@ -186,6 +189,13 @@ public:
     // has taken over when its error has fallen by this share of it, or sooner if the next is near. An object draws
     // twice meanwhile. 0 cuts between them; shadow cascades always do.
     void set_lod_fade(float share);
+
+    // Whether what's the same part in the same list is one instanced draw, or a draw each. Off is there to compare
+    // with: on a GPU slow at very small instances, it might be what's wanted. Not while a frame is being built.
+    void set_merged_draws(bool on);
+
+    // At most this many draws in a call, or fewer if the device says so: what a device with few would do.
+    void set_max_draws_per_call(uint32_t draws);
 
     // Whether a cascade leaves out casters whose shadow can't land on anything it's read for. This changes no picture:
     // off is there to compare with.
