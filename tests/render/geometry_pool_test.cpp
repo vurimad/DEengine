@@ -934,10 +934,48 @@ TEST_CASE("merged draws fit however few draws a call can take, and what has no r
         CHECK(scene.renderer.stats().draws_lost >= 3);
         const auto one = de::test::read_texture(scene.device, scene.target);
         CHECK(pixels_apart(both, one) > 0);
+        // About 19.5 pixels a meter, so a row is 12 pixels from the middle, and each square's center 20 from the next.
+        const auto squares = [&](uint32_t row, bool is_red_row) {
+            int shown = 0;
+            for (const uint32_t x : {kLeft, kMiddle, kRight}) {
+                const uint8_t* const color = texel(one, x, row);
+                shown += (is_red_row ? color[0] > 200 && color[1] < 60 : color[1] > 200 && color[0] < 60) ? 1 : 0;
+            }
+            return shown;
+        };
+        // Whichever got the draw, it's all three of it in their own places: nothing of the other's landed in its
+        // records.
+        const int red_shown = squares(kMiddle - 12, true);
+        const int green_shown = squares(kMiddle + 12, false);
+        CHECK(((red_shown == 3 && green_shown == 0) || (red_shown == 0 && green_shown == 3)));
         scene.renderer.set_max_draws_per_call(UINT32_MAX);
         scene.submit_for_stats(frame, light);
         CHECK(scene.renderer.stats().draws_lost == 0);
         CHECK(pixels_apart(both, de::test::read_texture(scene.device, scene.target)) == 0);
+    });
+}
+
+TEST_CASE("merged draws have a record for every object, however few draws a call can take") {
+    with_pool({.max_instances = 4096}, [](const PoolScene& scene) {
+        put_squares(scene.vfs, kCenter, kRed, {0.0f});
+        const AssetHandle mesh = scene.load(kCenter);
+        scene.uploader.flush_and_wait();
+        // More than the smallest room the records are given, in one list and one draw.
+        constexpr int kCount = 3000;
+        de::world::RenderFrame frame = PoolScene::frame_of({});
+        for (int i = 0; i < kCount; ++i) {
+            const float x = -1.0f + (2.0f * static_cast<float>(i % 60) / 60.0f);
+            const float y = -1.0f + (2.0f * static_cast<float>(i / 60) / 50.0f);
+            frame.instances.push(
+                {.transform = de::test::render_transform({0.01f, 0, 0, x, 0, 0.01f, 0, y, 0, 0, 0.01f, 0}),
+                 .mesh = mesh});
+        }
+        scene.renderer.set_max_draws_per_call(2);
+        scene.submit_for_stats(frame);
+        CHECK(scene.renderer.stats().visible_draws == kCount);
+        CHECK(scene.renderer.stats().merged_draws == 1);
+        CHECK(scene.renderer.stats().draws_lost == 0);
+        scene.renderer.set_max_draws_per_call(UINT32_MAX);
     });
 }
 
