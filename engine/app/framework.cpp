@@ -149,6 +149,15 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
             return false;
         }
     }
+    if (const char* lod_fade = flag_value(out, "--lod-fade")) {
+        char* end = nullptr;
+        out.lod_fade = std::strtof(lod_fade, &end);
+        // The range test is negated, so NaN fails it too.
+        if (end == lod_fade || *end != '\0' || !(out.lod_fade >= 0.0f && out.lod_fade < 1.0f)) {
+            DE_LOG_ERROR("render", "--lod-fade must be a number from 0 to below 1");
+            return false;
+        }
+    }
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -270,6 +279,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (created) {
             scene_renderer.emplace(std::move(*created));
             scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
+            scene_renderer->set_lod_fade(args.lod_fade);
         } else {
             DE_LOG_ERROR("render", "scene renderer: %s (the window is only cleared)", created.error().message);
         }
@@ -427,7 +437,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("shadow draws to cull", static_cast<int64_t>(drawn.shadow_draws));
                 DE_PROFILE_PLOT("indirect calls", static_cast<int64_t>(drawn.indirect_calls));
                 DE_PROFILE_PLOT("visible draws", static_cast<int64_t>(drawn.visible_draws));
+                DE_PROFILE_PLOT("visible fading draws", static_cast<int64_t>(drawn.visible_fading_draws));
                 DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
+                DE_PROFILE_PLOT("draws lost", static_cast<int64_t>(drawn.draws_lost));
                 DE_PROFILE_PLOT("visible triangles", static_cast<int64_t>(drawn.visible_triangles));
                 DE_PROFILE_PLOT("visible shadow triangles", static_cast<int64_t>(drawn.visible_shadow_triangles));
                 static_cast<void>(drawn);

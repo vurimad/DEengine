@@ -27,6 +27,7 @@ struct VertexOutput
     float4 clip : CLIP;                   // where the vertex is, and was last frame: the motion vector
     float4 previous_clip : PREVIOUS_CLIP;
     nointerpolation uint material : MATERIAL;
+    nointerpolation float fade : FADE;
 };
 
 struct GBufferOutput
@@ -64,7 +65,18 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     output.tangent = float4(mul(linear, tangent.xyz), tangent.w);
     output.uv = vertex.uv;
     output.material = draw.material;
+    output.fade = draw.fade;
     return output;
+}
+
+// Whether a LOD gives this pixel to the other one it's fading with. Both ask of the same value, so each pixel gets exactly
+// one. Interleaved gradient noise spreads any share evenly over the pixels. The golden ratio per TAA sample then spreads it
+// evenly over the frames at each pixel, so the history blends it.
+bool faded_out(float fade, float2 pixel)
+{
+    const float noise = 52.9829189 * frac(dot(floor(pixel), float2(0.06711056, 0.00583715)));
+    const float dither = frac(noise + 0.61803399 * push.frame.taa_params.y);
+    return fade > 0.0 ? dither >= fade : dither < -fade;
 }
 
 // The surface into the G-buffer, past any alpha test.
@@ -98,18 +110,14 @@ GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial mat
     return output;
 }
 
-// Opaque materials: no discard anywhere in the shader, so depth is tested before it runs.
-[shader("fragment")]
-GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFace)
+GBufferOutput opaque_surface(VertexOutput input, bool front_face)
 {
     const GpuMaterial material = push.materials[input.material];
     const float3 base = sample_texture(material.base_color_texture, push.sampler, input.uv).rgb * material.base_color.rgb;
     return write_surface(input, front_face, material, base);
 }
 
-// Masked materials (the renderer picks this one by their flag): the alpha test.
-[shader("fragment")]
-GBufferOutput fragment_masked(VertexOutput input, bool front_face: SV_IsFrontFace)
+GBufferOutput masked_surface(VertexOutput input, bool front_face)
 {
     const GpuMaterial material = push.materials[input.material];
     const float4 base = sample_texture(material.base_color_texture, push.sampler, input.uv) * material.base_color;
@@ -118,4 +126,39 @@ GBufferOutput fragment_masked(VertexOutput input, bool front_face: SV_IsFrontFac
         discard;
     }
     return write_surface(input, front_face, material, base.rgb);
+}
+
+// Opaque materials: no discard anywhere in the shader, so depth is tested before it runs.
+[shader("fragment")]
+GBufferOutput fragment_opaque(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    return opaque_surface(input, front_face);
+}
+
+// Masked materials (the renderer picks this one by their flag): the alpha test.
+[shader("fragment")]
+GBufferOutput fragment_masked(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    return masked_surface(input, front_face);
+}
+
+// What's fading between LODs. The discard costs the early depth test, so only this has it.
+[shader("fragment")]
+GBufferOutput fragment_opaque_fading(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    if (faded_out(input.fade, input.position.xy))
+    {
+        discard;
+    }
+    return opaque_surface(input, front_face);
+}
+
+[shader("fragment")]
+GBufferOutput fragment_masked_fading(VertexOutput input, bool front_face: SV_IsFrontFace)
+{
+    if (faded_out(input.fade, input.position.xy))
+    {
+        discard;
+    }
+    return masked_surface(input, front_face);
 }

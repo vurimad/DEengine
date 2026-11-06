@@ -76,6 +76,7 @@ inline constexpr uint32_t kNoMeshSlot = UINT32_MAX;
 // The most parts of each kind a mesh draws in any LOD.
 struct GpuMeshKinds {
     uint32_t parts[kDrawKindCount] = {};
+    bool has_lods = false; // more than LOD 0, so it can fade between them
 };
 
 constexpr uint32_t draw_kind(GpuMaterialFlags flags) {

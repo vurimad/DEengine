@@ -38,6 +38,8 @@ public struct GpuDraw
 {
     public uint instance; // its row in the instance data
     public uint material; // its slot in the material table
+    public float fade;    // between two LODs: above 0, the coarser, kept where the dither is below it; below 0, the
+                          // finer, kept where it's at or above minus this. 0: no fade
 };
 
 // The tables and lists of the GPU cull (scene.cull). All of these match C++ structs of the same name: the first
@@ -79,7 +81,8 @@ public struct GpuCullView
     public float4 depth_plane;   // dot(xyz, p) + w is the depth in front of the eye, in render-origin space
     public float lod_scale;      // what makes a LOD's error (in meters, over its depth if perspective) 1 at the most it may
                                  // be. Below 0: LOD 0 everywhere
-    public float padding[3];
+    public float lod_fade_end;   // that error (where it's 1, a LOD comes in), at which it has taken over. 1: no fade
+    public float padding[2];
 };
 
 public struct GpuDrawList
