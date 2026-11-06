@@ -327,7 +327,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit,
-                  .taa = setting(as_text(settings), "taa") == "on"};
+                  .taa = setting(as_text(settings), "taa") == "on",
+                  .freeze_cull = false};
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
@@ -422,6 +423,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                                                                      .final_state = rhi::ResourceState::Present,
                                                                      .discard = true});
             if (scene_renderer) {
+                scene_renderer->set_cull_frozen(engine.freeze_cull);
                 scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
                                            engine.lighting, engine.view, engine.taa);
                 if (scene_renderer->instances_stale()) {

@@ -195,6 +195,14 @@ public:
     // them.
     void set_shadow_min_texels(float texels);
 
+    // Freezes the cull, to check it by eye. From the next frame with a camera, every view it culls and picks LODs with
+    // (the camera's and each cascade's) stays as it was then, at the same place in the world wherever the camera or the
+    // render origin goes, while the picture follows the live camera: fly off, and it shows what was and wasn't drawn.
+    // Only the draw lists come from those views. Shadows are still drawn and read through cascades fitted to the live
+    // camera, from casters the frozen cascades kept, so they land in the right place but go missing, and can stay for
+    // what's no longer drawn. Unfrozen, the next frame is as usual; freezing again takes that frame's views.
+    void set_cull_frozen(bool frozen);
+
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).
     bool instances_stale() const;

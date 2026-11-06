@@ -50,6 +50,8 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
     next_view_ = engine.input.add_action("debug.next_view"_sid, platform::ActionKind::Button);
     toggle_taa_ = engine.input.add_action("debug.toggle_taa"_sid, platform::ActionKind::Button);
+    freeze_cull_ = engine.input.add_action("debug.freeze_cull"_sid, platform::ActionKind::Button);
+    engine.freeze_cull = has_flag(args, "--freeze-cull");
 #endif
     return true;
 }
@@ -121,6 +123,10 @@ bool Viewer::update(Engine& engine, float frame_s) {
     if (engine.input.state(toggle_taa_).pressed) {
         engine.taa = !engine.taa;
         DE_LOG_INFO("render", "TAA %s", engine.taa ? "on" : "off");
+    }
+    if (engine.input.state(freeze_cull_).pressed) {
+        engine.freeze_cull = !engine.freeze_cull;
+        DE_LOG_INFO("render", "cull %s", engine.freeze_cull ? "frozen where the camera is" : "live");
     }
 #endif
     return true;

@@ -342,6 +342,13 @@ void set_plane(float (&plane)[4], const float* view_proj, uint32_t row, float si
     normalize_plane(plane);
 }
 
+// A plane relative to a render origin, for an origin this far from it: the same plane in the world.
+void move_plane_origin(float (&plane)[4], const DVec3& moved) {
+    plane[3] =
+        static_cast<float>(static_cast<double>(plane[3]) + (static_cast<double>(plane[0]) * moved.x) +
+                           (static_cast<double>(plane[1]) * moved.y) + (static_cast<double>(plane[2]) * moved.z));
+}
+
 // The sides of a clip space, inside for |x| <= w and |y| <= w.
 void set_side_planes(GpuCullView& view, const float* view_proj) {
     set_plane(view.planes[0], view_proj, 0, 1.0f);
@@ -405,6 +412,12 @@ struct SceneRendererState {
     float lod_fade = 0.2f;
     bool shadow_caster_cull = true;
     float shadow_min_texels = 1.0f;
+    // A frozen cull (set_cull_frozen): its views, once a frame has given them, kept here because the frame's memory is
+    // very slow to read, and the render origin they're relative to.
+    bool cull_frozen = false;
+    bool frozen_views_held = false;
+    GpuCullView frozen_views[kCullViewCount] = {};
+    DVec3 frozen_origin{0.0};
     SceneShadows shadows; // this frame's, within limits
     shader::ProgramHandle taa_program;
     // What TAA keeps of a frame for the next: two sets, a frame's target and the last frame's to read.
@@ -859,15 +872,14 @@ struct SceneRendererState {
         plan.updates = count;
     }
 
-    // The cull's views, what changed in the instances, and from them the draw lists' sizes.
-    void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
-                         const ShadowCascade (&cascades)[kShadowCascadeCount], uint32_t height, CullPlan& plan) {
+    // The views this frame gives the cull.
+    void make_cull_views(const world::RenderFrame& frame, const SceneFrame& scene,
+                         const ShadowCascade (&cascades)[kShadowCascadeCount], uint32_t height,
+                         GpuCullView (&views)[kCullViewCount]) const {
         // At 0, LOD 0 everywhere, however small a LOD's error.
         const auto lod_scale_for = [this](float per_unit_of_error) {
             return lod_error_pixels > 0.0f ? per_unit_of_error / lod_error_pixels : -1.0f;
         };
-        // Made here and copied: this memory is fast to write and very slow to read.
-        GpuCullView views[kCullViewCount];
         // The camera: its sides, which meet at its eye, so they cover what's behind it too. Projection has no far
         // plane.
         views[0] = {.plane_count = 4,
@@ -909,6 +921,36 @@ struct SceneRendererState {
             set_plane(view.planes[view.plane_count], view_proj, 2, -1.0f);
             ++view.plane_count;
         }
+    }
+
+    // The frozen views, relative to this frame's render origin. Always worked out from the origin they froze at, so
+    // rounding doesn't add up as it moves.
+    void frozen_cull_views(const DVec3& origin, GpuCullView (&views)[kCullViewCount]) const {
+        const DVec3 moved = origin - frozen_origin;
+        for (uint32_t v = 0; v < kCullViewCount; ++v) {
+            views[v] = frozen_views[v];
+            for (uint32_t p = 0; p < views[v].plane_count; ++p) {
+                move_plane_origin(views[v].planes[p], moved);
+            }
+            move_plane_origin(views[v].depth_plane, moved);
+        }
+    }
+
+    // The cull's views, what changed in the instances, and from them the draw lists' sizes.
+    void write_cull_data(std::span<std::byte> mapped, const world::RenderFrame& frame, const SceneFrame& scene,
+                         const ShadowCascade (&cascades)[kShadowCascadeCount], uint32_t height, CullPlan& plan) {
+        // Made here and copied: this memory is fast to write and very slow to read.
+        GpuCullView views[kCullViewCount];
+        if (cull_frozen && frozen_views_held) {
+            frozen_cull_views(frame.origin, views);
+        } else {
+            make_cull_views(frame, scene, cascades, height, views);
+            if (cull_frozen) {
+                std::copy_n(views, kCullViewCount, frozen_views);
+                frozen_origin = frame.origin;
+                frozen_views_held = true;
+            }
+        }
         std::memcpy(mapped.data() + kCullViewsOffset, views, sizeof(views));
 
         write_instance_updates(mapped, frame, plan);
@@ -924,9 +966,10 @@ struct SceneRendererState {
             bool drawable = false;
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
                 kind_parts[kind] += uint64_t{count} * kinds[mesh].parts[kind];
-                // Two LODs at once, each with at most that many.
-                fading_parts[kind] +=
-                    kinds[mesh].has_lods && lod_fade > 0.0f ? uint64_t{2} * count * kinds[mesh].parts[kind] : 0;
+                // Two LODs at once, each with at most that many. Not lod_fade: a frozen view keeps its fades.
+                fading_parts[kind] += kinds[mesh].has_lods && views[0].lod_fade_end < 1.0f
+                                          ? uint64_t{2} * count * kinds[mesh].parts[kind]
+                                          : 0;
                 drawable = drawable || kinds[mesh].parts[kind] > 0;
             }
             plan.drawn += drawable ? count : 0;
@@ -2131,6 +2174,11 @@ void SceneRenderer::set_shadow_caster_cull(bool on) {
 
 void SceneRenderer::set_shadow_min_texels(float texels) {
     state_->shadow_min_texels = texels;
+}
+
+void SceneRenderer::set_cull_frozen(bool frozen) {
+    state_->cull_frozen = frozen;
+    state_->frozen_views_held = frozen && state_->frozen_views_held; // what freezes next takes a new view
 }
 
 bool SceneRenderer::instances_stale() const {
