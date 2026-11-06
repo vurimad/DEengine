@@ -52,6 +52,7 @@ add_executable(de_tests
     world/world_test.cpp
     support/gpu.h
     support/readback.h
+    support/render_transform.h
     support/sandbox.h
     support/shader_kit.h)
 

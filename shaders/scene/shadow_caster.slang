@@ -7,7 +7,7 @@ import scene.scene_common;
 struct ShadowCasterPush
 {
     SceneFrame* frame;
-    float4* instances; // 3 rows per instance: object to render-origin space
+    GpuInstance* instances;
     MeshVertex* vertices;
     GpuMaterial* materials;
     GpuDraw* draws;
@@ -30,10 +30,8 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const GpuDraw draw = push.draws[draw_id];
-    const float4 local = float4(vertex.position, 1.0);
-    const float3 world = float3(dot(push.instances[draw.instance * kInstanceRows + 0], local),
-                                dot(push.instances[draw.instance * kInstanceRows + 1], local),
-                                dot(push.instances[draw.instance * kInstanceRows + 2], local));
+    const float3 world =
+        instance_point(push.instances[draw.instance].transform, push.frame.render_origin_steps.xyz, vertex.position);
     VertexOutput output;
     output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;

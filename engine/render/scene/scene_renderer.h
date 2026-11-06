@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset/environment_format.h"
+#include "core/math.h"
 #include "core/result.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
@@ -129,12 +130,13 @@ struct ShadowCascade {
     float view_proj[16] = {}; // rows: render-origin space to the cascade's clip space
 };
 
-// Fits the cascades to a camera (3x4 rows, looking down -Z) and the sun (toward it; straight up if
-// it's zero):
+// Fits the cascades to a camera (3x4 rows relative to the render origin, looking down -Z) and the sun (toward it;
+// straight up if it's zero):
 // splits between near_m and the shadow distance, a bounding sphere per slice (its size doesn't
-// change as the camera turns), centered on a texel grid (it doesn't swim as the camera moves).
-void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
-                         const float (&sun_direction)[3], const SceneShadows& shadows,
+// change as the camera turns), centered on a texel grid in the world (it doesn't swim as the camera or the origin
+// moves).
+void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float vertical_fov_rad, float near_m,
+                         float aspect, const float (&sun_direction)[3], const SceneShadows& shadows,
                          ShadowCascade (&out)[kShadowCascadeCount]);
 
 struct SceneRendererState;

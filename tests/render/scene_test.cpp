@@ -15,6 +15,7 @@
 #include "render/shader/shader_library.h"
 #include "support/gpu.h"
 #include "support/readback.h"
+#include "support/render_transform.h"
 #include "support/sandbox.h"
 #include "world/render_extract.h"
 
@@ -234,7 +235,8 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         // The square seen from 3 m in front, filling the middle of a 64 x 64 target.
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
-        frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         const auto target =
             device->create_texture({.width = kSize,
                                     .height = kSize,
@@ -406,6 +408,35 @@ TEST_CASE("a mesh with many materials and mipped textures is ready within a few 
     de::test::check_clean(*device);
 }
 
+TEST_CASE("a cascade's texel grid stays put in the world as the render origin moves") {
+    const de::render::SceneShadows shadows;
+    const float sun[3] = {0.3f, 0.7f, 0.6f};
+    // One camera in the world, relative to two origins a step apart.
+    const de::DVec3 first_origin(10'240'000.0, 0.0, 0.0);
+    const de::DVec3 next_origin = first_origin + de::DVec3(de::world::kRenderOriginStep, 0.0, 0.0);
+    const float first_camera[12] = {1, 0, 0, 1000, 0, 1, 0, 2, 0, 0, 1, 30};
+    const float next_camera[12] = {1, 0, 0, 1000 - 1024, 0, 1, 0, 2, 0, 0, 1, 30};
+    de::render::ShadowCascade first[de::render::kShadowCascadeCount];
+    de::render::ShadowCascade next[de::render::kShadowCascadeCount];
+    de::render::fit_shadow_cascades(first_camera, first_origin, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, first);
+    de::render::fit_shadow_cascades(next_camera, next_origin, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, next);
+    // A point a little ahead lands on the same place in each tile, to within what floats hold.
+    const auto clip = [](const de::render::ShadowCascade& cascade, double x, double y, double z, int row) {
+        return static_cast<double>(cascade.view_proj[row * 4 + 0]) * x +
+               static_cast<double>(cascade.view_proj[row * 4 + 1]) * y +
+               static_cast<double>(cascade.view_proj[row * 4 + 2]) * z +
+               static_cast<double>(cascade.view_proj[row * 4 + 3]);
+    };
+    for (uint32_t c = 0; c < de::render::kShadowCascadeCount; ++c) {
+        CAPTURE(c);
+        for (int row = 0; row < 2; ++row) {
+            const double there = clip(first[c], 1000.0, 2.0, 25.0, row);
+            const double here = clip(next[c], 1000.0 - 1024.0, 2.0, 25.0, row);
+            CHECK(std::abs(there - here) * 0.5 * static_cast<double>(shadows.resolution) < 0.25);
+        }
+    }
+}
+
 TEST_CASE("shadow cascades split the view, grow outward, and don't change size as the camera turns") {
     const de::render::SceneShadows shadows;
     const float sun[3] = {0.0f, 0.70710678f, 0.70710678f};
@@ -414,8 +445,8 @@ TEST_CASE("shadow cascades split the view, grow outward, and don't change size a
     const float turned[12] = {0, 0, 1, 10, 0, 1, 0, 2, -1, 0, 0, 30};
     de::render::ShadowCascade a[4];
     de::render::ShadowCascade b[4];
-    de::render::fit_shadow_cascades(looking_ahead, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, a);
-    de::render::fit_shadow_cascades(turned, 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, b);
+    de::render::fit_shadow_cascades(looking_ahead, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, a);
+    de::render::fit_shadow_cascades(turned, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, sun, shadows, b);
     for (int c = 0; c < 4; ++c) {
         CAPTURE(c);
         if (c > 0) {
@@ -429,7 +460,7 @@ TEST_CASE("shadow cascades split the view, grow outward, and don't change size a
     // No sun (a zero direction): finite cascades all the same (straight down).
     const float none[3] = {0.0f, 0.0f, 0.0f};
     de::render::ShadowCascade night[de::render::kShadowCascadeCount];
-    de::render::fit_shadow_cascades(looking_ahead, 1.0f, 0.1f, 16.0f / 9.0f, none, shadows, night);
+    de::render::fit_shadow_cascades(looking_ahead, de::DVec3(0.0), 1.0f, 0.1f, 16.0f / 9.0f, none, shadows, night);
     for (const float value : night[0].view_proj) {
         CHECK(std::isfinite(value));
     }
@@ -504,8 +535,11 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
         // where the camera sees the back square itself (the occluder covers x > 0.5 from there).
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
-        frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
-        frame.instances.push({.transform = {0.25f, 0, 0, 0.6f, 0, 0.25f, 0, 0, 0, 0, 0.25f, 1}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({0.25f, 0, 0, 0.6f, 0, 0.25f, 0, 0, 0, 0, 0.25f, 1}),
+             .mesh = mesh});
         const auto target =
             device->create_texture({.width = kSize,
                                     .height = kSize,
@@ -599,7 +633,8 @@ TEST_CASE("a material whose texture was missing picks it up when it appears") {
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
         const de::asset::AssetHandle mesh = assets->load<de::asset::MeshAsset>(kQuad);
-        frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = mesh});
         // The engine's frame, a few times over: the registry, the GPU copies, the passes.
         const auto run_frames = [&](int count) {
             for (int i = 0; i < count; ++i) {
@@ -770,7 +805,8 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
                 frame.camera.transform[10] = -1.0f;
                 frame.camera.transform[11] = -3.0f;
             }
-            frame.instances.push({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}, .mesh = meshes[v]});
+            frame.instances.push(
+                {.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = meshes[v]});
             device->begin_frame();
             uploader->record();
             graph->begin(kSize, kSize);
@@ -1007,7 +1043,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         agree(thin, 1, kSize - 2);
         agree(thin, x, 1); // looking up at the sky: no fog dims it past where the fog ends
         // A surface inside the grid, close by: the fog up to it, read from between two slices.
-        frame.instances.push({.transform = {5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({5, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, -1}), .mesh = mesh});
         thin.density_per_m = 0.2f;
         thin.end_m = 1000.0f;
         agree(thin, kSize / 2, kSize / 2);
@@ -1015,7 +1052,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // A red surface in the grid behind dense fog, with red barely dimmed by it: a channel with a
         // small extinction scale goes on falling with depth (optical depth 27.5, red's e^-2.75 and
         // white's e^-27.5, far below what a stored transmittance could hold).
-        frame.instances.push({.transform = {300, 0, 0, 0, 0, 300, 0, 0, 0, 0, 300, -55}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({300, 0, 0, 0, 0, 300, 0, 0, 0, 0, 300, -55}), .mesh = mesh});
         de::render::SceneFog deep = closed;
         deep.density_per_m = 0.5f;
         deep.extinction_tint[0] = 0.1f;
@@ -1036,7 +1074,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // A roof 5 m up, 200 m wide (the square turned to lie flat), shadows the fog under it. The
         // closed form can't know; the grid does: what's left is the sky's light, and the sun's past
         // the roof's edge, behind nearly all of this fog.
-        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
         const de::core::Array<std::byte> closed_roofed = render(closed);
         const de::core::Array<std::byte> gridded_roofed = render(gridded);
         CHECK(static_cast<int>(texel(closed_roofed, x, y)[1]) ==
@@ -1061,8 +1100,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
 
         // Over frames: a shadow edge straight ahead, the roof over the left half of the view. Each frame's
         // samples move around in the froxels; the light keeps most of last frame's at the same place.
-        const de::world::RenderInstance half_roof{.transform = {100, 0, 0, -100, 0, 0, 100, 5, 0, 100, 0, 0},
-                                                  .mesh = mesh};
+        const de::world::RenderInstance half_roof{
+            .transform = de::test::render_transform({100, 0, 0, -100, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh};
         const uint32_t left = kSize / 4;
         const uint32_t right = kSize - kSize / 4;
         const uint32_t middle = kSize / 2;
@@ -1168,7 +1207,9 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         far_fog.volume_distance_m = 400.0f;
         for (const float edge_z : {-40.0f, -50.0f, -56.0f}) {
             frame.instances.clear();
-            frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, edge_z - 100.0f}, .mesh = mesh});
+            frame.instances.push(
+                {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, edge_z - 100.0f}),
+                 .mesh = mesh});
             restart();
             const int single_frame = green(render(far_fog), middle);
             settle(far_fog);
@@ -1275,9 +1316,9 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
             REQUIRE(shaft_target.ok());
             frame.instances.clear();
             for (int i = -15; i <= 15; ++i) {
-                frame.instances.push(
-                    {.transform = {1.5f, 0, 0, 4.0f * static_cast<float>(i), 0, 0, 100, 8, 0, 100, 0, -50.0f},
-                     .mesh = mesh});
+                frame.instances.push({.transform = de::test::render_transform(
+                                          {1.5f, 0, 0, 4.0f * static_cast<float>(i), 0, 0, 100, 8, 0, 100, 0, -50.0f}),
+                                      .mesh = mesh});
             }
             de::render::SceneFog shaft_fog = closed;
             shaft_fog.density_per_m = 0.05f;
@@ -1457,7 +1498,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
 
         // It's in the sun's shadow like any fog.
         frame.fog_volumes[0] = volume_at(0.0f, 0.0f, -10.0f, 3.0f, 0.5f, 0.5f);
-        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, 0}), .mesh = mesh});
         const de::core::Array<std::byte> roofed_box = render(clear_air);
         frame.instances.clear();
         CHECK(at_pixel(roofed_box, heart, heart, 1) < at_pixel(box, heart, heart, 1) - 15);
@@ -1472,8 +1514,8 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         late_start_fog.density_per_m = 0.3f;
         late_start_fog.start_m = 500.0f;
         late_start_fog.sun_start_m = 500.0f;
-        frame.instances.push(
-            {.transform = {100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -40}, .mesh = mesh}); // nothing past it
+        frame.instances.push({.transform = de::test::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -40}),
+                              .mesh = mesh}); // nothing past it
         const de::core::Array<std::byte> walled_clear = render(clear_air);
         const de::core::Array<std::byte> walled_late_start_fog = render(late_start_fog);
         frame.instances.clear();
@@ -1637,7 +1679,9 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         // as thick as the mist: it shows the mist in front of it, however much of the slice that is.
         const auto wall_at = [&](float depth) {
             frame.instances.clear();
-            frame.instances.push({.transform = {100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -depth}, .mesh = mesh});
+            frame.instances.push(
+                {.transform = de::test::render_transform({100, 0, 0, 0, 0, 100, 0, 0, 0, 0, 100, -depth}),
+                 .mesh = mesh});
         };
         const auto mist_slab = [&](float center_depth, float half_depth) {
             de::world::RenderFogVolume slab_ahead = volume_at(0.0f, 0.0f, -center_depth, 6.0f, 1.0f, 0.1f);
@@ -1696,9 +1740,11 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
         wall_at(55.0f);
         frame.fog_volumes.push(mist_slab(49.2f, 0.4f));
         const de::core::Array<std::byte> thin_lit = render(clear_air);
-        frame.instances.push({.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, -49.2f}, .mesh = mesh});
+        frame.instances.push(
+            {.transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 100, 0, -49.2f}), .mesh = mesh});
         const de::core::Array<std::byte> thin_all_roofed = render(clear_air);
-        frame.instances.back() = {.transform = {100, 0, 0, 0, 0, 0, 100, 5, 0, 0.8f, 0, -49.2f}, .mesh = mesh};
+        frame.instances.back() = {
+            .transform = de::test::render_transform({100, 0, 0, 0, 0, 0, 100, 5, 0, 0.8f, 0, -49.2f}), .mesh = mesh};
         const de::core::Array<std::byte> thin_narrow_roof = render(clear_air);
         frame.fog_volumes.clear();
         CHECK(at_pixel(thin_lit, heart, heart, 1) > at_pixel(thin_all_roofed, heart, heart, 1) + 15);
@@ -1965,9 +2011,10 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
         // view's middle from 3 m away: a meter there is 1 / (3 tan 0.5) of the view's half height.
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
-        const de::world::RenderInstance square{.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
-                                               .previous_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
-                                               .mesh = mesh};
+        const de::world::RenderInstance square{
+            .transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .previous_transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .mesh = mesh};
         frame.instances.push(square);
         const float uv_per_m = 0.5f / (3.0f * std::tan(0.5f));
         const auto shown = [&] {
@@ -2005,8 +2052,8 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
         check_center(0.0f, 0.1f * uv_per_m);
         check_center(0.0f, 0.0f);
         // The square moved 0.2 m right since last frame, and 0.1 m up.
-        frame.instances[0].transform[3] = 0.2f;
-        frame.instances[0].transform[7] = 0.1f;
+        frame.instances[0].transform.set_position_m(0, 0.2f);
+        frame.instances[0].transform.set_position_m(1, 0.1f);
         check_center(0.2f * uv_per_m, -0.1f * uv_per_m);
         frame.instances[0] = square;
         check_center(0.0f, 0.0f); // the camera didn't move, and the square says it didn't
@@ -2090,9 +2137,10 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         // A red square 3 m away over the sky, the sun behind the camera.
         de::world::RenderFrame frame;
         frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
-        const de::world::RenderInstance square{.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
-                                               .previous_transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
-                                               .mesh = mesh};
+        const de::world::RenderInstance square{
+            .transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .previous_transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}),
+            .mesh = mesh};
         de::render::SceneLighting light{.sun_direction = {0, 0, 1}};
         const auto draw = [&](bool taa) {
             device->begin_frame();
@@ -2151,8 +2199,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         CHECK(std::abs(red(next, edge) - red(settled, edge)) <= 12);
 
         // A big jump: 0.8 m in a frame. Where it was is sky at once, and it's at its new place at once.
-        frame.instances[0].transform[3] = 0.8f;
-        frame.instances[0].previous_transform[3] = 0.0f;
+        frame.instances[0].transform.set_position_m(0, 0.8f);
+        frame.instances[0].previous_transform.set_position_m(0, 0.0f);
         const de::core::Array<std::byte> jumped = draw(true);
         CHECK(std::abs(red(jumped, column(-0.6f)) - sky_red) < 8);
         CHECK(std::abs(red(jumped, column(-0.3f)) - sky_red) < 8);
@@ -2169,9 +2217,9 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             float x = 0.0f;
             for (int i = 0; i < 8; ++i) {
                 const float step = pixels_per_frame * pixel_m;
-                frame.instances[0].previous_transform[3] = x;
+                frame.instances[0].previous_transform.set_position_m(0, x);
                 x += step;
-                frame.instances[0].transform[3] = x;
+                frame.instances[0].transform.set_position_m(0, x);
                 const de::core::Array<std::byte> moved = draw(true);
                 CAPTURE(pixels_per_frame);
                 CAPTURE(i);
@@ -2181,9 +2229,9 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         }
 
         // It stops, and the image settles where it stopped: no slide, no trail.
-        frame.instances[0].previous_transform[3] = frame.instances[0].transform[3];
+        frame.instances[0].previous_transform.set_position_m(0, frame.instances[0].transform.position_m(0));
         settle();
-        const float stopped_at = frame.instances[0].transform[3];
+        const float stopped_at = frame.instances[0].transform.position_m(0);
         const de::core::Array<std::byte> stopped = draw(true);
         CHECK(std::abs(red(stopped, column(stopped_at - 1.0f - pixel_m * 2.0f)) - sky_red) < 6);
 
@@ -2205,12 +2253,12 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         // and on: the ring of sky around it reads history as well as the square does.
         frame.camera.transform[3] = 0.0f;
         frame.camera.previous_valid = false;
-        frame.instances[0].transform[3] = 0.0f;
-        frame.instances[0].previous_transform[3] = 0.0f;
+        frame.instances[0].transform.set_position_m(0, 0.0f);
+        frame.instances[0].previous_transform.set_position_m(0, 0.0f);
         const float half_pixel_x =
             (static_cast<float>(edge) + 0.5f - static_cast<float>(kSize) * 0.5f) * pixel_m - 1.0f;
-        frame.instances[0].transform[3] = half_pixel_x;
-        frame.instances[0].previous_transform[3] = half_pixel_x;
+        frame.instances[0].transform.set_position_m(0, half_pixel_x);
+        frame.instances[0].previous_transform.set_position_m(0, half_pixel_x);
         settle();
         int edge_lowest = 255;
         int edge_highest = 0;
@@ -2250,9 +2298,10 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
                    (static_cast<float>(pixel) - static_cast<float>(kSize) * 0.5f) * pixel_m * distance_m / 3.0f;
         };
         const auto thing = [](de::asset::AssetHandle what, float x, float z, float scale = 1.0f) {
-            return de::world::RenderInstance{.transform = {scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z},
-                                             .previous_transform = {scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z},
-                                             .mesh = what};
+            return de::world::RenderInstance{
+                .transform = de::test::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
+                .previous_transform = de::test::render_transform({scale, 0, 0, x, 0, scale, 0, 0, 0, 0, 1, z}),
+                .mesh = what};
         };
         const auto look_from = [&](float camera_x) { frame.camera.transform[3] = camera_x; };
         constexpr int kEdge = 52; // the strip's right edge, at first
@@ -2345,8 +2394,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         settle();
         for (int trailing = kEdge - 10; trailing <= kEdge + 2; trailing += 3) {
             de::world::RenderInstance& other = frame.instances[frame.instances.size() - 1];
-            other.previous_transform[3] = other.transform[3];
-            other.transform[3] = boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f;
+            other.previous_transform.set_position_m(0, other.transform.position_m(0));
+            other.transform.set_position_m(0, boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f);
             const de::core::Array<std::byte> left = draw(true);
             if (trailing == kEdge + 2) {
                 CHECK(level(left, kEdge) < kept);
@@ -2364,8 +2413,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         de::core::Array<std::byte> behind;
         for (int trailing = 11; trailing <= 24; ++trailing) {
             de::world::RenderInstance& other = frame.instances[1];
-            other.previous_transform[3] = other.transform[3];
-            other.transform[3] = boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f;
+            other.previous_transform.set_position_m(0, other.transform.position_m(0));
+            other.transform.set_position_m(0, boundary(trailing, 0.0f, 3.0f - nearer) + 1.0f);
             behind = draw(true);
         }
         CHECK(level(behind, 23) < kept);
@@ -2386,10 +2435,10 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         for (int step = 3; step >= 0; --step) {
             de::world::RenderInstance& dark = frame.instances[2];
             de::world::RenderInstance& bright = frame.instances[3];
-            dark.previous_transform[3] = dark.transform[3];
-            dark.transform[3] = boundary(kLeading + step * 3, 0.0f, 3.0f - dark_z) + 1.0f;
-            bright.previous_transform[3] = bright.transform[3];
-            bright.transform[3] = boundary(kLeading + 5 - step * 3, 0.0f, 3.0f - red_z) + 1.0f;
+            dark.previous_transform.set_position_m(0, dark.transform.position_m(0));
+            dark.transform.set_position_m(0, boundary(kLeading + step * 3, 0.0f, 3.0f - dark_z) + 1.0f);
+            bright.previous_transform.set_position_m(0, bright.transform.position_m(0));
+            bright.transform.set_position_m(0, boundary(kLeading + 5 - step * 3, 0.0f, 3.0f - red_z) + 1.0f);
             crossed = draw(true);
         }
         CHECK(level(crossed, kLeading) < kept);
@@ -2501,8 +2550,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         frame.instances.push(thing(wall_mesh, 0.0f, -0.005f, 20.0f));
         // Half a meter nearer than the wall: well outside the depth slack.
         de::world::RenderInstance wire = thing(mesh, boundary(40, 0.0f, 2.5f) + pixel_m * 0.5f * 2.5f / 3.0f, 0.5f);
-        wire.transform[0] = pixel_m * 0.1f * 2.5f / 3.0f;
-        wire.previous_transform[0] = wire.transform[0];
+        wire.transform.rows[0].linear[0] = pixel_m * 0.1f * 2.5f / 3.0f;
+        wire.previous_transform.rows[0].linear[0] = wire.transform.rows[0].linear[0];
         frame.instances.push(wire);
         settle();
         int wire_highest = 0;
@@ -2523,8 +2572,8 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
             followed_x += pixels * pixel_m;
             look_from(followed_x);
             de::world::RenderInstance& hero = frame.instances[0];
-            hero.previous_transform[3] = hero.transform[3];
-            hero.transform[3] = half_pixel_x + followed_x;
+            hero.previous_transform.set_position_m(0, hero.transform.position_m(0));
+            hero.transform.set_position_m(0, half_pixel_x + followed_x);
             return draw(true);
         };
         for (int i = 0; i < 4; ++i) {
@@ -2556,14 +2605,14 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
         for (int i = 0; i < 8; ++i) {
             approach_m *= 0.93f;
             const float edge_x = ray_x * approach_m;
-            frame.instances[0].previous_transform[3] = frame.instances[0].transform[3];
-            frame.instances[0].previous_transform[11] = frame.instances[0].transform[11];
-            frame.instances[0].transform[3] = edge_x - 1.0f;
-            frame.instances[0].transform[11] = 3.0f - approach_m;
-            frame.instances[1].previous_transform[3] = frame.instances[1].transform[3];
-            frame.instances[1].previous_transform[11] = frame.instances[1].transform[11];
-            frame.instances[1].transform[3] = edge_x + 1.0f;
-            frame.instances[1].transform[11] = 3.0f - approach_m;
+            frame.instances[0].previous_transform.set_position_m(0, frame.instances[0].transform.position_m(0));
+            frame.instances[0].previous_transform.set_position_m(2, frame.instances[0].transform.position_m(2));
+            frame.instances[0].transform.set_position_m(0, edge_x - 1.0f);
+            frame.instances[0].transform.set_position_m(2, 3.0f - approach_m);
+            frame.instances[1].previous_transform.set_position_m(0, frame.instances[1].transform.position_m(0));
+            frame.instances[1].previous_transform.set_position_m(2, frame.instances[1].transform.position_m(2));
+            frame.instances[1].transform.set_position_m(0, edge_x + 1.0f);
+            frame.instances[1].transform.set_position_m(2, 3.0f - approach_m);
             const de::core::Array<std::byte> coming = draw(true);
             const int value = static_cast<int>(texel(coming, kSize / 2, kSize / 2 - 4)[0]);
             coming_lowest = std::min(coming_lowest, value);

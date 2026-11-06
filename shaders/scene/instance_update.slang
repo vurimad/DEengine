@@ -6,7 +6,7 @@ import scene.scene_common;
 // Matches GpuInstanceUpdate in scene_renderer.cpp.
 struct InstanceUpdate
 {
-    float4 rows[kInstanceRows];
+    GpuInstance instance;
     uint slot;
     uint mesh; // its slot in the mesh table, or kNoMesh
     uint padding[2];
@@ -15,8 +15,8 @@ struct InstanceUpdate
 struct InstanceUpdatePush
 {
     InstanceUpdate* updates;
-    float4* instances;     // kInstanceRows per slot
-    uint* instance_meshes; // per slot
+    GpuInstance* instances; // per slot
+    uint* instance_meshes;  // per slot
     uint count;
 };
 
@@ -35,9 +35,6 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     push.instance_meshes[update.slot] = update.mesh;
     if (update.mesh != kNoMesh)
     {
-        for (uint row = 0; row < kInstanceRows; ++row)
-        {
-            push.instances[update.slot * kInstanceRows + row] = update.rows[row];
-        }
+        push.instances[update.slot] = update.instance;
     }
 }

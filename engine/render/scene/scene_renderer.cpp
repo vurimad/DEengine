@@ -42,15 +42,16 @@ struct SceneFrame {
     float camera_forward[4] = {};
     float shadow_params[4] = {}; // blend band, atlas texel, penumbra per meter, max penumbra (texels)
     // FogMedium in shaders/common/fog.slang.
-    float fog_density[4] = {};           // constant, height base, falloff, base height (render-origin space)
-    float fog_extinction[4] = {};        // tint, ambient height attenuation
-    float fog_sun_forward[4] = {};       // colour, sun height attenuation
-    float fog_sun_back[4] = {};          // colour, sun start
-    float fog_ambient[4] = {};           // colour, start
-    float fog_range[4] = {};             // end, froxel grid reach, slice offset, slices
-    float previous_view_proj[16] = {};   // last frame's camera, relative to this frame's render origin
-    float unjittered_view_proj[16] = {}; // view_proj without TAA's sub-pixel offset
-    float taa_params[4] = {};            // last frame's near, TAA's sample (0 without TAA), its offset in NDC
+    float fog_density[4] = {};            // constant, height base, falloff, base height (render-origin space)
+    float fog_extinction[4] = {};         // tint, ambient height attenuation
+    float fog_sun_forward[4] = {};        // colour, sun height attenuation
+    float fog_sun_back[4] = {};           // colour, sun start
+    float fog_ambient[4] = {};            // colour, start
+    float fog_range[4] = {};              // end, froxel grid reach, slice offset, slices
+    float previous_view_proj[16] = {};    // last frame's camera, relative to this frame's render origin
+    float unjittered_view_proj[16] = {};  // view_proj without TAA's sub-pixel offset
+    float taa_params[4] = {};             // last frame's near, TAA's sample (0 without TAA), its offset in NDC
+    uint32_t render_origin_steps[4] = {}; // world::render_position_steps of the origin, per axis
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -209,7 +210,7 @@ constexpr uint32_t kMaxFogVolumes = 64;
 static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
 // Per slice of the grid, which volumes reach it: a froxel tests only those.
 constexpr uint64_t kFogSliceMasksOffset = kFogVolumesOffset + kMaxFogVolumes * sizeof(GpuFogVolume);
-constexpr uint64_t kInstanceBytes = 96; // six float4 rows: its transform, and last frame's
+constexpr uint64_t kInstanceBytes = 96; // a GpuInstance: its transform, and last frame's
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
@@ -269,13 +270,14 @@ constexpr uint64_t kInstanceUpdatesOffset = kDrawListsOffset + kDrawListCount * 
 
 // Matches InstanceUpdate in shaders/scene/instance_update.slang.
 struct GpuInstanceUpdate {
-    float rows[24] = {};
+    world::RenderTransform transform;
+    world::RenderTransform previous_transform;
     uint32_t slot = 0;
     uint32_t mesh = 0;
     uint32_t padding[2] = {};
 };
 static_assert(sizeof(GpuInstanceUpdate) == 112);
-static_assert(sizeof(world::RenderInstance::transform) * 2 == kInstanceBytes);
+static_assert(sizeof(world::RenderTransform) * 2 == kInstanceBytes);
 
 constexpr uint64_t frame_bytes(uint64_t update_count) {
     return kInstanceUpdatesOffset + std::max<uint64_t>(update_count, 1) * sizeof(GpuInstanceUpdate);
@@ -299,6 +301,7 @@ struct CullPlan {
 
 // Matches CullPush in shaders/scene/cull.slang.
 struct CullPush {
+    uint64_t frame = 0;
     uint64_t instances = 0;
     uint64_t instance_meshes = 0;
     uint64_t meshes = 0;
@@ -370,9 +373,9 @@ struct SceneRendererState {
     shader::ProgramHandle instance_update;
     // The instances, on the GPU between frames, and what the CPU keeps of them: each slot's mesh, to size the draw
     // lists without walking the instances.
-    rhi::BufferHandle instance_rows;
+    rhi::BufferHandle instance_data;
     rhi::BufferHandle instance_meshes;
-    uint64_t instance_rows_address = 0;
+    uint64_t instance_data_address = 0;
     uint64_t instance_meshes_address = 0;
     uint32_t max_instances = 0;
     uint32_t cleared_slots = 0;                        // slots the GPU knows hold nothing or something real
@@ -442,7 +445,7 @@ struct SceneRendererState {
         for (const rhi::BufferHandle buffer : cull_readback) {
             device->destroy(buffer);
         }
-        device->destroy(instance_rows);
+        device->destroy(instance_data);
         device->destroy(instance_meshes);
         destroy_temporal();
         destroy_froxels();
@@ -836,8 +839,8 @@ struct SceneRendererState {
             }
             set_slot_mesh(slot, mesh);
             GpuInstanceUpdate& update = updates[count++];
-            std::memcpy(update.rows, instance.transform, kInstanceBytes / 2);
-            std::memcpy(update.rows + 12, instance.previous_transform, kInstanceBytes / 2);
+            update.transform = instance.transform;
+            update.previous_transform = instance.previous_transform;
             update.slot = slot;
             update.mesh = mesh;
         }
@@ -993,6 +996,9 @@ struct SceneRendererState {
         scene.camera_position[0] = frame.camera.transform[3];
         scene.camera_position[1] = frame.camera.transform[7];
         scene.camera_position[2] = frame.camera.transform[11];
+        for (int axis = 0; axis < 3; ++axis) {
+            scene.render_origin_steps[axis] = world::render_position_steps(frame.origin[axis]);
+        }
         const float* d = lighting.sun_direction;
         const float length = std::max(std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]), 1e-6f);
         for (int i = 0; i < 3; ++i) {
@@ -1010,8 +1016,8 @@ struct SceneRendererState {
         }
         const float sun[3] = {scene.sun_direction[0], scene.sun_direction[1], scene.sun_direction[2]};
         ShadowCascade cascades[kShadowCascadeCount];
-        fit_shadow_cascades(frame.camera.transform, frame.camera.vertical_fov_rad, frame.camera.near_m, aspect, sun,
-                            shadows, cascades);
+        fit_shadow_cascades(frame.camera.transform, frame.origin, frame.camera.vertical_fov_rad, frame.camera.near_m,
+                            aspect, sun, shadows, cascades);
         for (uint32_t c = 0; c < kShadowCascadeCount; ++c) {
             std::memcpy(&scene.cascade_view_proj[static_cast<size_t>(c) * 16], cascades[c].view_proj,
                         sizeof(cascades[c].view_proj));
@@ -1139,8 +1145,8 @@ void camera_view_proj(const float (&camera)[12], float vertical_fov_rad, float n
     }
 }
 
-void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, float near_m, float aspect,
-                         const float (&sun_direction)[3], const SceneShadows& shadows,
+void fit_shadow_cascades(const float (&camera)[12], const DVec3& origin, float vertical_fov_rad, float near_m,
+                         float aspect, const float (&sun_direction)[3], const SceneShadows& shadows,
                          ShadowCascade (&out)[kShadowCascadeCount]) {
     const glm::dvec3 position(camera[3], camera[7], camera[11]);
     const glm::dvec3 forward = -glm::normalize(glm::dvec3(camera[2], camera[6], camera[10]));
@@ -1172,10 +1178,12 @@ void fit_shadow_cascades(const float (&camera)[12], float vertical_fov_rad, floa
         double radius = std::max(radius_near, radius_far);
         radius = std::ceil(radius * 16.0) / 16.0; // steps of 1/16 m: stable
         const double texel = 2.0 * radius / static_cast<double>(shadows.resolution);
-        // The center snapped to the shadow texel grid, in the light's axes: no swimming.
+        // The center snapped to the shadow texel grid, in the light's axes: no swimming. The grid is the world's: the
+        // origin's step isn't a whole number of texels, so a grid relative to it would jump as it moves.
         glm::dvec3 center = position + forward * z;
-        const double cx = std::floor(glm::dot(center, right) / texel) * texel;
-        const double cy = std::floor(glm::dot(center, up) / texel) * texel;
+        const glm::dvec3 world_center = center + origin;
+        const double cx = std::floor(glm::dot(world_center, right) / texel) * texel - glm::dot(origin, right);
+        const double cy = std::floor(glm::dot(world_center, up) / texel) * texel - glm::dot(origin, up);
         const double cz = glm::dot(center, back);
         center = right * cx + up * cy + back * cz;
         // Clip space: x, y over the sphere; depth 1 nearest the sun (reverse Z), across the sphere
@@ -1239,12 +1247,12 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     const core::Result<rhi::BufferHandle> rows =
         desc.device->create_buffer({.size = uint64_t{desc.max_instances} * kInstanceBytes,
                                     .usage = rhi::BufferUsage::Storage,
-                                    .debug_name = "instance rows"});
+                                    .debug_name = "instance data"});
     if (!rows) {
         return core::fail(rows.error());
     }
-    state->instance_rows = *rows;
-    state->instance_rows_address = desc.device->buffer_address(*rows);
+    state->instance_data = *rows;
+    state->instance_data_address = desc.device->buffer_address(*rows);
     const core::Result<rhi::BufferHandle> meshes =
         desc.device->create_buffer({.size = uint64_t{desc.max_instances} * sizeof(uint32_t),
                                     .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
@@ -1394,9 +1402,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const GraphBuffer draw_counts = cull_clear.counts;
 
     // What changed in the instances. They stay between frames, so the graph is told how they were left.
-    const GraphBuffer instance_rows_graph = graph.import_buffer(
-        {.buffer = state.instance_rows,
-         .name = "instance rows",
+    const GraphBuffer instance_data_graph = graph.import_buffer(
+        {.buffer = state.instance_data,
+         .name = "instance data",
          .state = state.instance_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
          .final_state = rhi::ResourceState::ShaderRead});
     const GraphBuffer instance_meshes_graph = graph.import_buffer(
@@ -1418,14 +1426,14 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         graph.add_pass(
             "instance update",
             [&](PassBuilder& pass) {
-                pass.use(instance_rows_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                pass.use(instance_data_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
                 pass.use(instance_meshes_graph, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             },
             [renderer = &state, pipeline = instance_update, frame_address,
              updates = plan.updates](PassContext& context) {
                 DE_PROFILE_ZONE("instance update pass");
                 const InstanceUpdatePush push{.updates = frame_address + kInstanceUpdatesOffset,
-                                              .instances = renderer->instance_rows_address,
+                                              .instances = renderer->instance_data_address,
                                               .instance_meshes = renderer->instance_meshes_address,
                                               .count = updates};
                 context.list.bind_pipeline(pipeline);
@@ -1455,7 +1463,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                              .debug_name = "draw lists"});
             pass.use(data.draws, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             pass.use(data.counts, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
-            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
             pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
         },
         [](const CullPass& data, PassContext& context) {
@@ -1466,7 +1474,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 return;
             }
             const uint64_t draws = renderer.device->buffer_address(context.buffer(data.draws));
-            const CullPush push{.instances = renderer.instance_rows_address,
+            const CullPush push{.frame = data.frame_address,
+                                .instances = renderer.instance_data_address,
                                 .instance_meshes = renderer.instance_meshes_address,
                                 .meshes = renderer.gpu_assets->mesh_table_address(),
                                 .lods = renderer.gpu_assets->lod_table_address(),
@@ -1553,7 +1562,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             data.atlas = pass.create_texture(
                 {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
             pass.use(data.atlas, rhi::ResourceState::DepthWrite);
-            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
         },
         [](const ShadowPass& data, PassContext& context) {
             DE_PROFILE_ZONE("shadow pass");
@@ -1561,7 +1570,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             const rhi::BufferHandle args = context.buffer(data.draws);
             const rhi::BufferHandle counts = context.buffer(data.counts);
             ShadowCasterPush push{.frame = data.frame_address,
-                                  .instances = renderer.instance_rows_address,
+                                  .instances = renderer.instance_data_address,
                                   .vertices = renderer.gpu_assets->pool_vertex_address(),
                                   .materials = renderer.gpu_assets->material_table_address(),
                                   .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
@@ -1638,7 +1647,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
-            pass.use(instance_rows_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+            pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
         },
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
@@ -1653,7 +1662,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.begin_rendering({.colors = colors, .depth = &depth});
             context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
             const GBufferPush push{.frame = data.frame_address,
-                                   .instances = renderer.instance_rows_address,
+                                   .instances = renderer.instance_data_address,
                                    .vertices = renderer.gpu_assets->pool_vertex_address(),
                                    .materials = renderer.gpu_assets->material_table_address(),
                                    .draws = renderer.device->buffer_address(context.buffer(data.draws)) +
