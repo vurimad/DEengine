@@ -112,6 +112,7 @@ struct LibraryState {
     uint64_t next_poll_ns = 0;
     uint32_t reloads = 0;
     uint32_t failed_reloads = 0;
+    bool reload_refused = false; // the stamp was wrong at the last look: said so once
 };
 
 namespace {
@@ -373,9 +374,35 @@ bool sources_changed(const LibraryState& state, Program& program) {
     return changed;
 }
 
+// Whether what's in game:/ may replace what's running: its stamp must name this build's sources.
+// During a cook it has none. Sources compile as they are, so this never stands in their way. Says
+// so once per refusal, however many programs wait. Their watched files stay as they were, so they
+// reload once the stamp is right again.
+bool reload_allowed(LibraryState& state) {
+    if (state.compiler != nullptr) {
+        return true;
+    }
+    const core::Result<uint64_t> stamp = asset::read_shader_stamp(*state.vfs);
+    const bool allowed = stamp.ok() && *stamp == built_source_hash();
+    if (!allowed && !state.reload_refused) {
+        DE_LOG_WARN("shader",
+                    "not reloading cooked shaders: game:/ has none cooked from the sources this build was compiled "
+                    "from (a cook may be running; for edited shaders, rebuild the engine). Keeping the ones in use");
+    }
+    state.reload_refused = !allowed;
+    return allowed;
+}
+
 // Takes a finished build: swaps in the new pipeline, or keeps the last good one. Rendering thread only.
 void finish_build(LibraryState& state, Program& program) {
     PendingBuild& build = program.pending;
+    if (build.ok && !reload_allowed(state)) {
+        // The stamp changed while the file was read: what's read may be from either side of it.
+        ++state.failed_reloads;
+        build = PendingBuild{};
+        program.build.store(Build::Idle, std::memory_order_relaxed);
+        return;
+    }
     core::Result<rhi::PipelineHandle> pipeline =
         build.ok ? create_pipeline(state, program, build.program)
                  : core::Result<rhi::PipelineHandle>(core::fail(core::ErrorCode::InvalidArgument, "compile failed"));
@@ -433,6 +460,9 @@ void advance_builds(LibraryState& state, bool wait) {
 }
 
 void queue_changed(LibraryState& state) {
+    if (!reload_allowed(state)) {
+        return;
+    }
     for (Program* program : state.programs) {
         if (program->build.load(std::memory_order_relaxed) == Build::Idle && sources_changed(state, *program)) {
             program->build.store(Build::Queued, std::memory_order_relaxed);
@@ -513,6 +543,23 @@ bool is_bindless_binding(const ResourceBinding& binding) {
     return false;
 }
 
+core::Result<void> check_cooked_shaders(const platform::Vfs& vfs, uint64_t sources_hash) {
+    const core::Result<uint64_t> stamp = asset::read_shader_stamp(vfs);
+    if (!stamp) {
+        DE_LOG_ERROR("shader", "%s: %s. Re-run the cooker (a cook that failed must succeed first)",
+                     asset::kShaderStampPath, stamp.error().message);
+        return core::fail(stamp.error().code, "no complete cook of the shaders: re-run the cooker");
+    }
+    if (*stamp != sources_hash) {
+        DE_LOG_ERROR("shader",
+                     "the shaders in game:/ are stale: cooked from sources %016llx, but this build was compiled from "
+                     "%016llx. Re-run the cooker (and rebuild the engine, if the sources changed since it was built)",
+                     static_cast<unsigned long long>(*stamp), static_cast<unsigned long long>(sources_hash));
+        return core::fail(core::ErrorCode::CorruptData, "the cooked shaders are stale: re-run the cooker");
+    }
+    return {};
+}
+
 uint64_t defines_hash(std::span<const ShaderDefine> defines) {
     asset::ShaderDefineText texts[kMaxShaderDefines];
     const size_t count = std::min(defines.size(), kMaxShaderDefines);
@@ -569,6 +616,9 @@ core::Result<ShaderLibrary> ShaderLibrary::create(rhi::Device& device, platform:
 
 core::Result<ShaderLibrary> ShaderLibrary::create_cooked(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
                                                          const ShaderLibraryDesc& desc) {
+    if (const core::Result<void> fresh = check_cooked_shaders(vfs, built_source_hash()); !fresh) {
+        return core::fail(fresh.error());
+    }
     return make(device, vfs, jobs, nullptr, desc);
 }
 

@@ -37,6 +37,10 @@ constexpr rhi::ShaderStage from_asset_stage(asset::ShaderStageKind stage) {
     return rhi::ShaderStage::Vertex;
 }
 
+// shader_sources_hash() of the shaders/ this build was compiled from, embedded by the build (a file
+// tools/shader_hash generates, so an edited shader relinks what uses it).
+uint64_t built_source_hash();
+
 // The permutation key a .deshader stores for these defines (asset::shader_defines_hash).
 uint64_t defines_hash(std::span<const ShaderDefine> defines);
 

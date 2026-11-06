@@ -10,9 +10,9 @@ cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debu
 | --- | --- |
 | `--src DIR` | the repository root, mounted as `src:/` (default: this repository) |
 | `--out DIR` | where cooked files go, mounted as `game:/` (default: `<src>/cooked`, which the engine mounts by default) |
-| `--check` | check the source and meta trees and write nothing; exit code 1 on errors (CI) |
+| `--check` | check the source and meta trees and report stale cooked shaders, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
 | `--force` | cook every source again |
-| `--no-shaders` | skip shaders (no Slang compiler needed) |
+| `--no-shaders` | skip shaders (no Slang compiler needed), in `--check` too |
 | `--shader-debug`, `--shader-checks` | source-level debug info, `DE_SHADER_CHECKS=1` in cooked shaders |
 
 It exits with 0 when there are no errors, and writes a JSON report (counts and every message, with the file it is about) to `<out>/cook_report.json`.
@@ -88,6 +88,7 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 
 - The same inputs give the same bytes: no timestamps or paths in cooked files, padding zeroed.
 - A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references, or (for cells) the IDs of the models it places: a model cooked again doesn't cook its cells again. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
+- `game:/shader_sources.hash` names the shader sources of everything in `game:/` by `asset::shader_sources_hash()`: every `.slang` under `shaders/` but `shaders/tests/`, by path and content, with CRLF read as LF. It's removed when a cook of the shaders starts and written when every module made it (test modules aside) and the sources hash as they did at the start, so a cook that fails, stops halfway or sees a file saved meanwhile leaves none, and the next one cooks every module. If it can't be removed, no shaders are cooked and the cook fails. It comes from the sources this run read, not from this cooker's own build. The engine refuses cooked shaders whose stamp doesn't match its build (`engine/render/shader/README.md`), and `--check` compares it with the sources as they are now; `.deshader` files without one are stale too.
 - A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are; `CookOptions::content = false` (shaders only, for tests) leaves what was cooked from `content/` as it is.
 - A glTF buffer shorter than the glTF says (a Git LFS pointer that was never pulled) is reported, never read past.
 - LODs never move vertices where two material parts meet, so they don't crack along seams.
@@ -103,4 +104,4 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 - HDR sources (EXR through tinyexr, BC6H), alpha-coverage-preserving mips for foliage, a quality setting for the BC7 encoder.
 - Shader permutations: modules cook with no defines; a list of permutations per module comes with the materials that need them.
 - Removing files deleted from `config/` from `game:/config/`; checking config files (`--check`).
-- Running on file change (the editor), cooking in parallel across sources, `de asset move`, and the archive packer.
+- Running on file change (the editor), cooking in parallel across sources, `de asset move`, and the archive packer (which has to carry `game:/shader_sources.hash` along).

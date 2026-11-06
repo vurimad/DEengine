@@ -45,6 +45,9 @@ private:
     intptr_t handle_ = kInvalid;
 };
 
+// The process's working directory, for messages about relative paths.
+core::Result<PathString> working_directory();
+
 // Writes data to path atomically: a uniquely named temporary file next to it, flushed, then
 // renamed over it. A crash leaves either the old file or the new one, never half of one, and
 // concurrent writes to one path each land whole (the last rename wins).
