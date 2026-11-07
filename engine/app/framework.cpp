@@ -170,6 +170,12 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
             return false;
         }
     }
+#if DE_BUILD_DEV
+    if (!parse_eyes_flags(out, out.eyes)) {
+        return false; // logged
+    }
+    out.vsync = out.vsync && !out.eyes.no_vsync;
+#endif
     if (const char* deadzone = flag_value(out, "--deadzone")) {
         char* end = nullptr;
         out.deadzone = std::strtof(deadzone, &end);
@@ -255,6 +261,17 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                      folder ? folder->c_str() : "unknown");
         return EXIT_FAILURE;
     }
+#if DE_BUILD_DEV
+    AgentEyes eyes;
+    if (!eyes.start(args.eyes, *vfs, config_path(src_root != nullptr, "camera.views").c_str())) {
+        return EXIT_FAILURE; // logged, and no window has opened
+    }
+    const bool scripted = eyes.scripted();
+    const bool swapchain_copy_src = eyes.takes_pictures();
+#else
+    const bool scripted = false;
+    const bool swapchain_copy_src = false;
+#endif
     auto window = platform::Window::create({.title = "DEengine",
                                             .width_points = args.window_width_points,
                                             .height_points = args.window_height_points,
@@ -262,7 +279,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     if (!window) {
         return EXIT_FAILURE;
     }
-    auto device = rhi::Device::create({.window = &*window, .validation = args.validation, .vsync = args.vsync});
+    auto device = rhi::Device::create({.window = &*window,
+                                       .validation = args.validation,
+                                       .vsync = args.vsync,
+                                       .swapchain_copy_src = swapchain_copy_src});
     if (!device) {
         DE_LOG_ERROR("engine", "no usable GPU: %s", device.error().message);
         return EXIT_FAILURE;
@@ -356,7 +376,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
     tools::DebugUi debug_ui = tools::DebugUi::create(*window, *device, engine.shaders, *uploader);
     tools::StatsPanel stats_panel;
-    bool show_stats = true;
+    bool show_stats = !scripted; // what it shows changes from run to run: not in a picture to compare
     const platform::ActionId toggle_stats = input.add_action("debug.toggle_stats"_sid, platform::ActionKind::Button);
     // The raw stick readout (--show-sticks), for measuring drift: the deadzone is off, so these show
     // the true resting values.
@@ -376,6 +396,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
+#if DE_BUILD_DEV
+    if (scripted && !eyes.wait_for_scene(*window, input, *assets, *gpu_assets, *uploader, *device)) {
+        application.shutdown(engine);
+        static_cast<void>(eyes.finish(*device));
+        return EXIT_FAILURE;
+    }
+#endif
 
     // --- The frame loop ---------------------------------------------------------------------------
     uint64_t frame = 0;
@@ -390,13 +417,21 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         const double measured_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
         // What the camera and the world move by.
         // Minimized, nothing is presented: there are no refreshes to count.
-        const double frame_s =
+        const double clock_s =
             frame_clock.step(measured_s, device->vsync() && !window->minimized() ? window->refresh_hz() : 0.0);
+#if DE_BUILD_DEV
+        const double frame_s = eyes.frame_s(clock_s);
+        engine.camera_pose = eyes.begin_frame();
+#else
+        const double frame_s = clock_s;
+#endif
         DE_PROFILE_PLOT("frame clock on the refresh rate", static_cast<int64_t>(frame_clock.holds_rate() ? 1 : 0));
         previous_frame_ns = frame_start_ns;
 
         platform::pump_events(*window, input);
-        input.sample();
+        if (!scripted) { // a stray key or a drifting stick mustn't change a script's pictures
+            input.sample();
+        }
         if (window->minimized() != was_minimized) {
             was_minimized = window->minimized();
             DE_LOG_INFO("platform", was_minimized ? "minimized" : "restored");
@@ -466,6 +501,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             }
 #if DE_BUILD_DEV
             debug_ui.add_pass(*graph, back, device->swapchain_format());
+            eyes.add_picture_pass(*device, *graph, back, backbuffer);
 #endif
             graph->execute();
             if (scene_renderer) { // a frame that drew: minimized, these would repeat the last one's
@@ -485,6 +521,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             }
         }
         device->end_frame();
+#if DE_BUILD_DEV
+        eyes.end_frame(*device, *vfs, backbuffer.is_valid());
+#endif
         if (!backbuffer.is_valid()) {
             world->resync_render_instances();           // what changes while nothing's drawn would be lost
             platform::sleep_ns(5 * platform::kNsPerMs); // minimized: nothing to show, don't spin a core
@@ -535,10 +574,20 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (args.frames != 0 && frame >= args.frames) {
             break;
         }
+#if DE_BUILD_DEV
+        if (eyes.done()) {
+            break;
+        }
+#endif
     }
 
     // --- Down -------------------------------------------------------------------------------------
     application.shutdown(engine);
+#if DE_BUILD_DEV
+    const bool eyes_ok = eyes.finish(*device);
+#else
+    const bool eyes_ok = true;
+#endif
     device->log_memory_report(5);
     device->wait_idle();
     const asset::AssetRegistryStats asset_stats = assets->stats();
@@ -561,7 +610,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",
                 static_cast<unsigned long long>(frame), static_cast<unsigned long long>(world->tick_count()),
                 stats.validation_errors, stats.validation_warnings);
-    return stats.validation_errors == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return stats.validation_errors == 0 && eyes_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 } // namespace de::app

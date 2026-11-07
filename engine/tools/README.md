@@ -9,10 +9,14 @@ Debug and editor tools inside the engine, drawn with Dear ImGui (docs/design.md,
 | `debug_ui.h` | The ImGui context on the Tools heap (docking on, no ini file), and `DebugUi`: context, platform side and renderer made and torn down together |
 | `stats_panel.h` | `StatsPanel`: frame time and history, heap allocations per frame, GPU memory by category, GPU time per pass, the render graph, uploads and the device, where the camera is, to come back to a spot, and, while the cull is frozen, that it is and what it kept for the shadows (F1 in deengine) |
 | `free_camera.h` | `FreeCamera`: a fly camera driven by input actions, placing its entity each frame; `add_free_camera_actions` |
+| `camera_script.h` | `CameraPose` (position in doubles, yaw, pitch), `parse_camera_pose`, `find_camera_view` (named views as text), `CameraPath` (waypoints as text, flown by the frame) |
+| `screenshot.h` | `Screenshot`: reads a texture back at the end of a frame and makes a PNG of it; `encode_screenshot_png` |
+
+What runs these from the command line is `engine/app/agent_eyes.h`; how to use them, `engine/app/README.md`.
 
 ## Rules and invariants
 
-- Dev builds only in the engine's frame (`DE_BUILD_DEV`), except the free camera, which the viewer flies in every build.
+- Dev builds only in the engine's frame (`DE_BUILD_DEV`), except the free camera, which the viewer flies in every build. The library still builds them in ship, for the tests; nothing in ship's `deengine` reaches them, so the linker leaves them out.
 - The debug UI's memory is tagged Tools and counted per frame like everything else. Its frame: `begin_frame()`, ImGui windows, `end_frame()` before `uploader.record()`, then `add_pass()` over the backbuffer.
 - Without a shader library there is no renderer, and no UI frames are built.
 - The free camera reads actions, never device codes; its bindings are in `config/input.bindings`.

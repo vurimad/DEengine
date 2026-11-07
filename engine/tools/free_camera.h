@@ -2,6 +2,7 @@
 
 #include "core/math.h"
 #include "platform/input.h"
+#include "tools/camera_script.h"
 
 #include <flecs.h>
 
@@ -32,10 +33,18 @@ FreeCameraActions add_free_camera_actions(platform::Input& input);
 // (Input::set_stick_deadzone, deengine --deadzone).
 class FreeCamera {
 public:
+    static constexpr float kMaxPitchRad = 1.55f;
+
     FreeCamera(const DVec3& position, float yaw_rad, float pitch_rad)
         : position_(position), yaw_rad_(yaw_rad), pitch_rad_(pitch_rad) {}
 
     void update(const platform::Input& input, const FreeCameraActions& actions, float frame_s, flecs::entity camera);
+    // Puts it there, as if it had flown; update() places its entity.
+    void set_pose(const CameraPose& pose) {
+        position_ = pose.position;
+        yaw_rad_ = pose.yaw_rad;
+        pitch_rad_ = pose.pitch_rad;
+    }
 
     const DVec3& position() const { return position_; }
     Quat rotation() const;
