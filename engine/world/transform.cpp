@@ -63,15 +63,21 @@ void to_matrix_3x4(const WorldTransform& transform, const DVec3& origin, float (
     }
 }
 
-namespace {
-
-// The world transform of an entity whose local one is `local`: composed with its parent's, if its
-// parent has one (otherwise it's a root: a scope or a grouping entity isn't a transform parent).
 WorldTransform world_of(flecs::entity entity, const Transform& local) {
     const flecs::entity parent = entity.parent();
-    const auto* parent_world = parent.is_valid() ? parent.try_get<WorldTransform>() : nullptr;
+    if (!parent.is_valid()) {
+        return as_world(local);
+    }
+    // A scope or a grouping entity isn't a transform parent. Its Transform first: its WorldTransform is
+    // last tick's, or nothing yet if it's new.
+    if (const auto* parent_local = parent.try_get<Transform>(); parent_local != nullptr) {
+        return compose(world_of(parent, *parent_local), local);
+    }
+    const auto* parent_world = parent.try_get<WorldTransform>();
     return parent_world != nullptr ? compose(*parent_world, local) : as_world(local);
 }
+
+namespace {
 
 // Sets an entity's world and previous world transforms, then those of everything attached to it.
 void snap(flecs::entity entity, const WorldTransform& world) {

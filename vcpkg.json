@@ -15,6 +15,7 @@
         "docking-experimental"
       ]
     },
+    "joltphysics",
     "meshoptimizer",
     {
       "name": "sdl3",

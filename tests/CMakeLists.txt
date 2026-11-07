@@ -34,6 +34,7 @@ add_executable(de_tests
     core/test_support.h
     core/version_test.cpp
     core/work_stealing_deque_test.cpp
+    platform/cpu_test.cpp
     platform/input_test.cpp
     platform/thread_test.cpp
     platform/vfs_test.cpp
@@ -49,6 +50,7 @@ add_executable(de_tests
     render/scene_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
+    physics/physics_test.cpp
     world/scene_test.cpp
     world/world_test.cpp
     support/cook_kit.h

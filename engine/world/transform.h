@@ -17,7 +17,8 @@ struct Transform {
 
 // Where an entity is in the world: computed from Transform once per tick, after every PostSim
 // system (the same as Transform for a root; composed with the parent's for a child of an entity
-// with a transform). Systems read it; only the world writes it.
+// with a transform). Systems read it; the world writes it, and physics for the roots it moves
+// (move_root).
 struct WorldTransform {
     DVec3 position{0.0};
     Quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -38,6 +39,26 @@ struct PreviousWorldTransform {
 // A child's world transform from its parent's. Scale composes per axis: a non-uniformly scaled
 // parent with a rotated child skews in truth, which this doesn't represent (no shear).
 WorldTransform compose(const WorldTransform& parent, const Transform& local);
+
+// Where an entity is in the world right now, from the Transforms up its parents, so it holds for what
+// was made or moved this tick, before WorldTransform catches up. A parent with no transform makes it a
+// root, whichever hierarchy it's in.
+WorldTransform world_of(flecs::entity entity, const Transform& local);
+
+// A root's new pose, one row at a time, for what moves a few among many (physics). Writing Transform
+// instead has the world copy the whole table, at the end of this tick and again at the start of the
+// next, and has the renderer look through it every frame. This leaves the row as those copies would
+// have and marks no table, so report the entity to World::moved_rows() for the renderer. In the tick
+// after it stops, set its previous to its world and report it once more, or it's drawn going over its
+// last move for good.
+inline void move_root(Transform& transform, WorldTransform& world, PreviousWorldTransform& previous,
+                      const DVec3& position, const Quat& rotation) {
+    previous.value = world;
+    world.position = position;
+    world.rotation = rotation;
+    transform.position = position;
+    transform.rotation = rotation;
+}
 
 // The transform rendering shows between two ticks: alpha 0 is the previous tick, 1 the current.
 // Equal transforms (most of a world: static) come back as they are, without a slerp.
