@@ -1,11 +1,11 @@
 #include "app/viewer.h"
 
 #include "asset/asset_id.h"
+#include "asset/mesh_format.h"
 #include "asset/world_format.h"
 #include "core/log.h"
 #include "core/profile.h"
 #include "core/string_id.h"
-#include "asset/mesh_format.h"
 #include "physics/physics.h"
 #include "platform/input.h"
 #include "render/scene/scene_renderer.h"
@@ -179,8 +179,8 @@ void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
         return;
     }
     if (rock_half_.x == 0.0f) {
-        // A box around the mesh, a little inside it so rocks settle into each other: the bounding sphere is far too big for
-        // a wide, flat rock, which then hangs in the air.
+        // A box around the mesh, a little inside it so rocks settle into each other: the bounding sphere is far too big
+        // for a wide, flat rock, which then hangs in the air.
         Vec3 low(1e9f);
         Vec3 high(-1e9f);
         for (const asset::MeshVertex& vertex : mesh->vertices.get(engine.assets.file(rock_mesh_).data())) {
@@ -194,7 +194,7 @@ void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
                     static_cast<double>(rock_half_.x * 2.0f), static_cast<double>(rock_half_.y * 2.0f),
                     static_cast<double>(rock_half_.z * 2.0f), static_cast<double>(mesh->bounds.radius));
     }
-    flecs::world& ecs = engine.world.ecs();
+    const flecs::world& ecs = engine.world.ecs();
     const auto random = [this] {
         rock_random_ ^= rock_random_ << 13U;
         rock_random_ ^= rock_random_ >> 7U;
@@ -209,15 +209,20 @@ void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
     const float spacing_m = rubble ? 0.9f : 2.2f;
     for (uint32_t i = 0; i < count; ++i) {
         const auto column = static_cast<float>(i % side) - (static_cast<float>(side) * 0.5f);
-        const auto row = static_cast<float>((i / side) % side) - (static_cast<float>(side) * 0.5f);
-        const auto layer = static_cast<float>(i / (side * side));
+        const uint32_t in_layer = i / side;
+        const uint32_t layer_index = in_layer / side;
+        const auto row = static_cast<float>(in_layer % side) - (static_cast<float>(side) * 0.5f);
+        const auto layer = static_cast<float>(layer_index);
         const float scale = rubble ? 0.12f + (random() * 0.18f) : 0.35f + (random() * 0.6f);
-        const Quat rotation = glm::angleAxis(random() * 6.2831853f, glm::normalize(Vec3(random() - 0.5f, random() - 0.5f, random() - 0.5f) + Vec3(0.0f, 0.001f, 0.0f)));
+        const Quat rotation = glm::angleAxis(
+            random() * 6.2831853f,
+            glm::normalize(Vec3(random() - 0.5f, random() - 0.5f, random() - 0.5f) + Vec3(0.0f, 0.001f, 0.0f)));
         // The body is a box around the mesh, whose middle isn't where its origin is, so the mesh hangs off it.
         const flecs::entity body = ecs.entity();
-        world::place(body, world::Transform{.position = middle + DVec3(column * spacing_m, layer * spacing_m, row * spacing_m),
-                                            .rotation = rotation,
-                                            .scale = Vec3(scale)});
+        world::place(
+            body, world::Transform{.position = middle + DVec3(column * spacing_m, layer * spacing_m, row * spacing_m),
+                                   .rotation = rotation,
+                                   .scale = Vec3(scale)});
         body.set(physics::Collider{.shape = physics::ShapeKind::Box, .half_extents_m = rock_half_});
         body.set(physics::RigidBody{.kind = physics::BodyKind::Dynamic,
                                     .mass_kg = 200.0f * scale * scale * scale,
