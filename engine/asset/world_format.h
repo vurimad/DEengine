@@ -15,12 +15,13 @@ struct WorldCell {
 static_assert(sizeof(WorldCell) == 16);
 
 // .deworld (docs/design.md, Open world & streaming: world model): the binary form of a .world text
-// source. What a world is made of: its cells by grid coordinate, where the player starts, and the
-// environment it is lit by. The environment is its one dependency (loaded with it); the cells are
-// not (they stream), only named.
+// source. What a world is made of: its cells by grid coordinate, where the player starts, the
+// environment it is lit by and the terrain it stands on. The environment and the terrain are its
+// dependencies (loaded with it; the terrain's heights stream on their own); the cells are not (they
+// stream), only named.
 struct WorldAsset {
     static constexpr AssetType kType = AssetType::World;
-    static constexpr uint16_t kFormatVersion = 1;
+    static constexpr uint16_t kFormatVersion = 2; // 2: terrain
     static constexpr uint32_t kNone = UINT32_MAX;
 
     AssetHeader header;
@@ -29,10 +30,10 @@ struct WorldAsset {
     float start_pitch_rad = 0.0f;  // up is positive
     OffsetSpan<WorldCell> cells;   // by coord, z then x: one cell per coord
     uint32_t environment = kNone;  // into the header's dependencies (an environment)
-    uint32_t reserved = 0;
+    uint32_t terrain = kNone;      // into the header's dependencies (a terrain); kNone: none
 
-    // Cells inside the file, sorted and unique by coord; the environment one of the dependencies
-    // (and of type Environment); a finite start.
+    // Cells inside the file, sorted and unique by coord; the environment and the terrain each one of
+    // the dependencies (and of its type); a finite start.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
 static_assert(sizeof(WorldAsset) == 112);
