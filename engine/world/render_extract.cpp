@@ -6,6 +6,7 @@
 #include "core/profile.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -115,10 +116,78 @@ struct ExtractJob {
     RenderInstance* instances = nullptr;
     float alpha = 0.0f;
     float previous_alpha = 0.0f; // a frame ago: below 0 on the tick before, by the same motion
+    uint64_t frame = 0;
     DVec3 origin{0.0};
     bool has_camera = false; // no camera, no origin to be far from
     bool all = false;        // every row, whatever it last sent
 };
+
+// Sends a row. True if it's past where the renderer can reach.
+bool send_row(const ExtractJob& job, const WorldTransform& current, const PreviousWorldTransform& previous,
+              const MeshInstance& mesh, RenderSlot& slot, bool still, RenderInstance& instance) {
+    slot.sent = sent_hash(current, previous.value, mesh.mesh);
+    const DVec3 away = glm::abs(current.position - job.origin);
+    to_render_transform(interpolate(previous.value, current, job.alpha), instance.transform);
+    if (still) {
+        instance.previous_transform = instance.transform; // most of a world
+    } else {
+        to_render_transform(pose_at(previous.value, current, job.previous_alpha), instance.previous_transform);
+    }
+    instance.mesh = mesh.mesh;
+    instance.slot = slot.slot;
+    return job.has_camera && std::max({away.x, away.y, away.z}) >= kRenderReachM;
+}
+
+struct MovedRowsJob {
+    const ExtractJob* job = nullptr;
+    const flecs::entity_t* entities = nullptr;
+    RenderInstance* instances = nullptr; // one each
+    const ecs_world_t* world = nullptr;  // the world itself: a stage won't do for a table's columns
+    ecs_id_t current_id = 0;
+    ecs_id_t previous_id = 0;
+    ecs_id_t mesh_id = 0;
+    ecs_id_t slot_id = 0;
+    std::atomic<bool> out_of_reach{false};
+};
+
+void extract_moved_rows(size_t begin, size_t end, void* context) {
+    MovedRowsJob& moved = *static_cast<MovedRowsJob*>(context);
+    const auto column = [&moved](const ecs_table_t* table, ecs_id_t id) -> void* {
+        const int32_t index = ecs_table_get_column_index(moved.world, table, id);
+        return index >= 0 ? ecs_table_get_column(table, index, 0) : nullptr;
+    };
+    // Found once for a run of rows in one table, which is how they mostly come.
+    const ecs_table_t* table = nullptr;
+    const WorldTransform* current = nullptr;
+    const PreviousWorldTransform* previous = nullptr;
+    const MeshInstance* meshes = nullptr;
+    RenderSlot* slots = nullptr;
+    for (size_t i = begin; i < end; ++i) {
+        RenderInstance& instance = moved.instances[i];
+        instance.slot = kSkipRenderInstance;
+        const flecs::entity_t entity = moved.entities[i];
+        if (!ecs_is_alive(moved.world, entity)) {
+            continue; // gone since it moved
+        }
+        const ecs_record_t* const record = ecs_record_find(moved.world, entity);
+        if (record->table != table) {
+            table = record->table;
+            current = static_cast<const WorldTransform*>(column(table, moved.current_id));
+            previous = static_cast<const PreviousWorldTransform*>(column(table, moved.previous_id));
+            meshes = static_cast<const MeshInstance*>(column(table, moved.mesh_id));
+            slots = static_cast<RenderSlot*>(column(table, moved.slot_id));
+        }
+        if (current == nullptr || previous == nullptr || meshes == nullptr || slots == nullptr) {
+            continue; // nothing to draw
+        }
+        const auto row = static_cast<int32_t>(ECS_RECORD_TO_ROW(record->row));
+        slots[row].moved_frame = moved.job->frame;
+        const bool still = same_transform(previous[row].value, current[row]);
+        if (send_row(*moved.job, current[row], previous[row], meshes[row], slots[row], still, instance)) {
+            moved.out_of_reach.store(true, std::memory_order_relaxed);
+        }
+    }
+}
 
 void extract_chunks(size_t begin, size_t end, void* context) {
     const ExtractJob& job = *static_cast<const ExtractJob*>(context);
@@ -126,6 +195,11 @@ void extract_chunks(size_t begin, size_t end, void* context) {
         RenderExtractScratch::Chunk& chunk = job.scratch->chunks[c];
         for (uint32_t i = 0; i < chunk.count; ++i) {
             RenderInstance& instance = job.instances[chunk.first + i];
+            // Sent already, and its moving is no reason to come back to its table next frame.
+            if (chunk.slots[i].moved_frame == job.frame) {
+                instance.slot = kSkipRenderInstance;
+                continue;
+            }
             const bool still = same_transform(chunk.previous[i].value, chunk.current[i]);
             chunk.any_moving = chunk.any_moving || !still;
             if (still && !chunk.write_all) {
@@ -139,24 +213,28 @@ void extract_chunks(size_t begin, size_t end, void* context) {
                 instance.slot = kSkipRenderInstance;
                 continue;
             }
-            slot.sent = hash;
-            const DVec3 away = glm::abs(chunk.current[i].position - job.origin);
             chunk.out_of_reach =
-                chunk.out_of_reach || (job.has_camera && std::max({away.x, away.y, away.z}) >= kRenderReachM);
-            to_render_transform(interpolate(chunk.previous[i].value, chunk.current[i], job.alpha), instance.transform);
-            if (still) {
-                instance.previous_transform = instance.transform; // most of a world
-            } else {
-                to_render_transform(pose_at(chunk.previous[i].value, chunk.current[i], job.previous_alpha),
-                                    instance.previous_transform);
-            }
-            instance.mesh = chunk.meshes[i].mesh;
-            instance.slot = slot.slot;
+                send_row(job, chunk.current[i], chunk.previous[i], chunk.meshes[i], slot, still, instance) ||
+                chunk.out_of_reach;
         }
     }
 }
 
 } // namespace
+
+void MovedRows::report(std::span<const flecs::entity_t> moved) {
+    if (seen) {
+        entities.clear();
+        reports = 0;
+        seen = false;
+    }
+    if (!moved.empty()) {
+        const size_t at = entities.size();
+        entities.resize(at + moved.size());
+        std::memcpy(entities.data() + at, moved.data(), moved.size_bytes());
+        ++reports;
+    }
+}
 
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc) {
     // A slot from when an entity gets a MeshInstance, until it loses it or goes.
@@ -288,14 +366,45 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                 }
                 rows += count;
             }
-            out.instances.resize_uninit(rows);
+            // Named once for each tick they moved in, if there were several since the last frame. All of them being
+            // sent has them in it already.
+            MovedRows& moved = scratch.moved_rows;
+            if (moved.reports > 1) {
+                std::ranges::sort(moved.entities.span());
+                const auto repeats = std::ranges::unique(moved.entities.span());
+                moved.entities.resize(moved.entities.size() - repeats.size());
+                moved.reports = 1;
+            }
+            const size_t moved_count = all ? 0 : moved.entities.size();
+            moved.seen = true;
+            out.instances.resize_uninit(rows + moved_count);
             ExtractJob job{.scratch = &scratch,
                            .instances = out.instances.data(),
                            .alpha = *desc.alpha,
                            .previous_alpha = *desc.alpha - *desc.alpha_step,
+                           .frame = out.number,
                            .origin = out.origin,
                            .has_camera = out.camera.valid,
                            .all = all};
+            if (moved_count > 0) {
+                const flecs::world world = it.world();
+                MovedRowsJob moved_job{.job = &job,
+                                       .entities = moved.entities.data(),
+                                       .instances = out.instances.data() + rows,
+                                       .world = ecs_get_world(world.c_ptr()),
+                                       .current_id = world.id<WorldTransform>(),
+                                       .previous_id = world.id<PreviousWorldTransform>(),
+                                       .mesh_id = world.id<MeshInstance>(),
+                                       .slot_id = world.id<RenderSlot>()};
+                constexpr size_t kMovedBatch = 256;
+                if (desc.jobs != nullptr && moved_count > kMovedBatch) {
+                    desc.jobs->parallel_for(moved_count, kMovedBatch, &extract_moved_rows, &moved_job,
+                                            "render extract moved rows");
+                } else {
+                    extract_moved_rows(0, moved_count, &moved_job);
+                }
+                out.instance_out_of_reach = moved_job.out_of_reach.load(std::memory_order_relaxed);
+            }
             if (desc.jobs != nullptr && scratch.chunks.size() > 1) {
                 desc.jobs->parallel_for(scratch.chunks.size(), 1, &extract_chunks, &job, "render extract");
             } else {

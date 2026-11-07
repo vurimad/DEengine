@@ -27,6 +27,7 @@ struct MeshInstance {
 struct RenderSlot {
     uint32_t slot = 0;
     uint64_t sent = 0; // a hash of what the renderer was last sent: what a write to its table may not have changed
+    uint64_t moved_frame = 0; // the frame it was last sent from MovedRows, which a look through its table leaves alone
 };
 
 // Fog in the shape of a box or an ellipsoid around the entity: its world scale is its half extents.
@@ -151,6 +152,17 @@ inline constexpr double kRenderOriginStep = 1024.0;
 
 void register_render_components(flecs::world& ecs);
 
+// Rows moved one at a time (move_root), which mark no table: how extraction hears of them, so that a few moving in a
+// big table cost what the few do. Report what moved every tick, even if that's nothing. They're sent each frame until a
+// tick after that, as what's drawn moves between ticks. One writer, on the game thread.
+struct MovedRows {
+    core::Array<flecs::entity_t> entities{core::heap_allocator(core::MemoryTag::Render)};
+    uint32_t reports = 0; // since extraction last looked: more than one can name the same row twice
+    bool seen = false;    // by a frame, so the next report starts over
+
+    void report(std::span<const flecs::entity_t> moved);
+};
+
 // Extraction's working memory, kept between frames so it doesn't allocate once settled.
 struct RenderExtractScratch {
     struct Chunk {
@@ -171,6 +183,7 @@ struct RenderExtractScratch {
     core::Array<uint32_t> free_slots{core::heap_allocator(core::MemoryTag::Render)};
     core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
     uint32_t next_slot = 0;
+    MovedRows moved_rows;
     bool resync = false; // send all of them, next frame
     bool warned_out_of_reach = false;
 };
@@ -190,11 +203,11 @@ struct RenderExtractDesc {
 // goes back past the previous tick, by the same motion): no history per entity, exact for steady
 // motion, and none for what hasn't moved or was place()d.
 //
-// A table nothing wrote to, with nothing moving in it, costs next to nothing, whatever its size. In a table
-// something wrote to, which spawning anything into it does, each row is checked against a hash of what it last
-// sent. What stopped moving is sent once more when its previous transform catches up, in a tick: that row has no
-// motion in it. Those tables' rows are cut into chunks and run as one parallel job. After the first frames it doesn't
-// allocate (the arrays keep their capacity).
+// What's reported to MovedRows is sent without looking at its table. A table nothing wrote to, with nothing moving in
+// it, costs next to nothing, whatever its size. In a table something wrote to, which spawning anything into it does,
+// each row is checked against a hash of what it last sent. What stopped moving is sent once more when its previous
+// transform catches up, in a tick: that row has no motion in it. Those tables' rows are cut into chunks and run as one
+// parallel job. After the first frames it doesn't allocate (the arrays keep their capacity).
 //
 // What's sent past kRenderReachM from the origin is reported, and logged once. What the camera left that far behind
 // since it was sent isn't: streaming has to have unloaded it long before.

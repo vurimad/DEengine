@@ -28,6 +28,9 @@ class ShaderLibrary;
 namespace de::asset {
 class AssetRegistry;
 }
+namespace de::physics {
+class Physics;
+}
 namespace de::world {
 class World;
 }
@@ -87,6 +90,7 @@ struct Engine {
     shader::ShaderLibrary& shaders;
     asset::AssetRegistry& assets;
     world::World& world;
+    physics::Physics& physics;
     render::GpuAssets& gpu_assets;
     // config/engine.settings, as text (read with setting(engine.settings, "name")).
     std::string_view settings;

@@ -8,7 +8,7 @@ add_library(de_app STATIC
 add_library(de::app ALIAS de_app)
 
 target_link_libraries(de_app
-    PUBLIC de::asset de::core de::platform de::rhi de::render_graph de::render_scene de::shader de::tools de::world
+    PUBLIC de::asset de::core de::physics de::platform de::rhi de::render_graph de::render_scene de::shader de::tools de::world
            de::compile_options
     PRIVATE de::render_imgui)
 # Dev builds mount the source tree as src:/ (shaders compile from it and hot reload).

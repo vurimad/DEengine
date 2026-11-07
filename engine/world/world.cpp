@@ -145,6 +145,10 @@ void World::resync_render_instances() {
     state_->extract_scratch.resync = true;
 }
 
+MovedRows& World::moved_rows() {
+    return state_->extract_scratch.moved_rows;
+}
+
 const RenderFrame& World::render_frame() const {
     return state_->render_frame;
 }

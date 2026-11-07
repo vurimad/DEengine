@@ -10,3 +10,8 @@ if(PORT STREQUAL "tracy")
     set(VCPKG_CMAKE_CONFIGURE_OPTIONS
         -DTRACY_ONLY_LOCALHOST=ON -DTRACY_NO_BROADCAST=ON -DTRACY_NO_CRASH_HANDLER=ON -DTRACY_NO_CALLSTACK=ON)
 endif()
+
+if(PORT STREQUAL "joltphysics")
+    # Its math is inlined into ours and it has no reason to be a DLL.
+    set(VCPKG_LIBRARY_LINKAGE static)
+endif()
