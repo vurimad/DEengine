@@ -99,7 +99,7 @@ enum class NodeState : uint8_t { Unloaded, Reading, Uploading, Resident, Failed 
 
 struct Node {
     uint32_t slot = kNoSlot;
-    uint32_t last_wanted = 0; // the update that last wanted it
+    uint32_t last_wanted = 0;  // the update that last wanted it
     uint32_t parent = kNoSlot; // the node above it; none for a root
     uint32_t children_shown = 0;
     NodeState state = NodeState::Unloaded;
@@ -133,8 +133,9 @@ void terrain_wanted_nodes(const asset::TerrainAsset& terrain, std::span<const st
     for (uint32_t l = 0; l < levels.size(); ++l) {
         const asset::TerrainLevel& level = levels[l];
         const double node_size = static_cast<double>(level.spacing_m) * asset::kTerrainNodeQuads;
-        const double reach = l == 0 ? std::numeric_limits<double>::infinity()
-                                    : static_cast<double>(terrain_level_range_m(level.spacing_m)) * kTerrainStreamMargin;
+        const double reach = l == 0
+                                 ? std::numeric_limits<double>::infinity()
+                                 : static_cast<double>(terrain_level_range_m(level.spacing_m)) * kTerrainStreamMargin;
         const auto first = [&](double at, double limit) {
             return static_cast<uint32_t>(std::clamp(std::floor((at - reach) / node_size), 0.0, limit));
         };
@@ -144,8 +145,10 @@ void terrain_wanted_nodes(const asset::TerrainAsset& terrain, std::span<const st
         const double max_x = static_cast<double>(level.nodes_x) - 1.0;
         const double max_z = static_cast<double>(level.nodes_z) - 1.0;
         const size_t level_start = out.size();
-        for (uint32_t z = l == 0 ? 0 : first(south, max_z); z <= (l == 0 ? level.nodes_z - 1 : last(south, max_z)); ++z) {
-            for (uint32_t x = l == 0 ? 0 : first(east, max_x); x <= (l == 0 ? level.nodes_x - 1 : last(east, max_x)); ++x) {
+        for (uint32_t z = l == 0 ? 0 : first(south, max_z); z <= (l == 0 ? level.nodes_z - 1 : last(south, max_z));
+             ++z) {
+            for (uint32_t x = l == 0 ? 0 : first(east, max_x); x <= (l == 0 ? level.nodes_x - 1 : last(east, max_x));
+                 ++x) {
                 const uint32_t index = level.first_node + (z * level.nodes_x) + x;
                 if (nodes[index].block == asset::kTerrainNoBlock) {
                     continue;
@@ -174,10 +177,10 @@ struct TerrainState {
     platform::Vfs* vfs = nullptr;
     uint32_t max_blocks = 0;
 
-    rhi::BufferHandle heights;     // the pool: max_blocks blocks
-    rhi::BufferHandle indices;     // a patch's triangles, the same for all
-    rhi::BufferHandle draws;       // per view, kListCapacity
-    rhi::BufferHandle args;        // per view, a DrawIndexedIndirect
+    rhi::BufferHandle heights; // the pool: max_blocks blocks
+    rhi::BufferHandle indices; // a patch's triangles, the same for all
+    rhi::BufferHandle draws;   // per view, kListCapacity
+    rhi::BufferHandle args;    // per view, a DrawIndexedIndirect
     rhi::BufferHandle readback[rhi::kFramesInFlight];
     bool readback_used[rhi::kFramesInFlight] = {};
     rhi::BufferHandle slots[rhi::kFramesInFlight]; // per node, where its heights are, by frame in flight
@@ -397,9 +400,9 @@ struct TerrainState {
             const std::span<const std::byte> block(read_memory.data() + (r * asset::kTerrainNodeBytes),
                                                    asset::kTerrainNodeBytes);
             // Nothing reads this slot: the table doesn't name it until this has been recorded.
-            const core::Result<void> queued = uploader->upload_buffer(heights, node.slot * asset::kTerrainNodeBytes, block,
-                                                                      rhi::ResourceState::ShaderRead, rhi::ShaderStages::All,
-                                                                      rhi::BufferRange::Unread);
+            const core::Result<void> queued = uploader->upload_buffer(heights, node.slot * asset::kTerrainNodeBytes,
+                                                                      block, rhi::ResourceState::ShaderRead,
+                                                                      rhi::ShaderStages::All, rhi::BufferRange::Unread);
             if (!queued) {
                 DE_LOG_ERROR("terrain", "node %u: %s", read.node, queued.error().message);
                 node.state = NodeState::Failed;
@@ -414,15 +417,14 @@ struct TerrainState {
 
     void publish_uploads() {
         size_t kept = 0;
-        for (size_t i = 0; i < uploading.size(); ++i) {
-            const Uploading entry = uploading[i];
+        for (const Uploading entry : uploading) { // by value: kept only ever writes behind this
             if (!uploader->recorded(entry.ticket)) {
                 uploading[kept++] = entry;
                 continue;
             }
             Node& node = nodes[entry.node];
-            // Shown only after its parent, so the table holds whole chains from a root. If the parent can't come, nor can
-            // this: what's above them stands in.
+            // Shown only after its parent, so the table holds whole chains from a root. If the parent can't come, nor
+            // can this: what's above them stands in.
             if (node.parent != kNoSlot && nodes[node.parent].state != NodeState::Resident) {
                 if (nodes[node.parent].state == NodeState::Failed) {
                     node.state = NodeState::Failed;
@@ -446,8 +448,7 @@ struct TerrainState {
 
     void free_retired() {
         size_t kept = 0;
-        for (size_t i = 0; i < retired.size(); ++i) {
-            const Retired entry = retired[i];
+        for (const Retired entry : retired) { // by value: kept only ever writes behind this
             if (entry.free_after >= update_number) {
                 retired[kept++] = entry;
             } else {
@@ -566,8 +567,8 @@ core::Result<Terrain> Terrain::create(const TerrainDesc& desc) {
     const auto grid = [](uint32_t x, uint32_t z) { return static_cast<uint16_t>((z * kGridSide) + x); };
     for (uint32_t z = 0; z < kPatchQuads; ++z) {
         for (uint32_t x = 0; x < kPatchQuads; ++x) {
-            for (const uint16_t index : {grid(x, z), grid(x, z + 1), grid(x + 1, z + 1), grid(x, z), grid(x + 1, z + 1),
-                                         grid(x + 1, z)}) {
+            for (const uint16_t index :
+                 {grid(x, z), grid(x, z + 1), grid(x + 1, z + 1), grid(x, z), grid(x + 1, z + 1), grid(x + 1, z)}) {
                 indices.push(index);
             }
         }
@@ -594,9 +595,9 @@ core::Result<Terrain> Terrain::create(const TerrainDesc& desc) {
         side(west, hang_west);
         side(east, hang_east);
     }
-    if (const core::Result<void> queued =
-            desc.uploader->upload_buffer(state->indices, 0, std::as_bytes(indices.span()), rhi::ResourceState::IndexBuffer,
-                                         rhi::ShaderStages::All, rhi::BufferRange::Unread);
+    if (const core::Result<void> queued = desc.uploader->upload_buffer(
+            state->indices, 0, std::as_bytes(indices.span()), rhi::ResourceState::IndexBuffer, rhi::ShaderStages::All,
+            rhi::BufferRange::Unread);
         !queued) {
         return core::fail(queued.error());
     }
@@ -605,7 +606,7 @@ core::Result<Terrain> Terrain::create(const TerrainDesc& desc) {
     state->read_memory.resize(kMaxReads * asset::kTerrainNodeBytes);
     state->slot_owner.resize(desc.max_blocks);
     state->free_slots.reserve(desc.max_blocks);
-    state->uploading.reserve(kMaxReads * 4);
+    state->uploading.reserve(size_t{kMaxReads} * 4);
     state->retired.reserve(desc.max_blocks);
     return terrain;
 }
@@ -652,9 +653,9 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
     state.nodes.resize(nodes.size());
     state.slot_table.clear();
     state.slot_table.resize(nodes.size());
-    std::fill(state.slot_table.begin(), state.slot_table.end(), kNoSlot);
+    std::ranges::fill(state.slot_table, kNoSlot);
     ++state.slot_table_version;
-    std::fill(state.slot_owner.begin(), state.slot_owner.end(), kNoSlot);
+    std::ranges::fill(state.slot_owner, kNoSlot);
     state.free_slots.clear();
     for (uint32_t slot = state.max_blocks; slot-- > 0;) {
         state.free_slots.push(slot);
@@ -707,7 +708,8 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
             .nodes_z = level.nodes_z,
             .first_node = level.first_node,
             .first_patch = level.first_patch,
-            .spacing_steps = static_cast<uint32_t>(std::lround(static_cast<double>(level.spacing_m) * world::kRenderStepsPerM)),
+            .spacing_steps =
+                static_cast<uint32_t>(std::lround(static_cast<double>(level.spacing_m) * world::kRenderStepsPerM)),
             .spacing_m = level.spacing_m,
             .step_m = level.spacing_m / asset::kTerrainStepsPerSpacing,
             .range_m = range,
@@ -724,7 +726,8 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
             return false;
         }
         out = *made;
-        const core::Result<void> queued = state.uploader->upload_buffer(out, 0, bytes, rhi::ResourceState::ShaderRead, rhi::ShaderStages::All, rhi::BufferRange::Unread);
+        const core::Result<void> queued = state.uploader->upload_buffer(
+            out, 0, bytes, rhi::ResourceState::ShaderRead, rhi::ShaderStages::All, rhi::BufferRange::Unread);
         if (!queued) {
             DE_LOG_ERROR("terrain", "%s: %s", name, queued.error().message);
             return false;
@@ -739,11 +742,10 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
     }
     state.tables_ticket = state.uploader->buffer_upload_ticket();
     for (uint32_t i = 0; i < rhi::kFramesInFlight; ++i) {
-        core::Result<rhi::BufferHandle> made =
-            state.device->create_buffer({.size = nodes.size() * sizeof(uint32_t),
-                                         .usage = rhi::BufferUsage::Storage,
-                                         .memory = rhi::MemoryLocation::Upload,
-                                         .debug_name = "terrain slots"});
+        core::Result<rhi::BufferHandle> made = state.device->create_buffer({.size = nodes.size() * sizeof(uint32_t),
+                                                                            .usage = rhi::BufferUsage::Storage,
+                                                                            .memory = rhi::MemoryLocation::Upload,
+                                                                            .debug_name = "terrain slots"});
         if (!made) {
             DE_LOG_ERROR("terrain", "slots: %s", made.error().message);
             state.destroy_tables();
@@ -812,7 +814,8 @@ void Terrain::update(const DVec3& camera) {
                               state.counters.uploading;
 }
 
-TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle select, uint64_t frame, uint64_t views) {
+TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle select, uint64_t frame,
+                                        uint64_t views) {
     TerrainState& state = *state_;
     if (!select.is_valid() || !state.tables_ready()) {
         return {};
@@ -826,8 +829,10 @@ TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle 
         state.slots_version[slot] = state.slot_table_version;
     }
 
-    const rhi::ResourceState was_args = state.buffers_read ? rhi::ResourceState::IndirectArgument : rhi::ResourceState::Undefined;
-    const rhi::ResourceState was_draws = state.buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined;
+    const rhi::ResourceState was_args =
+        state.buffers_read ? rhi::ResourceState::IndirectArgument : rhi::ResourceState::Undefined;
+    const rhi::ResourceState was_draws =
+        state.buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined;
     state.buffers_read = true;
     TerrainFrame out;
     out.args = graph.import_buffer({.buffer = state.args,
@@ -848,7 +853,8 @@ TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle 
             // The camera draws the sides that hide gaps; a shadow map has no use for them.
             context.list.fill_buffer(buffer, 0, sizeof(uint32_t), kGridIndices + kSkirtIndices);
             for (uint32_t view = 1; view < kViewCount; ++view) {
-                context.list.fill_buffer(buffer, uint64_t{view} * kArgsWords * sizeof(uint32_t), sizeof(uint32_t), kGridIndices);
+                context.list.fill_buffer(buffer, uint64_t{view} * kArgsWords * sizeof(uint32_t), sizeof(uint32_t),
+                                         kGridIndices);
             }
         });
     graph.add_pass(
@@ -930,7 +936,8 @@ void Terrain::draw_shadow(PassContext& context, const TerrainFrame& frame, rhi::
     context.list.bind_pipeline(pipeline);
     context.list.push_constants(push);
     context.list.bind_index_buffer(state.indices, 0, rhi::IndexType::Uint16);
-    context.list.draw_indexed_indirect(context.buffer(frame.args), uint64_t{cascade + 1} * kArgsWords * sizeof(uint32_t), 1);
+    context.list.draw_indexed_indirect(context.buffer(frame.args),
+                                       uint64_t{cascade + 1} * kArgsWords * sizeof(uint32_t), 1);
 }
 
 void Terrain::add_stats_pass(RenderGraph& graph, const TerrainFrame& frame) {

@@ -93,7 +93,7 @@ struct Engine {
     // What each frame draws, as the application sets it.
     render::SceneLighting lighting;
     render::SceneView view = render::SceneView::Lit;
-    bool taa = false; // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+    bool taa = false;           // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
     asset::AssetHandle terrain; // the ground, a .deterrain the application keeps loaded; none: no ground
     bool fog_low_camera = true; // SceneRenderer::set_fog_low_camera
 #if DE_BUILD_DEV

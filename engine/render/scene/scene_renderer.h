@@ -56,8 +56,8 @@ struct SceneFog {
     float sun_start_m = 0.0f; // where sun haze starts: none on the camera's nose
     float end_m = 20000.0f;
     float volume_distance_m = 0.0f; // the froxel grid's reach, in view depth; 0: no grid
-    // Not physical, and on purpose: the height fog thins as the camera comes down into it, so low land reads as foggy from
-    // above and clear from inside. This much is left with the camera below low_camera_below_m, and all of it by
+    // Not physical, and on purpose: the height fog thins as the camera comes down into it, so low land reads as foggy
+    // from above and clear from inside. This much is left with the camera below low_camera_below_m, and all of it by
     // low_camera_above_m. 1: the fog is the same wherever the camera is.
     float low_camera_keep = 1.0f;
     float low_camera_below_m = 0.0f;
@@ -93,9 +93,9 @@ enum class SceneView : uint32_t {
     Metalness,
     Occlusion,
     Translucency,
-    ShadowMask, // sunlight seen
-    Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
-    Motion,     // screen motion since last frame, about grey (red: right, green: down)
+    ShadowMask,   // sunlight seen
+    Cascades,     // which shadow cascade each pixel uses (red, green, blue, yellow)
+    Motion,       // screen motion since last frame, about grey (red: right, green: down)
     TerrainLevel, // base color, with terrain tinted by which level of its quadtree each patch is
     Count,
 };
@@ -232,8 +232,8 @@ public:
     // Whether the height fog thins with a low camera (SceneFog::low_camera_keep): on, unless turned off to compare.
     void set_fog_low_camera(bool on);
 
-    // The terrain to show, or null for none. file holds it, and must stay valid and unchanged until the next call. Waits
-    // for what's in flight: only when the terrain changes.
+    // The terrain to show, or null for none. file holds it, and must stay valid and unchanged until the next call.
+    // Waits for what's in flight: only when the terrain changes.
     void set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no

@@ -1905,7 +1905,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                                         static_cast<double>(frame.camera.transform[11]));
         state.terrain->update(camera_world);
         state.stats.terrain = state.terrain->stats();
-        terrain_frame = state.terrain->add_select_passes(graph, terrain_select, frame_address, frame_address + kCullViewsOffset);
+        terrain_frame =
+            state.terrain->add_select_passes(graph, terrain_select, frame_address, frame_address + kCullViewsOffset);
     }
 
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
@@ -1967,7 +1968,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
                 if (renderer.terrain) {
-                    renderer.terrain->draw_shadow(context, data.terrain, data.terrain_pipeline, data.frame_address, cascade);
+                    renderer.terrain->draw_shadow(context, data.terrain, data.terrain_pipeline, data.frame_address,
+                                                  cascade);
                 }
                 context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
                 push.cascade = cascade;

@@ -302,12 +302,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     std::optional<render::SceneRenderer> scene_renderer;
-    auto created =
-        render::SceneRenderer::create({.device = &*device,
-                                       .shaders = &*shaders,
-                                       .gpu_assets = &*gpu_assets,
-                                       .uploader = &*uploader,
-                                       .vfs = &*vfs});
+    auto created = render::SceneRenderer::create(
+        {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .uploader = &*uploader, .vfs = &*vfs});
     if (created) {
         scene_renderer.emplace(std::move(*created));
         scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
@@ -350,15 +346,16 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit,
-                  .taa = setting(as_text(settings), "taa") == "on"};
+                  .taa = setting(as_text(settings), "taa") == "on",
+                  .terrain = {}};
+    asset::AssetHandle shown_terrain;
+    uint32_t shown_terrain_revision = 0;
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
     tools::DebugUi debug_ui = tools::DebugUi::create(*window, *device, engine.shaders, *uploader);
     tools::StatsPanel stats_panel;
     bool show_stats = true;
-    asset::AssetHandle shown_terrain;
-    uint32_t shown_terrain_revision = 0;
     const platform::ActionId toggle_stats = input.add_action("debug.toggle_stats"_sid, platform::ActionKind::Button);
     // The raw stick readout (--show-sticks), for measuring drift: the deadzone is off, so these show
     // the true resting values.
@@ -428,16 +425,6 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // Whether or not this frame draws: a minimized frame's toggle counts too, as it does for the application.
         if (scene_renderer) {
             scene_renderer->set_cull_frozen(engine.freeze_cull);
-            scene_renderer->set_fog_low_camera(engine.fog_low_camera);
-            // The ground: when the application names another, or it's re-cooked.
-            const uint32_t terrain_revision = engine.assets.revision(engine.terrain);
-            if (engine.terrain != shown_terrain || terrain_revision != shown_terrain_revision) {
-                shown_terrain = engine.terrain;
-                shown_terrain_revision = terrain_revision;
-                const auto* terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain);
-                scene_renderer->set_terrain(terrain, terrain != nullptr ? engine.assets.file(engine.terrain)
-                                                                        : std::span<const std::byte>{});
-            }
         }
         DE_PROFILE_PLOT("cull frozen", static_cast<int64_t>(engine.freeze_cull ? 1 : 0));
         // The debug UI's frame; its textures go to the uploader before record().
@@ -450,6 +437,19 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #endif
 
         device->begin_frame();
+        // What the application asks of the renderer, in every build.
+        if (scene_renderer) {
+            scene_renderer->set_fog_low_camera(engine.fog_low_camera);
+            // The ground: when the application names another, or it's re-cooked.
+            const uint32_t terrain_revision = engine.assets.revision(engine.terrain);
+            if (engine.terrain != shown_terrain || terrain_revision != shown_terrain_revision) {
+                shown_terrain = engine.terrain;
+                shown_terrain_revision = terrain_revision;
+                const auto* terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain);
+                scene_renderer->set_terrain(terrain, terrain != nullptr ? engine.assets.file(engine.terrain)
+                                                                        : std::span<const std::byte>{});
+            }
+        }
         uploader->record(); // uploads land at the start of the frame
         const rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
         if (backbuffer.is_valid()) {

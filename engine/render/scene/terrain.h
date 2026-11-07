@@ -23,8 +23,8 @@ class Uploader;
 
 namespace de::render {
 
-// A level's patches are drawn this many of its spacings from the camera at most, which keeps about 4 pixels to a square at
-// 2560 x 1440, and morphing starts at this share of that (docs/design.md, Terrain & vegetation).
+// A level's patches are drawn this many of its spacings from the camera at most, which keeps about 4 pixels to a square
+// at 2560 x 1440, and morphing starts at this share of that (docs/design.md, Terrain & vegetation).
 inline constexpr float kTerrainRangeSpacings = 300.0f;
 inline constexpr float kTerrainMorphStart = 0.7f;
 // A node starts loading this much farther out than it's needed, so it's normally there by the time it is.
@@ -44,8 +44,8 @@ struct TerrainWant {
 
 // The nodes wanted from where the camera is, coarsest level first and nearest first within one: every root, and every
 // other node within its level's range and the margin. It looks only around the camera, so its cost doesn't follow the
-// map's size. node_reach holds each node's lowest and highest, in meters. out is cleared, and doesn't allocate once it's
-// settled.
+// map's size. node_reach holds each node's lowest and highest, in meters. out is cleared, and doesn't allocate once
+// it's settled.
 void terrain_wanted_nodes(const asset::TerrainAsset& terrain, std::span<const std::byte> file,
                           std::span<const float> node_reach, const DVec3& camera, core::Array<TerrainWant>& out);
 
@@ -63,10 +63,10 @@ struct TerrainStats {
     uint32_t resident = 0; // on the GPU
     uint32_t reading = 0;
     uint32_t uploading = 0;
-    uint32_t failed = 0;         // couldn't be read: what's coarser stands in for them
-    uint32_t over_capacity = 0;  // wanted, but no room: max_blocks is too small for this camera
-    uint64_t blocks_loaded = 0;  // so far
-    uint32_t blocks = 0;         // the map's
+    uint32_t failed = 0;        // couldn't be read: what's coarser stands in for them
+    uint32_t over_capacity = 0; // wanted, but no room: max_blocks is too small for this camera
+    uint64_t blocks_loaded = 0; // so far
+    uint32_t blocks = 0;        // the map's
     // What was drawn, read back a frame or two late.
     uint32_t patches = 0;
     uint32_t shadow_patches = 0;
@@ -83,10 +83,10 @@ struct TerrainFrame {
 
 struct TerrainState;
 
-// The terrain on the GPU, and what keeps it there: heights are read a block at a time as the camera moves, into a pool of
-// fixed slots, and a table says which node is where. What's on the GPU is the roots and what's near the camera; everything
-// else about the map (where things are, how high they reach) stays loaded. Move-only. The device, uploader and vfs must
-// outlive it.
+// The terrain on the GPU, and what keeps it there: heights are read a block at a time as the camera moves, into a pool
+// of fixed slots, and a table says which node is where. What's on the GPU is the roots and what's near the camera;
+// everything else about the map (where things are, how high they reach) stays loaded. Move-only. The device, uploader
+// and vfs must outlive it.
 class Terrain {
 public:
     static core::Result<Terrain> create(const TerrainDesc& desc);
@@ -111,10 +111,10 @@ public:
 
     // Draws into a pass that declared use_draws().
     void use_draws(PassBuilder& pass, const TerrainFrame& frame) const;
-    void draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline, uint64_t frame_address,
-                      bool show_levels) const;
-    void draw_shadow(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline, uint64_t frame_address,
-                     uint32_t cascade) const;
+    void draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline,
+                      uint64_t frame_address, bool show_levels) const;
+    void draw_shadow(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline,
+                     uint64_t frame_address, uint32_t cascade) const;
 
     // Copies what was drawn for stats(). After the passes that draw.
     void add_stats_pass(RenderGraph& graph, const TerrainFrame& frame);
