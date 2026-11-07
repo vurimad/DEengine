@@ -10,8 +10,8 @@ Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, P
 ## How it fits
 
 - **Create `Physics` before the world and call `add_to_world` once the world exists.** It steps in `Phase::Physics`, at the world's fixed tick. The world's last entities let go of their bodies as it goes down, so `Physics` has to outlive it.
-- **Components drive it.** `Collider` and `RigidBody` on an entity give it a body at the start of the next tick, from its world transform, so `place()` it first. Taking either away takes the body away. Changing either later doesn't change the body.
-- **Static bodies cost nothing per tick.** Kinematic ones head for their `Transform`, and a dynamic one writes its `Transform` while it's awake. `place()` on a dynamic body or a character teleports it. A static one stays where it was made.
+- **Components drive it.** `Collider` and `RigidBody` on an entity give it a body at the start of the next tick, from where its `Transform` says. Taking either away takes the body away. Changing either later doesn't change the body.
+- **What's asleep costs nothing per tick.** Static bodies never do. Kinematic ones head for their `Transform`, and a dynamic one writes its `Transform` while it's awake and in the step it falls asleep. Writing a `Transform` from elsewhere teleports a dynamic body or a character, by a difference of more than a micrometer, and has every row of its table looked at once. A static one stays where it was made.
 - **Characters aren't bodies.** A `CharacterController` is a Jolt `CharacterVirtual`, with its entity's position at its feet. Set `desired_velocity_mps` across the ground, which is where root motion goes. Rays and shape casts don't hit them, and combat doesn't use them: it has its own swept capsules.
 - **Jolt's types stay inside this library.** Positions are doubles at both ends.
 
@@ -22,12 +22,12 @@ A cell entity with a mesh asks for it with `"collision": "mesh"` (`tools/cooker/
 - **What's cooked.** Every model cooks a `.dephys` beside its `.demesh`: a Jolt `MeshShape`'s binary state, from the finest LOD with at most `collision_triangles` triangles (the `mesh` setting, 2048 by default), with every position welded to one vertex. `tools/cooker/README.md` says why.
 - **One shape, however many bodies.** All the bodies of one asset share one shape, restored the first time one's needed: its file is checked first (`verify_content_hash`, then `mesh_shape_format()`), as Jolt believes what it reads. A scale other than 1 is a `JPH::ScaledShape` around that shape, shared by what has exactly that scale. `PhysicsStats::shapes` counts them both.
 - **Holding.** A cell has its entities' `.dephys` as dependencies, so it isn't Ready, and its members don't exist, until they're loaded, and they go after its bodies. A `MeshCollider` set from code doesn't hold its asset, like `MeshInstance`: whoever set it does. Its body waits, a look at the registry each tick, and the frame doesn't. Physics keeps a shape while the registry has its asset: on `Unloaded` the shape goes.
-- **A reload** swaps the shape: the bodies that use it go, and come back in the next tick. A refused asset that's cooked again, or a failed one whose file appears, gets its bodies then too.
+- **A reload** swaps the shape: at the next tick the bodies that use it go, and come back from the new one. A refused asset that's cooked again, or a failed one whose file appears, gets its bodies then too.
 - **Refused:** a failed or corrupt asset, one from another Jolt, a scale with a zero. Logged, no body, and not asked about again. The rest of the world carries on.
 
 ## What meshes cost
 
-`benchmark: physics at scale` in `tests/physics/physics_test.cpp` with `DE_PHYSICS_BENCH=1`, from a dev build, on a boulder of 1.3 x 1.0 x 1.8 m, on a machine doing other things: read these as rough.
+`benchmark: physics at scale` in `tests/physics/physics_test.cpp` with `DE_PHYSICS_BENCH=1`, from a dev build, on a boulder of 1.3 x 1.0 x 1.8 m, on a machine doing other things, and with Jolt on SSE2, before it was built for AVX2: read these as rough, and for how they compare.
 
 | On 10,000 of them | A box of its bounds | Mesh, 1,032 triangles (the default) | Mesh, 4,132 | Mesh, 66,122 (all of it) |
 | --- | --- | --- | --- | --- |
@@ -36,19 +36,25 @@ A cell entity with a mesh asks for it with `"collision": "mesh"` (`tools/cooker/
 | 200 characters on them, with what fell | 2.5 ms a tick | 11 ms | 28 ms | 430 ms |
 | Size of one shape | a few hundred bytes | 16 KB | 64 KB | 1 MB |
 
-A character's capsule is about as big as this boulder, so it meets most of its triangles: triangles are what characters pay for, far more than rays, whose tree makes them cheap. That's what the limit on triangles is for. Spheres cost about the same falling onto meshes as onto boxes: 10,000 settling take 4.2 ms a tick where 4,700 of them are still awake, against 0.8 ms where 590 are, because the boxes' flat tops let them sleep and the boulders roll them off. A thousand instances add 252 bytes each. Restoring and adding the first body took a tick of 50-120 us, against 3 us for an empty one.
+A character's capsule is about as big as this boulder, so it meets most of its triangles: triangles are what characters pay for, far more than rays, whose tree makes them cheap. That's what the limit on triangles is for. Spheres cost about the same falling onto meshes as onto boxes: 10,000 settling take 4.2 ms a tick where 4,700 of them are still awake, against 0.8 ms where 590 are, because the boxes' flat tops let them sleep and the boulders roll them off. A thousand instances add about 300 bytes each. Restoring and adding the first body took a tick of 50-120 us, against 3 us for an empty one.
 
 ## Build
 
 `cmake/vcpkg-ports/joltphysics` is vcpkg's port with `DOUBLE_PRECISION` and `CROSS_PLATFORM_DETERMINISTIC` on, because the design doc asks for doubles and strict determinism and both change Jolt's types and code. It's built as a static library (`cmake/vcpkg-triplets/port-options.cmake`).
+
+It needs AVX2, on Windows and Linux: that's Jolt's default, and the port names the platform on Windows, where vcpkg's Ninja build would otherwise leave Jolt on SSE2 without a word. `CROSS_PLATFORM_DETERMINISTIC` keeps fused multiply-add off.
+
+Jolt has to be built by the compiler that calls it, as its API passes vectors by value. Under `linux-clang`, `cmake/vcpkg-triplets/x64-linux-clang.cmake` sees to that, where vcpkg would use GCC.
 
 ## Limits
 
 - **Moving bodies allocate.** Jolt's broad phase takes one small scratch block per tick while anything is moving (`QuadTree::UpdatePrepare`), through `MemoryTag::Physics`, and whatever the body count. It stops when everything sleeps. Static bodies and characters allocate nothing per tick.
 - **Characters run on the game thread, one after another,** before the step. Fine for a handful; it hasn't been measured with many enemies.
 - **Moving a static body does nothing,** by design: there's no per-tick look at them.
+- **What moves shouldn't share a table with thousands that don't.** The world copies transforms a table at a time, so 100 bodies falling among 100k asleep in one table take about 1.8 ms a tick, against about 0.2 ms in a table of their own.
 - **Moving bodies must be roots.** Only their own `Transform` is read and written.
 - **Meshes are one-sided and static.** That's Jolt's rule for what simulates: a body meeting a triangle from behind goes through it (a character doesn't, and rays and shape casts see what they ask for). Jolt can't collide a dynamic mesh with a static one, so nothing here tries. There's one friction and no restitution per body, and none per triangle.
+- **A ray can slip through a mesh where triangles meet.** Jolt's ray-triangle test has no tolerance, so a ray within about a micrometer of a shared edge can miss both triangles: 25 of 20 million straight down and 21 of 20 million slanted, on a closed ramp of 128 triangles, and 20% of those aimed within a micrometer of a vertex. About one in a million, so what can't afford a miss shouldn't rest on one ray. Sphere casts didn't miss in the same aim at vertices (5,929 of them), and bodies and characters don't use rays.
 - **Non-uniform scale works, with one soft edge.** Which edges are smooth (Jolt's active edges, under 5 degrees between triangles) was decided on the unscaled mesh at cook time. Stretching a mesh hard changes those angles without changing that, so what slides along a once-flat crease can catch or dig in a little. A mirror (one or three negative axes) is fine: Jolt flips the winding. A zero in a scale is refused.
 - **A shape is in memory twice.** The restored shape is a copy, and the asset's file stays loaded behind it for as long as a cell holds it, about the same size again. Jolt offers no way to use the bytes where they lie.
 - **Every model cooks collision,** asked for or not: a few tens of kilobytes on disk, none in memory until something loads it. Nothing yet leaves out what no cell uses.

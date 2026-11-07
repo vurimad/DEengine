@@ -46,7 +46,11 @@
       "name": "linux-clang",
       "displayName": "Linux · clang",
       "inherits": "linux-base",
-      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++" }
+      "cacheVariables": {
+        "VCPKG_TARGET_TRIPLET": "x64-linux-clang",
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
     },
     {
       "name": "linux-gcc",

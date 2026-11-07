@@ -15,6 +15,13 @@ vcpkg_check_features(OUT_FEATURE_OPTIONS FEATURE_OPTIONS
         rtti                CPP_RTTI_ENABLED
 )
 
+# Jolt only turns on its instruction sets for MSVC when this says x64, and only Visual Studio generators set it: under
+# vcpkg's Ninja build it's empty, and Jolt would build for plain SSE2 with no JPH_USE_* for what includes it.
+set(PLATFORM_OPTIONS "")
+if(VCPKG_TARGET_IS_WINDOWS)
+    set(PLATFORM_OPTIONS -DCMAKE_VS_PLATFORM_NAME=x64)
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}/Build"
     OPTIONS
@@ -27,6 +34,7 @@ vcpkg_cmake_configure(
         # deterministic. Both change Jolt's types and code, so they're build options here, not choices at run time.
         -DDOUBLE_PRECISION=ON
         -DCROSS_PLATFORM_DETERMINISTIC=ON
+        ${PLATFORM_OPTIONS}
         # Scopes around maths in Jolt that it would set in Debug and Release only, while our dev build links its Release one.
         -DFLOATING_POINT_EXCEPTIONS_ENABLED=OFF
         -DINTERPROCEDURAL_OPTIMIZATION=OFF

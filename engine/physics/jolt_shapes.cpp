@@ -68,7 +68,8 @@ void trace_hook(const char* format, ...) {
 #ifdef JPH_ENABLE_ASSERTS
 bool assert_hook(const char* expression, const char* message, const char* file, JPH::uint line) {
     DE_LOG_ERROR("physics", "Jolt: %s (%s), %s:%u", expression, message != nullptr ? message : "", file, line);
-    return true; // stop here
+    DE_ASSERT_MSG(false, "a Jolt assertion failed");
+    return true;
 }
 #endif
 

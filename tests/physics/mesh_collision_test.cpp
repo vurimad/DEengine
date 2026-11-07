@@ -264,6 +264,33 @@ TEST_CASE("a cooked mesh's shape restores, and a ray hits it where the mesh is")
     CHECK(hit.position.y == doctest::Approx(1.125 + (0.5 / std::sqrt(17.0)) * 0.25).epsilon(1e-2));
 }
 
+TEST_CASE("a mesh is where it's put, far from the world's zero") {
+    Scene scene;
+    const AssetHandle collision = scene.model("ramp", ramp());
+    const flecs::entity plain = scene.instance(collision, Transform{.position = kFar});
+    const DVec3 scaled_at = kFar + DVec3(61.0, 0.0, 0.0);
+    const flecs::entity scaled =
+        scene.instance(collision, Transform{.position = scaled_at, .scale = {2.0f, 3.0f, 0.5f}});
+    scene.ticks(1);
+    QueryHit hit;
+    REQUIRE(scene.physics.ray_cast(kFar + DVec3(1.37, 50.0, 2.19), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(hit.entity == plain.id());
+    CHECK(std::abs(hit.position.y - (kFar.y + 1.37 * 0.25 + 1.125)) < 1e-4);
+    REQUIRE(scene.physics.ray_cast(scaled_at + DVec3(10.3, 50.0, 3.7), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(hit.entity == scaled.id());
+    CHECK(std::abs(hit.position.y - (scaled_at.y + 0.375 * 10.3 + 3.375)) < 1e-4);
+    // Its edges are where they should be, to a tenth of what a float could say here.
+    CHECK(scene.physics.ray_cast(kFar + DVec3(7.95, 50.0, 0.7), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK_FALSE(scene.physics.ray_cast(kFar + DVec3(8.05, 50.0, 0.7), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(scene.physics.ray_cast(kFar + DVec3(-7.95, 50.0, 0.7), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK_FALSE(scene.physics.ray_cast(kFar + DVec3(-8.05, 50.0, 0.7), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(scene.physics.ray_cast(kFar + DVec3(0.7, 50.0, 7.95), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK_FALSE(scene.physics.ray_cast(kFar + DVec3(0.7, 50.0, 8.05), {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    // What's cast at it, too.
+    REQUIRE(scene.physics.sphere_cast(kFar + DVec3(1.37, 50.0, 2.19), 0.5f, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(std::abs(hit.position.y - (kFar.y + (1.37 + 0.5 / std::sqrt(17.0)) * 0.25 + 1.125)) < 1e-2);
+}
+
 TEST_CASE("the collision of a coarser LOD keeps close to the mesh it came from") {
     Scene scene;
     const AssetHandle collision = scene.model("hill", hill());
@@ -295,7 +322,7 @@ TEST_CASE("an instance's scale and rotation reach its shape") {
     scene.ticks(1);
     // y = 3 (x / 2 / 4 + 1.125), out to 16 m along x and only 4 m along z.
     CHECK(scene.surface_y(at + DVec3(10.3, 50.0, 3.7)) == doctest::Approx(at.y + 0.375 * 10.3 + 3.375).epsilon(1e-4));
-    CHECK(scene.surface_y(at + DVec3(15.5, 50.0, 0.0)) == doctest::Approx(at.y + 0.375 * 15.5 + 3.375).epsilon(1e-4));
+    CHECK(scene.surface_y(at + DVec3(15.5, 50.0, 0.7)) == doctest::Approx(at.y + 0.375 * 15.5 + 3.375).epsilon(1e-4));
     CHECK(scene.surface_y(at + DVec3(16.2, 50.0, 0.0)) < -1e8);
     CHECK(scene.surface_y(at + DVec3(0.0, 50.0, 4.2)) < -1e8);
     stretched.destruct();
@@ -314,7 +341,7 @@ TEST_CASE("an instance's scale and rotation reach its shape") {
     scene.instance(collision, Transform{.position = mirrored_at, .scale = {-1.0f, 1.0f, 1.0f}});
     const flecs::entity ball = scene.ball(mirrored_at + DVec3(0.0, 4.0, 0.0));
     scene.ticks(2);
-    CHECK(scene.surface_y(mirrored_at + DVec3(5.0, 50.0, 0.0)) == doctest::Approx(-0.25 * 5.0 + 1.125).epsilon(1e-4));
+    CHECK(scene.surface_y(mirrored_at + DVec3(5.0, 50.0, 0.7)) == doctest::Approx(-0.25 * 5.0 + 1.125).epsilon(1e-4));
     scene.ticks(75);
     const double above_surface = where(ball).y - (-0.25 * where(ball).x + 1.125);
     CHECK(above_surface == doctest::Approx(0.5 / std::cos(std::atan(0.25))).epsilon(0.05));
@@ -368,7 +395,7 @@ TEST_CASE("many instances of a mesh share one restored shape, and each scale one
     scene.ticks(1);
     CHECK(scene.physics.stats().bodies == kInstances + 120);
     CHECK(scene.physics.stats().shapes == 3);
-    CHECK(scene.surface_y({30.37, 50.0, 0.19}) == doctest::Approx(hill_height(0.0f, 0.0f)).epsilon(0.05));
+    CHECK(scene.surface_y({31.5, 50.0, 0.9}) == doctest::Approx(hill_height(1.13f, 0.71f)).epsilon(0.05));
 }
 
 TEST_CASE("a dynamic body lands on a mesh, and stays there, far from the world's zero") {
@@ -491,6 +518,7 @@ TEST_CASE("a mesh body waits for its asset without blocking anything, and then a
     scene.held.push_back(collision);
     REQUIRE(scene.assets.state(collision) == AssetState::Loading);
     const flecs::entity entity = scene.instance(collision, Transform{.position = {0.37, 0.0, 0.19}});
+    const PhysicsErrors errors; // waiting isn't a failure that mends itself
     for (int i = 0; i < 60; ++i) {
         scene.world.tick();
         CHECK(scene.physics.stats().bodies == 0);
@@ -498,14 +526,15 @@ TEST_CASE("a mesh body waits for its asset without blocking anything, and then a
     }
     CHECK(scene.assets.state(collision) == AssetState::Loading); // nothing went and got it
     QueryHit hit;
-    CHECK_FALSE(scene.physics.ray_cast({0.37, 50.0, 0.19}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK_FALSE(scene.physics.ray_cast({0.68, 50.0, 0.46}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
 
     scene.assets.wait_all();
     REQUIRE(scene.assets.state(collision) == AssetState::Ready);
     scene.world.tick();
     CHECK(scene.physics.stats().bodies == 1);
-    REQUIRE(scene.physics.ray_cast({0.37, 50.0, 0.19}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    REQUIRE(scene.physics.ray_cast({0.68, 50.0, 0.46}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
     CHECK(hit.entity == entity.id());
+    CHECK(errors.count == 0);
 }
 
 TEST_CASE("a cell's members with collision get bodies when it loads and lose them when it goes") {
@@ -544,8 +573,8 @@ TEST_CASE("a cell's members with collision get bodies when it loads and lose the
     // Static ones cost nothing awake, and a static child lies where its parent puts it.
     CHECK(scene.physics.stats().active_bodies == 0);
     QueryHit hit;
-    REQUIRE(scene.physics.ray_cast({20.19, 50.0, 20.37}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
-    CHECK(hit.position.y == doctest::Approx(10.0 + 1.125).epsilon(1e-4));
+    REQUIRE(scene.physics.ray_cast({20.5, 50.0, 20.64}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK(hit.position.y == doctest::Approx(10.0 + 0.31 * 0.25 + 1.125).epsilon(1e-4));
     const flecs::entity boulder = scene.ecs().entity(hit.entity);
     CHECK(boulder.has<de::world::InCell>(cell));
     CHECK(boulder.has<de::world::StaticTransform>());
@@ -567,7 +596,7 @@ TEST_CASE("a cell's members with collision get bodies when it loads and lose the
     cell.destruct();
     scene.ticks(2);
     CHECK(scene.physics.stats().bodies == 1); // the ball
-    CHECK_FALSE(scene.physics.ray_cast({20.19, 50.0, 20.37}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    CHECK_FALSE(scene.physics.ray_cast({20.5, 50.0, 20.64}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
     scene.ticks(1); // what lets go runs at the next update
     CHECK_FALSE(scene.assets.find(ramp_ref).is_valid());
     CHECK(scene.physics.stats().shapes == 1); // the ball's: the meshes went with their assets
@@ -601,7 +630,7 @@ TEST_CASE("two cells share one shape, which stays until the last of them goes") 
     scene.ticks(3);
     CHECK(scene.physics.stats().bodies == 1);
     CHECK(scene.physics.stats().shapes == 1);
-    CHECK(scene.surface_y({148.37, 50.0, 20.19}) == doctest::Approx(1.125).epsilon(1e-4));
+    CHECK(scene.surface_y({148.68, 50.0, 20.46}) == doctest::Approx(0.31 * 0.25 + 1.125).epsilon(1e-4));
     // Another cell's body, made after the first let go, from the shape that's there.
     b.destruct();
     scene.ticks(3);
@@ -725,7 +754,7 @@ TEST_CASE("collision cooked again reaches the bodies that use it, and a bad file
     const AssetHandle collision = scene.model("ramp", ramp());
     const flecs::entity entity = scene.instance(collision, Transform{.position = {0.37, 0.0, 0.19}});
     scene.ticks(1);
-    CHECK(scene.surface_y({2.37, 50.0, 0.19}) == doctest::Approx(2.0 * 0.25 + 1.125).epsilon(1e-3));
+    CHECK(scene.surface_y({2.5, 50.0, 0.46}) == doctest::Approx(2.13 * 0.25 + 1.125).epsilon(1e-3));
 
     // The same mesh two meters up, in the source. Its body keeps its entity and gets the new shape, a tick or so later.
     scene.write_source("content/props/ramp.gltf", ramp(2.0f));
@@ -736,9 +765,9 @@ TEST_CASE("collision cooked again reaches the bodies that use it, and a bad file
     scene.world.tick();
     CHECK(scene.physics.stats().bodies == 1);
     CHECK(scene.physics.stats().shapes == 1);
-    CHECK(scene.surface_y({2.37, 50.0, 0.19}) == doctest::Approx(2.0 * 0.25 + 3.125).epsilon(1e-3));
+    CHECK(scene.surface_y({2.5, 50.0, 0.46}) == doctest::Approx(2.13 * 0.25 + 3.125).epsilon(1e-3));
     QueryHit hit;
-    REQUIRE(scene.physics.ray_cast({2.37, 50.0, 0.19}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+    REQUIRE(scene.physics.ray_cast({2.5, 50.0, 0.46}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
     CHECK(hit.entity == entity.id());
 
     // Corrupted: said so, and it has no body, until a cook mends it.
@@ -759,7 +788,7 @@ TEST_CASE("collision cooked again reaches the bodies that use it, and a bad file
     scene.world.tick();
     scene.world.tick();
     CHECK(scene.physics.stats().bodies == 1);
-    CHECK(scene.surface_y({2.37, 50.0, 0.19}) == doctest::Approx(2.0 * 0.25 + 3.125).epsilon(1e-3));
+    CHECK(scene.surface_y({2.5, 50.0, 0.46}) == doctest::Approx(2.13 * 0.25 + 3.125).epsilon(1e-3));
 }
 
 TEST_CASE("every byte a mesh collider's memory took comes back") {

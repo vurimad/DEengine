@@ -41,9 +41,9 @@ enum class BodyKind : uint8_t {
     Dynamic,   // gravity and contacts move it, and it writes its Transform. A root entity
 };
 
-// An entity with this and a Collider gets a body at the start of the next tick, from its world transform (so place() it
-// first), and loses it when either goes. Changing either later doesn't change the body. Bodies of the same shape and
-// size share one, so many of a kind cost little.
+// An entity with this and a Collider gets a body at the start of the next tick, from where its Transform says, and
+// loses it when either goes. Changing either later doesn't change the body. Bodies of the same shape and size share
+// one, so many of a kind cost little.
 //
 // For what never moves, a world::MeshCollider instead, with no Collider and none of this: see Physics.
 struct RigidBody {
@@ -96,6 +96,10 @@ struct PhysicsStats {
     uint32_t active_bodies = 0; // not asleep, and not static
     uint32_t characters = 0;
     uint32_t shapes = 0; // kept, for all the bodies that share them: a scale around a mesh's counts as one too
+    // Last tick: dynamic bodies whose pose reached their Transform, and rows looked at for a place().
+    uint32_t transforms_written = 0;
+    uint32_t transforms_compared = 0;
+    uint32_t tables_written = 0; // told of what moved in them, once each
 };
 
 // What's between a query and what it hit.
@@ -115,15 +119,15 @@ struct QueryHit {
 // world's fixed tick: bodies and characters come and go with their components, what's made in a tick is there for that
 // tick's step, and queries see the last step. Jolt's own types stay inside this library.
 //
-// Static bodies cost nothing per tick, and neither does anything while it's all asleep. Awake bodies are read back
-// across the job system. Tables are the unit of change, though: one body awake makes its table's other rows look
-// changed to what reads transforms, so what moves shouldn't share a table with thousands that don't.
+// Static bodies cost nothing per tick, and neither does anything asleep: a step's cost follows what's awake. Tables are
+// the unit of change, though: one body awake makes its table's other rows look changed to what reads transforms, and a
+// place() has every row of its table looked at once, so what moves shouldn't share a table with thousands that don't.
 //
 // A world::MeshCollider gets a static body with the same friction as RigidBody's, in the first tick its asset is
 // loaded: until then it has none, and nothing waits. Every body of one asset shares one shape, restored once from its
 // bytes, and those of one scale share one wrapper around that; it goes when the registry unloads the asset. An asset
 // that can't be used (it failed, it's corrupt, another Jolt wrote it) is logged, and its bodies don't appear unless
-// it's reloaded good. A reload gives its bodies the new shape, a tick later.
+// it's reloaded good. A reload gives its bodies the new shape in the next tick.
 //
 // Create this before the world and add it once the world's there: the world's last entities let go of their bodies as
 // it goes down, so this has to outlive it. Not thread-safe, and queries aren't for use during a step.
