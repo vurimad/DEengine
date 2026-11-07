@@ -793,7 +793,7 @@ TEST_CASE("the broad phase is rebuilt for a first load, and not for a cell among
 }
 
 TEST_CASE("a moving body or character under a parent with a transform is refused, and says so") {
-    PhysicsErrors errors;
+    PhysicsErrors errors; // NOLINT(misc-const-correctness): the log writes to it
     Scene scene;
     const flecs::entity parent = scene.ecs().entity();
     de::world::place(parent, Transform{.position = {100.0, 0.0, 0.0}});

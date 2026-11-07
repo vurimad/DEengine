@@ -50,8 +50,8 @@ CpuRegisters read_cpu_registers() {
     }
     constexpr uint32_t kOsUsesXsave = 1U << 27U;
     if ((out.leaf1_ecx & kOsUsesXsave) != 0) {
-        uint32_t low = 0;
-        uint32_t high = 0;
+        uint32_t low = 0;  // NOLINT(misc-const-correctness): the assembly writes it
+        uint32_t high = 0; // NOLINT(misc-const-correctness): the assembly writes it
         __asm__ volatile("xgetbv" : "=a"(low), "=d"(high) : "c"(0));
         out.xcr0 = (static_cast<uint64_t>(high) << 32U) | low;
     }
