@@ -1886,6 +1886,24 @@ TEST_CASE("a changed mesh cooks its collision again, and --check notices when it
     CHECK(check().ok());
     // Settled, it doesn't cook again.
     CHECK(run_cook(vfs).stats.cooked == 0);
+    // Checking with --force is about what's cooked as well: it isn't stale because a cook wouldn't skip it.
+    {
+        Vfs read_only = sandbox.make_vfs({.game_writable = false});
+        CHECK(run_cook(read_only, {.check_only = true, .force = true, .check_shaders = false}).ok());
+    }
+    // Forced, what comes out the same keeps its bytes, and what differs on disk is written. That a same file isn't
+    // written at all, which is what keeps a running game from reloading it, this can't see.
+    {
+        const CookedPath same = cooked_path(id, AssetType::Collision);
+        std::vector<std::byte> marked = file_bytes(vfs, id, AssetType::Collision);
+        const auto once = run_cook(vfs, {.force = true});
+        CHECK(once.ok());
+        CHECK(file_bytes(vfs, id, AssetType::Collision) == marked);
+        marked.back() ^= std::byte{1};
+        REQUIRE(vfs.write_file(same.c_str(), std::span<const std::byte>(marked)).ok());
+        REQUIRE(run_cook(vfs, {.force = true}).ok());
+        CHECK(file_bytes(vfs, id, AssetType::Collision) != marked); // different on disk: written
+    }
 
     // A setting of the mesh's is as good as a change to it.
     write_src(sandbox, "meta/_folder.json", R"({"rules": [{"match": "hill.*", "mesh": {"scale": 2}}]})");
