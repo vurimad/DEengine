@@ -152,10 +152,15 @@ private:
         }
     }
 
-    // A source whose inputs hash as they did last time, with its cooked files still there.
+    // A source to skip: unchanged, and not being cooked regardless.
     const CookRecord* unchanged(std::string_view path, uint64_t input_hash) const {
+        return options_.force ? nullptr : up_to_date(path, input_hash);
+    }
+
+    // A source whose inputs hash as they did last time, with its cooked files still there.
+    const CookRecord* up_to_date(std::string_view path, uint64_t input_hash) const {
         const CookRecord* record = previous_.find(path);
-        if (options_.force || record == nullptr || record->input_hash != input_hash) {
+        if (record == nullptr || record->input_hash != input_hash) {
             return nullptr;
         }
         for (const CookedOutput& output : record->outputs) {
@@ -250,6 +255,12 @@ private:
             return false;
         }
         const asset::CookedPath path = asset::cooked_path(id, type);
+        // Collision that came out the same stays the file it was: a new one would have a running game take away and
+        // make again every body that uses it, and wake what rests on them, for a change that wasn't to them.
+        if (type == asset::AssetType::Collision && same_as_on_disk(path.c_str(), bytes)) {
+            record.outputs.push(CookedOutput{.id = id, .type = type});
+            return true;
+        }
         if (const core::Result<void> written = vfs_.write_file(path.c_str(), bytes.span()); !written) {
             diagnostics_.error(record.path.view(), "%s could not be written: %s", path.c_str(),
                                written.error().message);
@@ -257,6 +268,14 @@ private:
         }
         record.outputs.push(CookedOutput{.id = id, .type = type});
         return true;
+    }
+
+    bool same_as_on_disk(const char* path, const core::Array<std::byte>& bytes) const {
+        if (!vfs_.exists(path)) {
+            return false;
+        }
+        const auto old = vfs_.read_whole_file(path, tools_heap());
+        return old && old->size() == bytes.size() && std::memcmp(old->data(), bytes.data(), bytes.size()) == 0;
     }
 
     core::Result<core::Array<std::byte>> read_source(std::string_view path) {
@@ -529,14 +548,14 @@ private:
     }
 
     // --check: collision comes from a mesh and is never seen, so nothing else tells that it's old. What's cooked from a
-    // model is checked as a whole, against what a cook would hash it as now. With no collision cooked at all (CI),
-    // there's nothing stale.
+    // model is checked as a whole, against what a cook would hash it as now. With nothing cooked at all (CI), there's
+    // nothing stale; a tree cooked before models had collision is stale, though it has none either.
     void check_cooked_collision() {
         const auto makes_collision = [](const CookRecord& record) {
             return std::ranges::any_of(
                 record.outputs, [](const CookedOutput& output) { return output.type == asset::AssetType::Collision; });
         };
-        if (!any_cooked(asset::AssetType::Collision) && std::ranges::none_of(previous_.records(), makes_collision)) {
+        if (!any_cooked(asset::AssetType::Collision) && std::ranges::empty(previous_.records())) {
             return;
         }
         for (const Source& source : tree_.sources()) {
@@ -552,7 +571,7 @@ private:
                     const uint64_t hash =
                         model_input_hash(source, core::hash_bytes(bytes->data(), bytes->size()), model_settings(source),
                                          last->dependencies.span(), last->texture_uses.span());
-                    current = unchanged(path, hash) != nullptr;
+                    current = up_to_date(path, hash) != nullptr;
                 }
             }
             if (!current) {

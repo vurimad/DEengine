@@ -359,6 +359,33 @@ TEST_CASE("a scale of nothing gets no body, and it's said once") {
     CHECK(scene.physics.stats().shapes == 1);
 }
 
+TEST_CASE("a scale too small for Jolt gets no body either") {
+    Scene scene;
+    const AssetHandle collision = scene.model("ramp", ramp());
+    scene.instance(collision, Transform{.position = {0.5, 0.0, 0.0}, .scale = {1e-7f, 1.0f, 1.0f}});
+    PhysicsErrors errors; // NOLINT(misc-const-correctness): the log writes to it
+    scene.ticks(3);
+    CHECK(errors.count == 1);
+    CHECK(scene.physics.stats().bodies == 0);
+}
+
+TEST_CASE("a Collider beside a mesh collider owns the body, and keeps it when the mesh collider goes") {
+    Scene scene;
+    const AssetHandle collision = scene.model("ramp", ramp());
+    const flecs::entity entity = scene.instance(collision, Transform{.position = {0.5, 20.0, 0.0}});
+    entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    entity.set(RigidBody{.kind = BodyKind::Dynamic, .mass_kg = 1.0f});
+    scene.ticks(30);
+    CHECK(scene.physics.stats().bodies == 1);
+    const double falling = entity.get<Transform>().position.y;
+    CHECK(falling < 20.0);
+    entity.remove<de::world::MeshCollider>();
+    scene.ticks(1);
+    CHECK(scene.physics.stats().bodies == 1);
+    // Carried on falling, not made again where it was, at rest.
+    CHECK(entity.get<Transform>().position.y < falling);
+}
+
 TEST_CASE("many instances of a mesh share one restored shape, and each scale one wrapper around it") {
     Scene scene;
     const AssetHandle collision = scene.model("hill", hill());

@@ -639,6 +639,10 @@ const JPH::Shape* Physics::State::mesh_shape_for(asset::AssetHandle handle, cons
     if (RestoredMesh* const known = meshes.find(key); known != nullptr) {
         unscaled = known->shape.GetPtr();
     } else {
+        // Said why once, and not worth reading its file again for each instance. Being cooked again clears this.
+        if (refused_meshes.contains(key)) {
+            return nullptr;
+        }
         const asset::AssetState state = assets != nullptr ? assets->state(handle) : asset::AssetState::Failed;
         waiting = state == asset::AssetState::Loading;
         if (waiting) {
@@ -656,8 +660,10 @@ const JPH::Shape* Physics::State::mesh_shape_for(asset::AssetHandle handle, cons
     if (scale == Vec3(1.0f)) {
         return unscaled;
     }
-    if (scale.x == 0.0f || scale.y == 0.0f || scale.z == 0.0f) {
-        DE_LOG_ERROR("physics", "a mesh collider with a scale of 0 has no body");
+    // What Jolt's own checks need of a scale, with room to spare: ScaledShape's constructor doesn't check for itself.
+    constexpr float kLeastScale = 1e-5f;
+    if (std::abs(scale.x) < kLeastScale || std::abs(scale.y) < kLeastScale || std::abs(scale.z) < kLeastScale) {
+        DE_LOG_ERROR("physics", "a mesh collider with a scale of about 0 has no body");
         return nullptr;
     }
     RestoredMesh& mesh = *meshes.find(key);
@@ -1192,8 +1198,11 @@ void Physics::add_to_world(world::World& world) {
                                .without<BodyHandle>()
                                .without<Collider>()
                                .build(),
-        .mesh_bodies =
-            ecs.query_builder<const world::MeshCollider>("de::physics::MeshBodies").cached().with<BodyHandle>().build(),
+        .mesh_bodies = ecs.query_builder<const world::MeshCollider>("de::physics::MeshBodies")
+                           .cached()
+                           .with<BodyHandle>()
+                           .without<Collider>()
+                           .build(),
         .new_characters = ecs.query_builder<CharacterController, const Transform>("de::physics::NewCharacters")
                               .cached()
                               .without<CharacterHandle>()
@@ -1259,7 +1268,11 @@ void Physics::add_to_world(world::World& world) {
         .each([](flecs::entity entity, RigidBody&) { entity.remove<BodyHandle>(); });
     ecs.observer<world::MeshCollider>("de::DropBodyOfMeshCollider")
         .event(flecs::OnRemove)
-        .each([](flecs::entity entity, world::MeshCollider&) { entity.remove<BodyHandle>(); });
+        .each([](flecs::entity entity, world::MeshCollider&) {
+            if (!entity.has<Collider>()) { // a Collider beside it wins, so the body is that one's
+                entity.remove<BodyHandle>();
+            }
+        });
     ecs.observer<CharacterHandle>("de::DestroyCharacter")
         .event(flecs::OnRemove)
         .each([state](flecs::entity, CharacterHandle& handle) {

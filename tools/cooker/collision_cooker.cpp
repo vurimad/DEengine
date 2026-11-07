@@ -33,8 +33,8 @@ core::Result<core::Array<std::byte>> cook_collision(std::span<const std::byte> m
         std::byte bytes[asset::kAssetAlignment];
     };
     core::Array<Block> aligned(tools_heap());
-    aligned.resize_uninit(mesh_file.size() / sizeof(Block));
-    std::memcpy(aligned.data(), mesh_file.data(), aligned.size() * sizeof(Block));
+    aligned.resize_uninit((mesh_file.size() + sizeof(Block) - 1) / sizeof(Block));
+    std::memcpy(aligned.data(), mesh_file.data(), mesh_file.size());
     const std::span<const std::byte> file(reinterpret_cast<const std::byte*>(aligned.data()), mesh_file.size());
     const core::Result<const asset::MeshAsset*> loaded = asset::load_in_place<asset::MeshAsset>(file);
     if (!loaded) {
@@ -60,6 +60,17 @@ core::Result<core::Array<std::byte>> cook_collision(std::span<const std::byte> m
                             "its coarsest LOD has %llu triangles, over its collision_triangles of %u: its collision "
                             "has them all",
                             static_cast<unsigned long long>(chosen_triangles), settings.collision_triangles);
+    }
+
+    // A LOD picked by its size can have lost what mattered: nothing would say so, and things would walk through it.
+    if (lods[chosen].part_count < lods[0].part_count) {
+        diagnostics.warning(path, "its collision comes from a LOD with %u of its %u parts: the rest have no collision",
+                            lods[chosen].part_count, lods[0].part_count);
+    }
+    constexpr float kFarFromDrawnShare = 0.05f; // of its bounding sphere's radius
+    if (lods[chosen].error > mesh.bounds.radius * kFarFromDrawnShare) {
+        diagnostics.warning(path, "its collision lies up to %.2f m from what's drawn: raise collision_triangles",
+                            static_cast<double>(lods[chosen].error));
     }
 
     // Each position once, in the order they're first used.
