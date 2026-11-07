@@ -17,14 +17,16 @@ static_assert(std::endian::native == std::endian::little, "cooked files are litt
 
 enum class AssetType : uint16_t {
     Unknown = 0,
-    Mesh = 1,        // .demesh
-    Texture = 2,     // .detex
-    Material = 3,    // .demat
-    Shader = 4,      // .deshader
-    Cell = 5,        // .decell
-    World = 6,       // .deworld
-    Environment = 7, // .deenv
-    Collision = 8,   // .dephys
+    Mesh = 1,           // .demesh
+    Texture = 2,        // .detex
+    Material = 3,       // .demat
+    Shader = 4,         // .deshader
+    Cell = 5,           // .decell
+    World = 6,          // .deworld
+    Environment = 7,    // .deenv
+    Terrain = 8,        // .deterrain
+    TerrainHeights = 9, // .deheights: never loaded whole, read a block at a time
+    Collision = 10,     // .dephys
 };
 
 // ".demesh"; "" for Unknown.

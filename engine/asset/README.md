@@ -13,9 +13,10 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
 | `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, collision, name, flags); its meshes and their collision are its dependencies |
 | `collision_format.h` | `.dephys`: a mesh's collision, as a Jolt shape's bytes only `engine/physics` reads, and the ID it has from its mesh's |
-| `world_format.h` | `.deworld`: a world's cells by coordinate (sorted, named but not dependencies: they stream), its start, its environment (the one dependency) |
+| `world_format.h` | `.deworld`: a world's cells by coordinate (sorted, named but not dependencies: they stream), its start, its environment and terrain (its dependencies) |
 | `environment_format.h` | `.deenv`: sun direction and color, sky and ground ambient, shadow color, exposure, sun shadow settings (`ShadowLimits`), fog (`FogLimits`) |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |
+| `terrain_format.h` | `.deterrain`: a pyramid's levels, nodes and patch bounds, and `.deheights`: its blocks of heights, read one at a time |
 | `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload |
 
 ## Rules and invariants
@@ -26,6 +27,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 - A format change bumps that type's `kFormatVersion`: old files are refused (`Unsupported`) and cooked again, never patched.
 - Numbers stored in files (`AssetType`, `TextureFormat`, `ShaderStageKind`...) are never renumbered, only added to.
 - Little-endian only (checked at compile time).
+- `.deheights` is the one file that isn't loaded in place: the registry refuses it before reading it, and what streams terrain reads blocks at `terrain_block_offset()` through the VFS. It starts with an `AssetHeader` like the rest, whose ID is its terrain's, and `TerrainAsset::check_heights_header()` says whether a header and a file length (`Vfs::file_info`) are those of the file its terrain was cooked with.
 
 ## The registry
 
@@ -34,7 +36,7 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 - `revision(handle)` counts the contents committed (Ready, then each reload swapped in): what was built from an asset is up to date while it's unchanged.
 - Every `load()` needs a `release()`. An asset nobody holds is unloaded at the next `update()`, and lets go of its dependencies, which may go too. One let go while its read is in flight goes once the read is in.
 - Listeners hear `Ready`, `Failed`, `Reloaded` and `Unloaded`, in order, from `update()`. Pointers from `get()` and `file()` stay valid until an `update()` reports `Reloaded` or `Unloaded` for that asset.
-- Assets are keyed by ID and type: the same ID asked for as another type is another (failed) asset, and a file whose header holds another ID is refused.
+- Assets are keyed by ID and type: the same ID asked for as another type is another asset, which fails unless it has a file of its own (a terrain and its heights do), and a file whose header holds another ID is refused.
 - Hot reload (dev builds): a job asks the OS about a few held files at a time (round robin) for a new size or write time, never the main thread; the next `update()` acts on its answers. A changed file is read and checked in the background; its new dependencies are held and loaded, and once they're settled it's swapped in place: the handle stays, the contents and dependencies change, old dependencies let go after. A broken version is logged and the loaded one kept; a failed asset whose file appears is loaded.
 - A dependency that is the asset itself or depends on it (a cycle, from a corrupt file) is logged and skipped: two assets holding each other would never be unloaded.
 - Listeners may `load()` and `release()`; what that causes is told in the same `update()`. They may not call `update()` or `wait_all()`.

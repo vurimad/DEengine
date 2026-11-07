@@ -36,6 +36,8 @@ add_library(de_cooker STATIC
     shader_cooker.h
     source_tree.cpp
     source_tree.h
+    terrain_cooker.cpp
+    terrain_cooker.h
     texture_cooker.cpp
     texture_cooker.h
     world_cooker.cpp

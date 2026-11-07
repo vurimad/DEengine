@@ -22,6 +22,10 @@ const char* asset_type_extension(AssetType type) {
         return ".deworld";
     case AssetType::Environment:
         return ".deenv";
+    case AssetType::Terrain:
+        return ".deterrain";
+    case AssetType::TerrainHeights:
+        return ".deheights";
     case AssetType::Collision:
         return ".dephys";
     case AssetType::Unknown:
@@ -46,6 +50,10 @@ const char* asset_type_name(AssetType type) {
         return "world";
     case AssetType::Environment:
         return "environment";
+    case AssetType::Terrain:
+        return "terrain";
+    case AssetType::TerrainHeights:
+        return "terrain heights";
     case AssetType::Collision:
         return "collision";
     case AssetType::Unknown:
