@@ -25,10 +25,12 @@ enum class SourceKind : uint8_t {
     Cell,        // .cell: the entities placed in one cell of the world (JSON)
     World,       // .world: a world's cells, start and environment (JSON)
     Environment, // .environment: how a place is lit (JSON)
+    Terrain,     // .terrain: a height image and how to read it (JSON)
 };
 
 const char* source_kind_name(SourceKind kind);
-// False for files that aren't assets of their own (a glTF's .bin buffers, notes, unknown types).
+// False for files that aren't assets of their own (a glTF's .bin buffers, a terrain's .heightpng, notes,
+// unknown types).
 bool source_kind_of(std::string_view path, SourceKind& kind);
 
 // One asset source under content/, with its meta.
