@@ -26,6 +26,7 @@ enum class AssetType : uint16_t {
     Environment = 7,    // .deenv
     Terrain = 8,        // .deterrain
     TerrainHeights = 9, // .deheights: never loaded whole, read a block at a time
+    Collision = 10,     // .dephys
 };
 
 // ".demesh"; "" for Unknown.

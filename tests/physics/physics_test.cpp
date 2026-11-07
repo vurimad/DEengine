@@ -1,9 +1,19 @@
+#include "asset/collision_format.h"
+#include "asset/mesh_format.h"
+#include "asset/registry.h"
+#include "cooker/collision_cooker.h"
+#include "cooker/cooker.h"
 #include "core/allocator.h"
 #include "core/job_system.h"
 #include "core/log.h"
 #include "core/memory_stats.h"
 #include "physics/physics.h"
+#include "platform/file.h"
 #include "platform/time.h"
+#include "platform/vfs.h"
+#include "support/gltf_source.h"
+#include "support/sandbox.h"
+#include "world/cell.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -15,15 +25,23 @@
 #include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <span>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 using de::DVec3;
 using de::Quat;
 using de::Vec3;
+using de::asset::AssetHandle;
+using de::asset::AssetId;
+using de::asset::AssetRegistry;
+using de::asset::AssetType;
 using de::physics::BodyKind;
 using de::physics::CharacterController;
 using de::physics::Collider;
@@ -32,6 +50,7 @@ using de::physics::PhysicsDesc;
 using de::physics::QueryHit;
 using de::physics::RigidBody;
 using de::physics::ShapeKind;
+using de::test::Sandbox;
 using de::world::Transform;
 using de::world::World;
 
@@ -1298,6 +1317,257 @@ double median_step_us(Scene& scene, int ticks) {
     return steps[steps.size() / 2];
 }
 
+// The mesh to measure with, as a .demesh: the boulder, from the repository's cooked/, when there's one and this is for
+// reading. Otherwise a wavy one cooked here, so this keeps working.
+std::vector<std::byte> benchmark_mesh(bool big, de::platform::Vfs& vfs, de::core::JobSystem& jobs,
+                                      const Sandbox& sandbox, std::string& name) {
+    const auto read = [](const de::platform::Vfs& from, AssetId wanted) {
+        const de::asset::CookedPath path = de::asset::cooked_path(wanted, AssetType::Mesh);
+        std::vector<std::byte> bytes(static_cast<size_t>(from.file_size(path.c_str()).value()));
+        REQUIRE(from.read_file(path.c_str(), bytes).ok());
+        return bytes;
+    };
+    const AssetId boulder = de::asset::asset_id([] {
+        de::asset::Guid guid;
+        REQUIRE(de::asset::parse_guid("6681c1d7-0c12-4528-9523-2642e902ae2d", guid));
+        return guid;
+    }());
+    if (big) {
+        const auto cooked = de::platform::Vfs::create({.game_root = DE_SOURCE_DIR "/cooked"});
+        if (cooked && cooked->exists(de::asset::cooked_path(boulder, AssetType::Mesh).c_str())) {
+            name = "boulder_01";
+            return read(*cooked, boulder);
+        }
+        MESSAGE("no cooked boulder (run the cooker): measuring a wavy grid instead");
+    }
+    name = "wavy grid";
+    std::vector<de::test::Vertex> vertices;
+    std::vector<uint32_t> indices;
+    de::test::grid(64, vertices, indices);
+    const de::platform::PathString source = [&] {
+        de::platform::PathString path = sandbox.folder("src");
+        REQUIRE(path.append("/content"));
+        REQUIRE(de::platform::create_directories(path.c_str()).ok());
+        REQUIRE(path.append("/wavy.gltf"));
+        return path;
+    }();
+    const std::string text = de::test::gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]");
+    REQUIRE(de::platform::write_file_atomic(source.c_str(), de::test::bytes_of(text)).ok());
+    REQUIRE(de::cooker::cook(vfs, jobs, nullptr).ok());
+    AssetId id;
+    const auto list = [&](const char* folder, bool is_directory) {
+        de::platform::PathString path("game:/");
+        REQUIRE(path.append(folder));
+        if (!is_directory) {
+            return;
+        }
+        static_cast<void>(vfs.list(path.c_str(), [&](const char* file, bool) {
+            const std::string_view file_name(file);
+            if (file_name.ends_with(".demesh")) {
+                REQUIRE(de::asset::parse_asset_id(file_name.substr(0, de::asset::kAssetIdTextLength), id));
+            }
+        }));
+    };
+    static_cast<void>(vfs.list("game:/", list));
+    REQUIRE(id.is_valid());
+    return read(vfs, id);
+}
+
+// What a mesh costs next to a box: cooking, memory, rays, falling bodies and characters, at each limit on triangles.
+void mesh_benchmark(bool big) {
+    const Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 7});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    std::string name;
+    const std::vector<std::byte> mesh_file = benchmark_mesh(big, vfs, jobs, sandbox, name);
+    struct alignas(16) Block {
+        std::byte bytes[16];
+    };
+    std::vector<Block> aligned(mesh_file.size() / sizeof(Block));
+    std::memcpy(aligned.data(), mesh_file.data(), mesh_file.size());
+    const auto* const mesh = reinterpret_cast<const de::asset::MeshAsset*>(aligned.data());
+    const Vec3 mesh_min(mesh->bounds.min[0], mesh->bounds.min[1], mesh->bounds.min[2]);
+    const Vec3 mesh_max(mesh->bounds.max[0], mesh->bounds.max[1], mesh->bounds.max[2]);
+    const Vec3 half_size = (mesh_max - mesh_min) * 0.5f;
+    const Vec3 center = (mesh_max + mesh_min) * 0.5f;
+    MESSAGE(doctest::String(name.c_str()), ": ", mesh->indices.count, " indices over all its LODs, ", mesh_file.size(),
+            " bytes of .demesh, ", half_size.x * 2.0f, " x ", half_size.y * 2.0f, " x ", half_size.z * 2.0f, " m");
+
+    auto assets = AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    const float spacing = std::max(half_size.x, half_size.z) * 2.5f;
+    const int side = big ? 100 : 8;
+    const auto field = [&](int i) {
+        const int row = i / side;
+        return DVec3((i % side) * static_cast<double>(spacing) + 0.37, 0.0, row * static_cast<double>(spacing) + 0.19);
+    };
+    const int fallers = big ? 10000 : 100;
+    const int walkers = big ? 200 : 10;
+    const int ticks = big ? 240 : 5;
+    const int rays = big ? 200000 : 2000;
+    // Over the field, on no pattern a grid would line up with.
+    const auto ray_origin = [&](int i, double height) {
+        const double width = static_cast<double>(spacing) * side;
+        const double u = std::fmod(static_cast<double>(i) * 0.7548776662466927, 1.0);
+        const double v = std::fmod(static_cast<double>(i) * 0.5698402909980532, 1.0);
+        return DVec3(u * width, height, v * width);
+    };
+    const auto time_rays = [&](Scene& scene, const Vec3& direction, const char* what) {
+        int hits = 0;
+        QueryHit hit;
+        const uint64_t start = de::platform::time_ns();
+        for (int i = 0; i < rays; ++i) {
+            hits +=
+                scene.physics.ray_cast(ray_origin(i, static_cast<double>(half_size.y) * 4.0), direction, 500.0f, hit)
+                    ? 1
+                    : 0;
+        }
+        const double each_ns = static_cast<double>(de::platform::time_ns() - start) / rays;
+        MESSAGE("  rays ", doctest::String(what), ": ", each_ns, " ns each, on one thread, ", hits, " of ", rays,
+                " hit");
+    };
+    // Things falling onto the field, then walking on it, for whatever it's made of.
+    const auto time_field = [&](Scene& scene) {
+        time_rays(scene, {0.0f, -1.0f, 0.0f}, "straight down");
+        time_rays(scene, glm::normalize(Vec3(1.0f, -0.25f, 0.5f)), "along the field");
+        // Ground under it all, so what rolls off comes to rest.
+        const double width = static_cast<double>(spacing) * (side - 1);
+        scene.box({width * 0.5, static_cast<double>(mesh_min.y) - 0.5, width * 0.5},
+                  {static_cast<float>(width), 0.5f, static_cast<float>(width)});
+        const int per_row = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(fallers))));
+        for (int i = 0; i < fallers; ++i) {
+            const int row = i / per_row;
+            const double x = (i % per_row) * width / per_row;
+            const double z = row * width / per_row;
+            scene.sphere({x + 0.13, static_cast<double>(half_size.y) * 2.0 + 2.0, z + 0.29}, 0.25f);
+        }
+        scene.ticks(1);
+        const double falling = median_step_us(scene, big ? 45 : 3);
+        const double landing = median_step_us(scene, ticks);
+        for (int i = 0; i < walkers; ++i) {
+            const flecs::entity walker =
+                scene.character(field(i) + DVec3(0.0, static_cast<double>(half_size.y) * 2.5, 0.0));
+            walker.get_mut<CharacterController>().desired_velocity_mps = {0.5f, 0.0f, 1.0f};
+        }
+        scene.ticks(big ? 30 : 1);
+        const double walking = median_step_us(scene, ticks);
+        const de::physics::PhysicsStats stats = scene.physics.stats();
+        MESSAGE("  ", fallers, " spheres falling: ", falling, " us a tick; landing: ", landing, " us; with ", walkers,
+                " characters: ", walking, " us; ", stats.bodies, " bodies, ", stats.active_bodies, " awake at the end");
+    };
+
+    PhysicsDesc scene_desc;
+    scene_desc.assets = &*assets;
+    if (big) {
+        scene_desc.max_body_pairs = 1024U * 1024U;
+        scene_desc.max_contact_constraints = 512U * 1024U;
+    }
+    {
+        Scene boxes(&jobs, scene_desc);
+        for (int i = 0; i < side * side; ++i) {
+            boxes.box(field(i) + DVec3(center), half_size);
+        }
+        boxes.ticks(1);
+        MESSAGE("a box of its bounds, ", side * side, " of them:");
+        time_field(boxes);
+    }
+
+    std::vector<double> finest_heights;
+    constexpr uint32_t kLimits[] = {100000000U, 8192U, 4096U, 2048U, 1024U, 512U, 256U};
+    for (const uint32_t limit :
+         big ? std::span<const uint32_t>(kLimits) : std::span<const uint32_t>(kLimits).subspan(3, 1)) {
+        const AssetId id = AssetId::from_value(0x7000 + limit);
+        de::cooker::MeshSettings settings;
+        settings.collision_triangles = limit;
+        de::cooker::Diagnostics diagnostics(false);
+        double best_ms = 1e30;
+        for (int run = 0; run < (big ? 5 : 1); ++run) {
+            const uint64_t start = de::platform::time_ns();
+            const auto cooked = de::cooker::cook_collision(mesh_file, settings, id, "benchmark", diagnostics);
+            best_ms = std::min(best_ms, static_cast<double>(de::platform::time_ns() - start) / 1e6);
+            REQUIRE(cooked.ok());
+            REQUIRE(vfs.write_file(de::asset::cooked_path(id, AssetType::Collision).c_str(), cooked->span()).ok());
+        }
+
+        Scene scene(&jobs, scene_desc);
+        const AssetHandle handle = assets->load<de::asset::CollisionAsset>(id);
+        assets->wait_all();
+        const auto* const collision = assets->get<de::asset::CollisionAsset>(handle);
+        REQUIRE(collision != nullptr);
+        const auto live = [] { return de::core::memory_stats(de::core::MemoryTag::Physics).live_bytes; };
+        const auto instance = [&](int i) {
+            const flecs::entity entity = scene.ecs().entity();
+            entity.set(de::world::MeshCollider{.collision = handle});
+            de::world::place(entity, Transform{.position = field(i)});
+        };
+        scene.ticks(1);
+        const uint64_t live_empty = live();
+        const double empty_us = median_step_us(scene, 16);
+        instance(0);
+        const uint64_t start = de::platform::time_ns();
+        scene.ticks(1);
+        const double first_us = static_cast<double>(de::platform::time_ns() - start) / 1000.0;
+        const uint64_t live_one = live();
+        const int thousand = big ? 1000 : 32;
+        for (int i = 1; i < thousand; ++i) {
+            instance(i);
+        }
+        scene.ticks(1);
+        const uint64_t live_thousand = live();
+        MESSAGE("collision of at most ", limit, " triangles: LOD ", collision->source_lod, ", ", collision->triangles,
+                " triangles, ", collision->vertices, " vertices, error ", collision->error_m, " m; cooked in ", best_ms,
+                " ms (from a cooked mesh, best of a few), ", assets->file(handle).size(), " bytes of .dephys");
+        MESSAGE("  memory: the first body and its shape ", live_one - live_empty, " bytes; the next ", thousand - 1,
+                " instances ", live_thousand - live_one, " bytes, ", (live_thousand - live_one) / (thousand - 1),
+                " each. The tick that restored it took ", first_us, " us, an empty one ", empty_us, " us");
+
+        // How far it lies from what's drawn at its finest: straight down on one of them, across it.
+        std::vector<double> heights;
+        constexpr int kSamples = 64;
+        std::vector<double> errors;
+        for (int row = 0; row < kSamples; ++row) {
+            for (int column = 0; column < kSamples; ++column) {
+                const DVec3 at = field(0) + DVec3(center) +
+                                 DVec3((static_cast<double>(column) + 0.5) / kSamples * 2.0 - 1.0, 0.0,
+                                       (static_cast<double>(row) + 0.5) / kSamples * 2.0 - 1.0) *
+                                     DVec3(half_size);
+                QueryHit hit;
+                const bool hits = scene.physics.ray_cast(at + DVec3(0.0, static_cast<double>(half_size.y) * 4.0, 0.0),
+                                                         {0.0f, -1.0f, 0.0f}, 500.0f, hit);
+                heights.push_back(hits ? hit.position.y : -1e9);
+                if (!finest_heights.empty()) {
+                    const double finest = finest_heights[heights.size() - 1];
+                    if (hits && finest > -1e8) {
+                        errors.push_back(std::abs(hit.position.y - finest));
+                    }
+                }
+            }
+        }
+        if (finest_heights.empty()) {
+            finest_heights = std::move(heights);
+        } else {
+            // The worst are rays just past its outline, which land far down its side on one and not the other.
+            std::ranges::sort(errors);
+            double total = 0.0;
+            for (const double error : errors) {
+                total += error;
+            }
+            MESSAGE("  against its finest, on ", errors.size(),
+                    " rays straight down: ", total / static_cast<double>(errors.size()), " m on average, median ",
+                    errors[errors.size() / 2], ", 99th percentile ", errors[errors.size() * 99 / 100], ", worst ",
+                    errors.back());
+        }
+        for (int i = thousand; i < side * side; ++i) {
+            instance(i);
+        }
+        scene.ticks(1);
+        MESSAGE("  ", side * side, " of them:");
+        time_field(scene);
+        assets->release(handle);
+        assets->update();
+    }
+}
+
 } // namespace
 
 // Not a check: numbers to read. Small unless DE_PHYSICS_BENCH is set, and only worth reading from a dev or ship build.
@@ -1498,4 +1768,5 @@ TEST_CASE("benchmark: physics at scale") {
             }
         }
     }
+    mesh_benchmark(big);
 }

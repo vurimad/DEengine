@@ -14,8 +14,8 @@ class ShaderCompiler;
 namespace de::cooker {
 
 struct CookOptions {
-    // Check the source and meta trees, the cooked shaders against their sources, and terrain sources
-    // and what's cooked from them, and write nothing (no metas, no cooked files): what CI runs.
+    // Check the source and meta trees, the cooked shaders and collision against their sources, and
+    // terrain sources and what's cooked from them, and write nothing (no metas, no cooked files): what CI runs.
     bool check_only = false;
     // Cook every source again, even unchanged ones.
     bool force = false;
@@ -56,7 +56,8 @@ struct CookReport {
 //   the stamp of the sources they came from (asset::kShaderStampPath), which the engine compares
 //   at startup; a module that fails, or sources that change during the cook, leave no stamp, and
 //   then every module cooks again next time. Needs a compiler; without one shaders are skipped.
-// - Models (glTF, FBX): one .demesh, a .demat per material and a .detex per embedded image.
+// - Models (glTF, FBX): one .demesh, its collision as a .dephys, a .demat per material and a .detex
+//   per embedded image.
 // - Materials (.material text): a .demat.
 // - Textures: a .detex, with defaults picked by how models and materials use them, then the folder
 //   rules, then the meta.

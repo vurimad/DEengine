@@ -25,7 +25,7 @@ asset::AssetType parse_type(std::string_view name) {
     for (const asset::AssetType type :
          {asset::AssetType::Mesh, asset::AssetType::Texture, asset::AssetType::Material, asset::AssetType::Shader,
           asset::AssetType::Cell, asset::AssetType::World, asset::AssetType::Environment, asset::AssetType::Terrain,
-          asset::AssetType::TerrainHeights}) {
+          asset::AssetType::TerrainHeights, asset::AssetType::Collision}) {
         if (name == asset::asset_type_name(type)) {
             return type;
         }

@@ -313,7 +313,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     // Before the world: the world's last entities let go of their bodies as it goes down.
-    physics::Physics physics({.jobs = &jobs});
+    physics::Physics physics({.jobs = &jobs, .assets = &*assets});
     auto world = world::World::create({.jobs = &jobs, .assets = &*assets});
     if (!world) {
         DE_LOG_ERROR("world", "%s", world.error().message);

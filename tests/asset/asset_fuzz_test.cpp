@@ -4,6 +4,7 @@
 // asset hands out lies inside the file, and every number a consumer sizes things by is sane.
 
 #include "asset/cell_format.h"
+#include "asset/collision_format.h"
 #include "asset/format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
@@ -127,6 +128,10 @@ bool safe(std::span<const std::byte> file, const MaterialAsset& material) {
     return true;
 }
 
+bool safe(std::span<const std::byte> file, const de::asset::CollisionAsset& collision) {
+    return inside(file, collision.shape) && collision.shape.count > 0;
+}
+
 // What spawning relies on: parents already made, meshes among the dependencies, names in the file,
 // finite transforms.
 bool safe(std::span<const std::byte> file, const CellAsset& cell) {
@@ -143,6 +148,9 @@ bool safe(std::span<const std::byte> file, const CellAsset& cell) {
               cell.header.dependencies.get(file.data())[entity.mesh].type != AssetType::Mesh)) ||
             uint64_t{entity.name_offset} + entity.name_length > cell.names.count ||
             (entity.fog_volume != CellEntity::kNone && entity.fog_volume >= cell.fog_volumes.count) ||
+            (entity.collision != CellEntity::kNone &&
+             (entity.collision >= cell.header.dependencies.count ||
+              cell.header.dependencies.get(file.data())[entity.collision].type != AssetType::Collision)) ||
             !std::isfinite(entity.position[0]) || !std::isfinite(entity.scale[1]) ||
             !std::isfinite(entity.rotation[3])) {
             return false;
@@ -354,15 +362,25 @@ std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = 
     de::cooker::CellBuild build;
     build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
     build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
+    build.collisions.push({.id = AssetId::from_value(23), .type = AssetType::Collision});
     const char names[] = "rootchildother";
     for (const char c : std::string_view(names)) {
         build.names.push(c);
     }
-    build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
+    build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4, .collision = 2});
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
     build.fog_volumes.push(fog_volume);
     build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
+}
+
+// A collision file with stand-in bytes: it isn't read here, and what's inside it is the content hash's to guard.
+std::vector<std::byte> sample_collision() {
+    de::cooker::BlobWriter writer(sizeof(de::asset::CollisionAsset));
+    de::asset::CollisionAsset collision;
+    const std::byte shape[40] = {};
+    collision.shape = writer.append(std::span<const std::byte>(shape));
+    return to_vector(writer.finish(collision, AssetId::from_value(17), {}));
 }
 
 // A terrain of 10 nodes, from a map 300 x 200 samples at 2 m.
@@ -492,6 +510,10 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     fuzz<CellAsset>(cell, 5, kRounds);
     fuzz<TerrainAsset>(terrain, 6, kRounds);
     fuzz<WorldAsset>(world, 7, kRounds);
+    const std::vector<std::byte> collision = sample_collision();
+    Buffer collision_file(collision);
+    REQUIRE(load_in_place<de::asset::CollisionAsset>(collision_file.bytes()).ok());
+    fuzz<de::asset::CollisionAsset>(collision, 8, kRounds);
 }
 
 TEST_CASE("textures whose sizes overflow the mip arithmetic are refused") {

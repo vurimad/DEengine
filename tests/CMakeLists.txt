@@ -52,6 +52,7 @@ add_executable(de_tests
     render/terrain_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
+    physics/mesh_collision_test.cpp
     physics/physics_test.cpp
     tools/camera_script_test.cpp
     tools/image_diff_test.cpp
@@ -59,6 +60,7 @@ add_executable(de_tests
     world/scene_test.cpp
     world/world_test.cpp
     support/cook_kit.h
+    support/gltf_source.h
     support/gpu.h
     support/readback.h
     support/render_transform.h

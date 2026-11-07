@@ -5,6 +5,8 @@ add_library(de_asset STATIC
     asset_id.h
     cell_format.cpp
     cell_format.h
+    collision_format.cpp
+    collision_format.h
     environment_format.cpp
     environment_format.h
     format.cpp

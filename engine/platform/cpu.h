@@ -5,9 +5,9 @@
 
 // Physics builds Jolt for AVX2, and that isn't contained by physics: Jolt's static initializers run before main, and
 // the linker keeps whichever copy of a shared inline function it sees first, so AVX-encoded glm, flecs and std
-// functions end up used by the whole program. Whatever links physics therefore checks the CPU here before any C++
-// static initializer runs, and leaves with a message instead of an illegal instruction. Nothing in here may use what's
-// shared with code built for AVX2, so no std templates and no snprintf.
+// functions end up used by the whole program. Whatever links Jolt (the engine, the cooker) therefore checks the CPU
+// here before any C++ static initializer runs, and leaves with a message instead of an illegal instruction. Nothing in
+// here may use what's shared with code built for AVX2, so no std templates and no snprintf.
 namespace de::platform {
 
 // What the CPU says about itself, in the registers it says it in.
@@ -27,7 +27,8 @@ const char* first_missing_cpu_feature(const CpuRegisters& registers);
 // What to tell the player about it. Always ends with a null.
 void cpu_requirement_message(const char* missing, char* out, size_t out_size);
 
-// Whether the check ran, which it did before anything else if this is linked in. Physics asks, which is what links it.
+// Whether the check ran, which it did before anything else if this is linked in. physics::acquire_jolt() asks, which is
+// what links it.
 bool cpu_checked_at_startup();
 
 } // namespace de::platform

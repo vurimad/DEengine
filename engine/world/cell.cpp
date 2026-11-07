@@ -43,6 +43,7 @@ void register_cells(flecs::world& ecs, asset::AssetRegistry* assets) {
         });
     ecs.component<Cell>().member<asset::AssetHandle>("asset").member<CellCoord>("coord");
     ecs.component<CellContents>("de::CellContents");
+    ecs.component<MeshCollider>("de::MeshCollider").member<asset::AssetHandle>("collision");
     ecs.component<CellAssets>("de::CellAssets");
     if (assets != nullptr) {
         ecs.set(CellAssets{.assets = assets});
@@ -61,8 +62,9 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
     if (asset == nullptr) {
         return; // failed, or unloaded: empty
     }
-    // The meshes by the header's dependencies, which the cell holds (a dependency the registry
-    // skipped, closing a cycle in a corrupt file, is an invalid handle: drawn as a placeholder).
+    // The meshes and collision by the header's dependencies, which the cell holds (a dependency the
+    // registry skipped, closing a cycle in a corrupt file, is an invalid handle: drawn as a placeholder,
+    // and no body).
     const std::span<const asset::AssetRef> dependencies = asset->header.dependencies.get(asset);
     scratch.meshes.resize(dependencies.size());
     for (size_t i = 0; i < dependencies.size(); ++i) {
@@ -100,6 +102,9 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
         if (source.mesh != asset::CellEntity::kNone) {
             member.set(MeshInstance{.mesh = scratch.meshes[source.mesh]});
         }
+        if (source.collision != asset::CellEntity::kNone) {
+            member.set(MeshCollider{.collision = scratch.meshes[source.collision]});
+        }
         if (source.fog_volume != asset::CellEntity::kNone) {
             const asset::CellFogVolume& fog = asset->fog_volumes.get(asset)[source.fog_volume];
             member.set(FogVolume{.density_per_m = fog.density_per_m,
@@ -117,7 +122,7 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
         scratch.members[i] = member.id();
     }
     ecs.defer_end();
-    DE_LOG_INFO("world", "cell [%d, %d] spawned: %zu entities, %zu meshes", asset->coord_x, asset->coord_z,
+    DE_LOG_INFO("world", "cell [%d, %d] spawned: %zu entities, %zu assets", asset->coord_x, asset->coord_z,
                 entities.size(), dependencies.size());
 }
 
