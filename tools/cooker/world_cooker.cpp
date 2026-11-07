@@ -85,7 +85,7 @@ void read_light(const JsonReader& parent, const char* key, float (&out)[3]) {
     }
 }
 
-// The fog block: every setting required but the colours' intensities.
+// The fog block: every setting required but the colours' intensities and low_camera.
 void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
     yyjson_val* fog = yyjson_obj_get(parent.object, "fog");
     if (!yyjson_is_obj(fog)) {
@@ -133,11 +133,27 @@ void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
     };
     // The known keys: the numbers', and the colours'.
     constexpr size_t kNumberCount = std::size(numbers);
-    const char* keys[kNumberCount + 4] = {"extinction_tint", "sun_forward", "sun_back", "ambient"};
+    const char* keys[kNumberCount + 5] = {"extinction_tint", "sun_forward", "sun_back", "ambient", "low_camera"};
     for (size_t i = 0; i < kNumberCount; ++i) {
-        keys[4 + i] = numbers[i].key;
+        keys[5 + i] = numbers[i].key;
     }
     reader.check_keys(keys, "fog");
+    // Optional: without it, the height fog is the same wherever the camera is.
+    if (yyjson_val* low = yyjson_obj_get(fog, "low_camera")) {
+        const JsonReader low_reader{.object = low, .path = parent.path, .diagnostics = parent.diagnostics};
+        static constexpr const char* kLowKeys[] = {"keep", "below_m", "above_m"};
+        low_reader.check_keys(kLowKeys, "low_camera");
+        double keep = 1.0;
+        double below = 0.0;
+        double above = 0.0;
+        if (required(low_reader, "keep", 0.0, 1.0, keep) &&
+            required(low_reader, "below_m", -F::kMaxBaseHeightM, F::kMaxBaseHeightM, below) &&
+            required(low_reader, "above_m", below, F::kMaxBaseHeightM, above)) {
+            environment.fog_low_camera_keep = static_cast<float>(keep);
+            environment.fog_low_camera_below_m = static_cast<float>(below);
+            environment.fog_low_camera_above_m = static_cast<float>(above);
+        }
+    }
     for (Number& number : numbers) {
         double value = 0.0;
         number.read = required(reader, number.key, number.least, number.most, value);

@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <utility>
 
 namespace de::render {
@@ -482,12 +483,28 @@ struct SceneRendererState {
     rhi::BufferHandle frame_buffers[rhi::kFramesInFlight];
     uint64_t frame_capacity[rhi::kFramesInFlight] = {};
     SceneRendererStats stats;
+    std::optional<Terrain> terrain;
+    shader::ProgramHandle terrain_gbuffer;
+    shader::ProgramHandle terrain_shadow;
+    shader::ProgramHandle terrain_select;
+    bool fog_low_camera = true;
+
+    // How much of the height fog is left where the frame's camera is.
+    [[nodiscard]] float fog_low_camera_share(const SceneFog& fog, const world::RenderFrame& frame) const {
+        if (!fog_low_camera || fog.low_camera_keep >= 1.0f) {
+            return 1.0f;
+        }
+        const auto camera_y = static_cast<float>(frame.origin.y + static_cast<double>(frame.camera.transform[7]));
+        const float span = std::max(fog.low_camera_above_m - fog.low_camera_below_m, 1e-3f);
+        const float t = std::clamp((camera_y - fog.low_camera_below_m) / span, 0.0f, 1.0f);
+        return fog.low_camera_keep + ((1.0f - fog.low_camera_keep) * t * t * (3.0f - (2.0f * t)));
+    }
 
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
              {gbuffer_opaque, gbuffer_masked, gbuffer_opaque_fading, gbuffer_masked_fading, deferred_light, tonemap,
               shadow_caster_opaque, shadow_caster_masked, shadow_mask, fog_program, fog_inject, fog_integrate, cull,
-              cull_assign, instance_update, taa_program}) {
+              cull_assign, instance_update, taa_program, terrain_gbuffer, terrain_shadow, terrain_select}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -608,6 +625,8 @@ struct SceneRendererState {
         gbuffer_opaque_fading = make("scene.gbuffer", gbuffer, "fragment_opaque_fading");
         gbuffer.debug_name = "gbuffer (masked, fading)";
         gbuffer_masked_fading = make("scene.gbuffer", gbuffer, "fragment_masked_fading");
+        gbuffer.debug_name = "terrain";
+        terrain_gbuffer = make("scene.terrain", gbuffer);
 
         rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
         light.color_formats[0] = kHdrFormat;
@@ -623,6 +642,9 @@ struct SceneRendererState {
         const core::Result<shader::ProgramHandle> inject =
             shaders->create_compute({.module = "scene.fog_inject", .debug_name = "fog inject"});
         fog_inject = inject ? *inject : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> select =
+            shaders->create_compute({.module = "scene.terrain_select", .debug_name = "terrain select"});
+        terrain_select = select ? *select : shader::ProgramHandle{};
         const core::Result<shader::ProgramHandle> cull_program =
             shaders->create_compute({.module = "scene.cull", .debug_name = "gpu cull"});
         cull = cull_program ? *cull_program : shader::ProgramHandle{};
@@ -645,6 +667,7 @@ struct SceneRendererState {
                                                .debug_name = "shadow caster"};
         shadow_caster_opaque = make("scene.shadow_caster", caster, "fragment_opaque");
         shadow_caster_masked = make("scene.shadow_caster", caster, "fragment_masked");
+        terrain_shadow = make("scene.terrain_shadow", caster);
         rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
         mask.color_formats[0] = kShadowMaskFormat;
         shadow_mask = make("scene.shadow_mask", mask);
@@ -1135,7 +1158,7 @@ struct SceneRendererState {
         const SceneFog& fog = lighting.fog;
         const auto base_height = static_cast<float>(fog.base_height_m - frame.origin.y);
         scene.fog_density[0] = fog.density_per_m;
-        scene.fog_density[1] = fog.height_density_per_m;
+        scene.fog_density[1] = fog.height_density_per_m * fog_low_camera_share(fog, frame);
         scene.fog_density[2] = fog.height_falloff_per_m;
         scene.fog_density[3] = base_height;
         copy3(fog.extinction_tint, scene.fog_extinction);
@@ -1188,6 +1211,9 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
     fog.sun_start_m = environment.fog_sun_start_m;
     fog.end_m = environment.fog_end_m;
     fog.volume_distance_m = environment.fog_volume_distance_m;
+    fog.low_camera_keep = environment.fog_low_camera_keep;
+    fog.low_camera_below_m = environment.fog_low_camera_below_m;
+    fog.low_camera_above_m = environment.fog_low_camera_above_m;
     return lighting;
 }
 
@@ -1213,6 +1239,8 @@ const char* scene_view_name(SceneView view) {
         return "shadow mask";
     case SceneView::Cascades:
         return "shadow cascades";
+    case SceneView::TerrainLevel:
+        return "terrain levels";
     case SceneView::Count:
         break;
     }
@@ -1439,6 +1467,14 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->max_instances = desc.max_instances;
     state->mesh_instances.resize(desc.gpu_assets->mesh_kinds().size(), 0);
     SceneRenderer renderer(state);
+    if (desc.uploader != nullptr && desc.vfs != nullptr) {
+        core::Result<Terrain> terrain =
+            Terrain::create({.device = desc.device, .uploader = desc.uploader, .vfs = desc.vfs});
+        if (!terrain) {
+            return core::fail(terrain.error());
+        }
+        state->terrain.emplace(std::move(*terrain));
+    }
     const core::Result<rhi::BufferHandle> rows =
         desc.device->create_buffer({.size = uint64_t{desc.max_instances} * kInstanceBytes,
                                     .usage = rhi::BufferUsage::Storage,
@@ -1541,6 +1577,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle instance_update = state.shaders->pipeline(state.instance_update);
     const rhi::PipelineHandle fog_inject = state.shaders->pipeline(state.fog_inject);
     const rhi::PipelineHandle fog_integrate = state.shaders->pipeline(state.fog_integrate);
+    const rhi::PipelineHandle terrain_gbuffer = state.shaders->pipeline(state.terrain_gbuffer);
+    const rhi::PipelineHandle terrain_shadow = state.shaders->pipeline(state.terrain_shadow);
+    const rhi::PipelineHandle terrain_select = state.shaders->pipeline(state.terrain_select);
     // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
     // scene. The grid likewise (the closed form goes on alone). What it adds over the closed form is
     // the sun's shadows, so it reaches no farther than they do.
@@ -1858,9 +1897,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         now.written = true; // the graph leaves it in ShaderRead, even if its passes are skipped
     }
 
+    // The ground: streamed by where the camera is, its patches picked before anything draws them.
+    TerrainFrame terrain_frame;
+    if (state.terrain) {
+        const DVec3 camera_world = frame.origin + DVec3(static_cast<double>(frame.camera.transform[3]),
+                                                        static_cast<double>(frame.camera.transform[7]),
+                                                        static_cast<double>(frame.camera.transform[11]));
+        state.terrain->update(camera_world);
+        state.stats.terrain = state.terrain->stats();
+        terrain_frame =
+            state.terrain->add_select_passes(graph, terrain_select, frame_address, frame_address + kCullViewsOffset);
+    }
+
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
     struct ShadowPass {
         SceneRendererState* state = nullptr;
+        TerrainFrame terrain;
+        rhi::PipelineHandle terrain_pipeline;
         GraphTexture atlas;
         rhi::PipelineHandle opaque;
         rhi::PipelineHandle masked;
@@ -1874,6 +1927,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         "sun shadows",
         [&](PassBuilder& pass, ShadowPass& data) {
             data = {.state = &state,
+                    .terrain = terrain_frame,
+                    .terrain_pipeline = terrain_shadow,
                     .atlas = {},
                     .opaque = caster_opaque,
                     .masked = caster_masked,
@@ -1889,6 +1944,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
             pass.use(data.atlas, rhi::ResourceState::DepthWrite);
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+            if (state.terrain) {
+                state.terrain->use_draws(pass, terrain_frame);
+            }
         },
         [](const ShadowPass& data, PassContext& context) {
             DE_PROFILE_ZONE("shadow pass");
@@ -1909,6 +1967,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                      .width = data.cascade_size,
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
+                if (renderer.terrain) {
+                    renderer.terrain->draw_shadow(context, data.terrain, data.terrain_pipeline, data.frame_address,
+                                                  cascade);
+                }
                 context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
                 push.cascade = cascade;
                 context.list.push_constants(push);
@@ -1935,6 +1997,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     };
     struct GBufferPass {
         SceneRendererState* state = nullptr;
+        TerrainFrame terrain;
+        rhi::PipelineHandle terrain_pipeline;
+        bool terrain_levels = false;
         Targets targets;
         rhi::PipelineHandle opaque;
         rhi::PipelineHandle masked;
@@ -1949,6 +2014,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         "gbuffer",
         [&](PassBuilder& pass, GBufferPass& data) {
             data = {.state = &state,
+                    .terrain = terrain_frame,
+                    .terrain_pipeline = terrain_gbuffer,
+                    .terrain_levels = view == SceneView::TerrainLevel,
                     .targets = {},
                     .opaque = gbuffer_opaque,
                     .masked = gbuffer_masked,
@@ -1974,6 +2042,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+            if (state.terrain) {
+                state.terrain->use_draws(pass, terrain_frame);
+            }
         },
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
@@ -1986,6 +2057,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             colors[4] = {.texture = context.texture(data.targets.motion)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
+            // The ground first: it hides the most, so what's behind a hill fails early depth.
+            if (renderer.terrain) {
+                renderer.terrain->draw_gbuffer(context, data.terrain, data.terrain_pipeline, data.frame_address,
+                                               data.terrain_levels);
+            }
             context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
             const GBufferPush push{.frame = data.frame_address,
                                    .instances = renderer.instance_data_address,
@@ -2014,6 +2090,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.end_rendering();
         });
     const Targets targets = gbuffer.targets;
+    if (state.terrain) {
+        state.terrain->add_stats_pass(graph, terrain_frame);
+    }
 
     // The cull's counts, for the stats. Made once: without it the frame goes on, and they stay 0.
     if (!state.cull_readback[cull_slot].is_valid()) {
@@ -2312,7 +2391,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         resolved = kept_history;
     }
 
-    const auto view_index = static_cast<uint32_t>(view);
+    // Terrain's levels are in the base color.
+    const auto view_index = static_cast<uint32_t>(view == SceneView::TerrainLevel ? SceneView::BaseColor : view);
     const uint32_t srgb_target = rhi::format_info(target_format).srgb ? 1 : 0;
     graph.add_pass(
         "tonemap",
@@ -2373,6 +2453,16 @@ void SceneRenderer::set_shadow_min_texels(float texels) {
 void SceneRenderer::set_cull_frozen(bool frozen) {
     state_->cull_frozen = frozen;
     state_->frozen_views_held = frozen && state_->frozen_views_held; // what freezes next takes a new view
+}
+
+void SceneRenderer::set_fog_low_camera(bool on) {
+    state_->fog_low_camera = on;
+}
+
+void SceneRenderer::set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file) {
+    if (state_->terrain) {
+        state_->terrain->set(terrain, file);
+    }
 }
 
 bool SceneRenderer::instances_stale() const {

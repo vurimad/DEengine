@@ -2021,7 +2021,8 @@ constexpr const char* kEvening = R"({
           "extinction_tint": [0.8, 1, 1.25], "sun_forward": {"color": [1, 0.5, 0.25], "intensity": 2},
           "sun_back": {"color": [0.1, 0.2, 0.3]}, "sun_height_attenuation": 0.5,
           "ambient": {"color": [0.2, 0.3, 0.4], "intensity": 0.5}, "ambient_height_attenuation": 2,
-          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90}
+          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90,
+          "low_camera": {"keep": 0.3, "below_m": 60, "above_m": 350}}
 })";
 
 } // namespace
@@ -2138,6 +2139,9 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
         CHECK(environment.fog_sun_start_m == 4.0f);
         CHECK(environment.fog_end_m == 5000.0f);
         CHECK(environment.fog_volume_distance_m == 90.0f);
+        CHECK(environment.fog_low_camera_keep == 0.3f);
+        CHECK(environment.fog_low_camera_below_m == 60.0f);
+        CHECK(environment.fog_low_camera_above_m == 350.0f);
     }
     // A cell moved to another coord cooks the world again; new light only cooks the environment.
     CHECK(run_cook(vfs).stats.cooked == 0);

@@ -177,6 +177,10 @@ core::Result<void> DeviceImpl::create_swapchain() {
         usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         texture_usage |= TextureUsage::CopyDst;
     }
+    if (want_swapchain_copy_src && (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) != 0) {
+        usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        texture_usage |= TextureUsage::CopySrc;
+    }
     VkCompositeAlphaFlagBitsKHR composite = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if ((caps.supportedCompositeAlpha & composite) == 0) {
         for (const VkCompositeAlphaFlagBitsKHR alpha :

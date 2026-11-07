@@ -7,6 +7,7 @@ The scene on the GPU (docs/design.md, Rendering): GPU copies of the assets the r
 | File | What it gives |
 | --- | --- |
 | `gpu_assets.h` | `GpuAssets`: meshes as vertex and index buffers, textures with their bindless index, materials in one table (`GpuMaterial`), mirrored from the registry's events |
+| `terrain.h` | `Terrain`: heights streamed around the camera into fixed slots on the GPU, and the passes that pick and draw patches; `terrain_wanted_nodes` |
 | `scene_renderer.h` | `SceneRenderer`: the passes drawing a `world::RenderFrame`, `SceneLighting` (with the sun's `SceneShadows`, per frame) and `scene_lighting()` (from an environment asset), `SceneView` (debug views); `fit_shadow_cascades`, `camera_view_proj` (infinite reverse-Z, looking down -Z), `invert_4x4` |
 
 ## The G-buffer (v1)
@@ -46,6 +47,17 @@ With TAA on, each frame is drawn with a sub-pixel offset (Halton 2, 3, 16 sample
 - **No history at all:** off the screen or behind last frame's camera, on the first frame, after a camera cut, after a frame not drawn with TAA (`RenderFrame::number` has a gap), or at a new size. A pixel softens as it loses history, to a soft blur of this frame without any, rather than raw aliasing.
 
 No TAA is free of ghosts for what doesn't write depth or motion (particles, transparents): those will need a reactive mask when they arrive. Thin geometry fades rather than flashes: when the jitter misses it, the colour box has no room for it. Very near the point something flies straight at the camera from, its depth rule can still drop history.
+
+## Terrain
+
+A map is a pyramid of nodes (`asset/terrain_format.h`). What's loaded follows the camera from the first version, on rings of its own, not with the world's cells: terrain never holds up a cell.
+
+- **Streaming.** Each frame `Terrain::update` asks which nodes are wanted (`terrain_wanted_nodes`: every root, and what's within its level's range and a margin, looking only around the camera). Blocks are read one at a time into a pool of fixed slots (`TerrainDesc::max_blocks`, 36 MiB at 1,024), coarsest and nearest first, at most 16 in flight, and uploaded. A node shows in the table of slots only once its upload is recorded and its parent shows, and goes only once its children have, so the table always holds whole chains from a root. What's let go waits for the frames in flight before its slot is reused. Over capacity, what's held and still wanted stays, the rest waits, and it warns once (`TerrainStats::over_capacity`). A node that can't be read fails alone: what's coarser stands in. Heights from another cook are refused whole.
+- **Choosing.** `terrain select` walks a flat table of every patch of each level, and each decides for itself from the camera's distance, its height bounds and the table of slots: drawn if it's near enough for its level and its children aren't, or aren't there. So any state of loading is one whole surface, and the cost follows the map's patches (0.03 ms is the estimate at 60,000, unmeasured). It's the same choice for the camera and every cascade, so they agree on the ground, and each view then keeps what's in it, through the cull's views, so a frozen cull freezes which patches are kept. LOD still follows the live camera.
+- **Drawing.** One indexed draw per view, instanced over its list: 32 x 32 squares, and for the camera a skirt on each side. Vertices read their height from the block by address, 16-bit, with whole steps per level. Positions are whole steps off the map's corner and then off the render origin, so they hold anywhere. The ground draws first in `gbuffer`, and hides the most. `F2` has a view tinting it by level.
+- **Morph.** Within the last 30% of its level's range, a vertex turns into what the coarser level's surface is at that point, height only, so an edge between levels meets and a swap moves nothing. Skirts cover what morphing can't: a neighbour two levels away while it loads, and the edge of the map, where vertices also stop.
+
+Not yet: materials, baked normals (derived from the heights in the vertex shader, so far land is smooth), far shadows (the ground casts into the cascades only, 140 m), patch back-face culling, collision, compression. Timings haven't been measured on a quiet GPU.
 
 ## Rules and invariants
 

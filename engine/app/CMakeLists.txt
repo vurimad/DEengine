@@ -1,5 +1,7 @@
 # The framework (the engine's systems and the frame loop) and the applications it runs.
 add_library(de_app STATIC
+    agent_eyes.cpp
+    agent_eyes.h
     frame_clock.h
     framework.cpp
     framework.h

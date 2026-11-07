@@ -25,11 +25,16 @@ TEST_CASE("each thing physics needs of a CPU is asked for by its own bit") {
         const char* name;
     };
     constexpr Case kCases[] = {
-        {&CpuRegisters::leaf1_ecx, 19, "SSE4.1"}, {&CpuRegisters::leaf1_ecx, 20, "SSE4.2"},
-        {&CpuRegisters::leaf1_ecx, 23, "POPCNT"}, {&CpuRegisters::leaf1_ecx, 28, "AVX"},
-        {&CpuRegisters::leaf7_ebx, 5, "AVX2"},    {&CpuRegisters::leaf1_ecx, 12, "FMA"},
-        {&CpuRegisters::leaf1_ecx, 29, "F16C"},   {&CpuRegisters::leaf7_ebx, 3, "BMI1"},
-        {&CpuRegisters::leaf7_ebx, 8, "BMI2"},    {&CpuRegisters::extended1_ecx, 5, "LZCNT"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 19, .name = "SSE4.1"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 20, .name = "SSE4.2"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 23, .name = "POPCNT"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 28, .name = "AVX"},
+        {.in = &CpuRegisters::leaf7_ebx, .bit = 5, .name = "AVX2"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 12, .name = "FMA"},
+        {.in = &CpuRegisters::leaf1_ecx, .bit = 29, .name = "F16C"},
+        {.in = &CpuRegisters::leaf7_ebx, .bit = 3, .name = "BMI1"},
+        {.in = &CpuRegisters::leaf7_ebx, .bit = 8, .name = "BMI2"},
+        {.in = &CpuRegisters::extended1_ecx, .bit = 5, .name = "LZCNT"},
     };
     for (const Case& test : kCases) {
         CpuRegisters registers = has_everything();
