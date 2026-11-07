@@ -2,6 +2,7 @@
 
 #include "app/frame_clock.h"
 #include "asset/registry.h"
+#include "asset/terrain_format.h"
 #include "core/array.h"
 #include "core/fixed_string.h"
 #include "core/job_system.h"
@@ -325,8 +326,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     std::optional<render::SceneRenderer> scene_renderer;
-    auto created =
-        render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+    auto created = render::SceneRenderer::create(
+        {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .uploader = &*uploader, .vfs = &*vfs});
     if (created) {
         scene_renderer.emplace(std::move(*created));
         scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
@@ -370,7 +371,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit,
-                  .taa = setting(as_text(settings), "taa") == "on"};
+                  .taa = setting(as_text(settings), "taa") == "on",
+                  .terrain = {}};
+    asset::AssetHandle shown_terrain;
+    uint32_t shown_terrain_revision = 0;
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
@@ -473,6 +477,19 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #endif
 
         device->begin_frame();
+        // What the application asks of the renderer, in every build.
+        if (scene_renderer) {
+            scene_renderer->set_fog_low_camera(engine.fog_low_camera);
+            // The ground: when the application names another, or it's re-cooked.
+            const uint32_t terrain_revision = engine.assets.revision(engine.terrain);
+            if (engine.terrain != shown_terrain || terrain_revision != shown_terrain_revision) {
+                shown_terrain = engine.terrain;
+                shown_terrain_revision = terrain_revision;
+                const auto* terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain);
+                scene_renderer->set_terrain(terrain, terrain != nullptr ? engine.assets.file(engine.terrain)
+                                                                        : std::span<const std::byte>{});
+            }
+        }
         uploader->record(); // uploads land at the start of the frame
         const rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
         if (backbuffer.is_valid()) {
@@ -513,6 +530,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("visible fading draws", static_cast<int64_t>(drawn.visible_fading_draws));
                 DE_PROFILE_PLOT("visible shadow draws", static_cast<int64_t>(drawn.visible_shadow_draws));
                 DE_PROFILE_PLOT("merged draws", static_cast<int64_t>(drawn.merged_draws));
+                DE_PROFILE_PLOT("terrain patches", static_cast<int64_t>(drawn.terrain.patches));
+                DE_PROFILE_PLOT("terrain triangles", static_cast<int64_t>(drawn.terrain.triangles));
+                DE_PROFILE_PLOT("terrain shadow triangles", static_cast<int64_t>(drawn.terrain.shadow_triangles));
+                DE_PROFILE_PLOT("terrain blocks resident", static_cast<int64_t>(drawn.terrain.resident));
+                DE_PROFILE_PLOT("terrain blocks wanted", static_cast<int64_t>(drawn.terrain.wanted));
                 DE_PROFILE_PLOT("merged shadow draws", static_cast<int64_t>(drawn.merged_shadow_draws));
                 DE_PROFILE_PLOT("draws lost", static_cast<int64_t>(drawn.draws_lost));
                 DE_PROFILE_PLOT("visible triangles", static_cast<int64_t>(drawn.visible_triangles));
@@ -603,6 +625,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         gpu_stats.meshes, gpu_stats.textures, gpu_stats.materials, static_cast<unsigned long long>(gpu_stats.bytes),
         scene_stats.drawn, scene_stats.instances, scene_stats.visible_draws, scene_stats.draws,
         scene_stats.visible_fading_draws);
+    if (scene_stats.terrain.blocks > 0) {
+        DE_LOG_INFO("terrain",
+                    "%u of %u blocks on the GPU, %u wanted, %u failed; %u patches, %u triangles in view, %u in shadows",
+                    scene_stats.terrain.resident, scene_stats.terrain.blocks, scene_stats.terrain.wanted,
+                    scene_stats.terrain.failed, scene_stats.terrain.patches, scene_stats.terrain.triangles,
+                    scene_stats.terrain.shadow_triangles);
+    }
     if (gpu_stats.meshes_dropped > 0) {
         DE_LOG_WARN("render", "%u meshes didn't fit in the geometry pool", gpu_stats.meshes_dropped);
     }

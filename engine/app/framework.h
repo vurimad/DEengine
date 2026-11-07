@@ -1,6 +1,7 @@
 #pragma once
 
 #include "app/agent_eyes.h"
+#include "asset/registry.h"
 #include "render/scene/scene_renderer.h"
 
 #include <cstdint>
@@ -101,7 +102,9 @@ struct Engine {
     // What each frame draws, as the application sets it.
     render::SceneLighting lighting;
     render::SceneView view = render::SceneView::Lit;
-    bool taa = false; // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+    bool taa = false;           // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+    asset::AssetHandle terrain; // the ground, a .deterrain the application keeps loaded; none: no ground
+    bool fog_low_camera = true; // SceneRenderer::set_fog_low_camera
 #if DE_BUILD_DEV
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
     // Where the application's camera goes this frame (the agent's eyes), or null to leave it alone.
