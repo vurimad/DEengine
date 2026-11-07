@@ -769,14 +769,12 @@ private:
 
     // --- Terrain -----------------------------------------------------------------------------
 
-    // What a terrain's outputs depend on: its GUID, its text, its height image's path and bytes, its format.
-    static uint64_t terrain_input_hash(const Source& source, uint64_t source_hash, std::string_view height_path,
-                                       uint64_t height_hash) {
+    // What a terrain's outputs depend on: its GUID, its text (which says which image), its image's bytes, its format.
+    static uint64_t terrain_input_hash(const Source& source, uint64_t source_hash, uint64_t height_hash) {
         Hasher hasher("terrain");
         hasher.add(source.id.value());
         hasher.add(asset::TerrainAsset::kFormatVersion);
         hasher.add(source_hash);
-        hasher.add(height_path);
         hasher.add(height_hash);
         return hasher.value();
     }
@@ -800,8 +798,8 @@ private:
             return;
         }
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
-        const uint64_t input_hash = terrain_input_hash(source, source_hash, terrain->height.view(),
-                                                       core::hash_bytes(height->data(), height->size()));
+        const uint64_t input_hash =
+            terrain_input_hash(source, source_hash, core::hash_bytes(height->data(), height->size()));
         if (const CookRecord* same = unchanged(path, input_hash); same != nullptr) {
             keep(*same);
             return;
@@ -814,7 +812,7 @@ private:
         const core::Result<CookedTerrain> cooked =
             image ? cook_terrain(*terrain, *image, source.id, &jobs_, path, diagnostics_)
                   : core::Result<CookedTerrain>(core::fail(image.error()));
-        // The heights first: a .deterrain on disk always names a whole file.
+        // The heights first, so a new .deterrain is never on disk before the heights it names.
         if (!cooked || !write(record, source.id, asset::AssetType::TerrainHeights, cooked->heights) ||
             !write(record, source.id, asset::AssetType::Terrain, cooked->terrain)) {
             failed(path, &record);
@@ -898,7 +896,6 @@ private:
             if (const CookRecord* record = previous_.find(path); record != nullptr) {
                 check_cooked_terrain(source, *record,
                                      terrain_input_hash(source, core::hash_bytes(bytes->data(), bytes->size()),
-                                                        terrain->height.view(),
                                                         core::hash_bytes(height->data(), height->size())));
             }
         }
