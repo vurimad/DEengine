@@ -48,6 +48,7 @@ add_executable(de_tests
     render/rhi_test.cpp
     render/geometry_pool_test.cpp
     render/scene_test.cpp
+    render/terrain_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
     physics/physics_test.cpp
