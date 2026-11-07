@@ -33,6 +33,18 @@ private:
     void apply_world(Engine& engine);
 
     asset::AssetHandle world_;
+#if DE_BUILD_DEV
+    // A demo of physics: F6 drops rocks in front of the camera, F7 a shower of rubble.
+    void drop_rocks(Engine& engine, uint32_t count, bool rubble);
+    platform::ActionId drop_rocks_{};
+    platform::ActionId drop_rubble_{};
+    asset::AssetHandle rock_mesh_;
+    bool floor_made_ = false;
+    uint32_t rocks_dropped_ = 0;
+    Vec3 rock_center_{0.0f}; // of the box around the mesh, in its own space
+    Vec3 rock_half_{0.0f};
+    uint64_t rock_random_ = 0x9e3779b97f4a7c15ULL;
+#endif
     uint32_t world_revision_ = 0;
     asset::AssetHandle environment_; // the world's dependency: held for it
     uint32_t environment_revision_ = 0;
