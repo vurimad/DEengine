@@ -51,6 +51,7 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     next_view_ = engine.input.add_action("debug.next_view"_sid, platform::ActionKind::Button);
     toggle_taa_ = engine.input.add_action("debug.toggle_taa"_sid, platform::ActionKind::Button);
     freeze_cull_ = engine.input.add_action("debug.freeze_cull"_sid, platform::ActionKind::Button);
+    toggle_fog_low_camera_ = engine.input.add_action("debug.toggle_fog_low_camera"_sid, platform::ActionKind::Button);
     engine.freeze_cull = has_flag(args, "--freeze-cull");
     if (engine.freeze_cull) {
         DE_LOG_INFO("render", "cull frozen at the first frame's camera (--freeze-cull; F4 to go live)");
@@ -97,6 +98,9 @@ void Viewer::apply_world(Engine& engine) {
                        ? asset::AssetHandle{}
                        : engine.assets.find(world->header.dependencies.get(file.data())[world->environment]);
     environment_revision_ = 0; // applied by the next update()
+    engine.terrain = world->terrain == asset::WorldAsset::kNone
+                         ? asset::AssetHandle{}
+                         : engine.assets.find(world->header.dependencies.get(file.data())[world->terrain]);
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
 }
@@ -126,6 +130,10 @@ bool Viewer::update(Engine& engine, float frame_s) {
     if (engine.input.state(toggle_taa_).pressed) {
         engine.taa = !engine.taa;
         DE_LOG_INFO("render", "TAA %s", engine.taa ? "on" : "off");
+    }
+    if (engine.input.state(toggle_fog_low_camera_).pressed) {
+        engine.fog_low_camera = !engine.fog_low_camera;
+        DE_LOG_INFO("render", "height fog thinning with a low camera %s", engine.fog_low_camera ? "on" : "off");
     }
     if (engine.input.state(freeze_cull_).pressed) {
         engine.freeze_cull = !engine.freeze_cull;

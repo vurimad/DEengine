@@ -16,6 +16,7 @@
 #include "render/shader/shader_asset.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "support/cook_kit.h"
 #include "support/gpu.h"
 #include "support/sandbox.h"
 
@@ -40,39 +41,19 @@ using namespace de::asset;
 using de::cooker::CookReport;
 using de::platform::Vfs;
 using de::test::bytes_of;
+using de::test::Cooked;
+using de::test::cooker_vfs;
+using de::test::guid_of;
+using de::test::has_message;
+using de::test::read_text;
+using de::test::remove_src;
+using de::test::run_cook;
 using de::test::Sandbox;
+using de::test::write_src;
 
 namespace {
 
 // --- Writing sources --------------------------------------------------------------------------
-
-void write_src(const Sandbox& sandbox, std::string_view relative, std::span<const std::byte> bytes) {
-    de::platform::PathString path = sandbox.folder("src");
-    REQUIRE(path.append('/'));
-    REQUIRE(path.append(relative));
-    const de::platform::PathString parent(path.view().substr(0, path.view().find_last_of('/')));
-    REQUIRE(de::platform::create_directories(parent.c_str()).ok());
-    REQUIRE(de::platform::write_file_atomic(path.c_str(), bytes).ok());
-}
-
-void write_src(const Sandbox& sandbox, std::string_view relative, std::string_view text) {
-    write_src(sandbox, relative, bytes_of(text));
-}
-
-void remove_src(const Sandbox& sandbox, std::string_view relative) {
-    de::platform::PathString path = sandbox.folder("src");
-    REQUIRE(path.append('/'));
-    REQUIRE(path.append(relative));
-    REQUIRE(de::platform::delete_tree(path.c_str()).ok());
-}
-
-std::string read_text(const Vfs& vfs, const char* path) {
-    const auto size = vfs.file_size(path);
-    REQUIRE(size.ok());
-    std::string text(static_cast<size_t>(*size), '\0');
-    REQUIRE(vfs.read_file(path, std::as_writable_bytes(std::span(text.data(), text.size()))).ok());
-    return text;
-}
 
 // An image as PNG: rgba8, rows top to bottom.
 std::vector<std::byte> png(uint32_t width, uint32_t height, const std::vector<uint8_t>& rgba) {
@@ -238,63 +219,6 @@ void grid(uint32_t n, std::vector<Vertex>& vertices, std::vector<uint32_t>& indi
 }
 
 // --- Reading results --------------------------------------------------------------------------
-
-Vfs cooker_vfs(const Sandbox& sandbox, bool writable = true) {
-    return sandbox.make_vfs({.game_writable = writable});
-}
-
-CookReport run_cook(Vfs& vfs, de::cooker::CookOptions options = {}) {
-    de::core::JobSystem jobs({.worker_count = 2});
-    return de::cooker::cook(vfs, jobs, nullptr, options);
-}
-
-bool has_message(const CookReport& report, std::string_view path, std::string_view text) {
-    for (const de::cooker::Diagnostic& diagnostic : report.diagnostics) {
-        if (diagnostic.path == path && diagnostic.message.view().find(text) != std::string_view::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Guid guid_of(const Vfs& vfs, const char* meta_path) {
-    const std::string text = read_text(vfs, meta_path);
-    const size_t at = text.find(R"("guid": ")");
-    REQUIRE(at != std::string::npos);
-    Guid guid;
-    REQUIRE(parse_guid(std::string_view(text).substr(at + 9, kGuidTextLength), guid));
-    return guid;
-}
-
-// A cooked file in aligned memory.
-class Cooked {
-public:
-    Cooked(const Vfs& vfs, AssetId id, AssetType type) {
-        const CookedPath path = cooked_path(id, type);
-        const auto size = vfs.file_size(path.c_str());
-        REQUIRE_MESSAGE(size.ok(), path.c_str(), " is missing");
-        blocks_.resize((*size + 15) / 16);
-        size_ = static_cast<size_t>(*size);
-        REQUIRE(vfs.read_file(path.c_str(), bytes()).ok());
-    }
-    std::span<std::byte> bytes() { return {reinterpret_cast<std::byte*>(blocks_.data()), size_}; }
-    const void* data() { return blocks_.data(); }
-
-    template <typename T>
-    const T& load() {
-        const auto loaded = load_in_place<T>(bytes());
-        REQUIRE_MESSAGE(loaded.ok(), (loaded.ok() ? "" : loaded.error().message));
-        CHECK(verify_content_hash(bytes()));
-        return **loaded;
-    }
-
-private:
-    struct alignas(16) Block {
-        std::byte bytes[16];
-    };
-    std::vector<Block> blocks_;
-    size_t size_ = 0;
-};
 
 // Peak signal-to-noise ratio of decoded blocks against the source, over the given channels.
 double psnr(const std::vector<uint8_t>& source, uint32_t size, std::span<const std::byte> blocks, TextureFormat format,
@@ -1919,7 +1843,8 @@ constexpr const char* kEvening = R"({
           "extinction_tint": [0.8, 1, 1.25], "sun_forward": {"color": [1, 0.5, 0.25], "intensity": 2},
           "sun_back": {"color": [0.1, 0.2, 0.3]}, "sun_height_attenuation": 0.5,
           "ambient": {"color": [0.2, 0.3, 0.4], "intensity": 0.5}, "ambient_height_attenuation": 2,
-          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90}
+          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90,
+          "low_camera": {"keep": 0.3, "below_m": 60, "above_m": 350}}
 })";
 
 } // namespace
@@ -2036,6 +1961,9 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
         CHECK(environment.fog_sun_start_m == 4.0f);
         CHECK(environment.fog_end_m == 5000.0f);
         CHECK(environment.fog_volume_distance_m == 90.0f);
+        CHECK(environment.fog_low_camera_keep == 0.3f);
+        CHECK(environment.fog_low_camera_below_m == 60.0f);
+        CHECK(environment.fog_low_camera_above_m == 350.0f);
     }
     // A cell moved to another coord cooks the world again; new light only cooks the environment.
     CHECK(run_cook(vfs).stats.cooked == 0);

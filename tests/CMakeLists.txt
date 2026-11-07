@@ -11,6 +11,7 @@ add_executable(de_tests
     asset/asset_test.cpp
     asset/registry_test.cpp
     cooker/cooker_test.cpp
+    cooker/terrain_test.cpp
     core/allocator_test.cpp
     core/arena_test.cpp
     core/array_test.cpp
@@ -47,11 +48,13 @@ add_executable(de_tests
     render/rhi_test.cpp
     render/geometry_pool_test.cpp
     render/scene_test.cpp
+    render/terrain_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
     physics/physics_test.cpp
     world/scene_test.cpp
     world/world_test.cpp
+    support/cook_kit.h
     support/gpu.h
     support/readback.h
     support/render_transform.h

@@ -133,11 +133,27 @@ void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
     };
     // The known keys: the numbers', and the colours'.
     constexpr size_t kNumberCount = std::size(numbers);
-    const char* keys[kNumberCount + 4] = {"extinction_tint", "sun_forward", "sun_back", "ambient"};
+    const char* keys[kNumberCount + 5] = {"extinction_tint", "sun_forward", "sun_back", "ambient", "low_camera"};
     for (size_t i = 0; i < kNumberCount; ++i) {
-        keys[4 + i] = numbers[i].key;
+        keys[5 + i] = numbers[i].key;
     }
     reader.check_keys(keys, "fog");
+    // Optional: without it, the height fog is the same wherever the camera is.
+    if (yyjson_val* low = yyjson_obj_get(fog, "low_camera")) {
+        const JsonReader low_reader{.object = low, .path = parent.path, .diagnostics = parent.diagnostics};
+        static constexpr const char* kLowKeys[] = {"keep", "below_m", "above_m"};
+        low_reader.check_keys(kLowKeys, "low_camera");
+        double keep = 1.0;
+        double below = 0.0;
+        double above = 0.0;
+        if (required(low_reader, "keep", 0.0, 1.0, keep) &&
+            required(low_reader, "below_m", -F::kMaxBaseHeightM, F::kMaxBaseHeightM, below) &&
+            required(low_reader, "above_m", below, F::kMaxBaseHeightM, above)) {
+            environment.fog_low_camera_keep = static_cast<float>(keep);
+            environment.fog_low_camera_below_m = static_cast<float>(below);
+            environment.fog_low_camera_above_m = static_cast<float>(above);
+        }
+    }
     for (Number& number : numbers) {
         double value = 0.0;
         number.read = required(reader, number.key, number.least, number.most, value);
@@ -181,7 +197,7 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the world has errors");
     }
-    static constexpr const char* kKeys[] = {"environment", "start", "cells"};
+    static constexpr const char* kKeys[] = {"environment", "terrain", "start", "cells"};
     reader.check_keys(kKeys, "world");
 
     const Source* environment = find_relative(tree, path, reader.string("environment", ""), SourceKind::Environment,
@@ -189,6 +205,14 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
     if (environment != nullptr) {
         build.environment = {.id = environment->id, .type = asset::AssetType::Environment};
         build.read.push(environment->path);
+    }
+    if (reader.has("terrain")) {
+        const Source* terrain = find_relative(tree, path, reader.string("terrain", ""), SourceKind::Terrain,
+                                              "a terrain source (.terrain)", diagnostics);
+        if (terrain != nullptr) {
+            build.terrain = {.id = terrain->id, .type = asset::AssetType::Terrain};
+            build.read.push(terrain->path);
+        }
     }
 
     yyjson_val* start = yyjson_obj_get(doc->root(), "start");
@@ -251,9 +275,12 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     asset.start_yaw_rad = build.start_yaw_rad;
     asset.start_pitch_rad = build.start_pitch_rad;
     asset.environment = 0;
+    const bool has_terrain = build.terrain.id.is_valid();
+    asset.terrain = has_terrain ? 1 : asset::WorldAsset::kNone;
     BlobWriter writer(sizeof(asset::WorldAsset));
     asset.cells = writer.append(build.cells.span());
-    return writer.finish(asset, id, std::span(&build.environment, 1));
+    const asset::AssetRef dependencies[] = {build.environment, build.terrain};
+    return writer.finish(asset, id, std::span(dependencies).first(has_terrain ? 2 : 1));
 }
 
 core::Result<asset::EnvironmentAsset> import_environment(const Source& source, std::span<const std::byte> bytes,
