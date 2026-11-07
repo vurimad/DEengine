@@ -51,7 +51,9 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
                within(fog_ambient_height_attenuation, 0.0f, F::kMaxAttenuation) &&
                within(fog_start_m, 0.0f, F::kMaxDistanceM) && within(fog_sun_start_m, 0.0f, F::kMaxDistanceM) &&
                within(fog_end_m, 0.0f, F::kMaxDistanceM) && fog_end_m > fog_start_m &&
-               within(fog_volume_distance_m, 0.0f, F::kMaxVolumeDistanceM);
+               within(fog_volume_distance_m, 0.0f, F::kMaxVolumeDistanceM) && within(fog_low_camera_keep, 0.0f, 1.0f) &&
+               within(fog_low_camera_below_m, -F::kMaxBaseHeightM, F::kMaxBaseHeightM) &&
+               within(fog_low_camera_above_m, fog_low_camera_below_m, F::kMaxBaseHeightM);
     for (int i = 0; i < 3; ++i) {
         fog = fog && within(fog_extinction_tint[i], F::kMinExtinctionTint, F::kMaxExtinctionTint) &&
               finite_at_least(fog_sun_forward[i], 0.0f) && finite_at_least(fog_sun_back[i], 0.0f) &&

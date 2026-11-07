@@ -5,9 +5,11 @@
 #include "core/result.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
+#include "render/scene/terrain.h"
 #include "render/shader/shader_library.h"
 
 #include <cstdint>
+#include <span>
 
 namespace de::world {
 struct RenderFrame;
@@ -54,6 +56,12 @@ struct SceneFog {
     float sun_start_m = 0.0f; // where sun haze starts: none on the camera's nose
     float end_m = 20000.0f;
     float volume_distance_m = 0.0f; // the froxel grid's reach, in view depth; 0: no grid
+    // Not physical, and on purpose: the height fog thins as the camera comes down into it, so low land reads as foggy
+    // from above and clear from inside. This much is left with the camera below low_camera_below_m, and all of it by
+    // low_camera_above_m. 1: the fog is the same wherever the camera is.
+    float low_camera_keep = 1.0f;
+    float low_camera_below_m = 0.0f;
+    float low_camera_above_m = 0.0f;
 };
 
 // The scene's light, linear: what an environment asset gives (scene_lighting()).
@@ -85,9 +93,10 @@ enum class SceneView : uint32_t {
     Metalness,
     Occlusion,
     Translucency,
-    ShadowMask, // sunlight seen
-    Cascades,   // which shadow cascade each pixel uses (red, green, blue, yellow)
-    Motion,     // screen motion since last frame, about grey (red: right, green: down)
+    ShadowMask,   // sunlight seen
+    Cascades,     // which shadow cascade each pixel uses (red, green, blue, yellow)
+    Motion,       // screen motion since last frame, about grey (red: right, green: down)
+    TerrainLevel, // base color, with terrain tinted by which level of its quadtree each patch is
     Count,
 };
 
@@ -97,6 +106,9 @@ struct SceneRendererDesc {
     rhi::Device* device = nullptr;
     shader::ShaderLibrary* shaders = nullptr;
     GpuAssets* gpu_assets = nullptr;
+    // What terrain streams through. Without them, there's no terrain.
+    rhi::Uploader* uploader = nullptr;
+    platform::Vfs* vfs = nullptr;
     // Made once, 100 bytes each: 51 MiB. An instance whose slot is past it isn't drawn, until something asks for all
     // the instances, and even then it keeps that slot: this is a limit to stay under, not one to touch.
     uint32_t max_instances = 512U * 1024U;
@@ -123,6 +135,7 @@ struct SceneRendererStats {
     uint32_t visible_triangles = 0;
     uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
+    TerrainStats terrain;
 };
 
 // The most planes it takes to bound what can shadow a slice of the view.
@@ -215,6 +228,13 @@ public:
     // whether the caster cull was right or wrong. What can still be trusted from there is the numbers it kept,
     // SceneRendererStats::visible_shadow_draws and visible_shadow_triangles.
     void set_cull_frozen(bool frozen);
+
+    // Whether the height fog thins with a low camera (SceneFog::low_camera_keep): on, unless turned off to compare.
+    void set_fog_low_camera(bool on);
+
+    // The terrain to show, or null for none. file holds it, and must stay valid and unchanged until the next call.
+    // Waits for what's in flight: only when the terrain changes.
+    void set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).
