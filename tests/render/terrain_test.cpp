@@ -205,9 +205,11 @@ TEST_CASE("terrain streams in around the camera, draws the ground with no holes,
 
         // There's nothing to draw until the heights are in.
         de::render::TerrainStats stats{};
-        for (int i = 0; i < 40 && (stats.wanted == 0 || stats.resident < stats.wanted); ++i) {
+        for (int i = 0; i < 2000 && (stats.wanted == 0 || stats.resident < stats.wanted); ++i) {
             draw();
             stats = renderer->stats().terrain;
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(1)); // reads finish on other threads, in their own time
         }
         CHECK(stats.wanted > 1);
         CHECK(stats.resident == stats.wanted);
@@ -271,26 +273,31 @@ TEST_CASE("terrain keeps to its blocks as the camera moves, and refuses heights 
     REQUIRE(terrain.ok());
     terrain->set(&asset, file);
     const auto settle = [&](const DVec3& camera) {
-        for (int i = 0; i < 24; ++i) {
+        // Past what it takes to let go and take up slots, until nothing's on its way.
+        for (int i = 0; i < 2000; ++i) {
             device->begin_frame();
             uploader->record();
             terrain->update(camera);
             device->end_frame();
+            const de::render::TerrainStats now = terrain->stats();
+            REQUIRE(now.resident <= kBlocks);
+            if (i >= 24 && now.reading == 0 && now.uploading == 0) {
+                break;
+            }
             // Reads finish on other threads, in their own time.
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            CHECK(terrain->stats().resident <= kBlocks);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
     };
     settle(DVec3(200.0, 30.0, 200.0));
     const de::render::TerrainStats first = terrain->stats();
-    CHECK(first.resident > 0);
+    CHECK(first.resident == kBlocks); // a slot lost along the way would leave this short
     CHECK(first.over_capacity > 0);
     CHECK(first.failed == 0);
     // Across the map: what isn't wanted any more makes room for what is.
     settle(DVec3(3900.0, 30.0, 3900.0));
     const de::render::TerrainStats second = terrain->stats();
     CHECK(second.blocks_loaded > first.blocks_loaded);
-    CHECK(second.resident <= kBlocks);
+    CHECK(second.resident == kBlocks);
     CHECK(second.failed == 0);
 
     // Heights from another cook are refused whole: nothing is read from them.

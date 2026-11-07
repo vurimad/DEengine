@@ -25,6 +25,7 @@ core::Allocator& render_heap() {
 }
 
 constexpr uint32_t kNoSlot = UINT32_MAX;
+constexpr uint32_t kLetGoOne = UINT32_MAX - 1; // no slot yet, but one has been let go, and comes back in a few frames
 constexpr uint32_t kViewCount = 1 + kShadowCascadeCount;
 // Patches a view can draw. A view asks for about 1,000 in a wide open vista.
 constexpr uint32_t kListCapacity = 16384;
@@ -99,9 +100,9 @@ enum class NodeState : uint8_t { Unloaded, Reading, Uploading, Resident, Failed 
 
 struct Node {
     uint32_t slot = kNoSlot;
-    uint32_t last_wanted = 0;  // the update that last wanted it
-    uint32_t parent = kNoSlot; // the node above it; none for a root
-    uint32_t children_shown = 0;
+    uint32_t last_wanted = 0;   // the update that last wanted it
+    uint32_t parent = kNoSlot;  // the node above it; none for a root
+    uint32_t children_held = 0; // with a slot, shown or on their way: it can't go before they do
     NodeState state = NodeState::Unloaded;
 };
 
@@ -221,6 +222,8 @@ struct TerrainState {
     core::Array<Retired> retired{render_heap()};
     core::Array<TerrainWant> wanted{render_heap()};
     uint32_t update_number = 0;
+    uint32_t next_to_let_go = 0;
+    uint32_t resident = 0; // shown in the table
     bool warned_over_capacity = false;
 
     TerrainStats counters;
@@ -317,35 +320,37 @@ struct TerrainState {
             free_slots.resize(free_slots.size() - 1);
             return slot;
         }
-        uint32_t best = kNoSlot;
-        uint32_t oldest = update_number; // what's wanted this update stays
-        for (uint32_t slot = 0; slot < max_blocks; ++slot) {
+        // The next that isn't wanted, going round, so this doesn't walk the pool each time. Not one with children held:
+        // the table has to hold whole chains from a root. Only with everything wanted does it go all the way round.
+        for (uint32_t tried = 0; tried < max_blocks; ++tried) {
+            const uint32_t slot = next_to_let_go;
+            next_to_let_go = (next_to_let_go + 1) % max_blocks;
             const uint32_t owner = slot_owner[slot];
-            // Not one with children showing: the table has to hold whole chains from a root.
-            if (owner != kNoSlot && nodes[owner].state == NodeState::Resident && nodes[owner].children_shown == 0 &&
-                nodes[owner].last_wanted < oldest) {
-                oldest = nodes[owner].last_wanted;
-                best = slot;
+            if (owner == kNoSlot || nodes[owner].state != NodeState::Resident || nodes[owner].children_held != 0 ||
+                nodes[owner].last_wanted >= update_number) {
+                continue;
             }
+            // What's in flight may still read this slot, so it's free again only after those frames.
+            Node& node = nodes[owner];
+            if (node.parent != kNoSlot) {
+                --nodes[node.parent].children_held;
+            }
+            node.state = NodeState::Unloaded;
+            node.slot = kNoSlot;
+            slot_table[owner] = kNoSlot;
+            ++slot_table_version;
+            slot_owner[slot] = kNoSlot;
+            retired.push(Retired{.slot = slot, .free_after = update_number + rhi::kFramesInFlight + 1});
+            --resident;
+            return kLetGoOne;
         }
-        if (best == kNoSlot) {
-            return kNoSlot;
-        }
-        // What's in flight may still read this slot, so it's free again only after those frames.
-        Node& node = nodes[slot_owner[best]];
-        if (node.parent != kNoSlot) {
-            --nodes[node.parent].children_shown;
-        }
-        node.state = NodeState::Unloaded;
-        node.slot = kNoSlot;
-        slot_table[slot_owner[best]] = kNoSlot;
-        ++slot_table_version;
-        slot_owner[best] = kNoSlot;
-        retired.push(Retired{.slot = best, .free_after = update_number + rhi::kFramesInFlight + 1});
         return kNoSlot;
     }
 
     void release_slot(Node& node) {
+        if (node.parent != kNoSlot) {
+            --nodes[node.parent].children_held;
+        }
         slot_owner[node.slot] = kNoSlot;
         free_slots.push(node.slot);
         node.slot = kNoSlot;
@@ -435,10 +440,8 @@ struct TerrainState {
                 }
                 continue;
             }
-            if (node.parent != kNoSlot) {
-                ++nodes[node.parent].children_shown;
-            }
             node.state = NodeState::Resident;
+            ++resident;
             slot_table[entry.node] = node.slot;
             ++slot_table_version;
             ++counters.blocks_loaded;
@@ -461,9 +464,14 @@ struct TerrainState {
     void start_reads() {
         counters.over_capacity = 0;
         uint32_t next_read = 0;
+        uint32_t let_go = 0;
         for (const TerrainWant& want : wanted) {
             Node& node = nodes[want.node];
             if (node.state != NodeState::Unloaded) {
+                continue;
+            }
+            // Its parent first: a block is shown only after it, so it'd only sit in its slot, waiting.
+            if (node.parent != kNoSlot && nodes[node.parent].state == NodeState::Unloaded) {
                 continue;
             }
             while (next_read < kMaxReads && reads[next_read].active) {
@@ -473,8 +481,15 @@ struct TerrainState {
                 return;
             }
             const uint32_t slot = take_slot();
+            if (slot == kLetGoOne) {
+                // It comes back in a few frames: as many at a time as could be read at once.
+                if (++let_go == kMaxReads) {
+                    return;
+                }
+                continue;
+            }
             if (slot == kNoSlot) {
-                // Either a slot has just been let go and comes back in a few frames, or everything held is wanted.
+                // Everything held is wanted, or waits for what's held below it.
                 if (retired.empty()) {
                     ++counters.over_capacity;
                     if (!warned_over_capacity) {
@@ -501,6 +516,9 @@ struct TerrainState {
             node.state = NodeState::Reading;
             node.slot = slot;
             slot_owner[slot] = want.node;
+            if (node.parent != kNoSlot) {
+                ++nodes[node.parent].children_held;
+            }
         }
     }
 };
@@ -640,6 +658,8 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
     state.header_ok = false;
     state.uploading.clear();
     state.retired.clear();
+    state.resident = 0;
+    state.next_to_let_go = 0;
     state.counters = {};
     state.drawn = {};
     if (terrain == nullptr) {
@@ -803,15 +823,12 @@ void Terrain::update(const DVec3& camera) {
     }
     state.start_reads();
     state.counters.wanted = static_cast<uint32_t>(state.wanted.size());
-    state.counters.resident = 0;
+    state.counters.resident = state.resident;
     state.counters.reading = 0;
     for (const Read& read : state.reads) {
         state.counters.reading += read.active ? 1 : 0;
     }
     state.counters.uploading = static_cast<uint32_t>(state.uploading.size());
-    state.counters.resident = state.max_blocks - static_cast<uint32_t>(state.free_slots.size()) -
-                              static_cast<uint32_t>(state.retired.size()) - state.counters.reading -
-                              state.counters.uploading;
 }
 
 TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle select, uint64_t frame,
@@ -849,12 +866,13 @@ TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle 
         "terrain clear", [&](PassBuilder& pass) { pass.use(out.args, rhi::ResourceState::CopyDst); },
         [args = out.args](PassContext& context) {
             const rhi::BufferHandle buffer = context.buffer(args);
-            context.list.fill_buffer(buffer, 0, kArgsBytes, 0);
-            // The camera draws the sides that hide gaps; a shadow map has no use for them.
-            context.list.fill_buffer(buffer, 0, sizeof(uint32_t), kGridIndices + kSkirtIndices);
-            for (uint32_t view = 1; view < kViewCount; ++view) {
-                context.list.fill_buffer(buffer, uint64_t{view} * kArgsWords * sizeof(uint32_t), sizeof(uint32_t),
-                                         kGridIndices);
+            // Each word once: fills over the same bytes have no order between them. The camera draws the sides that
+            // hide gaps; a shadow map has no use for them.
+            for (uint32_t view = 0; view < kViewCount; ++view) {
+                const uint64_t first = uint64_t{view} * kArgsWords * sizeof(uint32_t);
+                context.list.fill_buffer(buffer, first, sizeof(uint32_t),
+                                         view == 0 ? kGridIndices + kSkirtIndices : kGridIndices);
+                context.list.fill_buffer(buffer, first + sizeof(uint32_t), (kArgsWords - 1) * sizeof(uint32_t), 0);
             }
         });
     graph.add_pass(

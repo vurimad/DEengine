@@ -85,7 +85,7 @@ void read_light(const JsonReader& parent, const char* key, float (&out)[3]) {
     }
 }
 
-// The fog block: every setting required but the colours' intensities.
+// The fog block: every setting required but the colours' intensities and low_camera.
 void read_fog(const JsonReader& parent, asset::EnvironmentAsset& environment) {
     yyjson_val* fog = yyjson_obj_get(parent.object, "fog");
     if (!yyjson_is_obj(fog)) {
