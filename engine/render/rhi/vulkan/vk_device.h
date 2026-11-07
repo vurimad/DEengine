@@ -294,6 +294,7 @@ struct DeviceImpl {
     // nothing tells when a present from a retired swapchain has stopped using its semaphore.
     VkSemaphore present_semaphores[kMaxSwapchainImages] = {};
     bool want_vsync = true;
+    bool want_swapchain_copy_src = false;
     bool swapchain_out_of_date = false; // must be rebuilt before the next acquire
     bool swapchain_suboptimal = false;  // works, but a rebuild would match the surface better
     // Some surfaces keep reporting suboptimal with the best swapchain they allow: after one

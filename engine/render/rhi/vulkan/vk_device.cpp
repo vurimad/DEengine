@@ -190,6 +190,7 @@ core::Result<void> DeviceImpl::init(const DeviceDesc& desc) {
     DE_PROFILE_ZONE("rhi create device");
     window = desc.window;
     want_vsync = desc.vsync;
+    want_swapchain_copy_src = desc.swapchain_copy_src;
 
     if (volkInitialize() != VK_SUCCESS) {
         return core::fail(core::ErrorCode::Unsupported, "no Vulkan loader on this system");

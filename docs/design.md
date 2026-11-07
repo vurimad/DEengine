@@ -1047,10 +1047,11 @@ engine/
   game/       # combat, AI, player, items, saves
   script/     # Lua bindings
   editor/     # editor mode, panels, commands
-  tools/      # debug UI, stats panel, free camera
-config/       # engine settings as text: input bindings, engine.settings (copied into game:/config/)
+  tools/      # debug UI, stats panel, free camera, camera scripts and screenshots
+config/       # engine settings as text: input bindings, engine.settings, camera views and paths (copied into game:/config/)
 tools/
   cooker/     # asset cooker, validators, packer
+  image_diff/ # compares two PNGs, with a mask and a threshold
 shaders/      # Slang
 content/      # src:/ source assets, data, Lua
 meta/         # mirrored meta tree: GUIDs + import settings
@@ -1218,4 +1219,5 @@ Decisions so far:
 | 2026-11-06 | Terrain is a GPU-driven quadtree with morphing and skirts, not clipmap rings; streaming is in from the first version (the user's call), on its own rings; a map's size comes from the map, with 16 x 16 km the least the engine must carry | Clipmap detail ignores height above the ground and spends the same on flat land and mountains, and Far Cry 5 shipped this shape. Untested here: morphing with skirts, and what it costs on our GPU |
 | 2026-11-06 | Terrain starts before the M0b gate is met (editor, Lua, headless): a deliberate departure, on the user's word. Screenshot and camera flags stand in for agent eyes until then | The look target needs real land to judge, and the rest of the gate doesn't block it |
 | 2026-11-07 | A terrain step is 1/64 of its level's spacing, not 1/128: a node holds a rise of 8 to 1, and steeper land fails the cook | The first real map's cliffs are deliberate and rise 1,081 m across a 2 m node, past the 1,024 m that 1/128 holds, and would fail harder at the 1 m we aim for. It costs a step of 31 mm at 2 m (the source's own is 24 mm), and baked normals come from the float source anyway |
+| 2026-11-07 | Agent eyes, dev builds only, until the command API: flags place the free camera (doubles from the text to the entity), take a PNG of the final image, step the frame clock by a fixed amount and fly a path; a run that takes pictures listens to no input, hides the debug UI and starts with the scene on the GPU; `image_diff` (C++ on stb_image, in `tools/`) compares two PNGs; stb_image_write comes into the dev engine for it, and ship links none of this | An agent could not see the engine at all. Stills of one view at one frame count were identical across every comparison made at 96 frames, in Debug and dev, with validation and vsync on or off, so baselines are per GPU and driver; 96 frames is where TAA and the froxel history stop mattering in the test world (engine/app/README.md has the numbers) |
 | 2026-11-07 | Height fog can thin with a low camera, by a setting per environment, and a key in dev builds turns it off to compare | Low land should read as foggy from above and clear from inside, which one fog of one thickness per height can't do; the user judged it by eye on their map |

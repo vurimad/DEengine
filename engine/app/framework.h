@@ -1,5 +1,6 @@
 #pragma once
 
+#include "app/agent_eyes.h"
 #include "asset/registry.h"
 #include "render/scene/scene_renderer.h"
 
@@ -52,6 +53,7 @@ namespace de::app {
 //   --shadow-min-texels X    casters narrower than this many of a cascade's texels don't draw in it (default 0: all
 //   draw)
 //   --show-sticks    dev builds: deadzone off, raw stick values logged twice a second (drift)
+//   Dev builds: the agent's eyes (--camera, --still, --camera-path, --fixed-step and the rest): app/agent_eyes.h
 struct FrameworkArgs {
     int argc = 0;
     char** argv = nullptr;
@@ -70,6 +72,9 @@ struct FrameworkArgs {
     bool vsync = true;
     bool validation = true;
     bool show_sticks = false;
+#if DE_BUILD_DEV
+    EyesFlags eyes;
+#endif
 };
 
 // False (logged) on a malformed flag.
@@ -102,6 +107,8 @@ struct Engine {
     bool fog_low_camera = true; // SceneRenderer::set_fog_low_camera
 #if DE_BUILD_DEV
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
+    // Where the application's camera goes this frame (the agent's eyes), or null to leave it alone.
+    const tools::CameraPose* camera_pose = nullptr;
 #endif
 };
 
