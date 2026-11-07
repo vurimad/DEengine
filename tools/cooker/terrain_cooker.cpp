@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace de::cooker {
 
@@ -110,9 +111,8 @@ void read_block_pixels(const HeightImage& image, const Level& level, uint32_t no
     }
 }
 
-// A patch's reach: its samples, and those of the level above where it has them. What morphs reads is either: a vertex
-// goes from its own height toward the coarser surface, and a coarse sample can lie outside the fine ones by its
-// rounding. The border isn't the patch's.
+// A patch's reach: its samples, and the coarser level's where it has them. A vertex morphs from its own height toward
+// the coarser surface, and a coarse sample can lie outside the fine ones by its rounding. The border isn't the patch's.
 asset::TerrainPatch patch_bounds(const uint16_t* pixels, const Level& level, const Level* coarser, uint32_t patch_x,
                                  uint32_t patch_z) {
     int32_t lowest = INT32_MAX;
@@ -178,7 +178,7 @@ void cook_nodes(size_t begin, size_t end, void* context) {
         std::memcpy(job.blocks + (index * asset::kTerrainNodeBytes), samples.data(), samples.span().size_bytes());
         job.nodes[index] = {.base_steps = lowest, .block = static_cast<uint32_t>(index)};
 
-        // The patches of a level's first node come first, a row across every node at a time.
+        // A level's patches go z then x across all its nodes, so a node's 16 aren't next to each other.
         const Level* coarser = level_index > 0 ? &job.levels[level_index - 1] : nullptr;
         const uint32_t patches_x = level.nodes_x * kTerrainPatchesPerNode;
         const size_t first_patch = size_t{level.first_node} * kPatchesPerNode;

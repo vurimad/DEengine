@@ -2,8 +2,8 @@
 //   cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debug] [--shader-checks]
 //   --src DIR         the repository root, mounted as src:/ (default: this repository)
 //   --out DIR         where cooked files go, mounted as game:/ (default: <src>/cooked)
-//   --check           check the source and meta trees and that cooked shaders aren't stale, write
-//                     nothing (CI); exit code 1 on errors
+//   --check           check the source and meta trees, that cooked shaders aren't stale, and terrain
+//                     sources and what's cooked from them, write nothing (CI); exit code 1 on errors
 //   --force           cook everything again
 //   --no-shaders      skip shaders (no Slang compiler needed), in --check too
 //   --shader-debug    keep source-level debug info in cooked shaders (RenderDoc, Nsight)
