@@ -3,6 +3,7 @@
 #include "core/allocator.h"
 #include "core/assert.h"
 #include "core/log.h"
+#include "platform/cpu.h"
 
 // Jolt.h has to come first: it sets up what the others need.
 // clang-format off
@@ -106,6 +107,8 @@ private:
 } // namespace
 
 void acquire_jolt() {
+    // Here, not in Physics: this is what the cooker and the engine both call, and asking is what links the check.
+    DE_VERIFY_MSG(platform::cpu_checked_at_startup(), "the CPU check should have run before anything else");
     if (jolt_users++ > 0) {
         return;
     }

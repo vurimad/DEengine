@@ -14,6 +14,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | `file.h` | Native files: positional reads, atomic writes, size and write time, folders, the OS user and temp folders |
 | `time.h` | `time_ns()`, `sleep_ns()`: the same clock as input timestamps |
 | `thread.h` | `Thread` (named, joined on destruction), thread names and ids, core count |
+| `cpu.h` | What the CPU has: what links Jolt stops before any static initializer if it lacks AVX2, with a message |
 | `debug.h` | Debugger detection, break, and the debugger output log sink |
 | `random.h` | Random bytes from the OS: GUIDs for new assets, seeds (not gameplay randomness) |
 | `imgui_platform.h` | Dear ImGui's platform side: display size, time step and input events, so SDL stays here |

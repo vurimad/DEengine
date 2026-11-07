@@ -352,7 +352,7 @@ TEST_CASE("a scale of nothing gets no body, and it's said once") {
     Scene scene;
     const AssetHandle collision = scene.model("ramp", ramp());
     scene.instance(collision, Transform{.position = {0.5, 0.0, 0.0}, .scale = {1.0f, 0.0f, 1.0f}});
-    const PhysicsErrors errors;
+    PhysicsErrors errors; // NOLINT(misc-const-correctness): the log writes to it
     scene.ticks(3);
     CHECK(errors.count == 1);
     CHECK(scene.physics.stats().bodies == 0);
@@ -417,6 +417,40 @@ TEST_CASE("a dynamic body lands on a mesh, and stays there, far from the world's
         CHECK(std::abs(where(crate).x - (origin.x - 3.19)) < 1e-3);
         CHECK(scene.physics.stats().active_bodies == 0);
     }
+}
+
+TEST_CASE("what rests on a mesh wakes when its collision is cooked again, and when its body goes") {
+    Scene scene(2, true);
+    const AssetHandle collision = scene.model("floor", flat(0.625f));
+    const flecs::entity ground = scene.instance(collision, Transform{.position = {0.37, 0.0, 0.19}});
+    const flecs::entity ball = scene.ball({1.37, 3.0, -2.19});
+    scene.ticks(300);
+    REQUIRE(scene.physics.stats().active_bodies == 0);
+    // Its radius above the floor, less up to what Jolt lets contacts sink.
+    constexpr double kRestingM = 0.5;
+    constexpr double kSinksM = 0.021;
+    REQUIRE(std::abs(where(ball).y - (0.625 + kRestingM)) <= kSinksM);
+
+    // Half a meter lower: asleep, it would hang in the air.
+    scene.write_source("content/props/floor.gltf", flat(0.125f));
+    scene.cook();
+    for (int i = 0; i < 4; ++i) {
+        scene.assets.update();
+        scene.assets.wait_all();
+    }
+    REQUIRE(scene.assets.revision(collision) == 2);
+    scene.world.tick();
+    scene.world.tick();
+    CHECK(scene.physics.stats().bodies == 2);
+    CHECK(scene.physics.stats().active_bodies == 1);
+    scene.ticks(300);
+    CHECK(std::abs(where(ball).y - (0.125 + kRestingM)) <= kSinksM);
+    CHECK(scene.physics.stats().active_bodies == 0);
+
+    ground.destruct();
+    scene.ticks(1);
+    CHECK(scene.physics.stats().bodies == 1);
+    CHECK(scene.physics.stats().active_bodies == 1);
 }
 
 TEST_CASE("a character walks on a mesh, following its surface, far from the world's zero") {
@@ -518,7 +552,8 @@ TEST_CASE("a mesh body waits for its asset without blocking anything, and then a
     scene.held.push_back(collision);
     REQUIRE(scene.assets.state(collision) == AssetState::Loading);
     const flecs::entity entity = scene.instance(collision, Transform{.position = {0.37, 0.0, 0.19}});
-    const PhysicsErrors errors; // waiting isn't a failure that mends itself
+    // Waiting isn't a failure that mends itself.
+    PhysicsErrors errors; // NOLINT(misc-const-correctness): the log writes to it
     for (int i = 0; i < 60; ++i) {
         scene.world.tick();
         CHECK(scene.physics.stats().bodies == 0);
@@ -718,7 +753,7 @@ TEST_CASE("collision that can't be used gets no bodies, and it's said once for e
         scene.instance(missing_handle, Transform{}),
         scene.instance(AssetHandle{}, Transform{}), // what a corrupt cell's skipped dependency leaves
     };
-    const PhysicsErrors errors;
+    PhysicsErrors errors; // NOLINT(misc-const-correctness): the log writes to it
     scene.ticks(3);
     CHECK(errors.count == 4);
     CHECK(scene.physics.stats().bodies == 0);

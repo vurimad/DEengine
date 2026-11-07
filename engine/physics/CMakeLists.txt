@@ -9,7 +9,7 @@ add_library(de::physics_shapes ALIAS de_physics_shapes)
 
 target_link_libraries(de_physics_shapes
     PUBLIC de::core de::compile_options
-    PRIVATE Jolt::Jolt)
+    PRIVATE de::platform Jolt::Jolt)
 
 # Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, Physics, camera, input & audio).
 add_library(de_physics STATIC
