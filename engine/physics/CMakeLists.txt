@@ -9,4 +9,4 @@ add_library(de::physics ALIAS de_physics)
 # Private: Jolt's types stay in this library, and so do the build options it asks of what includes it.
 target_link_libraries(de_physics
     PUBLIC de::core de::world de::compile_options
-    PRIVATE Jolt::Jolt)
+    PRIVATE de::platform Jolt::Jolt)

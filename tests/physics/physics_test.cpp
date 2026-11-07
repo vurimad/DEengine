@@ -1,20 +1,25 @@
 #include "core/allocator.h"
 #include "core/job_system.h"
+#include "core/log.h"
 #include "core/memory_stats.h"
 #include "physics/physics.h"
 #include "platform/time.h"
+#include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
 
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 using de::DVec3;
 using de::Quat;
@@ -92,6 +97,28 @@ const CharacterController& controller(flecs::entity entity) {
 namespace {
 
 struct InATableOfItsOwn {};
+
+// Counts what physics complains of, instead of printing it.
+class PhysicsErrors final : public de::core::LogSink {
+public:
+    PhysicsErrors() {
+        de::core::remove_log_sink(de::core::console_log_sink());
+        de::core::add_log_sink(*this);
+    }
+    ~PhysicsErrors() {
+        de::core::remove_log_sink(*this);
+        de::core::add_log_sink(de::core::console_log_sink());
+    }
+    PhysicsErrors(PhysicsErrors&&) = delete;
+    PhysicsErrors& operator=(PhysicsErrors&&) = delete;
+
+    void write(const de::core::LogMessage& message) override {
+        if (message.level == de::core::LogLevel::Error && std::strcmp(message.channel, "physics") == 0) {
+            ++count;
+        }
+    }
+    int count = 0;
+};
 
 // Holds a worker until it's let go, which leaves jobs queued that only the thread waiting for them can get to.
 struct HeldWorkers {
@@ -423,16 +450,20 @@ TEST_CASE("a body's Transform ends where physics has it, through the step it fal
     REQUIRE(scene.physics.ray_cast(where(ball) - DVec3(5.0, 0.0, 0.0), {1.0f, 0.0f, 0.0f}, 10.0f, hit));
     REQUIRE(hit.entity == ball.id());
     CHECK(std::abs(hit.position.x - (where(ball).x - 0.5)) < 1e-5);
+    // Drawn as still going for one more tick, then as where it stopped, or it'd shimmer over its last move for good.
+    const auto previous = [&] { return ball.get<de::world::PreviousWorldTransform>().value.position; };
+    CHECK(previous() != where(ball));
+    scene.ticks(1);
+    CHECK(previous() == where(ball));
 }
 
-TEST_CASE("what reads transforms sees what physics moved, in every table, and each table is told once") {
+TEST_CASE("what reads transforms sees what physics moved, in every table") {
     Scene scene;
     const flecs::entity plain[2] = {scene.sphere({0.0, 500.0, 0.0}), scene.sphere({4.0, 500.0, 0.0})};
     const flecs::entity marked = scene.sphere({8.0, 500.0, 0.0});
     marked.add<InATableOfItsOwn>();
     scene.ticks(3);
     CHECK(scene.physics.stats().transforms_written == 3);
-    CHECK(scene.physics.stats().tables_written == 2);
     for (const flecs::entity entity : {plain[0], plain[1], marked}) {
         const auto* const world = entity.try_get<de::world::WorldTransform>();
         REQUIRE(world != nullptr);
@@ -502,20 +533,452 @@ TEST_CASE("no job of a step's is left behind when physics goes, with no worker f
     jobs.wait(held);
 }
 
-TEST_CASE("a child's body is made where its parent puts it") {
+TEST_CASE("a child's body is made where its parent is, even if neither has had a tick") {
+    Scene scene;
+    const auto child_of = [&](flecs::entity parent) {
+        const flecs::entity child = scene.ecs().entity().child_of(parent);
+        child.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {1.0f, 1.0f, 1.0f}});
+        child.set(RigidBody{});
+        child.set(Transform{.position = {0.0, 5.0, 0.0}});
+        return child;
+    };
+    const auto hit_at_x = [&](double x, flecs::entity expected) {
+        QueryHit hit;
+        REQUIRE(scene.physics.ray_cast({x, 20.0, 0.0}, {0.0f, -1.0f, 0.0f}, 30.0f, hit));
+        CHECK(hit.entity == expected.id());
+        CHECK(hit.distance_m == doctest::Approx(14.0f));
+    };
+    // Both new, with only a Transform on the parent.
+    const flecs::entity fresh = scene.ecs().entity();
+    fresh.set(Transform{.position = {100.0, 0.0, 0.0}});
+    const flecs::entity of_fresh = child_of(fresh);
+    scene.ticks(1);
+    hit_at_x(100.0, of_fresh);
+
+    // A parent that's been there, moved this tick.
+    const flecs::entity moved = scene.ecs().entity();
+    de::world::place(moved, Transform{.position = {200.0, 0.0, 0.0}});
+    scene.ticks(1);
+    moved.set(Transform{.position = {300.0, 0.0, 0.0}});
+    const flecs::entity of_moved = child_of(moved);
+    scene.ticks(1);
+    hit_at_x(300.0, of_moved);
+
+    // Two levels up.
+    const flecs::entity top = scene.ecs().entity();
+    top.set(Transform{.position = {400.0, 0.0, 0.0}});
+    const flecs::entity middle = scene.ecs().entity().child_of(top);
+    middle.set(Transform{.position = {50.0, 0.0, 0.0}});
+    const flecs::entity of_middle = child_of(middle);
+    scene.ticks(1);
+    hit_at_x(450.0, of_middle);
+}
+
+TEST_CASE("what rests on a body wakes when that body goes or is sent away") {
+    const auto stack_on = [](Scene& scene, flecs::entity support) {
+        const flecs::entity ball = scene.ecs().entity();
+        ball.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+        ball.set(RigidBody{.kind = BodyKind::Dynamic});
+        const DVec3 at = where(support);
+        de::world::place(ball, Transform{.position = at + DVec3(0.0, 1.02, 0.0)});
+        scene.ticks(300);
+        REQUIRE(scene.physics.stats().active_bodies == 0);
+        REQUIRE(where(ball).y > 1.0);
+        return ball;
+    };
+    constexpr double kOnTheGround = 0.6;
+    {
+        Scene scene;
+        scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+        const flecs::entity crate = scene.box({0.0, 0.5, 0.0}, {0.5f, 0.5f, 0.5f}, BodyKind::Dynamic);
+        const flecs::entity ball = stack_on(scene, crate);
+        crate.destruct();
+        scene.ticks(90);
+        CHECK(where(ball).y < kOnTheGround);
+    }
+    {
+        Scene scene;
+        scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+        const flecs::entity crate = scene.box({0.0, 0.5, 0.0}, {0.5f, 0.5f, 0.5f}, BodyKind::Dynamic);
+        const flecs::entity ball = stack_on(scene, crate);
+        de::world::place(crate, Transform{.position = {30.0, 5.0, 0.0}});
+        scene.ticks(90);
+        CHECK(where(ball).y < kOnTheGround);
+    }
+    {
+        // What a tick replaces: made asleep where something's just gone, it isn't woken for that.
+        Scene scene;
+        scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+        const flecs::entity old = scene.box({0.0, 0.5, 0.0}, {0.5f, 0.5f, 0.5f});
+        scene.ticks(2);
+        old.destruct();
+        const flecs::entity replacement = scene.ecs().entity();
+        replacement.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {0.5f, 0.5f, 0.5f}});
+        replacement.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+        de::world::place(replacement, Transform{.position = {0.0, 0.5, 0.0}});
+        scene.ticks(1);
+        CHECK(scene.physics.stats().active_bodies == 0);
+    }
+    {
+        // A static one, with a piece of debris on it.
+        Scene scene;
+        scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+        const flecs::entity shelf = scene.box({0.0, 2.0, 0.0}, {2.0f, 0.5f, 2.0f});
+        const flecs::entity piece = scene.ecs().entity();
+        piece.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+        piece.set(RigidBody{.kind = BodyKind::Dynamic, .debris = true});
+        de::world::place(piece, Transform{.position = {0.0, 3.02, 0.0}});
+        scene.ticks(300);
+        REQUIRE(scene.physics.stats().active_bodies == 0);
+        shelf.remove<RigidBody>();
+        scene.ticks(90);
+        CHECK(where(piece).y < kOnTheGround);
+    }
+}
+
+TEST_CASE("a body made asleep stays asleep, at whatever rotation it was made") {
+    Scene scene;
+    scene.box({0.0, -0.5, 0.0}, {500.0f, 0.5f, 500.0f});
+    for (int i = 0; i < 300; ++i) {
+        const flecs::entity entity = scene.ecs().entity();
+        entity.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {0.4f, 0.4f, 0.4f}});
+        entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+        const float angle = static_cast<float>(i) * 0.37f;
+        // Not quite unit length, as what's been through a file or a lot of multiplying isn't.
+        const Quat turned =
+            glm::angleAxis(angle, glm::normalize(Vec3(1.0f, static_cast<float>(i % 7), 0.5f))) * 1.000001f;
+        entity.set(Transform{.position = {static_cast<double>(i), 10.0, 0.0}, .rotation = turned});
+    }
+    scene.ticks(3);
+    CHECK(scene.physics.stats().active_bodies == 0);
+    // A quaternion and its negative are the same turn, so this moves nothing.
+    const flecs::entity last = scene.ecs().entity();
+    last.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {0.4f, 0.4f, 0.4f}});
+    last.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+    const Quat turned = glm::angleAxis(1.0f, Vec3(0.0f, 1.0f, 0.0f));
+    last.set(Transform{.position = {-5.0, 10.0, 0.0}, .rotation = turned});
+    scene.ticks(2);
+    last.set(Transform{.position = {-5.0, 10.0, 0.0}, .rotation = -turned});
+    scene.ticks(1);
+    CHECK(scene.physics.stats().active_bodies == 0);
+}
+
+TEST_CASE("many small turns by place() add up") {
+    Scene scene;
+    const flecs::entity crate = scene.box({0.0, 500.0, 0.0}, {0.5f, 0.5f, 0.5f}, BodyKind::Dynamic);
+    scene.ticks(1);
+    constexpr float kStepRad = 0.0005f; // under 0.03 of a degree a tick
+    constexpr int kSteps = 120;
+    const Quat step = glm::angleAxis(kStepRad, Vec3(0.0f, 1.0f, 0.0f));
+    for (int i = 0; i < kSteps; ++i) {
+        const Quat now = crate.get<Transform>().rotation;
+        de::world::place(crate, Transform{.position = where(crate), .rotation = glm::normalize(step * now)});
+        scene.ticks(1);
+    }
+    const Quat ended = crate.get<Transform>().rotation;
+    const float angle_rad = 2.0f * std::acos(std::min(std::abs(ended.w), 1.0f));
+    CHECK(angle_rad == doctest::Approx(kStepRad * kSteps).epsilon(0.05));
+}
+
+TEST_CASE("a character sent away from a turning platform goes where it was sent") {
+    Scene scene;
+    const flecs::entity platform = scene.box({0.0, -0.5, 0.0}, {20.0f, 0.5f, 20.0f}, BodyKind::Kinematic);
+    const flecs::entity walker = scene.character({5.0, 0.05, 0.0});
+    Quat turned(1.0f, 0.0f, 0.0f, 0.0f);
+    const Quat step = glm::angleAxis(1.0f / 60.0f, Vec3(0.0f, 1.0f, 0.0f)); // a radian a second
+    const auto turn_it = [&] {
+        turned = glm::normalize(step * turned);
+        platform.set(Transform{.position = {0.0, -0.5, 0.0}, .rotation = turned});
+    };
+    for (int i = 0; i < 30; ++i) {
+        turn_it();
+        scene.ticks(1);
+    }
+    REQUIRE(controller(walker).grounded);
+    const DVec3 target{2000.0, 50.0, 0.0};
+    de::world::place(walker, Transform{.position = target});
+    turn_it();
+    scene.ticks(1);
+    // By what it stood on, at this distance from its axis, it'd be going at 2 km/s.
+    CHECK(glm::length(where(walker) - target) < 1.0);
+    CHECK_FALSE(controller(walker).grounded);
+}
+
+TEST_CASE("several ticks in one frame send what moved in them once, and what stopped in them where it stopped") {
+    Scene scene;
+    const flecs::entity eye = scene.ecs().entity().set(de::world::Camera{});
+    de::world::place(eye, Transform{.position = {0.0, 50.0, 0.0}});
+    scene.ecs().set(de::world::ActiveCamera{.entity = eye.id()});
+    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+    const auto ball_at = [&](const DVec3& position) {
+        const flecs::entity entity = scene.ecs().entity();
+        entity.set(de::world::MeshInstance{});
+        entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+        entity.set(RigidBody{.kind = BodyKind::Dynamic});
+        de::world::place(entity, Transform{.position = position});
+        return entity;
+    };
+    const flecs::entity high = ball_at({20.0, 500.0, 0.0});
+    const flecs::entity ball = ball_at({0.0, 2.0, 0.0});
+    scene.world.advance(1.0 / 60.0);
+    scene.world.advance(1.0 / 60.0);
+    // A hitch: three ticks' worth, in which each moved in all three, and each is sent once.
+    scene.world.advance(3.0 / 60.0);
+    CHECK(scene.world.render_frame().instances.size() == 2);
+
+    // Slow frames all the way to where it stops, so that its last move, and coming to rest, share frames with ticks
+    // that moved nothing of its. What the renderer is left with has to be where it is, with no motion in it.
+    de::world::RenderTransform last_sent;
+    de::world::RenderTransform last_previous;
+    const uint32_t slot = ball.get<de::world::RenderSlot>().slot;
+    high.destruct();
+    for (int frame = 0; frame < 120; ++frame) {
+        scene.world.advance(5.0 / 60.0);
+        for (const de::world::RenderInstance& instance : scene.world.render_frame().instances) {
+            if (instance.slot == slot) {
+                last_sent = instance.transform;
+                last_previous = instance.previous_transform;
+            }
+        }
+    }
+    REQUIRE(scene.physics.stats().active_bodies == 0);
+    const DVec3 origin = scene.world.render_frame().origin;
+    CHECK(last_sent.position_m(1, origin) == doctest::Approx(static_cast<float>(where(ball).y)).epsilon(0.001));
+    CHECK(last_previous.position_m(1, origin) == last_sent.position_m(1, origin));
+}
+
+TEST_CASE("a moved row gone before the frame that would send it isn't asked about") {
+    Scene scene;
+    const flecs::entity eye = scene.ecs().entity().set(de::world::Camera{});
+    de::world::place(eye, Transform{.position = {0.0, 50.0, 0.0}});
+    scene.ecs().set(de::world::ActiveCamera{.entity = eye.id()});
+    const flecs::entity ball = scene.ecs().entity();
+    ball.set(de::world::MeshInstance{});
+    ball.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    ball.set(RigidBody{.kind = BodyKind::Dynamic});
+    de::world::place(ball, Transform{.position = {0.0, 500.0, 0.0}});
+    scene.world.advance(1.0 / 60.0);
+    scene.world.advance(1.0 / 60.0);
+    ball.destruct();
+    scene.world.advance(1.0 / 240.0); // no tick in it, so it still has its list from the last
+    CHECK(scene.world.render_frame().freed_slots.size() == 1);
+    for (const de::world::RenderInstance& instance : scene.world.render_frame().instances) {
+        CHECK(instance.slot == de::world::kSkipRenderInstance);
+    }
+}
+
+TEST_CASE("the broad phase is rebuilt for a first load, and not for a cell among many") {
+    Scene scene;
+    const auto spawn = [&](int count, double y) {
+        for (int i = 0; i < count; ++i) {
+            scene.box({static_cast<double>(i) * 2.0, y, 0.0}, {0.5f, 0.5f, 0.5f});
+        }
+    };
+    spawn(5000, 0.0);
+    scene.ticks(1);
+    CHECK(scene.physics.stats().broad_phase_rebuilds == 1);
+    spawn(1100, 20.0);
+    scene.ticks(1);
+    CHECK(scene.physics.stats().bodies == 6100);
+    CHECK(scene.physics.stats().broad_phase_rebuilds == 1);
+    // What came in is there all the same, from now.
+    QueryHit hit;
+    CHECK(scene.physics.ray_cast({2000.0, 40.0, 0.0}, {0.0f, -1.0f, 0.0f}, 50.0f, hit));
+    CHECK(hit.position.y == doctest::Approx(20.5));
+    // A few, however empty it is, aren't worth one either.
+    Scene other;
+    other.box({0.0, 0.0, 0.0}, {0.5f, 0.5f, 0.5f});
+    other.ticks(1);
+    CHECK(other.physics.stats().broad_phase_rebuilds == 0);
+}
+
+TEST_CASE("a moving body or character under a parent with a transform is refused, and says so") {
+    PhysicsErrors errors;
     Scene scene;
     const flecs::entity parent = scene.ecs().entity();
     de::world::place(parent, Transform{.position = {100.0, 0.0, 0.0}});
     scene.ticks(1);
-    const flecs::entity child = scene.ecs().entity().child_of(parent);
-    child.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {1.0f, 1.0f, 1.0f}});
-    child.set(RigidBody{});
-    child.set(Transform{.position = {0.0, 5.0, 0.0}});
+    const auto body_under = [&](flecs::entity on, BodyKind kind) {
+        const flecs::entity child = scene.ecs().entity().child_of(on);
+        child.set(Collider{.shape = ShapeKind::Box, .half_extents_m = {1.0f, 1.0f, 1.0f}});
+        child.set(RigidBody{.kind = kind});
+        child.set(Transform{.position = {5.0, 0.0, 0.0}});
+        return child;
+    };
+    // Made that way. A static one can be: it's put where it is, and stays.
+    const flecs::entity dynamic_child = body_under(parent, BodyKind::Dynamic);
+    const flecs::entity kinematic_child = body_under(parent, BodyKind::Kinematic);
+    body_under(parent, BodyKind::Static);
+    const flecs::entity walker_child = scene.ecs().entity().child_of(parent);
+    walker_child.set(CharacterController{});
+    walker_child.set(Transform{.position = {5.0, 2.0, 0.0}});
+    scene.ticks(3);
+    CHECK(scene.physics.stats().bodies == 1);
+    CHECK(scene.physics.stats().characters == 0);
+    CHECK(errors.count == 3); // once each
+    // They're left to the transform hierarchy, untouched.
+    CHECK(where(dynamic_child).x == 5.0);
+    CHECK(where(kinematic_child).x == 5.0);
+    CHECK(where(walker_child).y == 2.0);
+
+    // Given a parent later, both ways of having one.
+    const flecs::entity falling = scene.sphere({0.0, 500.0, 0.0});
+    const flecs::entity lift = scene.box({20.0, 0.0, 0.0}, {1.0f, 1.0f, 1.0f}, BodyKind::Kinematic);
+    const flecs::entity adopted = scene.sphere({-20.0, 500.0, 0.0});
+    const flecs::entity walker = scene.character({40.0, 2.0, 0.0});
+    scene.ticks(2);
+    REQUIRE(scene.physics.stats().bodies == 4);
+    REQUIRE(scene.physics.stats().characters == 1);
+    de::world::attach(falling, parent);
+    de::world::attach(lift, parent);
+    de::world::attach(walker, parent);
+    adopted.child_of(parent);
+    const DVec3 falling_local = where(falling);
+    const DVec3 lift_local = where(lift);
+    scene.ticks(3);
+    CHECK(scene.physics.stats().bodies == 1);
+    CHECK(scene.physics.stats().characters == 0);
+    CHECK(errors.count == 7);
+    CHECK(where(falling) == falling_local);
+    CHECK(where(lift) == lift_local);
+
+    // A parent with no transform is only a way of keeping things together.
+    const flecs::entity scope = scene.ecs().entity();
+    const flecs::entity free = scene.ecs().entity().child_of(scope);
+    free.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    free.set(RigidBody{.kind = BodyKind::Dynamic});
+    free.set(Transform{.position = {0.0, 500.0, 40.0}});
+    scene.ticks(10);
+    CHECK(where(free).y < 500.0);
+    CHECK(errors.count == 7);
+}
+
+TEST_CASE("a new body takes one table move, whatever its kind") {
+    for (const BodyKind kind : {BodyKind::Dynamic, BodyKind::Kinematic}) {
+        Scene scene;
+        const flecs::entity handle = scene.ecs().lookup("de::BodyHandle");
+        const flecs::entity tag =
+            scene.ecs().lookup(kind == BodyKind::Dynamic ? "de::DynamicBody" : "de::KinematicBody");
+        REQUIRE(handle.is_valid());
+        REQUIRE(tag.is_valid());
+        // In one move, what it's given all arrives together.
+        int handles = 0;
+        bool with_its_tag = false;
+        scene.ecs().observer<>().with(handle).event(flecs::OnAdd).each([&](flecs::entity entity) {
+            ++handles;
+            with_its_tag = entity.has(tag);
+        });
+        scene.box({0.0, 0.0, 0.0}, {0.5f, 0.5f, 0.5f}, kind);
+        scene.ticks(1);
+        CHECK(handles == 1);
+        CHECK(with_its_tag);
+        CHECK(scene.physics.stats().bodies == 1);
+    }
+}
+
+TEST_CASE("physics moves a row, and leaves its table alone") {
+    Scene scene;
+    const flecs::entity asleep = scene.ecs().entity();
+    asleep.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    asleep.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+    de::world::place(asleep, Transform{.position = {50.0, 500.0, 0.0}});
+    const flecs::entity falling = scene.ecs().entity();
+    falling.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+    falling.set(RigidBody{.kind = BodyKind::Dynamic});
+    de::world::place(falling, Transform{.position = {0.0, 500.0, 0.0}});
+    scene.ticks(3);
+
+    const auto changed = [](auto& query) {
+        bool any = false;
+        query.run([&](flecs::iter& it) {
+            while (it.next()) {
+                any = any || it.changed();
+            }
+        });
+        return any;
+    };
+    auto transforms = scene.ecs().query_builder<const Transform>().cached().detect_changes().build();
+    auto worlds = scene.ecs().query_builder<const de::world::WorldTransform>().cached().detect_changes().build();
+    auto previous =
+        scene.ecs().query_builder<const de::world::PreviousWorldTransform>().cached().detect_changes().build();
+    changed(transforms);
+    changed(worlds);
+    changed(previous);
+    const double was_at = falling.get<de::world::WorldTransform>().position.y;
     scene.ticks(1);
-    QueryHit hit;
-    REQUIRE(scene.physics.ray_cast({100.0, 20.0, 0.0}, {0.0f, -1.0f, 0.0f}, 30.0f, hit));
-    CHECK(hit.entity == child.id());
-    CHECK(hit.distance_m == doctest::Approx(14.0f));
+    // Nothing for the world's copies of the table to do, or for the renderer to look through.
+    CHECK_FALSE(changed(transforms));
+    CHECK_FALSE(changed(worlds));
+    CHECK_FALSE(changed(previous));
+    // And still all there, for this tick's move: what's seen goes from where it was to where it is.
+    const auto& world = falling.get<de::world::WorldTransform>();
+    CHECK(world.position.y < was_at);
+    CHECK(world.position == where(falling));
+    CHECK(falling.get<de::world::PreviousWorldTransform>().value.position.y == was_at);
+    CHECK(asleep.get<de::world::WorldTransform>().position.y == 500.0);
+}
+
+TEST_CASE("what physics moves reaches the renderer each frame, and where it stopped") {
+    Scene scene;
+    const flecs::entity eye = scene.ecs().entity().set(de::world::Camera{});
+    de::world::place(eye, Transform{.position = {0.0, 50.0, 0.0}});
+    scene.ecs().set(de::world::ActiveCamera{.entity = eye.id()});
+    scene.box({0.0, -0.5, 0.0}, {50.0f, 0.5f, 50.0f});
+    const auto ball_at = [&](const DVec3& position, bool sleeping) {
+        const flecs::entity entity = scene.ecs().entity();
+        entity.set(de::world::MeshInstance{});
+        entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.5f});
+        entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = sleeping});
+        de::world::place(entity, Transform{.position = position});
+        return entity;
+    };
+    const flecs::entity ball = ball_at({0.0, 3.0, 0.0}, false);
+    const flecs::entity neighbour = ball_at({10.0, 0.5, 0.0}, true);
+    const auto sent = [&](flecs::entity entity) -> const de::world::RenderInstance* {
+        const uint32_t slot = entity.get<de::world::RenderSlot>().slot;
+        for (const de::world::RenderInstance& instance : scene.world.render_frame().instances) {
+            if (instance.slot == slot) {
+                return &instance;
+            }
+        }
+        return nullptr;
+    };
+    scene.world.advance(1.0 / 60.0);
+    scene.world.advance(1.0 / 60.0);
+    // Frames between ticks too, as what's drawn moves between them.
+    float last_y = 1e9f;
+    for (int frame = 0; frame < 6; ++frame) {
+        scene.world.advance(1.0 / 240.0);
+        const de::world::RenderInstance* const instance = sent(ball);
+        REQUIRE(instance != nullptr);
+        const float y = instance->transform.position_m(1, scene.world.render_frame().origin);
+        CHECK(y < last_y);
+        last_y = y;
+        CHECK(sent(neighbour) == nullptr);
+        CHECK(scene.world.render_frame().instances.size() == 1); // its table wasn't looked through
+    }
+    for (int frame = 0; frame < 600 && scene.physics.stats().active_bodies > 0; ++frame) {
+        scene.world.advance(1.0 / 60.0);
+    }
+    REQUIRE(scene.physics.stats().active_bodies == 0);
+    // The tick after it stopped: sent once more, as where it is with no motion in it.
+    scene.world.advance(1.0 / 60.0);
+    const de::world::RenderInstance* const last = sent(ball);
+    REQUIRE(last != nullptr);
+    CHECK(last->transform.position_m(1, scene.world.render_frame().origin) ==
+          doctest::Approx(static_cast<float>(where(ball).y)).epsilon(0.001));
+    CHECK(last->previous_transform.position_m(1, scene.world.render_frame().origin) ==
+          last->transform.position_m(1, scene.world.render_frame().origin));
+    // Then it's left alone.
+    scene.world.advance(1.0 / 60.0);
+    CHECK(sent(ball) == nullptr);
+    CHECK(scene.world.render_frame().instances.empty());
+    scene.world.resync_render_instances();
+    scene.world.advance(1.0 / 60.0);
+    const de::world::RenderInstance* const resting = sent(ball);
+    REQUIRE(resting != nullptr);
+    CHECK(resting->transform.position_m(1, scene.world.render_frame().origin) ==
+          doctest::Approx(static_cast<float>(where(ball).y)).epsilon(0.001));
 }
 
 TEST_CASE("a few bodies awake among many asleep cost what the few do, and a place() still reaches the rest") {
@@ -958,6 +1421,81 @@ TEST_CASE("benchmark: physics at scale") {
             }
             scene.ticks(1);
             report("asleep, and 100 falling apart", scene, median_step_us(scene, ticks));
+        }
+        {
+            // A streamed cell: what a tick takes when 1,100 arrive among a great many.
+            Scene scene(&jobs, desc);
+            for (int i = 0; i < statics; ++i) {
+                scene.box(grid(i, 2.0), {0.5f, 0.5f, 0.5f});
+            }
+            scene.ticks(1);
+            const int cell_size = big ? 1100 : 10;
+            std::array<double, 7> arrival_us{};
+            for (size_t cell = 0; cell < arrival_us.size(); ++cell) {
+                for (int i = 0; i < cell_size; ++i) {
+                    scene.box(grid(i, 2.0) + DVec3(0.0, 10.0 + (static_cast<double>(cell) * 5.0), 0.0),
+                              {0.5f, 0.5f, 0.5f});
+                }
+                const uint64_t start = de::platform::time_ns();
+                scene.ticks(1);
+                arrival_us[cell] = static_cast<double>(de::platform::time_ns() - start) / 1e3;
+            }
+            std::ranges::sort(arrival_us);
+            report("a cell of 1,100 arrives", scene, arrival_us[arrival_us.size() / 2]);
+            report("the tick after it", scene, median_step_us(scene, ticks));
+        }
+        // Rendered: what the frames cost at 240 fps, with a mesh on every row, so extraction is in it. The median frame
+        // has no tick in it, and the mean shares out the ones that do.
+        for (const bool apart : {false, true}) {
+            Scene scene(&jobs, desc);
+            const flecs::entity eye = scene.ecs().entity().set(de::world::Camera{});
+            de::world::place(eye, Transform{.position = {0.0, 50.0, 0.0}});
+            scene.ecs().set(de::world::ActiveCamera{.entity = eye.id()});
+            scene.box({0.0, -0.5, 0.0}, {2000.0f, 0.5f, 2000.0f});
+            for (int i = 0; i < statics; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                entity.set(de::world::MeshInstance{});
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic, .start_asleep = true});
+                de::world::place(entity, Transform{.position = grid(i, 2.0) + DVec3(-300.0, 0.4, -100.0)});
+            }
+            scene.world.advance(1.0 / 60.0);
+            scene.world.advance(1.0 / 60.0);
+            const auto frames = [&](const char* name_median, const char* name_mean) {
+                const int count = big ? 480 : 8;
+                double total_us = 0.0;
+                std::vector<double> frame_us;
+                frame_us.reserve(static_cast<size_t>(count));
+                for (int frame = 0; frame < count; ++frame) {
+                    const uint64_t start = de::platform::time_ns();
+                    scene.world.advance(1.0 / 240.0);
+                    frame_us.push_back(static_cast<double>(de::platform::time_ns() - start) / 1e3);
+                    total_us += frame_us.back();
+                }
+                std::ranges::sort(frame_us);
+                report(name_median, scene, frame_us[frame_us.size() / 2]);
+                report(name_mean, scene, total_us / count);
+            };
+            if (!apart) {
+                frames("with meshes, all asleep, median frame", "with meshes, all asleep, mean frame");
+            }
+            for (int i = 0; i < 100; ++i) {
+                const flecs::entity entity = scene.ecs().entity();
+                if (apart) {
+                    entity.add<InATableOfItsOwn>();
+                }
+                entity.set(de::world::MeshInstance{});
+                entity.set(Collider{.shape = ShapeKind::Sphere, .radius_m = 0.4f});
+                entity.set(RigidBody{.kind = BodyKind::Dynamic});
+                de::world::place(entity, Transform{.position = {-400.0 - (static_cast<double>(i) * 2.0), 3000.0, 0.0}});
+            }
+            scene.world.advance(1.0 / 60.0);
+            if (apart) {
+                frames("with meshes, 100 falling apart, median frame", "with meshes, 100 falling apart, mean frame");
+            } else {
+                frames("with meshes, 100 falling among them, median frame",
+                       "with meshes, 100 falling among them, mean frame");
+            }
         }
     }
 }

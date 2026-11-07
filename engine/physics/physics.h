@@ -32,8 +32,8 @@ struct Collider {
 
 enum class BodyKind : uint8_t {
     Static,    // never moves: where it was when it got its body. To move one, take its body away and give it another
-    Kinematic, // goes where its Transform says, pushing what's in the way; nothing pushes it. A root entity
-    Dynamic,   // gravity and contacts move it, and it writes its Transform. A root entity
+    Kinematic, // goes where its Transform says, pushing what's in the way; nothing pushes it. Roots only
+    Dynamic,   // gravity and contacts move it, and it writes its Transform. Roots only
 };
 
 // An entity with this and a Collider gets a body at the start of the next tick, from where its Transform says, and
@@ -90,7 +90,7 @@ struct PhysicsStats {
     // Last tick: dynamic bodies whose pose reached their Transform, and rows looked at for a place().
     uint32_t transforms_written = 0;
     uint32_t transforms_compared = 0;
-    uint32_t tables_written = 0; // told of what moved in them, once each
+    uint32_t broad_phase_rebuilds = 0; // ever: for a first load, which is the only thing worth one
 };
 
 // What's between a query and what it hit.
@@ -110,9 +110,13 @@ struct QueryHit {
 // world's fixed tick: bodies and characters come and go with their components, what's made in a tick is there for that
 // tick's step, and queries see the last step. Jolt's own types stay inside this library.
 //
-// Static bodies cost nothing per tick, and neither does anything asleep: a step's cost follows what's awake. Tables are
-// the unit of change, though: one body awake makes its table's other rows look changed to what reads transforms, and a
-// place() has every row of its table looked at once, so what moves shouldn't share a table with thousands that don't.
+// Static bodies cost nothing per tick, and neither does anything asleep: a step's cost follows what's awake. What it
+// moves is written and reported a row at a time, so one waking in a big table doesn't have the table copied or looked
+// through. What writes a Transform itself (a kinematic body's or a character's mover, a place()) does, like anything
+// else in the world, so those shouldn't share a table with thousands that don't move.
+//
+// A moving body or a character has to be a root, as they're in world space: with a parent that has a transform they're
+// refused with an error, at the start or when one's attached later, and they lose what they had.
 //
 // Create this before the world and add it once the world's there: the world's last entities let go of their bodies as
 // it goes down, so this has to outlive it. Not thread-safe, and queries aren't for use during a step.

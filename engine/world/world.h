@@ -70,6 +70,8 @@ public:
     // What the last advance() extracted for the renderer: the camera and each MeshInstance that changed,
     // interpolated. Valid until the next advance().
     const RenderFrame& render_frame() const;
+    // Where what moves rows itself reports them (move_root), for as long as the world lasts.
+    MovedRows& moved_rows();
     // The next frame holds every instance, for a renderer that missed some frame's changes.
     void resync_render_instances();
     // The phase entity a system goes in: .kind(world.phase(Phase::Combat)).

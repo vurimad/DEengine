@@ -20,15 +20,17 @@ Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, P
 
 It needs AVX2, on Windows and Linux: that's Jolt's default, and the port names the platform on Windows, where vcpkg's Ninja build would otherwise leave Jolt on SSE2 without a word. `CROSS_PLATFORM_DETERMINISTIC` keeps fused multiply-add off.
 
-Jolt has to be built by the compiler that calls it, as its API passes vectors by value. Under `linux-clang`, `cmake/vcpkg-triplets/x64-linux-clang.cmake` sees to that, where vcpkg would use GCC.
+That goes for the whole program, not this library. The flag is on Jolt and `physics.cpp` only, but Jolt's static initializers run before `main`, and the linker keeps AVX-encoded copies of inline functions shared with the rest (`glm`, `flecs`, `std`, even `core::align_up`). So whatever uses `Physics` gets the check in `platform/cpu.h`, before any static initializer.
+
+Under `linux-clang`, `cmake/vcpkg-triplets/x64-linux-clang.cmake` builds Jolt with clang. vcpkg would use GCC: with that, Jolt's `IsNormalized` assert fired on the first call to `SetPositionAndRotation`, and with clang it doesn't. Jolt's API passes vectors by value, so the compilers disagreeing about how is the likely reason, though nobody has read how each passes them.
 
 ## Limits
 
 - **Moving bodies allocate.** Jolt's broad phase takes one small scratch block per tick while anything is moving (`QuadTree::UpdatePrepare`), through `MemoryTag::Physics`, and whatever the body count. It stops when everything sleeps. Static bodies and characters allocate nothing per tick.
 - **Characters run on the game thread, one after another,** before the step. Fine for a handful; it hasn't been measured with many enemies.
 - **Moving a static body does nothing,** by design: there's no per-tick look at them.
-- **What moves shouldn't share a table with thousands that don't.** The world copies transforms a table at a time, so 100 bodies falling among 100k asleep in one table take about 1.8 ms a tick, against about 0.2 ms in a table of their own.
-- **Moving bodies must be roots.** Only their own `Transform` is read and written.
+- **What writes a `Transform` is still per table.** Kinematic bodies and characters do, so one of them has its whole table copied and looked through by the renderer, and a `place()` has every row of its table compared once. They shouldn't share a table with thousands that don't move. Dynamic bodies don't have this: they're written and reported a row at a time, so a prop waking among thousands costs what the prop does.
+- **Moving bodies and characters must be roots.** They're refused with an error otherwise, when they're made or when `world::attach()` gives them a parent later, and they lose what they had. Giving them their `RigidBody` or `CharacterController` again asks again.
 
 ## Not here yet
 
