@@ -116,6 +116,11 @@ bool Viewer::update(Engine& engine, float frame_s) {
             DE_LOG_INFO("render", "lighting from the environment (revision %u)", revision);
         }
     }
+#if DE_BUILD_DEV
+    if (engine.camera_pose != nullptr) {
+        free_camera_.set_pose(*engine.camera_pose);
+    }
+#endif
     free_camera_.update(engine.input, camera_actions_, frame_s, camera_);
 #if DE_BUILD_DEV
     if (engine.input.state(next_view_).pressed) {

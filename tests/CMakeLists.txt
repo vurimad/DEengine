@@ -6,6 +6,7 @@ find_package(unofficial-bc7enc-rdo CONFIG REQUIRED)
 
 add_executable(de_tests
     main.cpp
+    app/agent_eyes_test.cpp
     app/framework_test.cpp
     asset/asset_fuzz_test.cpp
     asset/asset_test.cpp
@@ -51,6 +52,9 @@ add_executable(de_tests
     render/shader_test.cpp
     render/upload_test.cpp
     physics/physics_test.cpp
+    tools/camera_script_test.cpp
+    tools/image_diff_test.cpp
+    tools/screenshot_test.cpp
     world/scene_test.cpp
     world/world_test.cpp
     support/cook_kit.h
@@ -67,7 +71,7 @@ target_include_directories(de_tests SYSTEM PRIVATE "${Stb_INCLUDE_DIR}")
 target_link_libraries(de_tests PRIVATE unofficial::bc7enc-rdo::bc7enc_rdo)
 
 # Platform tests never open a window or initialize SDL's video, so they run on headless CI.
-target_link_libraries(de_tests PRIVATE de::app de::asset de::cooker de::core de::platform de::rhi de::render_graph de::render_imgui de::render_scene de::shader de::tools de::world de::compile_options imgui::imgui doctest::doctest Threads::Threads)
+target_link_libraries(de_tests PRIVATE de::app de::asset de::cooker de::core de::image_diff de::platform de::rhi de::render_graph de::render_imgui de::render_scene de::shader de::tools de::world de::compile_options imgui::imgui doctest::doctest Threads::Threads)
 
 # The engine builds without exceptions, so tests do too. REQUIRE failures terminate the run.
 target_compile_definitions(de_tests PRIVATE DOCTEST_CONFIG_NO_EXCEPTIONS_BUT_WITH_ALL_ASSERTS)

@@ -78,6 +78,9 @@ struct DeviceDesc {
     // sampled in the wrong state goes unreported (see render/rhi/README.md).
     bool gpu_validation = false;
     bool vsync = true;
+    // Swapchain images can be copied from (CopySrc usage), if the display allows it: for screenshots. Off unless
+    // asked for, so a run that takes none pays nothing for it, however little that is.
+    bool swapchain_copy_src = false;
 };
 
 struct DeviceStats {

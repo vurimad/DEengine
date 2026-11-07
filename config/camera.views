@@ -1,0 +1,8 @@
+# Named camera views for the agent's eyes (deengine --view NAME; engine/app/README.md): one a line, a name, a
+# position in meters and a yaw and a pitch in degrees, as the stats panel shows the camera (F1).
+
+# The test world: content/world/test/test.world.
+camp_south      64 2 74 0 -7        # its start: the fire pit, the mist bank behind it, the statue
+statue_close    63.5 2.6 66.5 25 -6 # thin shapes: what the jitter's hardest on
+in_the_mist     64 1.2 63 10 0      # fog noise fills the picture
+far_corner      16000.125 2 16000.25 45 0 # the far edge of the map to come: only sky and haze yet

@@ -1,0 +1,13 @@
+# A ride past the camp in the test world, for the agent's eyes (deengine --camera-path src:/config/camp_ride.path;
+# engine/app/README.md). A waypoint a line: a position in meters and a yaw and a pitch in degrees, as the stats panel
+# shows the camera (F1). "speed M/S" says how fast; without it, a gallop (13 m/s).
+
+speed 13
+
+64 2 90 0 -7        # up from the south
+64 2 72 0 -7
+70 2 60 40 -7       # round the mist bank
+64 2 50 90 -7
+54 2 50 135 -7
+48 2 64 180 -7      # and back along the west side
+48 2 90 180 -7
