@@ -45,6 +45,7 @@ private:
     platform::ActionId next_view_{};   // F2: the next G-buffer view
     platform::ActionId toggle_taa_{};  // F3: temporal anti-aliasing on and off, to compare
     platform::ActionId freeze_cull_{}; // F4: the cull stays where it is, and the camera can leave it
+    platform::ActionId toggle_fog_low_camera_{}; // F5: height fog thinning with a low camera on and off, to compare
 #endif
 };
 

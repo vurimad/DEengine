@@ -62,7 +62,7 @@ float3 ground_color(float height_m, float3 normal)
         return float3(0.015, 0.04, 0.06);
     }
     const float flat_share = smoothstep(0.62, 0.86, normal.y);
-    const float3 soil = lerp(float3(0.34, 0.30, 0.20), float3(0.16, 0.19, 0.08), smoothstep(4.0, 40.0, height_m));
+    const float3 soil = lerp(float3(0.34, 0.30, 0.20), float3(0.16, 0.19, 0.08), smoothstep(1.0, 6.0, height_m));
     const float3 rock = float3(0.27, 0.25, 0.23);
     const float3 land = lerp(rock, soil, flat_share);
     const float snow = smoothstep(640.0, 760.0, height_m) * smoothstep(0.5, 0.8, normal.y);

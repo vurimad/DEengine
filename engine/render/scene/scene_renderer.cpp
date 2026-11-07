@@ -487,6 +487,18 @@ struct SceneRendererState {
     shader::ProgramHandle terrain_gbuffer;
     shader::ProgramHandle terrain_shadow;
     shader::ProgramHandle terrain_select;
+    bool fog_low_camera = true;
+
+    // How much of the height fog is left where the frame's camera is.
+    [[nodiscard]] float fog_low_camera_share(const SceneFog& fog, const world::RenderFrame& frame) const {
+        if (!fog_low_camera || fog.low_camera_keep >= 1.0f) {
+            return 1.0f;
+        }
+        const auto camera_y = static_cast<float>(frame.origin.y + static_cast<double>(frame.camera.transform[7]));
+        const float span = std::max(fog.low_camera_above_m - fog.low_camera_below_m, 1e-3f);
+        const float t = std::clamp((camera_y - fog.low_camera_below_m) / span, 0.0f, 1.0f);
+        return fog.low_camera_keep + ((1.0f - fog.low_camera_keep) * t * t * (3.0f - (2.0f * t)));
+    }
 
     ~SceneRendererState() {
         for (const shader::ProgramHandle program :
@@ -1146,7 +1158,7 @@ struct SceneRendererState {
         const SceneFog& fog = lighting.fog;
         const auto base_height = static_cast<float>(fog.base_height_m - frame.origin.y);
         scene.fog_density[0] = fog.density_per_m;
-        scene.fog_density[1] = fog.height_density_per_m;
+        scene.fog_density[1] = fog.height_density_per_m * fog_low_camera_share(fog, frame);
         scene.fog_density[2] = fog.height_falloff_per_m;
         scene.fog_density[3] = base_height;
         copy3(fog.extinction_tint, scene.fog_extinction);
@@ -1199,6 +1211,9 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
     fog.sun_start_m = environment.fog_sun_start_m;
     fog.end_m = environment.fog_end_m;
     fog.volume_distance_m = environment.fog_volume_distance_m;
+    fog.low_camera_keep = environment.fog_low_camera_keep;
+    fog.low_camera_below_m = environment.fog_low_camera_below_m;
+    fog.low_camera_above_m = environment.fog_low_camera_above_m;
     return lighting;
 }
 
@@ -2436,6 +2451,10 @@ void SceneRenderer::set_shadow_min_texels(float texels) {
 void SceneRenderer::set_cull_frozen(bool frozen) {
     state_->cull_frozen = frozen;
     state_->frozen_views_held = frozen && state_->frozen_views_held; // what freezes next takes a new view
+}
+
+void SceneRenderer::set_fog_low_camera(bool on) {
+    state_->fog_low_camera = on;
 }
 
 void SceneRenderer::set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file) {

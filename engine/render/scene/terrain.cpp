@@ -362,10 +362,13 @@ struct TerrainState {
             DE_LOG_ERROR("terrain", "no heights: can't read %s", heights_path.c_str());
             return;
         }
-        if (heights_header.magic != asset::kAssetMagic || heights_header.type != asset::AssetType::TerrainHeights ||
-            heights_header.id != terrain->header.id || heights_header.content_hash != terrain->heights_hash) {
-            DE_LOG_ERROR("terrain", "no heights: %s isn't the one this terrain was cooked with (run the cooker)",
-                         heights_path.c_str());
+        const core::Result<platform::FileInfo> info = vfs->file_info(heights_path.c_str());
+        if (!info) {
+            DE_LOG_ERROR("terrain", "no heights: %s: %s", heights_path.c_str(), info.error().message);
+            return;
+        }
+        if (const core::Result<void> fits = terrain->check_heights_header(heights_header, info->size); !fits) {
+            DE_LOG_ERROR("terrain", "no heights: %s: %s (run the cooker)", heights_path.c_str(), fits.error().message);
             return;
         }
         header_ok = true;

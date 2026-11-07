@@ -40,7 +40,7 @@ struct FogLimits {
 // reads it as render::SceneLighting (render::scene_lighting()).
 struct EnvironmentAsset {
     static constexpr AssetType kType = AssetType::Environment;
-    static constexpr uint16_t kFormatVersion = 3;
+    static constexpr uint16_t kFormatVersion = 4;
 
     AssetHeader header;
     float sun_direction[3] = {0, 1, 0}; // toward the sun, unit length
@@ -72,12 +72,15 @@ struct EnvironmentAsset {
     float fog_sun_start_m = 0.0f;
     float fog_end_m = 20000.0f;         // past fog_start_m
     float fog_volume_distance_m = 0.0f; // the froxel grid's reach; 0: no grid
-    uint32_t reserved = 0;
+    // How much of the height fog is left with the camera low (render::SceneFog); 1: all of it.
+    float fog_low_camera_keep = 1.0f; // 0 to 1
+    float fog_low_camera_below_m = 0.0f;
+    float fog_low_camera_above_m = 0.0f; // at least fog_low_camera_below_m
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
     // within ShadowLimits, the fog's within FogLimits.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(EnvironmentAsset) == 248);
+static_assert(sizeof(EnvironmentAsset) == 256);
 
 } // namespace de::asset
