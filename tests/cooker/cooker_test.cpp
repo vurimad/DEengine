@@ -1,4 +1,5 @@
 #include "asset/cell_format.h"
+#include "asset/collision_format.h"
 #include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
@@ -16,6 +17,8 @@
 #include "render/shader/shader_asset.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "support/cook_kit.h"
+#include "support/gltf_source.h"
 #include "support/gpu.h"
 #include "support/sandbox.h"
 
@@ -39,40 +42,25 @@
 using namespace de::asset;
 using de::cooker::CookReport;
 using de::platform::Vfs;
+using de::test::base64;
 using de::test::bytes_of;
+using de::test::Cooked;
+using de::test::cooker_vfs;
+using de::test::gltf;
+using de::test::grid;
+using de::test::guid_of;
+using de::test::has_message;
+using de::test::quad;
+using de::test::read_text;
+using de::test::remove_src;
+using de::test::run_cook;
 using de::test::Sandbox;
+using de::test::Vertex;
+using de::test::write_src;
 
 namespace {
 
 // --- Writing sources --------------------------------------------------------------------------
-
-void write_src(const Sandbox& sandbox, std::string_view relative, std::span<const std::byte> bytes) {
-    de::platform::PathString path = sandbox.folder("src");
-    REQUIRE(path.append('/'));
-    REQUIRE(path.append(relative));
-    const de::platform::PathString parent(path.view().substr(0, path.view().find_last_of('/')));
-    REQUIRE(de::platform::create_directories(parent.c_str()).ok());
-    REQUIRE(de::platform::write_file_atomic(path.c_str(), bytes).ok());
-}
-
-void write_src(const Sandbox& sandbox, std::string_view relative, std::string_view text) {
-    write_src(sandbox, relative, bytes_of(text));
-}
-
-void remove_src(const Sandbox& sandbox, std::string_view relative) {
-    de::platform::PathString path = sandbox.folder("src");
-    REQUIRE(path.append('/'));
-    REQUIRE(path.append(relative));
-    REQUIRE(de::platform::delete_tree(path.c_str()).ok());
-}
-
-std::string read_text(const Vfs& vfs, const char* path) {
-    const auto size = vfs.file_size(path);
-    REQUIRE(size.ok());
-    std::string text(static_cast<size_t>(*size), '\0');
-    REQUIRE(vfs.read_file(path, std::as_writable_bytes(std::span(text.data(), text.size()))).ok());
-    return text;
-}
 
 // An image as PNG: rgba8, rows top to bottom.
 std::vector<std::byte> png(uint32_t width, uint32_t height, const std::vector<uint8_t>& rgba) {
@@ -120,181 +108,7 @@ std::vector<uint8_t> normal_texels(uint32_t size) {
     return rgba;
 }
 
-std::string base64(const void* data, size_t size) {
-    static constexpr char kDigits[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    std::string out;
-    for (size_t i = 0; i < size; i += 3) {
-        const uint32_t chunk = (uint32_t{bytes[i]} << 16U) | (i + 1 < size ? uint32_t{bytes[i + 1]} << 8U : 0U) |
-                               (i + 2 < size ? uint32_t{bytes[i + 2]} : 0U);
-        out += kDigits[(chunk >> 18U) & 63U];
-        out += kDigits[(chunk >> 12U) & 63U];
-        out += i + 1 < size ? kDigits[(chunk >> 6U) & 63U] : '=';
-        out += i + 2 < size ? kDigits[chunk & 63U] : '=';
-    }
-    return out;
-}
-
-struct Vertex {
-    float position[3];
-    float normal[3];
-    float uv[2];
-};
-
-// A glTF with one mesh in one node (translated by node_y), its buffer embedded as a data: URI.
-// materials_json, images_json and textures_json are spliced in as they are. With second_indices,
-// the mesh has a second primitive over the same vertices, with material 1.
-std::string gltf(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices, float node_y,
-                 const std::string& materials_json, const std::string& images_json, const std::string& textures_json,
-                 const std::vector<uint32_t>& second_indices = {}) {
-    std::vector<uint8_t> buffer;
-    const auto append = [&](const void* data, size_t size) {
-        const auto* bytes = static_cast<const uint8_t*>(data);
-        buffer.insert(buffer.end(), bytes, bytes + size);
-    };
-    float min[3] = {1e9f, 1e9f, 1e9f};
-    float max[3] = {-1e9f, -1e9f, -1e9f};
-    for (const Vertex& vertex : vertices) {
-        append(vertex.position, 12);
-        for (int axis = 0; axis < 3; ++axis) {
-            min[axis] = std::min(min[axis], vertex.position[axis]);
-            max[axis] = std::max(max[axis], vertex.position[axis]);
-        }
-    }
-    for (const Vertex& vertex : vertices) {
-        append(vertex.normal, 12);
-    }
-    for (const Vertex& vertex : vertices) {
-        append(vertex.uv, 8);
-    }
-    append(indices.data(), indices.size() * 4);
-    const size_t count = vertices.size();
-    std::string second_primitive;
-    std::string second_view;
-    std::string second_accessor;
-    if (!second_indices.empty()) {
-        const size_t offset = buffer.size();
-        append(second_indices.data(), second_indices.size() * 4);
-        second_primitive =
-            R"(, {"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 4, "material": 1})";
-        second_view = R"(, {"buffer": 0, "byteOffset": )" + std::to_string(offset) + R"(, "byteLength": )" +
-                      std::to_string(second_indices.size() * 4) + "}";
-        second_accessor = R"(, {"bufferView": 4, "componentType": 5125, "count": )" +
-                          std::to_string(second_indices.size()) + R"(, "type": "SCALAR"})";
-    }
-    char text[4096];
-    std::snprintf(text, sizeof(text),
-                  R"({"asset": {"version": "2.0"}, "scene": 0, "scenes": [{"nodes": [0]}],
-  "nodes": [{"mesh": 0, "translation": [0, %g, 0]}],
-  "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1, "TEXCOORD_0": 2}, "indices": 3, "material": 0}%s]}],
-  "buffers": [{"byteLength": %zu, "uri": "data:application/octet-stream;base64,%%s"}],
-  "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": %zu}, {"buffer": 0, "byteOffset": %zu, "byteLength": %zu},
-                  {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}, {"buffer": 0, "byteOffset": %zu, "byteLength": %zu}%s],
-  "accessors": [
-    {"bufferView": 0, "componentType": 5126, "count": %zu, "type": "VEC3", "min": [%g, %g, %g], "max": [%g, %g, %g]},
-    {"bufferView": 1, "componentType": 5126, "count": %zu, "type": "VEC3"},
-    {"bufferView": 2, "componentType": 5126, "count": %zu, "type": "VEC2"},
-    {"bufferView": 3, "componentType": 5125, "count": %zu, "type": "SCALAR"}%s],
-  "materials": %s, "images": %s, "textures": %s}
-)",
-                  node_y, second_primitive.c_str(), buffer.size(), count * 12, count * 12, count * 12, count * 24,
-                  count * 8, count * 32, indices.size() * 4, second_view.c_str(), count, min[0], min[1], min[2], max[0],
-                  max[1], max[2], count, count, indices.size(), second_accessor.c_str(), materials_json.c_str(),
-                  images_json.c_str(), textures_json.c_str());
-    std::string json(text);
-    const size_t at = json.find("%s");
-    json.replace(at, 2, base64(buffer.data(), buffer.size()));
-    return json;
-}
-
-// A flat square, two triangles, facing +Z.
-void quad(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
-    vertices = {{.position = {-1, -1, 0}, .normal = {0, 0, 1}, .uv = {0, 1}},
-                {.position = {1, -1, 0}, .normal = {0, 0, 1}, .uv = {1, 1}},
-                {.position = {1, 1, 0}, .normal = {0, 0, 1}, .uv = {1, 0}},
-                {.position = {-1, 1, 0}, .normal = {0, 0, 1}, .uv = {0, 0}}};
-    indices = {0, 1, 2, 0, 2, 3};
-}
-
-// A wavy n x n grid: something to simplify.
-void grid(uint32_t n, std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
-    vertices.clear();
-    indices.clear();
-    for (uint32_t y = 0; y <= n; ++y) {
-        for (uint32_t x = 0; x <= n; ++x) {
-            const float u = static_cast<float>(x) / static_cast<float>(n);
-            const float v = static_cast<float>(y) / static_cast<float>(n);
-            vertices.push_back({.position = {u * 4.0f, 0.05f * std::sin(u * 6.0f) * std::cos(v * 5.0f), v * 4.0f},
-                                .normal = {0, 1, 0},
-                                .uv = {u, v}});
-        }
-    }
-    for (uint32_t y = 0; y < n; ++y) {
-        for (uint32_t x = 0; x < n; ++x) {
-            const uint32_t i = y * (n + 1) + x;
-            indices.insert(indices.end(), {i, i + n + 1, i + 1, i + 1, i + n + 1, i + n + 2});
-        }
-    }
-}
-
 // --- Reading results --------------------------------------------------------------------------
-
-Vfs cooker_vfs(const Sandbox& sandbox, bool writable = true) {
-    return sandbox.make_vfs({.game_writable = writable});
-}
-
-CookReport run_cook(Vfs& vfs, de::cooker::CookOptions options = {}) {
-    de::core::JobSystem jobs({.worker_count = 2});
-    return de::cooker::cook(vfs, jobs, nullptr, options);
-}
-
-bool has_message(const CookReport& report, std::string_view path, std::string_view text) {
-    for (const de::cooker::Diagnostic& diagnostic : report.diagnostics) {
-        if (diagnostic.path == path && diagnostic.message.view().find(text) != std::string_view::npos) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Guid guid_of(const Vfs& vfs, const char* meta_path) {
-    const std::string text = read_text(vfs, meta_path);
-    const size_t at = text.find(R"("guid": ")");
-    REQUIRE(at != std::string::npos);
-    Guid guid;
-    REQUIRE(parse_guid(std::string_view(text).substr(at + 9, kGuidTextLength), guid));
-    return guid;
-}
-
-// A cooked file in aligned memory.
-class Cooked {
-public:
-    Cooked(const Vfs& vfs, AssetId id, AssetType type) {
-        const CookedPath path = cooked_path(id, type);
-        const auto size = vfs.file_size(path.c_str());
-        REQUIRE_MESSAGE(size.ok(), path.c_str(), " is missing");
-        blocks_.resize((*size + 15) / 16);
-        size_ = static_cast<size_t>(*size);
-        REQUIRE(vfs.read_file(path.c_str(), bytes()).ok());
-    }
-    std::span<std::byte> bytes() { return {reinterpret_cast<std::byte*>(blocks_.data()), size_}; }
-    const void* data() { return blocks_.data(); }
-
-    template <typename T>
-    const T& load() {
-        const auto loaded = load_in_place<T>(bytes());
-        REQUIRE_MESSAGE(loaded.ok(), (loaded.ok() ? "" : loaded.error().message));
-        CHECK(verify_content_hash(bytes()));
-        return **loaded;
-    }
-
-private:
-    struct alignas(16) Block {
-        std::byte bytes[16];
-    };
-    std::vector<Block> blocks_;
-    size_t size_ = 0;
-};
 
 // Peak signal-to-noise ratio of decoded blocks against the source, over the given channels.
 double psnr(const std::vector<uint8_t>& source, uint32_t size, std::span<const std::byte> blocks, TextureFormat format,
@@ -1888,6 +1702,294 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(cell.header.dependencies.get(file.data())[0].id == new_lamp);
 }
 
+namespace {
+
+std::vector<std::byte> file_bytes(const Vfs& vfs, AssetId id, AssetType type) {
+    Cooked file(vfs, id, type);
+    const std::span<std::byte> bytes = file.bytes();
+    return {bytes.begin(), bytes.end()};
+}
+
+} // namespace
+
+TEST_CASE("a model cooks to collision from the finest LOD under its limit") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(64, vertices, indices);
+    const std::string model = gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]");
+    write_src(sandbox, "content/props/hill.gltf", model);
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport first = run_cook(vfs);
+    REQUIRE(first.ok());
+    const AssetId mesh_id = asset_id(guid_of(vfs, "src:/meta/props/hill.gltf.json"));
+    const AssetId id = collision_asset_id(mesh_id);
+
+    const auto lod_triangles = [&](uint32_t lod) {
+        Cooked file(vfs, mesh_id, AssetType::Mesh);
+        const auto& mesh = file.load<MeshAsset>();
+        const MeshLod level = mesh.lods.get(file.data())[lod];
+        uint64_t count = 0;
+        for (uint32_t part = 0; part < level.part_count; ++part) {
+            count += mesh.parts.get(file.data())[level.first_part + part].index_count / 3;
+        }
+        return count;
+    };
+    {
+        Cooked file(vfs, id, AssetType::Collision);
+        const auto& collision = file.load<CollisionAsset>();
+        CHECK(collision.header.id == id);
+        // The finest within the limit: the one before it is over it.
+        CHECK(collision.source_lod > 0);
+        CHECK(lod_triangles(collision.source_lod) <= 2048);
+        CHECK(lod_triangles(std::max(collision.source_lod, 1U) - 1) > 2048);
+        CHECK(collision.triangles == lod_triangles(collision.source_lod));
+        CHECK(collision.vertices < collision.triangles);
+        CHECK(collision.shape.count > 0);
+        CHECK(collision.shape_format != 0);
+        Cooked mesh_file(vfs, mesh_id, AssetType::Mesh);
+        CHECK(collision.error_m == mesh_file.load<MeshAsset>().lods.get(mesh_file.data())[collision.source_lod].error);
+    }
+    const std::vector<std::byte> default_bytes = file_bytes(vfs, id, AssetType::Collision);
+
+    // The same inputs give the same bytes.
+    REQUIRE(run_cook(vfs, {.force = true}).ok());
+    CHECK(file_bytes(vfs, id, AssetType::Collision) == default_bytes);
+
+    // Its limit is a setting, and changing it cooks it again.
+    write_src(sandbox, "meta/_folder.json",
+              R"({"rules": [{"match": "*.gltf", "mesh": {"collision_triangles": 300}}]})");
+    const CookReport limited = run_cook(vfs);
+    CHECK(limited.stats.cooked == 1);
+    uint32_t limited_triangles = 0;
+    {
+        Cooked file(vfs, id, AssetType::Collision);
+        const auto& collision = file.load<CollisionAsset>();
+        limited_triangles = collision.triangles;
+        CHECK(limited_triangles <= 300);
+        CHECK(lod_triangles(std::max(collision.source_lod, 1U) - 1) > 300);
+    }
+
+    // Under what its LODs reach, it takes the coarsest, and says so.
+    write_src(sandbox, "meta/_folder.json", R"({"rules": [{"match": "*.gltf", "mesh": {"collision_triangles": 1}}]})");
+    const CookReport too_low = run_cook(vfs);
+    CHECK(too_low.ok());
+    CHECK(has_message(too_low, "content/props/hill.gltf", "over its collision_triangles of 1"));
+    {
+        Cooked file(vfs, id, AssetType::Collision);
+        const auto& collision = file.load<CollisionAsset>();
+        Cooked mesh_file(vfs, mesh_id, AssetType::Mesh);
+        CHECK(collision.source_lod + 1 == mesh_file.load<MeshAsset>().lods.count);
+        CHECK(collision.triangles <= limited_triangles);
+    }
+
+    // What isn't a good limit is reported.
+    write_src(sandbox, "meta/_folder.json",
+              R"({"rules": [{"match": "*.gltf", "mesh": {"collision_triangles": 0.5}}]})");
+    CHECK(has_message(run_cook(vfs), "content/props/hill.gltf", "collision_triangles should be a whole number"));
+    write_src(sandbox, "meta/_folder.json", R"({"rules": [{"match": "*.gltf", "mesh": {"collision_triangles": 0}}]})");
+    CHECK(has_message(run_cook(vfs), "content/props/hill.gltf", "collision_triangles should be a whole number"));
+}
+
+TEST_CASE("collision has every position once, however its vertices are split") {
+    const Sandbox sandbox;
+    // Every triangle with its own three vertices, told apart by their uvs and normals, as a mesh with hard edges and uv
+    // seams everywhere would be: all that's shared is where they are.
+    std::vector<Vertex> shared;
+    std::vector<uint32_t> indices;
+    constexpr uint32_t kCells = 8;
+    grid(kCells, shared, indices);
+    std::vector<Vertex> split;
+    std::vector<uint32_t> split_indices;
+    for (size_t i = 0; i < indices.size(); ++i) {
+        Vertex vertex = shared[indices[i]];
+        vertex.uv[0] = static_cast<float>(i) * 0.01f;
+        split.push_back(vertex);
+        split_indices.push_back(static_cast<uint32_t>(i));
+    }
+    write_src(sandbox, "content/props/split.gltf",
+              gltf(split, split_indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "meta/_folder.json", R"({"rules": [{"match": "*.gltf", "mesh": {"lod_count": 1}}]})");
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const AssetId mesh_id = asset_id(guid_of(vfs, "src:/meta/props/split.gltf.json"));
+    Cooked mesh_file(vfs, mesh_id, AssetType::Mesh);
+    CHECK(mesh_file.load<MeshAsset>().vertices.count == indices.size()); // none merged in what's drawn
+    Cooked file(vfs, collision_asset_id(mesh_id), AssetType::Collision);
+    const auto& collision = file.load<CollisionAsset>();
+    CHECK(collision.triangles == kCells * kCells * 2);
+    CHECK(collision.vertices == (kCells + 1) * (kCells + 1));
+}
+
+TEST_CASE("a mesh with nothing to collide with is drawn, with a warning and no collision") {
+    const Sandbox sandbox;
+    // All in one line: a triangle with no area.
+    const std::vector<Vertex> vertices = {{.position = {0, 0, 0}, .normal = {0, 1, 0}, .uv = {0, 0}},
+                                          {.position = {1, 0, 0}, .normal = {0, 1, 0}, .uv = {1, 0}},
+                                          {.position = {2, 0, 0}, .normal = {0, 1, 0}, .uv = {1, 1}}};
+    const std::vector<uint32_t> indices = {0, 1, 2};
+    write_src(sandbox, "content/props/line.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    CHECK(report.ok());
+    CHECK(has_message(report, "content/props/line.gltf", "has no collision"));
+    const AssetId mesh_id = asset_id(guid_of(vfs, "src:/meta/props/line.gltf.json"));
+    CHECK(vfs.exists(cooked_path(mesh_id, AssetType::Mesh).c_str()));
+    CHECK_FALSE(vfs.exists(cooked_path(collision_asset_id(mesh_id), AssetType::Collision).c_str()));
+    // That's up to date, not stale.
+    CHECK(run_cook(vfs).stats.up_to_date == 1);
+    CHECK(run_cook(vfs, {.check_only = true, .check_shaders = false}).ok());
+}
+
+TEST_CASE("a changed mesh cooks its collision again, and --check notices when it hasn't been") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(16, vertices, indices);
+    write_src(sandbox, "content/props/hill.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "content/props/other.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    const auto check = [&] {
+        Vfs read_only = sandbox.make_vfs({.game_writable = false});
+        return run_cook(read_only, {.check_only = true, .check_shaders = false});
+    };
+    // With nothing cooked, there's nothing stale. These have no metas yet, which is what's reported.
+    {
+        const CookReport nothing_cooked = check();
+        CHECK_FALSE(has_message(nothing_cooked, "content/props/hill.gltf", "stale"));
+    }
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    CHECK(check().ok());
+    // Content left out of a check isn't content gone.
+    {
+        Vfs read_only = sandbox.make_vfs({.game_writable = false});
+        CHECK(run_cook(read_only, {.check_only = true, .content = false, .check_shaders = false}).ok());
+    }
+    const AssetId mesh_id = asset_id(guid_of(vfs, "src:/meta/props/hill.gltf.json"));
+    const AssetId id = collision_asset_id(mesh_id);
+    const std::vector<std::byte> before = file_bytes(vfs, id, AssetType::Collision);
+
+    // Moved up a meter in the source.
+    write_src(sandbox, "content/props/hill.gltf", gltf(vertices, indices, 1.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    {
+        const CookReport stale = check();
+        CHECK_FALSE(stale.ok());
+        CHECK(has_message(stale, "content/props/hill.gltf", "its cooked collision is stale"));
+        CHECK_FALSE(has_message(stale, "content/props/other.gltf", "stale"));
+    }
+    CHECK(file_bytes(vfs, id, AssetType::Collision) == before); // --check wrote nothing
+
+    const CookReport again = run_cook(vfs);
+    CHECK(again.stats.cooked == 1);
+    CHECK(again.stats.up_to_date == 1);
+    CHECK(file_bytes(vfs, id, AssetType::Collision) != before);
+    CHECK(check().ok());
+    // Settled, it doesn't cook again.
+    CHECK(run_cook(vfs).stats.cooked == 0);
+
+    // A setting of the mesh's is as good as a change to it.
+    write_src(sandbox, "meta/_folder.json", R"({"rules": [{"match": "hill.*", "mesh": {"scale": 2}}]})");
+    CHECK(has_message(check(), "content/props/hill.gltf", "its cooked collision is stale"));
+    REQUIRE(run_cook(vfs).ok());
+    CHECK(check().ok());
+
+    // Its file gone, though nothing else is.
+    const CookedPath cooked = cooked_path(id, AssetType::Collision);
+    REQUIRE(vfs.remove_file(cooked.c_str()).ok());
+    CHECK(has_message(check(), "content/props/hill.gltf", "its cooked collision is stale"));
+    // Cooked again from nothing but that.
+    const CookReport restored = run_cook(vfs);
+    CHECK(restored.stats.cooked == 1);
+    CHECK(vfs.exists(cooked.c_str()));
+    CHECK(check().ok());
+
+    // A new model no cook has seen: its meta's written by hand, as a cook would.
+    write_src(sandbox, "content/props/new.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "meta/props/new.gltf.json", R"({"guid": "6681c1d7-0c12-4528-9523-2642e902ae00"})");
+    CHECK(has_message(check(), "content/props/new.gltf", "its cooked collision is stale, or was never cooked"));
+    REQUIRE(run_cook(vfs).ok());
+    CHECK(check().ok());
+
+    // A model deleted: its collision is still there till a cook takes it away.
+    remove_src(sandbox, "content/props/new.gltf");
+    remove_src(sandbox, "meta/props/new.gltf.json");
+    CHECK(has_message(check(), "content/props/new.gltf", "its source is gone"));
+    REQUIRE(run_cook(vfs).ok());
+    CHECK(check().ok());
+
+    // Collision on disk with no state to say what it's from: a first cook that was stopped.
+    REQUIRE(vfs.remove_file(de::cooker::CookState::kPath).ok());
+    CHECK(has_message(check(), "content/props/hill.gltf", "its cooked collision is stale"));
+}
+
+TEST_CASE("cells ask for collision from their meshes, and its assets are their dependencies") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    quad(vertices, indices);
+    write_src(sandbox, "content/props/crate.gltf", gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "content/props/lamp.gltf", gltf(vertices, indices, 1.0f, R"([{"name": "paint"}])", "[]", "[]"));
+    write_src(sandbox, "content/world/good.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "post", "mesh": "../props/lamp.gltf", "position": [10, 0, 10]},
+    {"name": "first", "mesh": "../props/crate.gltf", "position": [20, 0, 10], "collision": "mesh"},
+    {"name": "second", "mesh": "../props/crate.gltf", "position": [30, 0, 10], "collision": "mesh"},
+    {"name": "third", "parent": "post", "mesh": "../props/lamp.gltf", "collision": "mesh"},
+  ],
+})");
+    write_src(sandbox, "content/world/broken.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "boxed", "mesh": "../props/crate.gltf", "collision": "box"},
+    {"name": "yes", "mesh": "../props/crate.gltf", "collision": true},
+    {"name": "bare", "position": [1, 0, 1], "collision": "mesh"},
+    {"name": "cart", "mesh": "../props/crate.gltf", "static": false, "collision": "mesh"},
+    {"name": "wheel", "parent": "cart", "mesh": "../props/crate.gltf", "collision": "mesh"},
+    {"name": "ghost", "mesh": "../props/nothing.gltf", "collision": "mesh"},
+  ],
+})");
+    Vfs vfs = cooker_vfs(sandbox);
+    const CookReport report = run_cook(vfs);
+    const char* broken = "content/world/broken.cell";
+    CHECK(has_message(report, broken, "boxed: collision should be mesh"));
+    CHECK(has_message(report, broken, "'collision' should be a string"));
+    CHECK(has_message(report, broken, "bare: collision needs a mesh"));
+    CHECK(has_message(report, broken, "cart: collision is for what's static"));
+    CHECK(has_message(report, broken, "wheel: collision is for what's static")); // moves with what it's on
+    CHECK(has_message(report, broken, "ghost: mesh '../props/nothing.gltf' should name a model source"));
+    CHECK(report.stats.failed == 1);
+    CHECK_FALSE(has_message(report, "content/world/good.cell", ""));
+
+    const AssetId crate = asset_id(guid_of(vfs, "src:/meta/props/crate.gltf.json"));
+    const AssetId lamp = asset_id(guid_of(vfs, "src:/meta/props/lamp.gltf.json"));
+    Cooked file(vfs, asset_id(guid_of(vfs, "src:/meta/world/good.cell.json")), AssetType::Cell);
+    const auto& cell = file.load<CellAsset>();
+    const auto dependencies = cell.header.dependencies.get(file.data());
+    REQUIRE(dependencies.size() == 4); // each once, the meshes first
+    CHECK(dependencies[0] == AssetRef{.id = lamp, .type = AssetType::Mesh});
+    CHECK(dependencies[1] == AssetRef{.id = crate, .type = AssetType::Mesh});
+    CHECK(dependencies[2] == AssetRef{.id = collision_asset_id(crate), .type = AssetType::Collision});
+    CHECK(dependencies[3] == AssetRef{.id = collision_asset_id(lamp), .type = AssetType::Collision});
+    const auto entities = cell.entities.get(file.data());
+    REQUIRE(entities.size() == 4);
+    CHECK(entities[0].collision == CellEntity::kNone); // post: only drawn
+    CHECK(entities[1].collision == 2);
+    CHECK(entities[1].mesh == 1);
+    CHECK(entities[2].collision == 2);
+    CHECK(entities[3].collision == 3);
+    CHECK(entities[3].mesh == 0);
+
+    // What a cell can't use is refused when it's loaded.
+    Cooked tampered(vfs, asset_id(guid_of(vfs, "src:/meta/world/good.cell.json")), AssetType::Cell);
+    const auto* const in_memory = reinterpret_cast<const CellAsset*>(tampered.data());
+    auto* const list = reinterpret_cast<CellEntity*>(tampered.bytes().data() + in_memory->entities.offset);
+    list[1].collision = 1; // a mesh, not collision
+    CHECK_FALSE(load_in_place<CellAsset>(tampered.bytes()).ok());
+    list[1].collision = 9; // off the end
+    CHECK_FALSE(load_in_place<CellAsset>(tampered.bytes()).ok());
+}
+
 TEST_CASE("a glTF buffer shorter than the glTF says is reported, not read past") {
     const Sandbox sandbox;
     // What a Git LFS pointer looks like where the buffer should be.
@@ -1919,7 +2021,8 @@ constexpr const char* kEvening = R"({
           "extinction_tint": [0.8, 1, 1.25], "sun_forward": {"color": [1, 0.5, 0.25], "intensity": 2},
           "sun_back": {"color": [0.1, 0.2, 0.3]}, "sun_height_attenuation": 0.5,
           "ambient": {"color": [0.2, 0.3, 0.4], "intensity": 0.5}, "ambient_height_attenuation": 2,
-          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90}
+          "start_m": 1, "sun_start_m": 4, "end_m": 5000, "volume_distance_m": 90,
+          "low_camera": {"keep": 0.3, "below_m": 60, "above_m": 350}}
 })";
 
 } // namespace
@@ -2036,6 +2139,9 @@ TEST_CASE("worlds list their cells by coord, with an environment, and cook again
         CHECK(environment.fog_sun_start_m == 4.0f);
         CHECK(environment.fog_end_m == 5000.0f);
         CHECK(environment.fog_volume_distance_m == 90.0f);
+        CHECK(environment.fog_low_camera_keep == 0.3f);
+        CHECK(environment.fog_low_camera_below_m == 60.0f);
+        CHECK(environment.fog_low_camera_above_m == 350.0f);
     }
     // A cell moved to another coord cooks the world again; new light only cooks the environment.
     CHECK(run_cook(vfs).stats.cooked == 0);

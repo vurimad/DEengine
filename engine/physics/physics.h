@@ -6,6 +6,11 @@
 
 #include <cstdint>
 
+namespace de::asset {
+class AssetRegistry;
+struct AssetNotice;
+} // namespace de::asset
+
 namespace de::core {
 class JobSystem;
 }
@@ -39,6 +44,8 @@ enum class BodyKind : uint8_t {
 // An entity with this and a Collider gets a body at the start of the next tick, from where its Transform says, and
 // loses it when either goes. Changing either later doesn't change the body. Bodies of the same shape and size share
 // one, so many of a kind cost little.
+//
+// For what never moves, a world::MeshCollider instead, with no Collider and none of this: see Physics.
 struct RigidBody {
     BodyKind kind = BodyKind::Static;
     float mass_kg = 0.0f; // Dynamic. 0: from the shape's volume, at 1000 kg per cubic meter
@@ -74,6 +81,8 @@ struct CharacterController {
 struct PhysicsDesc {
     // Null, or a system with no workers: one thread. The results are the same bit for bit either way.
     core::JobSystem* jobs = nullptr;
+    // Where a world::MeshCollider's cooked shape comes from. It has to outlive this. Null: those never get a body.
+    asset::AssetRegistry* assets = nullptr;
     uint32_t max_bodies = 256U * 1024U;
     uint32_t max_body_pairs = 256U * 1024U;
     uint32_t max_contact_constraints = 64U * 1024U;
@@ -86,7 +95,7 @@ struct PhysicsStats {
     uint32_t bodies = 0;
     uint32_t active_bodies = 0; // not asleep, and not static
     uint32_t characters = 0;
-    uint32_t shapes = 0; // kept, for all the bodies that share them
+    uint32_t shapes = 0; // kept, for all the bodies that share them: a scale around a mesh's counts as one too
     // Last tick: dynamic bodies whose pose reached their Transform, and rows looked at for a place().
     uint32_t transforms_written = 0;
     uint32_t transforms_compared = 0;
@@ -118,6 +127,12 @@ struct QueryHit {
 // A moving body or a character has to be a root, as they're in world space: with a parent that has a transform they're
 // refused with an error, at the start or when one's attached later, and they lose what they had.
 //
+// A world::MeshCollider gets a static body with the same friction as RigidBody's, in the first tick its asset is
+// loaded: until then it has none, and nothing waits. Every body of one asset shares one shape, restored once from its
+// bytes, and those of one scale share one wrapper around that; it goes when the registry unloads the asset. An asset
+// that can't be used (it failed, it's corrupt, another Jolt wrote it) is logged, and its bodies don't appear unless
+// it's reloaded good. A reload gives its bodies the new shape in the next tick.
+//
 // Create this before the world and add it once the world's there: the world's last entities let go of their bodies as
 // it goes down, so this has to outlive it. Not thread-safe, and queries aren't for use during a step.
 class Physics {
@@ -143,6 +158,7 @@ public:
 
 private:
     struct State;
+    static void on_asset(void* state, const asset::AssetNotice& notice);
     State* state_ = nullptr;
 };
 

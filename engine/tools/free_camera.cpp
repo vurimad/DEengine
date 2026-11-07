@@ -43,7 +43,7 @@ void FreeCamera::update(const platform::Input& input, const FreeCameraActions& a
     const float pitch =
         axis(actions.look_y) * stick + (mouse ? input.state(actions.mouse_y).value * mouse_rad_per_px : 0.0f);
     yaw_rad_ -= yaw;
-    pitch_rad_ = std::clamp(pitch_rad_ - pitch, -1.55f, 1.55f);
+    pitch_rad_ = std::clamp(pitch_rad_ - pitch, -kMaxPitchRad, kMaxPitchRad);
 
     const Quat rotation = this->rotation();
     const Vec3 right = rotation * Vec3(1.0f, 0.0f, 0.0f);

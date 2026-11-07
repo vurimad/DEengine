@@ -56,6 +56,14 @@ struct CellContents {
 // entity. An entity is in at most one cell.
 struct InCell {};
 
+// On an entity: a static body in the shape of a mesh's cooked collision (a .dephys), where the entity is, at its world
+// scale. Physics makes it once the asset is loaded, and it goes with this or the entity. It's here and not in
+// de::physics because what spawns cells can't see that. The handle doesn't hold the asset: whatever spawned the entity
+// does (its cell, which has it as a dependency), like MeshInstance's.
+struct MeshCollider {
+    asset::AssetHandle collision;
+};
+
 // Registers the components (reflection included) and the hooks that release a cell's asset through
 // `assets` when the cell goes, and keeps `assets` for load_cell(). World::create calls it.
 void register_cells(flecs::world& ecs, asset::AssetRegistry* assets);
@@ -64,7 +72,7 @@ void register_cells(flecs::world& ecs, asset::AssetRegistry* assets);
 // uses are loaded, its members are spawned in one batch, at the start of the next tick or before
 // the frame's render extraction, whichever comes first (so no frame ever extracts members whose
 // meshes a reload let go): each placed (world and previous transforms set, so nothing slides in), a
-// member of the cell, with its mesh and, for static ones, StaticTransform. Moving children keep
+// member of the cell, with its mesh, its MeshCollider and, for static ones, StaticTransform. Moving children keep
 // their flecs::Parent; static ones (whose parents are static too: the cooker sees to it) become
 // roots at their world transform, so they cost nothing per tick. Cell::coord is set then. A cell that
 // fails to load stays empty (the registry logs why). Deleting the entity unloads it. It loads

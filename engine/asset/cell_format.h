@@ -47,17 +47,20 @@ struct CellEntity {
     uint16_t name_length = 0;         // unique in the cell; may be empty
     CellEntityFlags flags = CellEntityFlags::None;
     uint32_t fog_volume = kNone; // into CellAsset::fog_volumes
+    uint32_t collision = kNone;  // into the header's dependencies (a mesh's collision): a static body in that shape
+    uint32_t reserved = 0;
 };
-static_assert(sizeof(CellEntity) == 72);
+static_assert(sizeof(CellEntity) == 80);
 
 // .decell (docs/design.md, Open world & streaming: world model): the binary form of a .cell text
-// source, the entities placed in one cell of the world grid. The meshes they use are the header's
-// dependencies, so the registry makes the cell Ready only once they're loaded; an entity names its
-// mesh by its index there (look its handle up with AssetRegistry::find on that header entry).
+// source, the entities placed in one cell of the world grid. The meshes they use, and the collision of
+// those that ask for it, are the header's dependencies, so the registry makes the cell Ready only once
+// they're loaded; an entity names each by its index there (look its handle up with AssetRegistry::find
+// on that header entry).
 // Entities are in an order where every parent comes before its children.
 struct CellAsset {
     static constexpr AssetType kType = AssetType::Cell;
-    static constexpr uint16_t kFormatVersion = 3;
+    static constexpr uint16_t kFormatVersion = 4; // 4: collision
 
     AssetHeader header;
     int32_t coord_x = 0; // the cell's place in the grid (world::CellCoord)
@@ -66,9 +69,10 @@ struct CellAsset {
     OffsetSpan<char> names; // every entity's name, back to back, no terminators
     OffsetSpan<CellFogVolume> fog_volumes;
 
-    // Arrays inside the file; parents earlier in the list, meshes among the dependencies (and of
-    // type Mesh), names inside the names array, finite transforms, and fog volumes in the list, with
-    // finite values, a density up to the limit, an edge of 0 or more, and a known shape.
+    // Arrays inside the file; parents earlier in the list, meshes and collision among the
+    // dependencies (and of those types), names inside the names array, finite transforms, and fog
+    // volumes in the list, with finite values, a density up to the limit, an edge of 0 or more, and
+    // a known shape.
     core::Result<void> validate(std::span<const std::byte> file) const;
 
     std::string_view name(const void* file, const CellEntity& entity) const {

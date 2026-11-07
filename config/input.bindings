@@ -34,6 +34,7 @@ debug.toggle_stats          key:F1
 debug.next_view             key:F2
 debug.toggle_taa            key:F3
 debug.freeze_cull           key:F4
+debug.toggle_fog_low_camera key:F5
 debug.drop_rocks            key:F6
 debug.drop_rubble           key:F7
 

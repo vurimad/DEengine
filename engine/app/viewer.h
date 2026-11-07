@@ -39,7 +39,6 @@ private:
     platform::ActionId drop_rocks_{};
     platform::ActionId drop_rubble_{};
     asset::AssetHandle rock_mesh_;
-    bool floor_made_ = false;
     uint32_t rocks_dropped_ = 0;
     Vec3 rock_center_{0.0f}; // of the box around the mesh, in its own space
     Vec3 rock_half_{0.0f};
@@ -54,9 +53,10 @@ private:
     tools::FreeCamera free_camera_;
     flecs::entity camera_;
 #if DE_BUILD_DEV
-    platform::ActionId next_view_{};   // F2: the next G-buffer view
-    platform::ActionId toggle_taa_{};  // F3: temporal anti-aliasing on and off, to compare
-    platform::ActionId freeze_cull_{}; // F4: the cull stays where it is, and the camera can leave it
+    platform::ActionId next_view_{};             // F2: the next G-buffer view
+    platform::ActionId toggle_taa_{};            // F3: temporal anti-aliasing on and off, to compare
+    platform::ActionId freeze_cull_{};           // F4: the cull stays where it is, and the camera can leave it
+    platform::ActionId toggle_fog_low_camera_{}; // F5: height fog thinning with a low camera on and off, to compare
 #endif
 };
 

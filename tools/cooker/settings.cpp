@@ -103,7 +103,8 @@ MeshSettings read_mesh_settings(yyjson_val* section, std::string_view path, Diag
         return settings;
     }
     const JsonReader reader{.object = section, .path = path, .diagnostics = &diagnostics};
-    static constexpr const char* kKeys[] = {"scale", "lod_count", "lod_ratio", "lod_error", "optimize"};
+    static constexpr const char* kKeys[] = {"scale",     "lod_count", "lod_ratio",
+                                            "lod_error", "optimize",  "collision_triangles"};
     reader.check_keys(kKeys, "mesh");
     const double scale = reader.number("scale", settings.scale);
     const double lod_count = reader.number("lod_count", settings.lod_count);
@@ -130,6 +131,13 @@ MeshSettings read_mesh_settings(yyjson_val* section, std::string_view path, Diag
         settings.lod_error = static_cast<float>(lod_error);
     }
     settings.optimize = reader.boolean("optimize", settings.optimize);
+    const double collision_triangles = reader.number("collision_triangles", settings.collision_triangles);
+    if (collision_triangles < 1.0 || collision_triangles > 16777216.0 ||
+        collision_triangles != static_cast<double>(static_cast<uint32_t>(collision_triangles))) {
+        diagnostics.error(path, "mesh collision_triangles should be a whole number from 1 to 16777216");
+    } else {
+        settings.collision_triangles = static_cast<uint32_t>(collision_triangles);
+    }
     return settings;
 }
 

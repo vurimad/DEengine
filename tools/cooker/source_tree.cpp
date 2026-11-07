@@ -195,6 +195,8 @@ const char* source_kind_name(SourceKind kind) {
         return "world";
     case SourceKind::Environment:
         return "environment";
+    case SourceKind::Terrain:
+        return "terrain";
     }
     return "unknown";
 }
@@ -218,6 +220,7 @@ bool source_kind_of(std::string_view path, SourceKind& kind) {
         {.extension = ".cell", .kind = SourceKind::Cell},
         {.extension = ".world", .kind = SourceKind::World},
         {.extension = ".environment", .kind = SourceKind::Environment},
+        {.extension = ".terrain", .kind = SourceKind::Terrain},
     };
     for (const Entry& entry : kKinds) {
         if (entry.extension == extension) {
@@ -280,7 +283,7 @@ SourceTree SourceTree::scan(const platform::Vfs& vfs, const CookState& previous,
         SourceKind kind = SourceKind::Texture;
         if (!source_kind_of(path.view(), kind)) {
             const std::string_view extension = extension_of(path.view());
-            if (extension != ".bin" && extension != ".md" && extension != ".txt") {
+            if (extension != ".bin" && extension != ".heightpng" && extension != ".md" && extension != ".txt") {
                 diagnostics.warning(path.view(), "not a type of source the cooker knows: ignored");
             }
             continue;

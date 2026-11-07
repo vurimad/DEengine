@@ -17,8 +17,9 @@ struct CellBuild {
     core::Array<asset::CellEntity> entities{tools_heap()}; // parents first
     core::Array<char> names{tools_heap()};
     core::Array<asset::CellFogVolume> fog_volumes{tools_heap()};
-    core::Array<asset::AssetRef> meshes{tools_heap()};  // the dependencies, in first-use order
-    core::Array<SourcePath> mesh_sources{tools_heap()}; // their sources, in the same order
+    core::Array<asset::AssetRef> meshes{tools_heap()};     // dependencies, in first-use order
+    core::Array<SourcePath> mesh_sources{tools_heap()};    // their sources, in the same order
+    core::Array<asset::AssetRef> collisions{tools_heap()}; // the dependencies after those, in first-use order
 };
 
 // A .cell text source (JSON): the entities placed in one cell of the world grid.
@@ -38,6 +39,8 @@ struct CellBuild {
 //             "height_fade_m": 2                  //   how far down from its top it thins from nothing
 //           },
 //           "mesh": "../props/statue/statue.gltf", // optional: a model source, relative to the cell
+//           "collision": "mesh",                  // optional: a static body in the shape of its mesh, so it
+//                                                 // needs a mesh, and to be static. "mesh" is all there is so far
 //           "position": [12, 0, 30.5],            // meters; world space, or the parent's
 //           "rotation_deg": [0, 45, 0],           // degrees about x, y, z (roll z, then pitch x,
 //                                                 // then yaw y), or "rotation": [x, y, z, w]
@@ -54,7 +57,7 @@ struct CellBuild {
 core::Result<CellBuild> import_cell(const SourceTree& tree, const Source& source, std::span<const std::byte> bytes,
                                     Diagnostics& diagnostics);
 
-// The .decell; its meshes are its dependencies.
+// The .decell; its meshes, then their collision, are its dependencies.
 core::Array<std::byte> cook_cell(const CellBuild& build, asset::AssetId id);
 
 } // namespace de::cooker

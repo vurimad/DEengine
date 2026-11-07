@@ -10,7 +10,7 @@ cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debu
 | --- | --- |
 | `--src DIR` | the repository root, mounted as `src:/` (default: this repository) |
 | `--out DIR` | where cooked files go, mounted as `game:/` (default: `<src>/cooked`, which the engine mounts by default) |
-| `--check` | check the source and meta trees and report stale cooked shaders, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
+| `--check` | check the source and meta trees, report stale cooked shaders and collision, read every terrain source and check what's cooked from it, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
 | `--force` | cook every source again |
 | `--no-shaders` | skip shaders (no Slang compiler needed), in `--check` too |
 | `--shader-debug`, `--shader-checks` | source-level debug info, `DE_SHADER_CHECKS=1` in cooked shaders |
@@ -26,10 +26,12 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `cook_state.h` | `CookState`: what the last cook made from what (`game:/cook_state.json`) |
 | `gltf_import.cpp`, `fbx_import.cpp`, `model.h` | glTF (cgltf) and FBX (ufbx) to one in-memory model |
 | `mesh_cooker.h` | `.demesh`: merged, optimized and LOD-chained with meshoptimizer |
+| `collision_cooker.h` | `.dephys`: a cooked mesh's collision, through `physics/jolt_shapes.h` |
 | `texture_cooker.h` | `.detex`: mips filtered with stb_image_resize2, then BC1/BC4/BC5 (rgbcx) or BC7 (bc7enc) |
 | `material_cooker.h` | `.demat`: from model materials and `.material` text sources |
 | `cell_cooker.h` | `.decell`: from `.cell` text sources (the format is described there) |
 | `world_cooker.h` | `.deworld` and `.deenv`: from `.world` and `.environment` text sources (the formats are described there) |
+| `terrain_cooker.h` | `.deterrain` and `.deheights`: the height pyramid, from `.terrain` text sources and their 16-bit height images (the format is described there) |
 | `shader_cooker.h` | `.deshader`: every entry point of a Slang module, with reflection |
 | `blob_writer.h` | `BlobWriter`: the load-in-place layout and common header of every cooked file |
 | `json.h`, `settings.h` | yyjson on the Tools heap; the `texture` and `mesh` settings |
@@ -38,7 +40,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 
 ## Sources, metas and settings
 
-- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials, `.cell` cells, `.world` worlds, `.environment` environments. `.bin` files (glTF buffers) are read by their models; other files are ignored with a warning.
+- Sources live under `content/` (lowercase names, forward slashes; uppercase or spaces are reported and skipped). Kinds by extension: `.png .jpg .jpeg .tga .bmp` textures, `.gltf .glb` and `.fbx` models, `.material` text materials, `.cell` cells, `.world` worlds, `.environment` environments, `.terrain` terrains. `.bin` files (glTF buffers) are read by their models and `.heightpng` files (16-bit height images) by their terrains, so neither has a meta; other files are ignored with a warning.
 - Every source has a meta at the same path under `meta/`, plus `.json`: `content/rocks/rock.png` has `meta/rocks/rock.png.json`. A meta holds the source's GUID, and the settings sections (`texture`, `mesh`) that differ from the folder rules. New sources get a meta with a fresh GUID on the next cook. Metas are committed with their sources.
 - A source moved without its meta is found again by content (the last cook's hash) and its meta moved after it. A meta whose source can't be found is reported, and a new file that may be that source gets no GUID until it's settled: a GUID is never silently replaced, so references never break.
 - Two metas with one GUID (a copied meta): the file the last cook knew by that GUID keeps it, and the other is reported; deleting that one's meta gives it a GUID of its own. Deleting a meta re-cooks its source under the new ID and removes the old ID's files.
@@ -68,6 +70,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `lod_ratio` | triangles kept from one LOD to the next | 0.5 |
 | `lod_error` | largest error a LOD may add, relative to the mesh's size. The renderer picks a LOD only where its error stays under a pixel, so a large error costs nothing up close | 0.5 |
 | `optimize` | vertex cache, overdraw and fetch order | true |
+| `collision_triangles` | its `.dephys` is the finest LOD with at most this many triangles | 2048 |
 
 ## What a source cooks to
 
@@ -76,13 +79,25 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 | Source | Cooked |
 | --- | --- |
 | Texture | a `.detex` |
-| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
+| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.dephys` (`collision`: see below), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
 | `.material` | a `.demat` |
-| `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies |
-| `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment as its dependency; cooked again when a cell it lists changes (its coordinate may have), not when the environment does |
+| `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies, and the `.dephys` of those that ask with `"collision": "mesh"` after them |
+| `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment and optionally its terrain as its dependencies; cooked again when a cell it lists changes (its coordinate may have), not when the environment or the terrain does |
 | `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth, the shadow and fog settings within their limits |
+| `.terrain` | a `.deterrain` (levels, nodes, patch bounds: small, loaded with its world) and a `.deheights` (the blocks, read one at a time), both under its ID |
 | `config/**` | copied as is to `game:/config/` when its bytes differ (input bindings and engine settings: what ship builds read) |
 | `shaders/**.slang` with `[shader("...")]` entry points (outside comments, spaced any way) | a `.deshader` (ID from the module name, `shader_asset_id("imgui")`); library modules without entry points and `shaders/tests/` are skipped |
+
+## Collision
+
+A `.dephys` is the binary state of a Jolt `MeshShape` (`Shape::SaveBinaryState`), made by `physics::build_mesh_shape`, so the cooker doesn't see Jolt's types or need its own copy of its setup.
+
+- **From the LOD chain,** not a simplification of its own: the finest LOD with at most `collision_triangles` triangles is the closest to what's drawn that collision can afford, and it's already there. With no LOD that small, it's the coarsest, with a warning. The default of 2048 gives 1,000 to 2,000 triangles on a prop, and a plane stays its two. On the boulder that's 1,032 of its 66,122: 16 KB, and on rays straight down 1.6 cm from the full mesh on average, 0.9 cm at the median and 12 cm at the 99th percentile, those being rays just past its outline. Its limit is there for what's walked on: a character's cost goes with the triangles under its capsule (`engine/physics/README.md`), far more than a ray's. Raise it for a big mesh that needs the detail.
+- **Welded.** LODs split vertices along uv seams and between materials, so all a LOD's parts go into one list with each position once. Jolt's smooth edges go by shared indices: every split vertex would be an open edge for things to catch on.
+- **Reproducible,** like everything: the same mesh makes the same bytes.
+- **A mesh with no triangles of any area** has no `.dephys`, with a warning: what's only drawn isn't wrong. A cell that asks for it finds out when it's loaded.
+- **Jolt's version** is in the file (`shape_format`) and in the model's input hash, so a new Jolt cooks every model again, and the engine refuses what another wrote. It isn't `JPH_VERSION_ID`, which also changes with asserts and profiling: a debug cooker's files have to work in a dev engine.
+- **`--check`** hashes each model as a cook would and compares that with the last cook: that covers its bytes, settings, buffers and GUID. A collision file gone, a model no cook has seen or one deleted are stale too. With no collision cooked at all, there's nothing to be stale.
 
 ## Rules and invariants
 
@@ -96,6 +111,20 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 - Texture blocks encode in parallel on the job system. Shader compiles run one at a time (Slang's global session).
 - Each file is read once per run: importers get the bytes the cooker hashed, and shared shader imports are hashed once.
 - Mips of color textures are filtered alpha-weighted and sRGB-correct; data textures filter each channel on its own.
+- One ID can name two files of different types (a terrain and its heights), so a cook record's outputs, and what's removed as stale, go by ID and type.
+
+## Terrain
+
+`engine/asset/terrain_format.h` is the format; these are the cook's rules.
+
+- A map's size comes from its image: `width_m` is (samples - 1) times `meters_per_pixel`, and the same for depth. Maps needn't be square. `meters_per_pixel` must be 16 divided by a power of 2, down to 0.125, and levels run from 16 m to it (2 m gives 4 levels). Each level's grid is every node touching the map: one ending exactly on a node's edge has no node past it.
+- A level's sample is exactly the source sample at that point, unfiltered, so a coarse vertex stands where a fine one does. Past the map's edge it's the nearest source sample, which may not be on the level's grid.
+- Samples round to their level's step as whole steps across the level, so neighbours share edges and borders to the bit. A node's `base_steps` is the lowest in its block, border included. A block whose heights don't fit 16 bits above its base fails the cook, naming the level, the worst node, where it is, how far it rises and by how much too far.
+- A patch's `min_m` and `max_m` are its samples and the coarser level's samples in its area, rounded outward as floats, without its border: morphing goes from one toward the other, and a coarse sample can lie outside the fine ones by its rounding. Skirts aren't counted: whatever hangs them adds their depth.
+- Height images are 16-bit grayscale PNGs (stb's limit: under 2 GB of samples) with the extension `.heightpng`, so they aren't cooked as textures. Anything else is refused: 8 bits, other channel counts, under 2 x 2 samples. The range is required, since a PNG doesn't store one.
+- A terrain cooks again when its GUID, its text, its image's bytes or the format's version change, or a cooked file is gone. The image is read once per run, for its hash and its samples. The heights are written first, so a new `.deterrain` is never on disk before the heights it names. Nodes cook on jobs: each writes its own block and patches, so the bytes don't depend on the threads.
+- `--check` reads each terrain source and its image's header, and, for what was cooked, compares the source's inputs with the record's, loads the `.deterrain`, and checks the `.deheights` against it: its header, its length and the hash of its bytes. It reports cooked files whose source has gone too.
+- `tools/terrain_testmap.py` generates the capacity test map, 16 x 16 km at 2 m with a few steep ranges: what the engine must carry at least. Real maps and that one live in `content/terrain/` and `meta/terrain/`, which aren't committed.
 
 ## Not yet
 
@@ -105,3 +134,4 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 - Shader permutations: modules cook with no defines; a list of permutations per module comes with the materials that need them.
 - Removing files deleted from `config/` from `game:/config/`; checking config files (`--check`).
 - Running on file change (the editor), cooking in parallel across sources, `de asset move`, and the archive packer (which has to carry `game:/shader_sources.hash` along).
+- Leaving out collision that nothing asks for; hand-made collision meshes; a material per triangle.

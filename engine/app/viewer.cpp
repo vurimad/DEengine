@@ -57,6 +57,7 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     next_view_ = engine.input.add_action("debug.next_view"_sid, platform::ActionKind::Button);
     toggle_taa_ = engine.input.add_action("debug.toggle_taa"_sid, platform::ActionKind::Button);
     freeze_cull_ = engine.input.add_action("debug.freeze_cull"_sid, platform::ActionKind::Button);
+    toggle_fog_low_camera_ = engine.input.add_action("debug.toggle_fog_low_camera"_sid, platform::ActionKind::Button);
     drop_rocks_ = engine.input.add_action("debug.drop_rocks"_sid, platform::ActionKind::Button);
     drop_rubble_ = engine.input.add_action("debug.drop_rubble"_sid, platform::ActionKind::Button);
     engine.freeze_cull = has_flag(args, "--freeze-cull");
@@ -105,6 +106,9 @@ void Viewer::apply_world(Engine& engine) {
                        ? asset::AssetHandle{}
                        : engine.assets.find(world->header.dependencies.get(file.data())[world->environment]);
     environment_revision_ = 0; // applied by the next update()
+    engine.terrain = world->terrain == asset::WorldAsset::kNone
+                         ? asset::AssetHandle{}
+                         : engine.assets.find(world->header.dependencies.get(file.data())[world->terrain]);
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
 }
@@ -124,6 +128,11 @@ bool Viewer::update(Engine& engine, float frame_s) {
             DE_LOG_INFO("render", "lighting from the environment (revision %u)", revision);
         }
     }
+#if DE_BUILD_DEV
+    if (engine.camera_pose != nullptr) {
+        free_camera_.set_pose(*engine.camera_pose);
+    }
+#endif
     free_camera_.update(engine.input, camera_actions_, frame_s, camera_);
 #if DE_BUILD_DEV
     if (engine.input.state(next_view_).pressed) {
@@ -134,6 +143,10 @@ bool Viewer::update(Engine& engine, float frame_s) {
     if (engine.input.state(toggle_taa_).pressed) {
         engine.taa = !engine.taa;
         DE_LOG_INFO("render", "TAA %s", engine.taa ? "on" : "off");
+    }
+    if (engine.input.state(toggle_fog_low_camera_).pressed) {
+        engine.fog_low_camera = !engine.fog_low_camera;
+        DE_LOG_INFO("render", "height fog thinning with a low camera %s", engine.fog_low_camera ? "on" : "off");
     }
     if (engine.input.state(drop_rocks_).pressed) {
         drop_rocks(engine, 30, false);
@@ -182,14 +195,6 @@ void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
                     static_cast<double>(rock_half_.z * 2.0f), static_cast<double>(mesh->bounds.radius));
     }
     flecs::world& ecs = engine.world.ecs();
-    if (!floor_made_) {
-        // The ground has no collision of its own until mesh collision lands: a floor where the test level's ground is.
-        floor_made_ = true;
-        const flecs::entity floor = ecs.entity();
-        world::place(floor, world::Transform{.position = {64.0, -0.5, 64.0}});
-        floor.set(physics::Collider{.shape = physics::ShapeKind::Box, .half_extents_m = Vec3(400.0f, 0.5f, 400.0f)});
-        floor.set(physics::RigidBody{.kind = physics::BodyKind::Static, .friction = 0.8f});
-    }
     const auto random = [this] {
         rock_random_ ^= rock_random_ << 13U;
         rock_random_ ^= rock_random_ >> 7U;

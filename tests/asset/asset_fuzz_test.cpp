@@ -4,16 +4,21 @@
 // asset hands out lies inside the file, and every number a consumer sizes things by is sane.
 
 #include "asset/cell_format.h"
+#include "asset/collision_format.h"
 #include "asset/format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
+#include "asset/terrain_format.h"
 #include "asset/texture_format.h"
+#include "asset/world_format.h"
 #include "cooker/blob_writer.h"
 #include "cooker/cell_cooker.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
+#include "cooker/terrain_cooker.h"
 #include "cooker/texture_cooker.h"
+#include "cooker/world_cooker.h"
 
 #include <doctest/doctest.h>
 
@@ -123,6 +128,10 @@ bool safe(std::span<const std::byte> file, const MaterialAsset& material) {
     return true;
 }
 
+bool safe(std::span<const std::byte> file, const de::asset::CollisionAsset& collision) {
+    return inside(file, collision.shape) && collision.shape.count > 0;
+}
+
 // What spawning relies on: parents already made, meshes among the dependencies, names in the file,
 // finite transforms.
 bool safe(std::span<const std::byte> file, const CellAsset& cell) {
@@ -139,6 +148,9 @@ bool safe(std::span<const std::byte> file, const CellAsset& cell) {
               cell.header.dependencies.get(file.data())[entity.mesh].type != AssetType::Mesh)) ||
             uint64_t{entity.name_offset} + entity.name_length > cell.names.count ||
             (entity.fog_volume != CellEntity::kNone && entity.fog_volume >= cell.fog_volumes.count) ||
+            (entity.collision != CellEntity::kNone &&
+             (entity.collision >= cell.header.dependencies.count ||
+              cell.header.dependencies.get(file.data())[entity.collision].type != AssetType::Collision)) ||
             !std::isfinite(entity.position[0]) || !std::isfinite(entity.scale[1]) ||
             !std::isfinite(entity.rotation[3])) {
             return false;
@@ -165,6 +177,64 @@ bool safe(std::span<const std::byte> file, const ShaderAsset& shader) {
         }
     }
     return true;
+}
+
+// What the renderer and the streamer rely on: every node and patch a level's grid can name lies in the tables, every
+// block in the heights file, once, and every height a patch reports is a number, in order.
+bool safe(std::span<const std::byte> file, const TerrainAsset& terrain) {
+    if (!inside(file, terrain.levels) || !inside(file, terrain.nodes) || !inside(file, terrain.patches) ||
+        terrain.levels.count == 0 || terrain.levels.count > kTerrainMaxLevels || !std::isfinite(terrain.origin_m[0]) ||
+        !std::isfinite(terrain.origin_m[1]) || !(terrain.width_m > 0.0f) || !(terrain.depth_m > 0.0f) ||
+        !std::isfinite(terrain.width_m) || !std::isfinite(terrain.depth_m) ||
+        terrain.block_count > terrain.nodes.count) {
+        return false;
+    }
+    const auto levels = terrain.levels.get(file.data());
+    for (size_t l = 0; l < levels.size(); ++l) {
+        const TerrainLevel& level = levels[l];
+        const uint64_t nodes = uint64_t{level.nodes_x} * level.nodes_z;
+        if (nodes == 0 || level.first_node + nodes > terrain.nodes.count ||
+            level.first_patch + (nodes * kTerrainPatchesPerNode * kTerrainPatchesPerNode) > terrain.patches.count ||
+            !(level.spacing_m > 0.0f) || (l > 0 && level.spacing_m != levels[l - 1].spacing_m / 2.0f) ||
+            level.nodes_x * static_cast<double>(level.spacing_m) * kTerrainNodeQuads <
+                static_cast<double>(terrain.width_m) ||
+            level.nodes_z * static_cast<double>(level.spacing_m) * kTerrainNodeQuads <
+                static_cast<double>(terrain.depth_m)) {
+            return false;
+        }
+    }
+    std::vector<uint8_t> used(terrain.block_count, 0);
+    for (const TerrainNode& node : terrain.nodes.get(file.data())) {
+        if (node.block == kTerrainNoBlock) {
+            continue;
+        }
+        if (node.block >= terrain.block_count || used[node.block] != 0) {
+            return false; // a read past the file, or a node drawn with another's land
+        }
+        used[node.block] = 1;
+        if (int64_t{node.base_steps} + UINT16_MAX > INT32_MAX) {
+            return false;
+        }
+    }
+    for (const TerrainPatch& patch : terrain.patches.get(file.data())) {
+        if (!std::isfinite(patch.min_m) || !std::isfinite(patch.max_m) || patch.min_m > patch.max_m) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool safe(std::span<const std::byte> file, const WorldAsset& world) {
+    if (!inside(file, world.cells) || !inside(file, world.header.dependencies)) {
+        return false;
+    }
+    const auto dependencies = world.header.dependencies.get(file.data());
+    if (world.environment != WorldAsset::kNone &&
+        (world.environment >= dependencies.size() || dependencies[world.environment].type != AssetType::Environment)) {
+        return false;
+    }
+    return world.terrain == WorldAsset::kNone ||
+           (world.terrain < dependencies.size() && dependencies[world.terrain].type == AssetType::Terrain);
 }
 
 // Corrupts a copy of file many ways; every copy that still loads must be safe. The asset struct
@@ -292,15 +362,53 @@ std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = 
     de::cooker::CellBuild build;
     build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
     build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
+    build.collisions.push({.id = AssetId::from_value(23), .type = AssetType::Collision});
     const char names[] = "rootchildother";
     for (const char c : std::string_view(names)) {
         build.names.push(c);
     }
-    build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4});
+    build.entities.push({.position = {1.0, 2.0, 3.0}, .mesh = 0, .name_offset = 0, .name_length = 4, .collision = 2});
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
     build.fog_volumes.push(fog_volume);
     build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
+}
+
+// A collision file with stand-in bytes: it isn't read here, and what's inside it is the content hash's to guard.
+std::vector<std::byte> sample_collision() {
+    de::cooker::BlobWriter writer(sizeof(de::asset::CollisionAsset));
+    de::asset::CollisionAsset collision;
+    const std::byte shape[40] = {};
+    collision.shape = writer.append(std::span<const std::byte>(shape));
+    return to_vector(writer.finish(collision, AssetId::from_value(17), {}));
+}
+
+// A terrain of 10 nodes, from a map 300 x 200 samples at 2 m.
+std::vector<std::byte> sample_terrain() {
+    de::cooker::TerrainSource source;
+    source.meters_per_pixel = 2.0;
+    source.lowest_m = -10.0;
+    source.highest_m = 100.0;
+    de::cooker::HeightImage image;
+    image.width = 300;
+    image.depth = 200;
+    for (uint32_t i = 0; i < image.width * image.depth; ++i) {
+        image.samples.push(static_cast<uint16_t>(i * 31));
+    }
+    de::cooker::Diagnostics diagnostics;
+    const auto cooked = de::cooker::cook_terrain(source, image, AssetId::from_value(15), nullptr, "fuzz", diagnostics);
+    REQUIRE(cooked.ok());
+    return to_vector(cooked->terrain);
+}
+
+// A world with an environment, a terrain and two cells.
+std::vector<std::byte> sample_world() {
+    de::cooker::WorldBuild build;
+    build.environment = {.id = AssetId::from_value(31), .type = AssetType::Environment};
+    build.terrain = {.id = AssetId::from_value(32), .type = AssetType::Terrain};
+    build.cells.push({.cell = AssetId::from_value(33), .coord_x = 0, .coord_z = 0});
+    build.cells.push({.cell = AssetId::from_value(34), .coord_x = 1, .coord_z = 0});
+    return to_vector(de::cooker::cook_world(build, AssetId::from_value(16)));
 }
 
 // A shader file as the cooker lays it out, around stand-in SPIR-V.
@@ -335,7 +443,15 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     const std::vector<std::byte> material = sample_material();
     const std::vector<std::byte> shader = sample_shader();
     const std::vector<std::byte> cell = sample_cell();
+    const std::vector<std::byte> terrain = sample_terrain();
+    const std::vector<std::byte> world = sample_world();
     // The samples themselves load and are safe.
+    Buffer terrain_file(terrain);
+    REQUIRE(load_in_place<TerrainAsset>(terrain_file.bytes()).ok());
+    REQUIRE(safe(terrain_file.bytes(), **load_in_place<TerrainAsset>(terrain_file.bytes())));
+    Buffer world_file(world);
+    REQUIRE(load_in_place<WorldAsset>(world_file.bytes()).ok());
+    REQUIRE(safe(world_file.bytes(), **load_in_place<WorldAsset>(world_file.bytes())));
     Buffer mesh_file(mesh);
     REQUIRE(load_in_place<MeshAsset>(mesh_file.bytes()).ok());
     REQUIRE(safe(mesh_file.bytes(), **load_in_place<MeshAsset>(mesh_file.bytes())));
@@ -392,6 +508,12 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     fuzz<MaterialAsset>(material, 3, kRounds);
     fuzz<ShaderAsset>(shader, 4, kRounds);
     fuzz<CellAsset>(cell, 5, kRounds);
+    fuzz<TerrainAsset>(terrain, 6, kRounds);
+    fuzz<WorldAsset>(world, 7, kRounds);
+    const std::vector<std::byte> collision = sample_collision();
+    Buffer collision_file(collision);
+    REQUIRE(load_in_place<de::asset::CollisionAsset>(collision_file.bytes()).ok());
+    fuzz<de::asset::CollisionAsset>(collision, 8, kRounds);
 }
 
 TEST_CASE("textures whose sizes overflow the mip arithmetic are refused") {

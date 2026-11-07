@@ -38,7 +38,7 @@ The engine is designed for a full Elden Ring-scale world: at least 16 x 16 km of
 | Area | First playable | Vertical slice | Later |
 | --- | --- | --- | --- |
 | World | Streamed terrain tiles around the player | 2 x 2 km world, cells + dungeon interior, no loading screens | Multiple regions, underground maps |
-| Terrain | Heightfield clipmap, splat materials | Virtual texturing, sculpt + paint in editor, holes for caves | Runtime deformation, snow/mud trails |
+| Terrain | Streamed heightfield quadtree, splat materials | Virtual texturing, sculpt + paint in editor, holes for caves | Runtime deformation, snow/mud trails |
 | Vegetation | GPU-instanced grass on a patch | GPU-driven indirect grass fields, trees with LOD and impostors, wind | Interactive bending, destructible foliage |
 | Rendering | Deferred PBR, sun shadows | Render graph, GPU culling, cascades + local shadows, volumetrics, sky, SSR, TAA | GI probes or DDGI, upscalers |
 | VFX | GPU particles | Data-driven emitters, decals, trails, weather, spell and blood effects | Fluid/smoke sims, mesh particles at scale |
@@ -380,14 +380,14 @@ meta/characters/knight/
 | Animation | `.deanim` | Compressed ozz tracks, root motion, events |
 | Texture | `.detex` | BC1/BC4/BC5/BC7 or BC6H, full mip chain, GPU-ready |
 | Material | `.demat` | Shader template, parameters, texture IDs |
-| Terrain tile | `.deterrain` | Height mips, splat maps, holes, grass density |
+| Terrain | `.deterrain`, `.deheights` | A map's pyramid of levels, nodes and patch bounds; its heights in a second file, read a block at a time. Splat maps, holes and grass density to come |
 | Physics | `.dephys` | Jolt-serialized collision shapes |
 | Navmesh tile | `.denav` | Detour tile data |
 | Sound | `.desnd` | Opus/Vorbis data + playback metadata |
 | Shader | `.deshader` | SPIR-V per permutation + reflection |
 | Cloth | `.decloth` | Simulation mesh, constraints, painted limits, render-mesh mapping, LODs |
 | Cell / prefab | `.decell` | Binary form of the text scene data |
-| World | `.deworld` | A world's cells by grid coordinate (named, not loaded with it), where the player starts, its environment |
+| World | `.deworld` | A world's cells by grid coordinate (named, not loaded with it), where the player starts, its environment and terrain |
 | Environment | `.deenv` | How a place is lit: sun, sky and ground ambient, shadow tint, exposure, sun shadows |
 
 **Rules for every cooked format.**
@@ -408,7 +408,8 @@ The editor browses source assets but always loads their cooked versions, so prev
 - Texture defaults follow from use: a texture a material samples as a normal map compresses to BC5, color to sRGB BC7, other maps to linear BC7. Folder rules and metas override them (JSON merge patches, root to leaf).
 - Our text material source is `.material` (JSON): a template, named parameters and textures by relative path.
 - Cells are `.cell` (JSON): the cell's grid coordinates and its entities (name, mesh by relative path to a model source, position, rotation, scale, parent by name, static). The `.decell` lists the meshes as dependencies, puts parents before children, and is cooked again when a model it names gets a new ID, not when a model is cooked again.
-- Worlds are `.world` (JSON): the environment and the cells by relative path, and the start position and view. The cooker reads each cell's coordinates into the `.deworld` (sorted, one cell per coordinate), so streaming can find cells without loading them; the environment is its one dependency. Environments are `.environment` (JSON): the sun by elevation and azimuth (degrees, clockwise from north, -Z), colors with intensities (1 when left out), exposure and shadow settings, every other one required so a file states the whole look. Editing the light cooks only the environment; moving a cell cooks the world again.
+- Worlds are `.world` (JSON): the environment and the cells by relative path, and the start position and view. The cooker reads each cell's coordinates into the `.deworld` (sorted, one cell per coordinate), so streaming can find cells without loading them; the environment and the terrain are its dependencies. Environments are `.environment` (JSON): the sun by elevation and azimuth (degrees, clockwise from north, -Z), colors with intensities (1 when left out), exposure and shadow settings, every other one required so a file states the whole look. Editing the light cooks only the environment; moving a cell cooks the world again.
+- Terrains are `.terrain` (JSON): a 16-bit grayscale height image by relative path, with its own extension (`.heightpng`) so it isn't cooked as a texture, its spacing, the height range its pixels span, and where its first sample lies. It cooks to a small `.deterrain` that loads with its world and a `.deheights` under the same ID, read a block at a time; a cook record's outputs go by ID and type. Land too steep for a node's 16 bits fails the cook, saying where and by how much.
 - The cooker keeps its state in `game:/cook_state.json`: per source, the hash of every input (bytes, settings, files it reads, versions) and what it made. Unchanged sources are skipped, outputs of deleted sources removed, and metas of files moved outside the tools re-linked by the last content hash.
 - `cooker --check` validates the source and meta trees, reports cooked shaders that are stale, and writes nothing, for CI.
 - Cooked shaders and the engine both name the shader sources they came from, by a hash of every `.slang` under `shaders/` but `shaders/tests/`. The build embeds it in the engine; the cooker writes it to `game:/shader_sources.hash` once every module is cooked, and removes it while it works. An engine loading cooked shaders refuses to start on any other hash, or none, before opening a window, and keeps the pipelines it has if a cooked reload doesn't match. Compiling from source doesn't look at it.
@@ -549,13 +550,13 @@ The simulation stays at a fixed 60 Hz tick; the renderer interpolates transforms
 
 ## Terrain & vegetation
 
-Terrain is a first-class system, not a mesh: a streamed heightfield rendered with GPU-driven clipmaps, shaded through a virtual texture, and covered by GPU-generated grass and foliage.
+Terrain is a first-class system, not a mesh: a streamed heightfield rendered as a GPU-driven quadtree, shaded through a virtual texture, and covered by GPU-generated grass and foliage.
 
 **Heightfield and streaming.**
 
-- World split into terrain tiles (e.g. 256 m, 1 m height resolution, 16-bit heights) cooked into a mip pyramid.
-- Geometry clipmap rings around the camera, rendered as instanced patches; LOD morphing between rings removes cracks and popping.
-- Tiles stream by distance with the world cells; far tiles keep only low mips.
+- A map is any size, read from its source; the engine must carry at least 16 x 16 km. It's cooked into a pyramid of nodes of 129 x 129 samples plus a border, 16-bit, with a fixed height step per level and a whole-number base per node, so neighbours on a level share edges to the bit. The coarsest nodes are 2,048 m across at 16 m spacing, and each level halves that. The first map comes at 2 m. The aim is 1 m everywhere and 0.5 m where authored, refined by the cooker.
+- A GPU-driven quadtree: a compute pass walks a flat table of patches (32 x 32 squares, 4 x 4 to a node), and each one decides for itself from the camera's distance, its own height bounds and what's loaded. It's the same choice for the camera and every shadow cascade, so they agree on the ground. Vertices morph toward the coarser level before a swap so nothing pops, and skirts cover what morphing can't: a neighbour two levels away while its data loads, and the edge of the map.
+- Terrain streams from the first version, on its own rings around the camera, not with the world cells: terrain never holds up a cell, and land needs no cell. Heights live in a file read a block at a time. The coarsest level is always loaded. A patch splits only once its children are on the GPU, so what's drawn is always a whole, valid surface, whatever has arrived.
 - Holes mask for cave entrances and dungeon openings; meshes (cliffs, rocks) blend into terrain with height-based blending.
 
 **Materials and texturing.**
@@ -588,7 +589,7 @@ The sky is a core system, not a skybox: it drives the lighting, fog, mood and co
 - Aerial perspective applied to every pixel, so distant mountains and castles fade into the sky color naturally; this is a large part of the Elden Ring look.
 - Artist controls on top of physics: tint, haze density, horizon glow, golden-hour boost, stored per region and per weather state.
 
-**Fog: one medium model, near and far.** Elden Ring's way (study 04): extinction is a constant plus a height fog around a base height, with a bounded exponential profile (thinning upward; below the base, rising only to twice its density, so valleys don't fill without limit), coloured per channel (blue fades first, the sun reddens through haze). Light scattered in: the sun through a colour looking toward it and another looking away (artists' controls in place of one phase parameter), dimmed by the fog column above, plus an ambient colour; a start distance, another for sun haze, and an end distance that is also the sky's. The sky is fogged like everything else, so the horizon takes the haze of the land below it.
+**Fog: one medium model, near and far.** Elden Ring's way (study 04): extinction is a constant plus a height fog around a base height, with a bounded exponential profile (thinning upward; below the base, rising only to twice its density, so valleys don't fill without limit), coloured per channel (blue fades first, the sun reddens through haze). Light scattered in: the sun through a colour looking toward it and another looking away (artists' controls in place of one phase parameter), dimmed by the fog column above, plus an ambient colour; a start distance, another for sun haze, and an end distance that is also the sky's. The sky is fogged like everything else, so the horizon takes the haze of the land below it. An environment can also thin the height fog as the camera comes down into it (`low_camera`), which isn't physical and is there on purpose: real height fog is thick from inside and looks thinner from above, the reverse of what reads well, with low land foggy from afar and clear once you're there. The user chose this over a far start distance alone, by eye, on their map.
 
 - Far range (built, `shaders/common/fog.slang`): the closed-form integral of that medium along each view ray, in a full-screen pass after lighting (about 0.06 ms at 1600 x 900). Settings in the environment asset, hot reloaded.
 - Near range, a froxel grid with the same medium, in phases:
@@ -886,6 +887,8 @@ The world is one seamless space streamed around the player in a grid of cells, w
 
 **Physics (Jolt).** Static level collision from simplified meshes; a capsule character controller (Jolt CharacterVirtual) for player and enemies; simple rigid bodies only for breakables and corpses (ragdolls in a later tier); soft bodies for character cloth (see Cloth & secondary motion). Combat hit detection does not use physics bodies; it uses its own swept capsule queries so it stays deterministic and frame-exact.
 
+Static collision is authored on a cell's entity with `"collision": "mesh"`, and cooked from a mesh's LOD chain into a `.dephys` beside its `.demesh`: the finest LOD under a limit on triangles (`collision_triangles`, 2048 by default), welded by position, as a Jolt `MeshShape`'s binary state. A cell depends on its `.dephys` as it does on its meshes, so it's Ready only when they're loaded, and its bodies come and go with its members. All instances of a mesh share one restored shape, with a `ScaledShape` around it per distinct scale.
+
 **Camera.** A third-person orbit camera with collision (sphere cast back from the pivot), smoothed follow, and a lock-on mode that frames player and target. Camera shake is data-driven per hit type. Camera pull-in near walls must never hide an enemy's startup frames.
 
 **Input.** SDL3 gamepad first, keyboard and mouse second. Inputs are mapped to actions (attack\_light, roll, use\_item), sampled once per tick, and pushed into the input buffer. Code adds actions; their bindings are text, `config/input.bindings` (read from `src:/` in dev builds, from `game:/config/` in ship), then the player's `user:/input.bindings`, whose lines replace the defaults of the actions they name. Target input-to-action latency: 3 ticks or less (about 50 ms) plus render latency.
@@ -1046,10 +1049,11 @@ engine/
   game/       # combat, AI, player, items, saves
   script/     # Lua bindings
   editor/     # editor mode, panels, commands
-  tools/      # debug UI, stats panel, free camera
-config/       # engine settings as text: input bindings, engine.settings (copied into game:/config/)
+  tools/      # debug UI, stats panel, free camera, camera scripts and screenshots
+config/       # engine settings as text: input bindings, engine.settings, camera views and paths (copied into game:/config/)
 tools/
   cooker/     # asset cooker, validators, packer
+  image_diff/ # compares two PNGs, with a mask and a threshold
 shaders/      # Slang
 content/      # src:/ source assets, data, Lua
 meta/         # mirrored meta tree: GUIDs + import settings
@@ -1172,7 +1176,7 @@ Decisions so far:
 | 2026-10-31 | Deferred, GPU-driven, bindless renderer on Vulkan 1.3 | Material variety, many lights, decals, scale |
 | 2026-10-31 | Render graph with transient resource aliasing | Easy passes, automatic barriers, VRAM reuse |
 | 2026-10-31 | Lua as first-class scripting; heavy logic stays in C++ | Fast iteration without per-frame cost |
-| 2026-10-31 | Terrain clipmaps + GPU-driven indirect grass | Huge fields at low CPU cost |
+| 2026-10-31 | Terrain clipmaps + GPU-driven indirect grass (terrain superseded on 2026-11-06: quadtree, below) | Huge fields at low CPU cost |
 | 2026-10-31 | AI-friendly: text sources, command API, MCP server | AI and humans use the same doors |
 | 2026-10-31 | Elden Ring shaders used as reference only (superseded on 2026-11-03: studied in full, below) | Own implementations, clean IP |
 | 2026-10-31 | 120 FPS target for the full game; 60 Hz fixed simulation with interpolation | Smooth, responsive feel; deterministic frame data |
@@ -1193,6 +1197,7 @@ Decisions so far:
 | 2026-11-02 | Cooked files named by asset ID in game:/, not by source path | Runtime loads by ID; one source makes several assets; the archive packer works by ID anyway |
 | 2026-11-03 | Double-precision world positions on the CPU; floats relative to a render origin on the GPU | No rebasing of simulation state; about 2 MB at 60k entities; change-only uploads keep working |
 | 2026-11-06 | Jolt is built in double precision with cross-platform determinism on, from an overlay of vcpkg's port, as a static library behind `de::physics`, with no Jolt types above it | Positions are doubles and the simulation stays deterministic, and both change Jolt's types and code, so they can't be chosen at run time; the same world steps to the same bits on any number of threads, tested |
+| 2026-11-06 | Static collision is a `.dephys` per model: a Jolt `MeshShape` from the finest LOD of at most 2048 triangles (a `mesh` setting), welded by position, its bytes refused by any other Jolt version; one restored shape per mesh, a `ScaledShape` per distinct scale | The chain's already there and a coarser shape costs little accuracy: the boulder's 1,032 triangles lie 1.6 cm from its 66,122 on average, in 16 KB rather than 1 MB. Triangles under a capsule are what characters pay for: 200 of them cost about 11 ms a tick on these and about 430 ms on the full mesh. A thousand instances add about 300 bytes each |
 | 2026-11-06 | The GPU cull merges everything of one mesh part in one view and pipeline into one instanced draw, counting first and writing records second | A draw's cost was what limited 100k objects, not triangles; a draw per object stays behind a switch for GPUs slow at very small instances. How much time this saves still has to be measured |
 | 2026-11-06 | A cascade draws only casters whose shadow can land on what reads it: the part of the view it serves, swept toward the sun | Half the shadow draws go (28,603 to 14,054 in a mixed scene of 100k, 186,378 to 65,668 in a grid of 100k quads), and tests find the same picture; a cache of far cascades will need all that its map could hold instead |
 | 2026-11-06 | Instances keep world positions as wrapping 32-bit fixed point, in place of floats relative to the render origin | Re-sending every instance when the origin moved cost one frame about 3.7 ms of CPU and 0.7 ms of GPU at 100k, most of a 240 fps frame; now it sends nothing, the world still has no limit, and precision within 1 km stays 0.06 mm |
@@ -1214,3 +1219,8 @@ Decisions so far:
 | 2026-11-05 | Fog volumes stay in the froxel grid: 3 points through the ray's span inside each volume for extinction, and the fog pass takes the share of a slice really in front of a pixel's surface; noise and shape next, a per-pixel raymarch only if that isn't enough | Backing away from a mist bank on the ground, at about 94 m, the wave measured 7.9%; with this 2.6%, as low as mist off the ground (2.7%): what's left is the grid's. More slices cost more and helped less (128: 4.7%). Elden Ring's grid path reads one filtered sample at the pixel's depth; its mist also has moving noise and a raymarched path |
 | 2026-11-06 | One hash of all shader sources decides whether cooked shaders fit an engine, compared at startup; any edit counts, comments too, line endings don't. The build gets it from a small tool running the cooker's own code | Layouts shared with C++ are matched by hand and reached through pointers, so a mismatch was a GPU crash (`VK_ERROR_DEVICE_LOST`) in ship builds, which load cooked shaders. A hash per module would need the build to know each one's imports; asking for a cook after a comment edit costs a few seconds, a crash costs far more. The stamp comes from the sources the cooker read, not the cooker's own build, which may be older |
 | 2026-11-06 | LODs crossfade by a screen-space dither, from the error alone: a LOD comes in at the error limit and takes over within a share of it; a separate list and pipeline for what's fading; shadows keep cuts for now | The user requires a fade ("fade is a MUST"). No state per instance, so still instances cost the CPU nothing and the fade works on the GPU cull as it stands. Fading draws twice and loses early depth only where it happens. Alpha blending would need sorting, and time-based fades need history per object per view |
+| 2026-11-06 | Terrain is a GPU-driven quadtree with morphing and skirts, not clipmap rings; streaming is in from the first version (the user's call), on its own rings; a map's size comes from the map, with 16 x 16 km the least the engine must carry | Clipmap detail ignores height above the ground and spends the same on flat land and mountains, and Far Cry 5 shipped this shape. Untested here: morphing with skirts, and what it costs on our GPU |
+| 2026-11-06 | Terrain starts before the M0b gate is met (editor, Lua, headless): a deliberate departure, on the user's word. Screenshot and camera flags stand in for agent eyes until then | The look target needs real land to judge, and the rest of the gate doesn't block it |
+| 2026-11-07 | A terrain step is 1/64 of its level's spacing, not 1/128: a node holds a rise of 8 to 1, and steeper land fails the cook | The first real map's cliffs are deliberate and rise 1,081 m across a 2 m node, past the 1,024 m that 1/128 holds, and would fail harder at the 1 m we aim for. It costs a step of 31 mm at 2 m (the source's own is 24 mm), and baked normals come from the float source anyway |
+| 2026-11-07 | Agent eyes, dev builds only, until the command API: flags place the free camera (doubles from the text to the entity), take a PNG of the final image, step the frame clock by a fixed amount and fly a path; a run that takes pictures listens to no input, hides the debug UI and starts with the scene on the GPU; `image_diff` (C++ on stb_image, in `tools/`) compares two PNGs; stb_image_write comes into the dev engine for it, and ship links none of this | An agent could not see the engine at all. Stills of one view at one frame count were identical across every comparison made at 96 frames, in Debug and dev, with validation and vsync on or off, so baselines are per GPU and driver; 96 frames is where TAA and the froxel history stop mattering in the test world (engine/app/README.md has the numbers) |
+| 2026-11-07 | Height fog can thin with a low camera, by a setting per environment, and a key in dev builds turns it off to compare | Low land should read as foggy from above and clear from inside, which one fog of one thickness per height can't do; the user judged it by eye on their map |
