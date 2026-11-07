@@ -7,6 +7,10 @@
 /Archives/
 *.arc
 
+# Real maps stay local until their data can be credited and hosted (the repository is public)
+/content/terrain/
+/meta/terrain/
+
 # vcpkg
 /vcpkg_installed/
 

@@ -5,6 +5,7 @@
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
+#include "asset/terrain_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "core/allocator.h"
@@ -70,6 +71,9 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<WorldAsset>(file));
     case AssetType::Environment:
         return checked(load_in_place<EnvironmentAsset>(file));
+    case AssetType::Terrain:
+        return checked(load_in_place<TerrainAsset>(file));
+    case AssetType::TerrainHeights: // start_read refuses these before reading them
     case AssetType::Unknown:
         break;
     }
@@ -209,6 +213,11 @@ void start_read(void* context) {
     DE_PROFILE_ZONE("asset read");
     Entry& entry = *static_cast<Entry*>(context);
     RegistryState& state = *entry.registry;
+    if (entry.asset.type == AssetType::TerrainHeights) {
+        entry.pending_error = "terrain heights are read a block at a time, never loaded whole";
+        finish_read(entry);
+        return;
+    }
     const CookedPath path = cooked_path(entry.asset.id, entry.asset.type);
     const core::Result<platform::FileInfo> info = state.desc.vfs->file_info(path.c_str());
     if (!info || info->is_directory) {

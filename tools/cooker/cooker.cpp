@@ -5,6 +5,7 @@
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
+#include "asset/terrain_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "cooker/cell_cooker.h"
@@ -14,6 +15,7 @@
 #include "cooker/model.h"
 #include "cooker/shader_cooker.h"
 #include "cooker/source_tree.h"
+#include "cooker/terrain_cooker.h"
 #include "cooker/texture_cooker.h"
 #include "cooker/third_party.h"
 #include "cooker/world_cooker.h"
@@ -21,6 +23,7 @@
 #include "core/log.h"
 #include "core/profile.h"
 #include "platform/file.h"
+#include "platform/time.h"
 #include "platform/vfs.h"
 #include "render/shader/shader_asset.h"
 
@@ -75,8 +78,13 @@ public:
         stats_.metas_relinked = scan.metas_relinked;
         if (!options_.check_only) {
             cook_all();
-        } else if (options_.check_shaders) {
-            check_cooked_shaders();
+        } else {
+            if (options_.check_shaders) {
+                check_cooked_shaders();
+            }
+            if (options_.content) {
+                check_terrains();
+            }
         }
         CookReport report{.stats = stats_};
         report.diagnostics = diagnostics_.all();
@@ -113,6 +121,8 @@ private:
                 cook_world_source(source);
             } else if (source.kind == SourceKind::Environment) {
                 cook_environment_source(source);
+            } else if (source.kind == SourceKind::Terrain) {
+                cook_terrain_source(source);
             }
         }
         for (const Source& source : tree_.sources()) {
@@ -202,8 +212,9 @@ private:
         kept.input_hash = 0;
         if (partial != nullptr) {
             for (const CookedOutput& output : partial->outputs) {
-                const bool known =
-                    std::ranges::any_of(kept.outputs, [&](const CookedOutput& other) { return other.id == output.id; });
+                const bool known = std::ranges::any_of(kept.outputs, [&](const CookedOutput& other) {
+                    return other.id == output.id && other.type == output.type;
+                });
                 if (!known) {
                     kept.outputs.push(output);
                 }
@@ -224,7 +235,9 @@ private:
     }
 
     bool write(CookRecord& record, asset::AssetId id, asset::AssetType type, const core::Array<std::byte>& bytes) {
-        if (std::ranges::any_of(record.outputs, [&](const CookedOutput& output) { return output.id == id; })) {
+        // One ID may name two files of different types: a terrain and its heights.
+        if (std::ranges::any_of(record.outputs,
+                                [&](const CookedOutput& output) { return output.id == id && output.type == type; })) {
             diagnostics_.error(record.path.view(), "makes asset %s twice (two sub-assets with one name)",
                                asset::format_asset_id(id).c_str());
             return false;
@@ -754,6 +767,150 @@ private:
         ++stats_.cooked;
     }
 
+    // --- Terrain -----------------------------------------------------------------------------
+
+    // What a terrain's outputs depend on: its GUID, its text (which says which image), its image's bytes, its format.
+    static uint64_t terrain_input_hash(const Source& source, uint64_t source_hash, uint64_t height_hash) {
+        Hasher hasher("terrain");
+        hasher.add(source.id.value());
+        hasher.add(asset::TerrainAsset::kFormatVersion);
+        hasher.add(source_hash);
+        hasher.add(height_hash);
+        return hasher.value();
+    }
+
+    // The height image is read here, once, for its hash and its samples, so it's this source's own dependency to hash:
+    // the text says which image it is, and the text is read every time anyway.
+    void cook_terrain_source(const Source& source) {
+        const uint64_t start_ns = platform::time_ns();
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const core::Result<TerrainSource> terrain = import_terrain(path, bytes->span(), diagnostics_);
+        const core::Result<core::Array<std::byte>> height =
+            terrain ? read_source(terrain->height.view())
+                    : core::Result<core::Array<std::byte>>(core::fail(terrain.error()));
+        if (!height) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        const uint64_t input_hash =
+            terrain_input_hash(source, source_hash, core::hash_bytes(height->data(), height->size()));
+        if (const CookRecord* same = unchanged(path, input_hash); same != nullptr) {
+            keep(*same);
+            return;
+        }
+        CookRecord record{
+            .path = source.path, .guid = source.guid, .source_hash = source_hash, .input_hash = input_hash};
+        record.dependencies.push(terrain->height);
+        const core::Result<HeightImage> image =
+            decode_height_image(height->span(), terrain->height.view(), diagnostics_);
+        const core::Result<CookedTerrain> cooked =
+            image ? cook_terrain(*terrain, *image, source.id, &jobs_, path, diagnostics_)
+                  : core::Result<CookedTerrain>(core::fail(image.error()));
+        // The heights first, so a new .deterrain is never on disk before the heights it names.
+        if (!cooked || !write(record, source.id, asset::AssetType::TerrainHeights, cooked->heights) ||
+            !write(record, source.id, asset::AssetType::Terrain, cooked->terrain)) {
+            failed(path, &record);
+            return;
+        }
+        DE_LOG_INFO("cooker", "%s: %u x %u samples, %u levels, %u nodes: %.2f s; %s %.1f KB, %s %.1f MB",
+                    source.path.c_str(), image->width, image->depth, cooked->levels, cooked->nodes,
+                    static_cast<double>(platform::time_ns() - start_ns) / platform::kNsPerSecond,
+                    asset::cooked_path(source.id, asset::AssetType::Terrain).c_str(),
+                    static_cast<double>(cooked->terrain.size()) / 1024.0,
+                    asset::cooked_path(source.id, asset::AssetType::TerrainHeights).c_str(),
+                    static_cast<double>(cooked->heights.size()) / (1024.0 * 1024.0));
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
+
+    // Whether what's cooked from a terrain is whole, and from the source as it is now. Not a cook: only the height
+    // image's header is decoded, but both cooked files are read.
+    void check_cooked_terrain(const Source& source, const CookRecord& record, uint64_t input_hash) {
+        const std::string_view path = source.path.view();
+        if (record.input_hash != input_hash) {
+            diagnostics_.error(path, "its cooked files are stale: re-run the cooker");
+            return;
+        }
+        const asset::CookedPath terrain_path = asset::cooked_path(source.id, asset::AssetType::Terrain);
+        const asset::CookedPath heights_path = asset::cooked_path(source.id, asset::AssetType::TerrainHeights);
+        const core::Result<uint64_t> terrain_size = vfs_.file_size(terrain_path.c_str());
+        const core::Result<core::Array<std::byte>> heights_file = read_whole_file(vfs_, heights_path.c_str());
+        if (!terrain_size || !heights_file || heights_file->size() < sizeof(asset::AssetHeader)) {
+            diagnostics_.error(path, "%s or %s is missing or too short: re-run the cooker", terrain_path.c_str(),
+                               heights_path.c_str());
+            return;
+        }
+        // Loaded where it lies, so in memory aligned as that needs.
+        struct alignas(asset::kAssetAlignment) FileBlock {
+            std::byte bytes[asset::kAssetAlignment];
+        };
+        core::Array<FileBlock> terrain_blocks(tools_heap());
+        terrain_blocks.resize((static_cast<size_t>(*terrain_size) + asset::kAssetAlignment - 1) /
+                              asset::kAssetAlignment);
+        const std::span<std::byte> terrain_file =
+            std::as_writable_bytes(terrain_blocks.span()).first(static_cast<size_t>(*terrain_size));
+        const core::Result<size_t> terrain_read = vfs_.read_file(terrain_path.c_str(), terrain_file);
+        const core::Result<const asset::TerrainAsset*> terrain =
+            terrain_read ? asset::load_in_place<asset::TerrainAsset>(terrain_file)
+                         : core::Result<const asset::TerrainAsset*>(core::fail(terrain_read.error()));
+        if (!terrain) {
+            diagnostics_.error(path, "%s is broken (%s): re-run the cooker", terrain_path.c_str(),
+                               terrain.error().message);
+            return;
+        }
+        asset::AssetHeader header;
+        std::memcpy(&header, heights_file->data(), sizeof(header));
+        const core::Result<void> matches = (*terrain)->check_heights_header(header, heights_file->size());
+        if (!matches || !asset::verify_content_hash(heights_file->span())) {
+            diagnostics_.error(path, "%s is broken (%s): re-run the cooker", heights_path.c_str(),
+                               matches ? "its bytes don't hash as its header says" : matches.error().message);
+        }
+    }
+
+    // --check: every terrain source can be read, and what's cooked from one is whole and up to date. With nothing
+    // cooked (CI) there's nothing stale. What a cook would remove, because its source has gone, is stale too.
+    void check_terrains() {
+        for (const Source& source : tree_.sources()) {
+            if (source.kind != SourceKind::Terrain) {
+                continue;
+            }
+            const std::string_view path = source.path.view();
+            const core::Result<core::Array<std::byte>> bytes = read_source(path);
+            if (!bytes) {
+                continue;
+            }
+            const core::Result<TerrainSource> terrain = import_terrain(path, bytes->span(), diagnostics_);
+            if (!terrain) {
+                continue;
+            }
+            const core::Result<core::Array<std::byte>> height = read_source(terrain->height.view());
+            if (!height || !check_height_image(height->span(), terrain->height.view(), diagnostics_)) {
+                continue;
+            }
+            if (const CookRecord* record = previous_.find(path); record != nullptr) {
+                check_cooked_terrain(source, *record,
+                                     terrain_input_hash(source, core::hash_bytes(bytes->data(), bytes->size()),
+                                                        core::hash_bytes(height->data(), height->size())));
+            }
+        }
+        for (const CookRecord& record : previous_.records()) {
+            const bool is_terrain = std::ranges::any_of(
+                record.outputs, [](const CookedOutput& output) { return output.type == asset::AssetType::Terrain; });
+            const bool left_out = std::ranges::any_of(
+                tree_.skipped(), [&](const SourcePath& skipped) { return skipped == record.path.view(); });
+            if (is_terrain && !left_out && tree_.find(record.path.view()) == nullptr) {
+                diagnostics_.error(record.path.view(),
+                                   "is gone, and its cooked files are still there: re-run the cooker");
+            }
+        }
+    }
+
     // --- Textures ----------------------------------------------------------------------------
 
     void cook_texture_source(const Source& source) {
@@ -795,18 +952,20 @@ private:
 
     // Cooked files no source makes any more: their source was deleted, or no longer has them.
     void remove_stale() {
-        core::HashMap<uint64_t, uint8_t> live(tools_heap());
+        // By ID and type: a terrain and its heights are two files of one ID.
+        core::HashMap<asset::AssetRef, uint8_t> live(tools_heap());
         for (const CookRecord& record : next_.records()) {
             for (const CookedOutput& output : record.outputs) {
-                live.set(output.id.value(), 1);
+                live.set({.id = output.id, .type = output.type}, 1);
             }
         }
         for (const CookRecord& record : previous_.records()) {
             for (const CookedOutput& output : record.outputs) {
-                if (live.find(output.id.value()) != nullptr) {
+                const asset::AssetRef ref{.id = output.id, .type = output.type};
+                if (live.find(ref) != nullptr) {
                     continue;
                 }
-                live.set(output.id.value(), 1); // once
+                live.set(ref, 1); // once
                 const asset::CookedPath path = asset::cooked_path(output.id, output.type);
                 if (vfs_.remove_file(path.c_str()).ok()) {
                     ++stats_.removed;

@@ -181,7 +181,7 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the world has errors");
     }
-    static constexpr const char* kKeys[] = {"environment", "start", "cells"};
+    static constexpr const char* kKeys[] = {"environment", "terrain", "start", "cells"};
     reader.check_keys(kKeys, "world");
 
     const Source* environment = find_relative(tree, path, reader.string("environment", ""), SourceKind::Environment,
@@ -189,6 +189,14 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
     if (environment != nullptr) {
         build.environment = {.id = environment->id, .type = asset::AssetType::Environment};
         build.read.push(environment->path);
+    }
+    if (reader.has("terrain")) {
+        const Source* terrain = find_relative(tree, path, reader.string("terrain", ""), SourceKind::Terrain,
+                                              "a terrain source (.terrain)", diagnostics);
+        if (terrain != nullptr) {
+            build.terrain = {.id = terrain->id, .type = asset::AssetType::Terrain};
+            build.read.push(terrain->path);
+        }
     }
 
     yyjson_val* start = yyjson_obj_get(doc->root(), "start");
@@ -251,9 +259,12 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     asset.start_yaw_rad = build.start_yaw_rad;
     asset.start_pitch_rad = build.start_pitch_rad;
     asset.environment = 0;
+    const bool has_terrain = build.terrain.id.is_valid();
+    asset.terrain = has_terrain ? 1 : asset::WorldAsset::kNone;
     BlobWriter writer(sizeof(asset::WorldAsset));
     asset.cells = writer.append(build.cells.span());
-    return writer.finish(asset, id, std::span(&build.environment, 1));
+    const asset::AssetRef dependencies[] = {build.environment, build.terrain};
+    return writer.finish(asset, id, std::span(dependencies).first(has_terrain ? 2 : 1));
 }
 
 core::Result<asset::EnvironmentAsset> import_environment(const Source& source, std::span<const std::byte> bytes,
