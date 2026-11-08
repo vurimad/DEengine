@@ -222,7 +222,10 @@ def bake(heights, real_m, share, spacing_m, line_m, wind_from_deg, suns, ice_fro
     fall *= _resize(np.clip(1.35 - 0.55 * sunshine(_resize(heights, half), spacing_m * 2.0, suns), 0.15, 1.25), (rows, cols))
     # 4. Gravity, at the map's own spacing, so it runs down the gullies in streaks.
     snow = np.ascontiguousarray(fall, dtype=np.float32)
-    erosion.slide(heights.copy(), snow, spacing_m, repose_deg, iterations)
+    # On the land as it is over about 14 m (SHAPE_SAMPLES): judged at the map's own 2 m, every step and rib a few meters
+    # across bared rock, in spots and streaks rather than faces.
+    shape = _box(heights, SHAPE_SAMPLES)
+    erosion.slide(shape.copy(), snow, spacing_m, repose_deg, iterations)
 
     # 5. What each slope holds, the ice up high, and the fine relief: on rock faces, measured at the map's own spacing,
     #    so ribs stand out; on ground that's gentle over tens of meters, a glacier or a snowfield, over that much, so a
@@ -230,13 +233,13 @@ def bake(heights, real_m, share, spacing_m, line_m, wind_from_deg, suns, ice_fro
     rocky = rockiness(heights, spacing_m)
     if glacier is not None:
         rocky = rocky * (1.0 - glacier)
-    gz, gx = np.gradient(heights, spacing_m)
+    gz, gx = np.gradient(shape, spacing_m)
     slope_deg = np.degrees(np.arctan(np.hypot(gx, gz))).astype(np.float32)
     cold = np.clip((real_m - ice_from_m) / 700.0, 0.0, 1.0) * (share > 0.0)
     face = np.minimum(snow, np.interp(slope_deg, HOLD_DEG, HOLD_M).astype(np.float32))
     face = np.maximum(face, cold * np.interp(slope_deg, COAT_DEG, COAT_M).astype(np.float32))
-    hollow = 1.2 * (_box(heights, 1) - heights) + 0.6 * (_box(heights, 2) - heights) + 0.3 * (_box(heights, 6) - heights)
-    face = face + np.clip(hollow, -3.0, 3.0) * (face > 0.0)
+    # No ribs standing out of thin snow, nor hollows filling, by the land's relief: on a rugged face it moved the depth by
+    # meters, more than the snow itself, and decided snow or rock in patches.
     gz, gx = np.gradient(_box(heights, BROAD_SAMPLES), spacing_m)
     broad_deg = np.degrees(np.arctan(np.hypot(gx, gz))).astype(np.float32)
     field = np.minimum(_box(snow, BROAD_SAMPLES), np.interp(broad_deg, HOLD_DEG, HOLD_M).astype(np.float32))
@@ -252,6 +255,8 @@ def bake(heights, real_m, share, spacing_m, line_m, wind_from_deg, suns, ice_fro
 GLACIER_COVER_M = 1.0
 
 
+# What snow lies on: the land over SHAPE_SAMPLES * 2 + 1 samples (14 m at 2 m).
+SHAPE_SAMPLES = 3
 # Rock shows its ribs only where the ground is steep over BROAD_SAMPLES * 2 + 1 samples (22 m at 2 m): past
 # ROCKY_DEG[0] it starts to, past ROCKY_DEG[1] it does fully.
 BROAD_SAMPLES = 5

@@ -41,13 +41,17 @@ SUN_AZIMUTH_DEG, SUN_ELEVATION_DEG = 255.0, 11.0
 # from, which says where it lies. Used if both are there.
 WC_EXPORT = 'C:/Users/Ark/Documents/World Creator/Export/Project_Height Map_4096x4096_0_0.tif'
 WC_CUT = 'C:/Users/Ark/Documents/World Creator/RealData/Aoraki_South_4096m/Aoraki_South_4096m.json'
+# Its splat map, the same square: two layers' weights summing to 255, snow (on the steep faces) and debris (rock and
+# moraine on the gentle ground), taken for the map's snow and scree there.
+WC_SPLAT = 'C:/Users/Ark/Documents/World Creator/Export/Project_Splat Map_0_0_0.tif'
 # Snow (snow.py, after study 12): a winter's, from the real mountain's snow line (the mean winter line near Aoraki is
 # about 1,263 m), loaded by the prevailing north-westerlies and thinned on the faces a midwinter sun at 43.6 degrees
 # south sees most, low in the north. The real mountains' north is the map's -Z.
 SNOW_LINE_REAL_M = 1300.0
 SNOW_WIND_FROM_DEG = 300.0
 SNOW_SUNS = ((50.0, 10.0), (25.0, 19.0), (0.0, 23.0), (335.0, 19.0), (310.0, 10.0))
-ICE_FROM_REAL_M = 2300.0         # steep rock keeps a coat of ice from here up, all of it 700 m higher
+ICE_FROM_REAL_M = 2300.0
+USE_GLACIERS = False             # the RGI outlines' ice in the snow: off, the user's call (2026-11-08)         # steep rock keeps a coat of ice from here up, all of it 700 m higher
 SNOW_FROM_M = 700.0            # no snow below this on the map, rising in over 200 m: the field stops below 520 m
 GRASS_TO_M = (600.0, 700.0)      # and grass fades out over this, before the snow starts
 SNOW_SHOWS_M = 0.4               # snow shows from this depth up
@@ -150,6 +154,7 @@ def main():
     # data blown up holds none. Vertex i lies where the window's sample i does: 4 m sample k's centre is 2 m past 4 k,
     # and 1 m sample c's is half a meter past the 1 m data's own origin plus c.
     fine, fine_meta = fine_detail.load('D:/DE/build/terrain_raw/aoraki_1m', 'aoraki_1m')
+    wc_extent = None
     # The big mountain as World Creator left it, where the user's export covers it (local, never committed): its own
     # units fitted back to metres against the real heights under it.
     if os.path.exists(WC_EXPORT) and os.path.exists(WC_CUT):
@@ -161,6 +166,7 @@ def main():
         scale, offset, stray = fine_detail.paste_heights(fine, fine_meta, box_west, box_north, tifffile.imread(WC_EXPORT),
                                                          extent['E_min'], extent['N_max'])
         print('world creator', f'{scale:.3f} m a unit, {offset:.1f} m offset, {stray:.1f} m from the real heights (rms)')
+        wc_extent = (extent, box_west, box_north)
     fine_col0 = center_x - COLS / 2.0 * SPACING_M + aoraki_m / 2.0 - fine_meta['origin_in_aoraki_box_m'][0] - 0.5
     fine_row0 = center_z - ROWS / 2.0 * SPACING_M + aoraki_m / 2.0 - fine_meta['origin_in_aoraki_box_m'][1] - 0.5
     fine_vertices = fine_detail.vertex_heights(fine, fine_col0, fine_row0, COLS, ROWS)
@@ -196,24 +202,21 @@ def main():
     # lies below its feet here. Where they meet the field the land runs straight, so the line wanders, or it would too.
     wander = (field_noise(400.0, 1) - 0.5) * 200.0 + (field_noise(90.0, 1) - 0.5) * 60.0
     above_field = np.clip((heights - SNOW_FROM_M - wander) / 200.0, 0.0, 1.0)
-    # The real glaciers, where the mountains are the real ones: ice, which no slope bares (glaciers.py).
-    with open('D:/DE/build/terrain_raw/aoraki/aoraki.json', encoding='utf-8') as f:
-        box_west, box_north = json.load(f)['box_corners_nztm2000_en']['north_west']
-    glacier = glaciers.ice_map('D:/DE/build/terrain_raw/rgi60_nz/unpacked/18_rgi60_NewZealand.shp',
-                               box_west + center_x - COLS / 2.0 * SPACING_M + aoraki_m / 2.0,
-                               box_north - (center_z - ROWS / 2.0 * SPACING_M + aoraki_m / 2.0), SPACING_M, COLS, ROWS)
-    glacier = glacier * np.clip(mountain * 2.5, 0.0, 1.0)
+    # The real glaciers, where the mountains are the real ones: ice, which no slope bares (glaciers.py). Off: their
+    # outlines are polygons of straight segments, and the snow drew their zig-zags.
+    glacier = np.zeros_like(heights)
+    if USE_GLACIERS:
+        with open('D:/DE/build/terrain_raw/aoraki/aoraki.json', encoding='utf-8') as f:
+            box_west, box_north = json.load(f)['box_corners_nztm2000_en']['north_west']
+        glacier = glaciers.ice_map('D:/DE/build/terrain_raw/rgi60_nz/unpacked/18_rgi60_NewZealand.shp',
+                                   box_west + center_x - COLS / 2.0 * SPACING_M + aoraki_m / 2.0,
+                                   box_north - (center_z - ROWS / 2.0 * SPACING_M + aoraki_m / 2.0), SPACING_M, COLS, ROWS)
+        glacier = glacier * np.clip(mountain * 2.5, 0.0, 1.0)
     snow_depth = snow.bake(heights, real_m, mountain * above_field * above_field * (3.0 - 2.0 * above_field), SPACING_M,
                            SNOW_LINE_REAL_M, SNOW_WIND_FROM_DEG, SNOW_SUNS, ICE_FROM_REAL_M, glacier)
-    # How much of each 2 m square it covers, from its four 1 m samples: the scan's own ribs and hollows at that size, and
-    # on steep ground the ledges and joints the scan is too coarse for (snow.py).
-    gz, gx = np.gradient(heights, SPACING_M)
-    slope_deg = np.degrees(np.arctan(np.hypot(gx, gz))).astype(np.float32)
-    # The scan's ribs and hollows count only on rock faces: on a glacier they're crevasses and drifts (snow.rockiness).
-    fine_share = np.where(np.isfinite(fine_vertices), mountain * snow.rockiness(heights, SPACING_M) * (1.0 - glacier),
-                          0.0).astype(np.float32)
-    snow_cover = snow.coverage_detailed(snow_depth, SNOW_SHOWS_M, heights, SPACING_M, slope_deg, fine, fine_col0, fine_row0,
-                                        fine_share, seed=7)
+    # How much of each 2 m square it covers, from its depth alone: the scan's 1 m ribs and hollows deciding snow or rock
+    # drew its ripples as lines of rock (snow.coverage_detailed is there to bring them back).
+    snow_cover = snow.coverage(snow_depth, SNOW_SHOWS_M)
     high = (real_m > 2000.0) & (mountain > 0.9)
     print('snow: rock above 2,000 m', f'{float(np.mean(snow_depth[high] < SNOW_SHOWS_M)):.0%} by depth,',
           f'{1.0 - float(np.mean(snow_cover[high])):.0%} by cover', f'{time.time() - started:.0f}s')
@@ -237,6 +240,23 @@ def main():
     # mountains' bare ground above where grass gives out), the mountains as mountain.
     in_mountains = np.clip(mountain * 2.5, 0.0, 1.0)
     scree = np.maximum(apron, np.clip((real_m - (SNOW_LINE_REAL_M - 250.0)) / 200.0, 0.0, 1.0) * in_mountains)
+    # Where the user's World Creator square lies, its own snow and debris, as its splat map has them, faded in from its
+    # edges and only where the mountains are.
+    if wc_extent is not None and os.path.exists(WC_SPLAT):
+        import tifffile
+        extent, box_west, box_north = wc_extent
+        p0, q0 = fine_meta['origin_in_aoraki_box_m']
+        wc_col0 = box_west + p0 + fine_col0 - extent['E_min']
+        wc_row0 = extent['N_max'] - box_north + q0 + fine_row0
+        splat = tifffile.imread(WC_SPLAT).astype(np.float32) / 255.0
+        wc_snow, weight = fine_detail.at_vertices(splat[..., 0], wc_col0, wc_row0, COLS, ROWS, 200.0)
+        wc_debris, _ = fine_detail.at_vertices(splat[..., 1], wc_col0, wc_row0, COLS, ROWS, 200.0)
+        del splat
+        weight = weight * in_mountains
+        have = np.isfinite(wc_snow)
+        snow_cover = np.where(have, snow_cover + (np.nan_to_num(wc_snow) - snow_cover) * weight, snow_cover)
+        scree = np.where(have, scree + (np.nan_to_num(wc_debris) - scree) * weight, scree)
+        print('world creator splat', f'snow {float(np.mean(wc_snow[weight > 0.99])):.0%} of its square in the mountains')
     channels = [Image.fromarray((np.clip(c, 0, 1) * 255.0 + 0.5).astype(np.uint8))
                 for c in (snow_cover, np.zeros_like(heights), scree, in_mountains)]
     Image.merge('RGBA', channels).save(f'{folder}/{NAME}_details.png')

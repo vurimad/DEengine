@@ -110,3 +110,28 @@ def paste_heights(fine, fine_meta, box_west_e, box_north_n, heights, west_e, nor
     weight = t * t * (3.0 - 2.0 * t)
     fine[r0:r1, c0:c1] = np.where(known, under + (metres - under) * weight, metres)
     return float(scale), float(offset), stray
+
+
+def at_vertices(values, col0, row0, cols, rows, blend_samples):
+    """A 1 m map at a map's 2 m vertices: vertex (i, j) lies at (col0 + 2 i, row0 + 2 j) in its samples, between two
+    each way (a whole number and a half), and takes the mean of the four around it. NaN where it doesn't reach; and a
+    weight fading from 0 at its edges to 1 blend_samples in, to lay it over something else."""
+    out = np.full((rows, cols), np.nan, np.float32)
+    weight = np.zeros((rows, cols), np.float32)
+    c = col0 + 2.0 * np.arange(cols)
+    r = row0 + 2.0 * np.arange(rows)
+    lo_c = np.floor(c).astype(np.int64)
+    lo_r = np.floor(r).astype(np.int64)
+    ii = np.nonzero((lo_c >= 0) & (lo_c + 1 < values.shape[1]))[0]
+    jj = np.nonzero((lo_r >= 0) & (lo_r + 1 < values.shape[0]))[0]
+    if ii.size == 0 or jj.size == 0:
+        return out, weight
+    lc, lr = lo_c[ii], lo_r[jj]
+    v = values.astype(np.float32)
+    mean = 0.25 * (v[np.ix_(lr, lc)] + v[np.ix_(lr, lc + 1)] + v[np.ix_(lr + 1, lc)] + v[np.ix_(lr + 1, lc + 1)])
+    out[np.ix_(jj, ii)] = mean
+    inside_c = np.minimum(c[ii], values.shape[1] - 1 - c[ii])
+    inside_r = np.minimum(r[jj], values.shape[0] - 1 - r[jj])
+    t = np.clip(np.minimum(inside_r[:, None], inside_c[None, :]) / blend_samples, 0.0, 1.0)
+    weight[np.ix_(jj, ii)] = (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+    return out, weight

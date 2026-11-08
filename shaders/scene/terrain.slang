@@ -154,6 +154,31 @@ float value_noise(float2 at)
     return lerp(lerp(hash(cell), hash(cell + float2(1.0, 0.0)), t.x), lerp(hash(cell + float2(0.0, 1.0)), hash(cell + float2(1.0, 1.0)), t.x), t.y);
 }
 
+// A texture read along a cubic B-spline through its texels (four bilinear reads): smooth, with no corners at the texels.
+float4 sample_smooth(Texture2D texture, SamplerState linear, float2 uv)
+{
+    uint width;
+    uint height;
+    uint mips;
+    texture.GetDimensions(0, width, height, mips);
+    const float2 size = float2(width, height);
+    const float2 at = uv * size - 0.5;
+    const float2 cell = floor(at);
+    const float2 f = at - cell;
+    const float2 f2 = f * f;
+    const float2 f3 = f2 * f;
+    const float2 w0 = (1.0 - 3.0 * f + 3.0 * f2 - f3) / 6.0;
+    const float2 w1 = (4.0 - 6.0 * f2 + 3.0 * f3) / 6.0;
+    const float2 w2 = (1.0 + 3.0 * f + 3.0 * f2 - 3.0 * f3) / 6.0;
+    const float2 w3 = f3 / 6.0;
+    const float2 g0 = w0 + w1;
+    const float2 g1 = w2 + w3;
+    const float2 h0 = (cell - 0.5 + w1 / g0) / size;
+    const float2 h1 = (cell + 1.5 + w3 / g1) / size;
+    return g0.y * (g0.x * texture.SampleLevel(linear, float2(h0.x, h0.y), 0.0) + g1.x * texture.SampleLevel(linear, float2(h1.x, h0.y), 0.0)) +
+           g1.y * (g0.x * texture.SampleLevel(linear, float2(h0.x, h1.y), 0.0) + g1.x * texture.SampleLevel(linear, float2(h1.x, h1.y), 0.0));
+}
+
 // --- Painted ground ---------------------------------------------------------------------------------------------------
 
 // The ground's color worked out per pixel, as terrain tools paint theirs (the look's "colors": masks over the whole map
@@ -678,9 +703,15 @@ GBufferOutput fragment_main(VertexOutput input)
     {
         const Texture2D details_texture = texture_2d(push.materials[push.details_material].metallic_roughness_texture);
         const SamplerState clamped = sampler_state(kSamplerLinearClamp);
-        details = details_texture.SampleGrad(clamped, uv, uv_dx, uv_dy);
-        details_width = fwidth(details);
         details_far = saturate(details_texture.CalculateLevelOfDetail(clamped, uv));
+        details = details_texture.SampleGrad(clamped, uv, uv_dx, uv_dy);
+        if (details_far < 1.0)
+        {
+            // Up close, where a texel spans pixels, a smooth curve through the texels rather than straight lines between
+            // them: a sharp rule through straight lines draws the grid's stairs, and a lone texel's square.
+            details = lerp(sample_smooth(details_texture, clamped, uv), details, details_far);
+        }
+        details_width = fwidth(details);
     }
     // The painted ground, where the look has it: its color per pixel, and the snow over it, its edge broken up close by
     // noise finer than the 2 m snow map, so it's crisp rather than stepped.
