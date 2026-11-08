@@ -1,5 +1,6 @@
 #pragma once
 
+#include "asset/asset_id.h"
 #include "core/array.h"
 #include "core/math.h"
 
@@ -21,6 +22,7 @@ struct SceneSea {
 struct SceneWater {
     bool sea = false;
     double sea_level_m = 0.0; // world space
+    asset::AssetId shore;     // the sea's shore map, a material (tools/worldgen/shore.py); none: open water everywhere
 };
 
 // The water's mesh: kWaterLevels square grids around the camera, each kWaterLevelQuads squares across, the first

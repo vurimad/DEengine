@@ -35,7 +35,7 @@ public struct SceneFrame
     public uint2 terrain_light;        // x: the map's material slot, y: 1 if there is one
     public uint2 terrain_origin_steps; // the terrain's corner, in render steps
     public uint2 terrain_size_steps;
-    public uint2 light_padding;
+    public float2 sea; // x: the sea's level, relative to the render origin; y: 1 if there is one
 };
 
 public static const uint kCascadeCount = 4;

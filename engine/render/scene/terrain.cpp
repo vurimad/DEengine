@@ -1041,6 +1041,16 @@ bool Terrain::light_map(uint32_t& slot, uint32_t (&origin_steps)[2], uint32_t (&
     return true;
 }
 
+bool Terrain::extent(uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const {
+    const TerrainState& state = *state_;
+    if (state.terrain == nullptr) {
+        return false;
+    }
+    std::copy_n(state.origin_steps, 2, origin_steps);
+    std::copy_n(state.size_steps, 2, size_steps);
+    return true;
+}
+
 void Terrain::update(const DVec3& camera) {
     DE_PROFILE_ZONE("Terrain::update");
     TerrainState& state = *state_;

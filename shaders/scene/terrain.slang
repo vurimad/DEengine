@@ -727,6 +727,13 @@ GBufferOutput fragment_main(VertexOutput input)
                                                  float3(0.8, 0.35, 0.95), float3(0.2, 0.9, 0.9), float3(1.0, 1.0, 1.0), float3(0.5, 0.5, 0.5)};
         base = tints[input.level] * (0.35 + 0.65 * saturate(geometric.y));
     }
+    // Wet just above the sea, where the waves wash up and the spray reaches: darker and smoother.
+    if (push.frame.sea.y > 0.0)
+    {
+        const float wet = 1.0 - smoothstep(push.frame.sea.x + 0.3, push.frame.sea.x + 2.2, input.from_origin.y);
+        base *= lerp(1.0, 0.55, wet);
+        roughness = lerp(roughness, 0.35, wet);
+    }
     // How much sky the land around lets this place see: valleys and the feet of cliffs darken, at any distance.
     occlusion *= lerp(1.0, terrain_light(push.frame, input.from_origin).sky, 0.9);
     GBufferOutput output;

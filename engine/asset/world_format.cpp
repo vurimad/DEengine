@@ -39,6 +39,10 @@ core::Result<void> WorldAsset::validate(std::span<const std::byte> file) const {
     if (sea > 1 || !std::isfinite(sea_level_m) || std::abs(sea_level_m) > kMostSeaLevelM) {
         return core::fail(ErrorCode::CorruptData, "world's sea is out of range");
     }
+    if (sea_shore != kNone &&
+        (sea == 0 || sea_shore >= dependencies.size() || dependencies[sea_shore].type != AssetType::Material)) {
+        return core::fail(ErrorCode::CorruptData, "world's shore map isn't a material among its dependencies, or has no sea");
+    }
     return {};
 }
 

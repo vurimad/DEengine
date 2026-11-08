@@ -114,6 +114,8 @@ public:
     // The light map the frame carries (shaders/scene/terrain_light.slang): its material's slot, and the terrain's corner
     // and size in render steps. False while there is none, or it hasn't loaded.
     bool light_map(uint32_t& slot, uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const;
+    // Where the terrain lies, in render steps: its corner and its size. False (left as they are) without one.
+    bool extent(uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const;
 
     // A frame's streaming: collects what's been read, publishes what's been uploaded, and starts what's wanted most.
     // No allocation per frame once it's settled.

@@ -2,13 +2,17 @@
 // depth and motion, so the fog and TAA take it as any surface. What's behind it is read from copies made just before
 // (water_behind.slang): seen through it, bent a little by its slopes, dimmed by how much water the light crossed and
 // replaced by the light the water itself scatters (clear in the shallows, its own deep color farther down), then the
-// sky and the sun reflected on top as Fresnel says.
+// sky and the sun reflected on top as Fresnel says, light through thin crests, and foam.
 //
 // The mesh: square levels of a grid around the camera, each twice the spacing of the one inside it (water.h), moved by
 // the ocean's waves (ocean.slang): three tiles, summed. Toward a level's edge its vertices morph into the next level's,
 // and so does how finely they read the waves, so neighbouring levels meet without a crack. The slopes, read per pixel,
 // give the normal; how much of them the mips averaged away gives the roughness, so far off the sun's glitter spreads
 // as it does over waves too small to see.
+//
+// The shore (the sea's shore map, tools/worldgen/shore.py: distance to land, depth, the way to land): the waves feel the
+// bottom, growing as it shallows and dying out at the waterline; surf, the swell's sets, runs in toward the land, its
+// crests white where they break and against cliffs, leaving foam that thins seaward; the water's edge foams.
 
 import common.bindless;
 import scene.brdf;
@@ -36,8 +40,12 @@ struct WaterPush
     uint waves;          // the ocean's, this frame (sampled arrays, a layer per tile)
     uint previous_waves; // last frame's, for motion
     uint slopes;
-    uint padding;
+    uint shore_material; // the shore map's material slot, if has_shore
     float2 tile_offset[3]; // where the render origin is in each tile, as a share of it
+    uint has_shore;
+    float surf_period_s; // the surf's sets: the swell's period
+    float surf_height_m; // their height, out where they start to feel the bottom
+    uint padding;
 };
 
 [[vk::push_constant]]
@@ -45,9 +53,10 @@ ConstantBuffer<WaterPush> push;
 
 static const uint kLevelQuads = 96; // kWaterLevelQuads
 static const uint kSide = kLevelQuads + 1;
-static const uint kTiles = 3;                                 // kOceanCascades
-static const float kTileM[3] = {640.0, 101.0, 17.3};          // kOceanTileM
-static const float kTexels = 256.0;                           // kOceanSize
+static const uint kLevels = 12;                       // kWaterLevels
+static const uint kTiles = 3;                         // kOceanCascades
+static const float kTileM[3] = {640.0, 101.0, 17.3};  // kOceanTileM
+static const float kTexels = 256.0;                   // kOceanSize
 // Toward a level's edge, from this share of its half-width on, its vertices morph into the next level's.
 static const float kMorphFrom = 0.8;
 static const float kMorphTo = 0.95;
@@ -61,13 +70,28 @@ static const float kFarPathM = 2000.0; // the path through the water where nothi
 static const float kMostColumnM = 60.0;
 static const float kSmoothest = 0.02;  // the sun's glitter on water as smooth as it gets (GGX alpha)
 static const float kRefractPixels = 48.0; // how far the slopes bend what's seen through, at most
-static const float3 kFoamColor = float3(0.85, 0.87, 0.88);
+static const float3 kFoamColor = float3(0.82, 0.85, 0.86);
+static const float3 kCrestColor = float3(0.10, 0.45, 0.38); // light through a thin crest: green-blue
+
+// The shore map (tools/worldgen/shore.py).
+static const float kShoreReachM = 255.0;
+static const float kShoreDepthM = 64.0;
+// The surf: how long its waves are near the shore, where they start to rise out of the open sea's, how far crests
+// still break white against a cliff, and how far the foam they leave drifts seaward.
+static const float kSurfWavelengthM = 70.0;
+static const float kSurfFromM = 200.0;
+static const float kSurfFullM = 70.0;
+static const float kWallFoamM = 18.0;
+static const float kTrailFoamM = 90.0;
+static const float kPeriodS = 256.0; // the wind's period, which wave_time wraps to
+static const float kTwoPi = 6.28318531;
 
 struct VertexOutput
 {
     float4 position : SV_Position;
     float3 from_origin : FROM_ORIGIN; // the moved surface
     float2 grid : GRID;               // where it came from on the sea's plane, x and z: what the slopes are read at
+    float height : WAVE_HEIGHT;       // how far the waves lifted it
     float4 jittered : JITTERED;       // as drawn, for points behind it from their depth
     float4 clip : CLIP;
     float4 previous_clip : PREVIOUS_CLIP;
@@ -78,6 +102,110 @@ struct WaterOutput
     float4 color : SV_Target0;
     float2 motion : SV_Target1;
 };
+
+// --- Noise -----------------------------------------------------------------------------------------------------------
+
+float hash(float2 at)
+{
+    float3 p = frac(float3(at.xyx) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return frac((p.x + p.y) * p.z);
+}
+
+float value_noise(float2 at)
+{
+    const float2 cell = floor(at);
+    float2 t = at - cell;
+    t = t * t * (3.0 - 2.0 * t);
+    return lerp(lerp(hash(cell), hash(cell + float2(1.0, 0.0)), t.x), lerp(hash(cell + float2(0.0, 1.0)), hash(cell + float2(1.0, 1.0)), t.x), t.y);
+}
+
+// --- The shore -------------------------------------------------------------------------------------------------------
+
+struct Shore
+{
+    float distance_m; // to land at the sea's level
+    float depth_m;
+    float2 to_land;   // the way there, x and z
+};
+
+// Where there's no map, or past it: open, deep water.
+Shore shore_at(float2 xz)
+{
+    Shore shore;
+    shore.distance_m = 1e4;
+    shore.depth_m = 1e3;
+    shore.to_land = float2(0.0, -1.0);
+    if (push.has_shore == 0u)
+    {
+        return shore;
+    }
+    SceneFrame* frame = push.frame;
+    const float2 from_corner = xz + float2(int2(frame.render_origin_steps.xz - frame.terrain_origin_steps)) * kMetersPerRenderStep;
+    const float2 uv = from_corner / (float2(frame.terrain_size_steps) * kMetersPerRenderStep);
+    if (any(uv < 0.0) || any(uv > 1.0))
+    {
+        return shore;
+    }
+    const uint texture = frame.materials[push.shore_material].metallic_roughness_texture;
+    const float4 map = texture_2d(texture).SampleLevel(sampler_state(kSamplerLinearClamp), uv, 0.0);
+    shore.distance_m = map.r >= 0.999 ? 1e4 : map.r * kShoreReachM;
+    shore.depth_m = map.g >= 0.999 ? 1e3 : map.g * kShoreDepthM;
+    const float2 way = map.ba * 2.0 - 1.0;
+    shore.to_land = dot(way, way) > 1e-4 ? normalize(way) : float2(0.0, -1.0);
+    return shore;
+}
+
+// How the waves feel the bottom: higher as it shallows (Green's law, a quarter power of the depth), down to nothing at
+// the waterline.
+float shoaling(Shore shore)
+{
+    return clamp(pow(max(shore.depth_m, 0.5) / 20.0, -0.25), 1.0, 1.5) * saturate(shore.depth_m / 1.5);
+}
+
+struct Surf
+{
+    float height;     // m
+    float push;       // m, toward land
+    float2 slope;     // x, z
+    float crest;      // 0 to 1: 1 on a crest
+    float phase;      // in turns: 0 on a crest, rising seaward behind it
+    float strength;   // 0 to 1: how much surf there is here
+};
+
+// The swell's sets running in toward the land: one long wave along the way to land, its crests sharpened, rising out
+// of the open sea's from kSurfFromM in and breaking up against the shore; its time rounded to repeat with the wind's.
+Surf surf_at(float2 xz, Shore shore, float time_s)
+{
+    Surf surf;
+    surf.height = 0.0;
+    surf.push = 0.0;
+    surf.slope = float2(0.0);
+    surf.crest = 0.0;
+    surf.phase = 1.0;
+    surf.strength = smoothstep(kSurfFromM, kSurfFullM, shore.distance_m);
+    if (surf.strength <= 0.0 || push.surf_height_m <= 0.0)
+    {
+        return surf;
+    }
+    const float base = kTwoPi / kPeriodS;
+    const float omega = max(round(kTwoPi / max(push.surf_period_s, 1.0) / base), 1.0) * base;
+    const float k = kTwoPi / kSurfWavelengthM;
+    // Along the shore the sets come and go, and arrive a little out of step.
+    const float along = value_noise(xz / 260.0);
+    const float phase = k * shore.distance_m + omega * time_s + along * 2.5;
+    const float c = 0.5 + 0.5 * cos(phase);
+    const float amplitude = push.surf_height_m * surf.strength * (0.55 + 0.45 * along);
+    surf.height = amplitude * (c * c - 0.33);
+    surf.push = amplitude * 0.6 * sin(phase);
+    // d(height)/d(phase) times d(phase)/d(xz): the phase grows away from land.
+    surf.slope = (-amplitude * c * sin(phase)) * k * -shore.to_land;
+    surf.crest = c * c * c * c;
+    surf.phase = frac(phase / kTwoPi);
+    return surf;
+}
+
+// --- Waves -----------------------------------------------------------------------------------------------------------
 
 // Where a point of the plane lies in a tile's texture.
 float3 tile_uv(float2 xz, uint tile)
@@ -99,6 +227,20 @@ float3 displacement(uint waves, float2 xz, float spacing_m)
     return sum;
 }
 
+// Where a point of the plane is moved to, by the open sea's waves as the bottom lets them be and by the surf.
+float3 moved(uint waves, float2 xz, float spacing_m, Shore shore, float time_s)
+{
+    float3 offset = float3(0.0);
+    if (push.has_waves != 0u)
+    {
+        offset = displacement(waves, xz, spacing_m) * shoaling(shore);
+    }
+    const Surf surf = surf_at(xz, shore, time_s);
+    offset.y += surf.height * saturate(shore.depth_m / 1.5);
+    offset.xz += surf.push * shore.to_land * saturate(shore.depth_m / 1.5);
+    return offset;
+}
+
 [shader("vertex")]
 VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint level_id: SV_VulkanInstanceID)
 {
@@ -106,27 +248,44 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint level_id: SV_Vu
     const float2 grid = float2(float(vertex_id % kSide), float(vertex_id / kSide)) - float(kLevelQuads / 2);
     // Toward the edge, every other vertex slides onto its even neighbour: the next level's vertices, and its edges.
     const float edge = max(abs(grid.x), abs(grid.y)) / float(kLevelQuads / 2);
-    const float morph = level_id + 1 < 12 ? saturate((edge - kMorphFrom) / (kMorphTo - kMorphFrom)) : 0.0;
+    const float morph = level_id + 1 < kLevels ? saturate((edge - kMorphFrom) / (kMorphTo - kMorphFrom)) : 0.0;
     const float2 odd = grid - 2.0 * floor(grid * 0.5);
     const float2 xz = level.center + (grid - odd * morph) * level.spacing_m;
-    float3 moved = float3(0.0);
-    float3 moved_before = float3(0.0);
-    if (push.has_waves != 0u)
-    {
-        const float spacing = level.spacing_m * (1.0 + morph);
-        moved = displacement(push.waves, xz, spacing);
-        moved_before = displacement(push.previous_waves, xz, spacing);
-    }
-    const float4 world = float4(xz.x + moved.x, push.sea_level + moved.y, xz.y + moved.z, 1.0);
-    const float4 before = float4(xz.x + moved_before.x, push.sea_level + moved_before.y, xz.y + moved_before.z, 1.0);
+    const float spacing = level.spacing_m * (1.0 + morph);
+    const Shore shore = shore_at(xz);
+    const float3 now = moved(push.waves, xz, spacing, shore, push.frame.wind_field.z);
+    const float3 before = moved(push.previous_waves, xz, spacing, shore, push.frame.wind_field.w);
+    const float4 world = float4(xz.x + now.x, push.sea_level + now.y, xz.y + now.z, 1.0);
+    const float4 last = float4(xz.x + before.x, push.sea_level + before.y, xz.y + before.z, 1.0);
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, world);
     output.jittered = output.position;
     output.clip = mul_rows(push.frame.unjittered_view_proj, world);
-    output.previous_clip = mul_rows(push.frame.previous_view_proj, before);
+    output.previous_clip = mul_rows(push.frame.previous_view_proj, last);
     output.from_origin = world.xyz;
     output.grid = xz;
+    output.height = now.y;
     return output;
+}
+
+// --- Shading ---------------------------------------------------------------------------------------------------------
+
+// Foam as bubbles and streaks rather than paint: coverage 0 to 1 into how much of the pixel is white, the pattern fading
+// to its mean where it's finer than the pixel.
+float foam_pattern(float2 xz, float coverage, float footprint_m, float time_s)
+{
+    if (coverage <= 0.0)
+    {
+        return 0.0;
+    }
+    const float2 drift = float2(0.13, 0.07) * time_s;
+    const float fine = value_noise((xz + drift) / 0.35);
+    const float mid = value_noise((xz - drift * 0.5) / 1.2);
+    const float broad = value_noise(xz / 5.0);
+    const float detail = 1.0 - smoothstep(0.15, 0.6, footprint_m);
+    const float pattern = lerp(0.5, 0.35 * fine + 0.4 * mid, detail) + 0.25 * broad;
+    const float edge = lerp(0.5, 0.12, detail);
+    return smoothstep(1.0 - coverage - edge, 1.0 - coverage + edge, pattern) * saturate(coverage * 3.0);
 }
 
 [shader("fragment")]
@@ -136,13 +295,19 @@ WaterOutput fragment_main(VertexOutput input)
     const int2 texel = int2(input.position.xy);
     const float3 p = input.from_origin;
     const float3 to_camera = frame.camera_position.xyz - p;
-    const float3 v = normalize(to_camera);
+    const float distance_m = length(to_camera);
+    const float3 v = to_camera / distance_m;
     const float3 l = frame.sun_direction.xyz;
+    const float time_s = frame.wind_field.z;
+    const float footprint_m = max(length(ddx(input.grid)), length(ddy(input.grid)));
+    const Shore shore = shore_at(input.grid);
+    const float shoal = shoaling(shore);
+    const Surf surf = surf_at(input.grid, shore, time_s);
 
     // The slopes, summed over the tiles, and what the mips averaged away of them: the roughness that's left.
     float2 slope = float2(0.0);
     float variance = 0.0;
-    float foam = 0.0;
+    float whitecaps = 0.0;
     if (push.has_waves != 0u)
     {
         const Texture2DArray texture = texture_2d_array(push.slopes);
@@ -152,15 +317,16 @@ WaterOutput fragment_main(VertexOutput input)
             const float4 s = texture.Sample(filtered, tile_uv(input.grid, tile));
             slope += s.xy;
             variance += max(s.z - dot(s.xy, s.xy), 0.0);
-            foam = max(foam, s.w);
+            whitecaps = max(whitecaps, s.w);
         }
     }
+    slope = slope * shoal + surf.slope * saturate(shore.depth_m / 1.5);
     float3 n = normalize(float3(-slope.x, 1.0, -slope.y));
     if (v.y < 0.0)
     {
         n = -n; // from below
     }
-    const float a = sqrt(kSmoothest * kSmoothest + variance); // GGX's alpha: its square is the slopes' variance
+    const float a = sqrt(kSmoothest * kSmoothest + variance * shoal * shoal); // GGX's alpha: its square, the variance
 
     // What's behind, and how much water the light crossed to reach the eye from it: down to it and back up along the
     // view. Nothing behind (past the land's edge): deep water. What's seen through is bent by the slopes, unless
@@ -171,11 +337,10 @@ WaterOutput fragment_main(VertexOutput input)
     if (behind_depth > 0.0)
     {
         const float3 behind = position_from_depth(frame, input.jittered.xy / input.jittered.w, behind_depth);
-        column_m = clamp(push.sea_level - behind.y, 0.0, kMostColumnM);
+        column_m = clamp(p.y - behind.y, 0.0, kMostColumnM);
         path_m = length(behind - p) + column_m;
     }
     const int2 size = int2(texture_size(push.behind_color));
-    const float distance_m = length(to_camera);
     int2 bent = clamp(texel + int2(n.xz * kRefractPixels * saturate(path_m / 4.0) / (1.0 + distance_m / 30.0)),
                       int2(0), size - 1);
     if (load_texture(push.behind_depth, bent).r > input.position.z)
@@ -211,9 +376,29 @@ WaterOutput fragment_main(VertexOutput input)
                            f_schlick(float3(0.02), saturate(dot(v, h))) * n_dot_l;
     float3 color = lerp(refracted, reflected, fresnel) + glitter;
 
-    // Foam where the surface folds, lit as a rough white surface.
+    // Light through a crest seen against the sun: on the high, tilted faces of the waves, where they're thin.
+    const float backlit = pow(saturate(dot(-v, l)), 4.0) * saturate(dot(n, -l) * 0.5 + 0.5);
+    const float crest_face = saturate(input.height / 1.5) * saturate(length(slope) * 5.0);
+    color += kCrestColor * sun * backlit * crest_face * (1.0 - fresnel) * 0.3;
+
+    // Foam: whitecaps where the open sea's waves fold (more where it shallows), surf white on its crests as it breaks
+    // and against cliffs, the foam it leaves thinning seaward behind each crest, and the water's very edge.
+    // Along the shore the white water comes and goes in patches; its foam lies in streaks along the crests that left it.
+    const float2 along_shore = float2(-shore.to_land.y, shore.to_land.x);
+    const float along_m = dot(input.grid, along_shore);
+    const float patches = 0.45 + 0.9 * value_noise(float2(along_m / 70.0, shore.distance_m / 40.0));
+    const float breaking = saturate(1.0 - shore.depth_m / 4.0) * surf.crest;
+    const float wall = exp(-shore.distance_m / kWallFoamM) * (0.5 + 0.5 * surf.crest) * surf.strength * patches;
+    const float trail = exp(-surf.phase * 3.0) * exp(-shore.distance_m / kTrailFoamM) * surf.strength * patches;
+    const float edge = 1.0 - smoothstep(0.05, 0.6, column_m);
+    const float surf_foam = saturate(wall + trail * 0.9);
+    const float open_foam = saturate(max(whitecaps * shoal, max(breaking, edge * 0.7)));
+    // The surf's foam read in streaks: stretched along the shore, drifting seaward.
+    const float2 streaks = float2(along_m / 3.0, (shore.distance_m - time_s * 0.4) / 0.8);
+    const float foam = max(foam_pattern(input.grid, open_foam, footprint_m, time_s),
+                           foam_pattern(streaks, surf_foam, footprint_m / 0.8, time_s * 0.2));
     const float3 foam_light = frame.sky_color.rgb + sun * saturate(dot(n, l) * 0.6 + 0.4);
-    color = lerp(color, kFoamColor * foam_light, saturate(foam));
+    color = lerp(color, kFoamColor * foam_light, foam);
 
     WaterOutput output;
     output.color = float4(min(color, kHalfMax), 1.0);

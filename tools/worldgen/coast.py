@@ -20,6 +20,7 @@ from PIL import Image  # noqa: E402
 import fine as fine_detail  # noqa: E402
 import glaciers  # noqa: E402
 import lightbake  # noqa: E402
+import shore  # noqa: E402
 import snow  # noqa: E402
 import worldgen as wg  # noqa: E402
 from realtest import load, window  # noqa: E402
@@ -228,6 +229,7 @@ def main():
         json.dump({'textures': {'metallic_roughness': f'{NAME}_details.png'}}, f, indent=1)
     four = np.asarray(Image.fromarray(heights).resize((COLS // 2, ROWS // 2), Image.BILINEAR), dtype=np.float32)
     lightbake.write_light_map(folder, NAME, four, SPACING_M * 2.0, SUN_AZIMUTH_DEG, SUN_ELEVATION_DEG)
+    shore.write_shore_map(folder, NAME, heights, SPACING_M, 0.0)
     # The ground's normal at 1 m: the mesh's, with the mountains' 1 m detail back on it.
     size = fine_detail.write_normal_map(f'{folder}/{NAME}_normals_tmp.png', heights, SPACING_M, fine, fine_vertices, fine_col0,
                                         fine_row0, (mountain * ALPINE_RELIEF).astype(np.float32))
@@ -277,12 +279,14 @@ def main():
     # The sea, from 10 m above it half a kilometer out: into the low sun, and away from it toward the cliffs.
     views += [f'sea_sun {mid:.1f} 10.0 {edge_mid + 500.0:.1f} 105.0 -3.0',
               f'sea_cliffs {mid:.1f} 10.0 {edge_mid + 500.0:.1f} -20.0 4.0']
+    # From the cliff's edge on the headland west of the middle, down along the cliffs to their foot and the surf.
+    views.append(view('cliff_down', 5600.0, float(coast[int(5600.0 / SPACING_M)]) - 12.0, -80.0, -28.0))
     with open(f'{out}/{NAME}.views', 'w', encoding='utf-8') as f:
         f.write('\n'.join(views) + '\n')
     start = views[0].split()
     with open(f'{out}/{NAME}.world', 'w', encoding='utf-8') as f:
         json.dump({'environment': f'{NAME}.environment', 'terrain': f'{NAME}.terrain', 'terrain_layers': f'{NAME}.terrainlayers',
-                   'sea': {'level_m': 0.0},
+                   'sea': {'level_m': 0.0, 'shore': f'layers/masks/{NAME}_shore.material'},
                    'start': {'position': [float(start[1]), float(start[2]), float(start[3])], 'yaw_deg': float(start[4]),
                              'pitch_deg': float(start[5])}, 'cells': []}, f, indent=1)
     print('\n'.join(views))

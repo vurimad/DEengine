@@ -65,7 +65,7 @@ struct SceneFrame {
     uint32_t terrain_light[2] = {};
     uint32_t terrain_origin_steps[2] = {};
     uint32_t terrain_size_steps[2] = {};
-    uint32_t padding[2] = {};
+    float sea[2] = {}; // the sea's level, relative to the render origin, and 1 if there is one
 };
 static_assert(sizeof(SceneFrame) <= 1024);
 
@@ -291,8 +291,12 @@ struct WaterPush {
     uint32_t waves = 0;
     uint32_t previous_waves = 0;
     uint32_t slopes = 0;
-    uint32_t padding = 0;
+    uint32_t shore_material = 0; // the shore map's material slot, if has_shore
     float tile_offset[kOceanCascades][2] = {};
+    uint32_t has_shore = 0;
+    float surf_period_s = 0.0f; // the surf's sets: the swell's period
+    float surf_height_m = 0.0f; // their height, where they start to feel the bottom
+    uint32_t padding = 0;
 };
 static_assert(sizeof(WaterPush) <= 128);
 
@@ -1308,11 +1312,20 @@ struct SceneRendererState {
         scene.fog_range[2] = kFroxelSliceOffsetM;
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
         write_wind(lighting.wind, frame, scene);
+        if (gpu_assets != nullptr) {
+            scene.materials = gpu_assets->material_table_address();
+        }
+        if (terrain) {
+            terrain->extent(scene.terrain_origin_steps, scene.terrain_size_steps);
+        }
         if (uint32_t slot = 0; terrain && gpu_assets != nullptr &&
                                terrain->light_map(slot, scene.terrain_origin_steps, scene.terrain_size_steps)) {
-            scene.materials = gpu_assets->material_table_address();
             scene.terrain_light[0] = slot;
             scene.terrain_light[1] = 1;
+        }
+        if (water.sea) {
+            scene.sea[0] = static_cast<float>(water.sea_level_m - frame.origin.y);
+            scene.sea[1] = 1.0f;
         }
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         if (water.sea) {
@@ -2424,10 +2437,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             ocean = state.ocean->add_pass(graph, lighting.sea, lighting.wind.speed_mps, lighting.wind.direction,
                                           frame.time_s, frame.time_s - frame.previous_time_s, frame.origin);
         }
+        // The shore map, once it's all in (a default texture standing in would read as a shore everywhere).
+        uint32_t shore_slot = 0;
+        if (state.water.shore.is_valid() && state.gpu_assets->material_complete(state.water.shore)) {
+            shore_slot = state.gpu_assets->material_slot(state.water.shore);
+        }
+        // The surf: the swell's sets, about half its height where they start to feel the bottom; with no swell, the
+        // wind's own waves breaking.
+        const SceneSea& sea = lighting.sea;
+        const float wind_waves_m = 0.21f * lighting.wind.speed_mps * lighting.wind.speed_mps / 9.81f;
         WaterPush water_push{.frame = frame_address,
                              .levels = frame_address + kWaterLevelsOffset,
                              .sea_level = sea_level,
-                             .has_waves = ocean.valid ? 1U : 0U};
+                             .has_waves = ocean.valid ? 1U : 0U,
+                             .shore_material = shore_slot,
+                             .has_shore = shore_slot != 0 ? 1U : 0U,
+                             .surf_period_s = sea.swell_height_m > 0.0f ? sea.swell_period_s : 6.0f,
+                             .surf_height_m = std::max(0.5f * sea.swell_height_m, 0.4f * wind_waves_m)};
         for (uint32_t c = 0; c < kOceanCascades; ++c) {
             water_push.tile_offset[c][0] = ocean.tile_offset[c][0];
             water_push.tile_offset[c][1] = ocean.tile_offset[c][1];
