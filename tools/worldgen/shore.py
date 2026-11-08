@@ -1,9 +1,12 @@
 """The shore map: what the water needs to know of the land under it and around it (shaders/scene/water.slang reads it),
-over the whole terrain at a few meters a texel, as a material's metallic-roughness texture the world's sea names:
+over the whole terrain at a few meters a texel, as a material's metallic-roughness texture the world's sea names. It's
+read texel by texel and filtered by the shader, so it isn't compressed (meta/.../_folder.json: "*_shore.*"):
 
-    r: distance to the nearest land at the sea's level, over REACH_M (1 at REACH_M or more; 0 on land)
-    g: the water's depth, over DEPTH_M (0 on land)
-    b, a: the way to that land, x and z, at 0.5 + 0.5 x: where waves near the shore run
+    r, g: distance to the nearest land at the sea's level, in centimeters, high byte then low (0 on land, up to 655 m)
+    b: the water's depth, over DEPTH_M (0 on land)
+    a: 1
+
+The way to land is the distance's own slope.
 
 Waves grow and steepen as the water shallows, run in toward the shore and break white against it, and leave foam
 drifting off it, all from these.
@@ -14,56 +17,63 @@ import numba
 import numpy as np
 from PIL import Image
 
-REACH_M = 255.0
+DISTANCE_STEP_M = 0.01
 DEPTH_M = 64.0
 
 
 @numba.njit(cache=True)
+def _squared_1d(f, out, v, z):
+    """Felzenszwalb and Huttenlocher's distance transform of one line of squared distances: the lower envelope of the
+    parabolas rooted at each sample."""
+    n = f.shape[0]
+    k = 0
+    v[0] = 0
+    z[0] = -1e30
+    z[1] = 1e30
+    for q in range(1, n):
+        s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
+        while s <= z[k]:
+            k -= 1
+            s = ((f[q] + q * q) - (f[v[k]] + v[k] * v[k])) / (2.0 * q - 2.0 * v[k])
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = 1e30
+    k = 0
+    for q in range(n):
+        while z[k + 1] < q:
+            k += 1
+        out[q] = (q - v[k]) * (q - v[k]) + f[v[k]]
+
+
+@numba.njit(cache=True)
 def _distance(land, cell_m):
-    """Distance to the nearest land cell, in meters: two chamfer passes over 8 neighbours (within 8% of exact)."""
+    """Exact distance to the nearest land cell, in meters: squared distances along rows, then along columns."""
     rows, cols = land.shape
-    far = 1e9
-    d = np.empty((rows, cols), np.float32)
+    far = 1e18
+    d = np.empty((rows, cols), np.float64)
+    longest = max(rows, cols)
+    line = np.empty(longest, np.float64)
+    out = np.empty(longest, np.float64)
+    v = np.empty(longest, np.int64)
+    z = np.empty(longest + 1, np.float64)
     for r in range(rows):
         for c in range(cols):
-            d[r, c] = 0.0 if land[r, c] else far
-    straight = cell_m
-    diagonal = cell_m * 1.41421356
+            line[c] = 0.0 if land[r, c] else far
+        _squared_1d(line[:cols], out[:cols], v, z)
+        for c in range(cols):
+            d[r, c] = out[c]
+    for c in range(cols):
+        for r in range(rows):
+            line[r] = d[r, c]
+        _squared_1d(line[:rows], out[:rows], v, z)
+        for r in range(rows):
+            d[r, c] = out[r]
+    result = np.empty((rows, cols), np.float32)
     for r in range(rows):
         for c in range(cols):
-            v = d[r, c]
-            if r > 0:
-                v = min(v, d[r - 1, c] + straight)
-                if c > 0:
-                    v = min(v, d[r - 1, c - 1] + diagonal)
-                if c < cols - 1:
-                    v = min(v, d[r - 1, c + 1] + diagonal)
-            if c > 0:
-                v = min(v, d[r, c - 1] + straight)
-            d[r, c] = v
-    for r in range(rows - 1, -1, -1):
-        for c in range(cols - 1, -1, -1):
-            v = d[r, c]
-            if r < rows - 1:
-                v = min(v, d[r + 1, c] + straight)
-                if c < cols - 1:
-                    v = min(v, d[r + 1, c + 1] + diagonal)
-                if c > 0:
-                    v = min(v, d[r + 1, c - 1] + diagonal)
-            if c < cols - 1:
-                v = min(v, d[r, c + 1] + straight)
-            d[r, c] = v
-    return d
-
-
-def _box(a, radius):
-    size = 2 * radius + 1
-    out = a.astype(np.float64)
-    for axis in (0, 1):
-        pad = [(radius + 1, radius) if i == axis else (0, 0) for i in range(2)]
-        c = np.cumsum(np.pad(out, pad, mode='edge'), axis=axis)
-        out = ((c[size:, :] - c[:-size, :]) if axis == 0 else (c[:, size:] - c[:, :-size])) / size
-    return out.astype(np.float32)
+            result[r, c] = np.sqrt(d[r, c]) * cell_m
+    return result
 
 
 def write_shore_map(folder, name, heights, spacing_m, level_m, step=2):
@@ -76,13 +86,10 @@ def write_shore_map(folder, name, heights, spacing_m, level_m, step=2):
     land = small >= level_m
     distance = _distance(land, np.float32(cell_m))
     depth = np.clip(level_m - small, 0.0, None)
-    # The way to the shore: down the distance's slope, smoothed so it turns gently around headlands.
-    smooth = _box(np.minimum(distance, REACH_M * 2.0), 3)
-    gz, gx = np.gradient(smooth, cell_m)
-    length = np.maximum(np.hypot(gx, gz), 1e-6)
-    to_shore_x, to_shore_z = -gx / length, -gz / length
-    channels = [distance / REACH_M, depth / DEPTH_M, 0.5 + 0.5 * to_shore_x, 0.5 + 0.5 * to_shore_z]
-    image = Image.merge('RGBA', [Image.fromarray((np.clip(c, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)) for c in channels])
+    steps = np.clip(np.round(distance / DISTANCE_STEP_M), 0, 65535).astype(np.uint32)
+    channels = [(steps >> 8).astype(np.uint8), (steps & 255).astype(np.uint8),
+                (np.clip(depth / DEPTH_M, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), np.full(depth.shape, 255, np.uint8)]
+    image = Image.merge('RGBA', [Image.fromarray(c) for c in channels])
     image.save(f'{folder}/{name}_shore.png')
     with open(f'{folder}/{name}_shore.material', 'w', encoding='utf-8') as f:
         json.dump({'textures': {'metallic_roughness': f'{name}_shore.png'}}, f, indent=1)

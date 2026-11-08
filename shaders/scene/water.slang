@@ -73,8 +73,7 @@ static const float kRefractPixels = 48.0; // how far the slopes bend what's seen
 static const float3 kFoamColor = float3(0.82, 0.85, 0.86);
 static const float3 kCrestColor = float3(0.10, 0.45, 0.38); // light through a thin crest: green-blue
 
-// The shore map (tools/worldgen/shore.py).
-static const float kShoreReachM = 255.0;
+// The shore map (tools/worldgen/shore.py): distance in centimeters over two bytes, depth over kShoreDepthM.
 static const float kShoreDepthM = 64.0;
 // The surf: how long its waves are near the shore, where they start to rise out of the open sea's, how far crests
 // still break white against a cliff, and how far the foam they leave drifts seaward.
@@ -85,6 +84,7 @@ static const float kWallFoamM = 18.0;
 static const float kTrailFoamM = 90.0;
 static const float kPeriodS = 256.0; // the wind's period, which wave_time wraps to
 static const float kTwoPi = 6.28318531;
+static const float kMostFoam = 0.8; // foam never covers all of a place: the sea shows through it
 
 struct VertexOutput
 {
@@ -127,6 +127,7 @@ struct Shore
     float distance_m; // to land at the sea's level
     float depth_m;
     float2 to_land;   // the way there, x and z
+    bool land;        // all land here, where the terrain covers the water
 };
 
 // Where there's no map, or past it: open, deep water.
@@ -136,6 +137,7 @@ Shore shore_at(float2 xz)
     shore.distance_m = 1e4;
     shore.depth_m = 1e3;
     shore.to_land = float2(0.0, -1.0);
+    shore.land = false;
     if (push.has_shore == 0u)
     {
         return shore;
@@ -147,12 +149,29 @@ Shore shore_at(float2 xz)
     {
         return shore;
     }
+    // Filtered here, from the four texels around: a distance split over two bytes can't be filtered as it's stored.
     const uint texture = frame.materials[push.shore_material].metallic_roughness_texture;
-    const float4 map = texture_2d(texture).SampleLevel(sampler_state(kSamplerLinearClamp), uv, 0.0);
-    shore.distance_m = map.r >= 0.999 ? 1e4 : map.r * kShoreReachM;
-    shore.depth_m = map.g >= 0.999 ? 1e3 : map.g * kShoreDepthM;
-    const float2 way = map.ba * 2.0 - 1.0;
-    shore.to_land = dot(way, way) > 1e-4 ? normalize(way) : float2(0.0, -1.0);
+    const int2 size = int2(texture_size(texture));
+    const float2 at = uv * float2(size) - 0.5;
+    const int2 corner = int2(floor(at));
+    const float2 t = at - float2(corner);
+    float distance[4];
+    float depth[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        const int2 texel = clamp(corner + int2(i & 1, i >> 1), int2(0), size - 1);
+        const float4 map = load_texture(texture, texel);
+        distance[i] = (round(map.r * 255.0) * 256.0 + round(map.g * 255.0)) * 0.01;
+        depth[i] = map.b * kShoreDepthM;
+    }
+    shore.distance_m = lerp(lerp(distance[0], distance[1], t.x), lerp(distance[2], distance[3], t.x), t.y);
+    shore.depth_m = lerp(lerp(depth[0], depth[1], t.x), lerp(depth[2], depth[3], t.x), t.y);
+    // Toward land: down the distance's slope.
+    const float2 slope = float2(lerp(distance[1] - distance[0], distance[3] - distance[2], t.y),
+                                lerp(distance[2] - distance[0], distance[3] - distance[1], t.x));
+    shore.to_land = dot(slope, slope) > 1e-8 ? -normalize(slope) : float2(0.0, -1.0);
+    shore.land = max(max(depth[0], depth[1]), max(depth[2], depth[3])) <= 0.0 &&
+                 max(max(distance[0], distance[1]), max(distance[2], distance[3])) <= 0.0;
     return shore;
 }
 
@@ -270,22 +289,66 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint level_id: SV_Vu
 
 // --- Shading ---------------------------------------------------------------------------------------------------------
 
-// Foam as bubbles and streaks rather than paint: coverage 0 to 1 into how much of the pixel is white, the pattern fading
-// to its mean where it's finer than the pixel.
+// Cell noise: the distance to the nearest of points scattered one to a cell, and to the next nearest. Their difference
+// is small along the borders between cells: a web.
+float2 cells(float2 at)
+{
+    const float2 cell = floor(at);
+    const float2 inside = at - cell;
+    float nearest = 8.0;
+    float next = 8.0;
+    for (int y = -1; y <= 1; ++y)
+    {
+        for (int x = -1; x <= 1; ++x)
+        {
+            const float2 offset = float2(float(x), float(y));
+            const float2 point = offset + float2(hash(cell + offset), hash(cell + offset + 17.31));
+            const float d = length(point - inside);
+            if (d < nearest)
+            {
+                next = nearest;
+                nearest = d;
+            }
+            else if (d < next)
+            {
+                next = d;
+            }
+        }
+    }
+    return float2(nearest, next);
+}
+
+// Foam as foam is: a lace of white along the borders of bubbles, the lines thickening into patches as there's more of
+// it, at two sizes. Coverage 0 to 1 into how much of the pixel is white; where the lace is finer than the pixel, its
+// mean.
 float foam_pattern(float2 xz, float coverage, float footprint_m, float time_s)
 {
-    if (coverage <= 0.0)
+    // Too little to see, or finer than the pixel: no lace to work out.
+    const float detail = 1.0 - smoothstep(0.08, 0.4, footprint_m);
+    if (coverage <= 0.03)
     {
         return 0.0;
     }
-    const float2 drift = float2(0.13, 0.07) * time_s;
-    const float fine = value_noise((xz + drift) / 0.35);
-    const float mid = value_noise((xz - drift * 0.5) / 1.2);
-    const float broad = value_noise(xz / 5.0);
-    const float detail = 1.0 - smoothstep(0.15, 0.6, footprint_m);
-    const float pattern = lerp(0.5, 0.35 * fine + 0.4 * mid, detail) + 0.25 * broad;
-    const float edge = lerp(0.5, 0.12, detail);
-    return smoothstep(1.0 - coverage - edge, 1.0 - coverage + edge, pattern) * saturate(coverage * 3.0);
+    if (detail <= 0.0)
+    {
+        return coverage * 0.9 * saturate(coverage * 2.0);
+    }
+    const float2 drift = float2(0.11, 0.06) * time_s;
+    // Warped, so the bubbles are torn and stretched rather than a honeycomb.
+    const float2 warp = float2(value_noise(xz / 2.3), value_noise(xz / 2.3 + 31.7)) - 0.5;
+    const float2 at = xz + warp * 1.4;
+    const float2 big = cells((at + drift) / 1.6);
+    const float2 small = cells((at - drift * 0.7) / 0.45);
+    const float big_border = big.y - big.x;
+    const float small_border = small.y - small.x;
+    // How wide the white is around the borders: thin lines at a little foam, whole bubbles at a lot.
+    const float width = coverage * coverage * 0.9 + 0.04;
+    const float soft = 0.06;
+    const float lace = max(1.0 - smoothstep(width - soft, width + soft, big_border),
+                           0.8 * (1.0 - smoothstep(width * 0.8 - soft, width * 0.8 + soft, small_border)));
+    // Patches of more and less within it, then the pattern's own mean where it's finer than the pixel.
+    const float patches = smoothstep(0.25, 0.75, value_noise(xz / 6.0) + coverage * 0.6 - 0.3);
+    return lerp(coverage * 0.9, lace * patches, detail) * saturate(coverage * 2.0);
 }
 
 [shader("fragment")]
@@ -301,6 +364,10 @@ WaterOutput fragment_main(VertexOutput input)
     const float time_s = frame.wind_field.z;
     const float footprint_m = max(length(ddx(input.grid)), length(ddy(input.grid)));
     const Shore shore = shore_at(input.grid);
+    if (shore.land)
+    {
+        discard; // the terrain covers it: only through a crack in the ground would it show
+    }
     const float shoal = shoaling(shore);
     const Surf surf = surf_at(input.grid, shore, time_s);
 
@@ -383,20 +450,19 @@ WaterOutput fragment_main(VertexOutput input)
 
     // Foam: whitecaps where the open sea's waves fold (more where it shallows), surf white on its crests as it breaks
     // and against cliffs, the foam it leaves thinning seaward behind each crest, and the water's very edge.
-    // Along the shore the white water comes and goes in patches; its foam lies in streaks along the crests that left it.
-    const float2 along_shore = float2(-shore.to_land.y, shore.to_land.x);
-    const float along_m = dot(input.grid, along_shore);
-    const float patches = 0.45 + 0.9 * value_noise(float2(along_m / 70.0, shore.distance_m / 40.0));
+    // The white water comes and goes in patches, by where it is, not by the shore map's directions, which turn from
+    // texel to texel. Against the shore it's never solid: it bursts as a crest arrives and thins between them.
+    const float patches = 0.45 + 0.9 * value_noise(input.grid / 90.0);
     const float breaking = saturate(1.0 - shore.depth_m / 4.0) * surf.crest;
-    const float wall = exp(-shore.distance_m / kWallFoamM) * (0.5 + 0.5 * surf.crest) * surf.strength * patches;
+    const float wall = exp(-shore.distance_m / kWallFoamM) * (0.25 + 0.5 * surf.crest) * surf.strength * patches;
     const float trail = exp(-surf.phase * 3.0) * exp(-shore.distance_m / kTrailFoamM) * surf.strength * patches;
-    const float edge = 1.0 - smoothstep(0.05, 0.6, column_m);
-    const float surf_foam = saturate(wall + trail * 0.9);
-    const float open_foam = saturate(max(whitecaps * shoal, max(breaking, edge * 0.7)));
-    // The surf's foam read in streaks: stretched along the shore, drifting seaward.
-    const float2 streaks = float2(along_m / 3.0, (shore.distance_m - time_s * 0.4) / 0.8);
-    const float foam = max(foam_pattern(input.grid, open_foam, footprint_m, time_s),
-                           foam_pattern(streaks, surf_foam, footprint_m / 0.8, time_s * 0.2));
+    const float edge = 1.0 - smoothstep(0.05, 0.3, column_m);
+    const float coverage = min(max(max(whitecaps * shoal, breaking * 0.8), max(wall + trail * 0.85, edge * 0.6)), kMostFoam);
+    // Read in streaks along the wind, as foam lies on the sea, drifting with it.
+    const float2 wind = frame.wind.xy;
+    const float2 across = float2(-wind.y, wind.x);
+    const float2 streaks = float2(dot(input.grid, wind) / 2.5, dot(input.grid, across)) - wind * time_s * 0.3;
+    const float foam = foam_pattern(streaks, coverage, footprint_m, time_s);
     const float3 foam_light = frame.sky_color.rgb + sun * saturate(dot(n, l) * 0.6 + 0.4);
     color = lerp(color, kFoamColor * foam_light, foam);
 

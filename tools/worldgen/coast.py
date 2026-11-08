@@ -281,6 +281,7 @@ def main():
               f'sea_cliffs {mid:.1f} 10.0 {edge_mid + 500.0:.1f} -20.0 4.0']
     # From the cliff's edge on the headland west of the middle, down along the cliffs to their foot and the surf.
     views.append(view('cliff_down', 5600.0, float(coast[int(5600.0 / SPACING_M)]) - 12.0, -80.0, -28.0))
+    views.append('shore_close 7984.4 61.1 5215.0 116.5 -53.6')  # the user's look down at the surf at the cliff's foot
     with open(f'{out}/{NAME}.views', 'w', encoding='utf-8') as f:
         f.write('\n'.join(views) + '\n')
     start = views[0].split()
