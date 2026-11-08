@@ -486,6 +486,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // What the application asks of the renderer, in every build.
         if (scene_renderer) {
             scene_renderer->set_fog_low_camera(engine.fog_low_camera);
+            scene_renderer->set_water(engine.water);
             // The ground: when the application names another, or it's re-cooked.
             const uint32_t terrain_revision = engine.assets.revision(engine.terrain);
             if (engine.terrain != shown_terrain || terrain_revision != shown_terrain_revision) {

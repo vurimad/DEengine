@@ -5,7 +5,9 @@
 #include "core/math.h"
 #include "core/profile.h"
 #include "render/rhi/device.h"
+#include "render/rhi/upload.h"
 #include "render/scene/gpu_assets.h"
+#include "render/scene/ocean.h"
 #include "world/render_extract.h"
 
 #include <glm/gtc/matrix_access.hpp>
@@ -270,6 +272,29 @@ constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16Float;
 constexpr rhi::Format kMotionFormat = rhi::Format::RG16Float;
 constexpr rhi::Format kDepthFormat = rhi::Format::D32Float;
 constexpr rhi::Format kShadowMaskFormat = rhi::Format::RG8Unorm;
+constexpr rhi::Format kWaterBehindDepthFormat = rhi::Format::R32Float;
+
+// Matches WaterBehindPush in shaders/scene/water_behind.slang.
+struct WaterBehindPush {
+    uint32_t hdr = 0;
+    uint32_t depth = 0;
+};
+
+// Matches WaterPush in shaders/scene/water.slang.
+struct WaterPush {
+    uint64_t frame = 0;
+    uint64_t levels = 0;
+    uint32_t behind_color = 0;
+    uint32_t behind_depth = 0;
+    float sea_level = 0.0f; // relative to the render origin
+    uint32_t has_waves = 0;
+    uint32_t waves = 0;
+    uint32_t previous_waves = 0;
+    uint32_t slopes = 0;
+    uint32_t padding = 0;
+    float tile_offset[kOceanCascades][2] = {};
+};
+static_assert(sizeof(WaterPush) <= 128);
 
 void copy3(const float (&from)[3], float (&to)[4]) {
     to[0] = from[0];
@@ -321,8 +346,10 @@ constexpr uint32_t kCountRecordsPerList = kDrawListCount + 6;
 constexpr uint32_t kCullCounterCount = kCountRecordsPerList + kDrawListCount;
 constexpr uint32_t kCullGroups = 2 + kShadowCascadeCount; // the camera's plain draws, what's fading, and each cascade
 constexpr uint32_t kNoMesh = UINT32_MAX;
+// The water's levels around the camera (water.h).
+constexpr uint64_t kWaterLevelsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
 // The views and lists, then what changed in the instances, which stay on the GPU between frames.
-constexpr uint64_t kCullViewsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
+constexpr uint64_t kCullViewsOffset = kWaterLevelsOffset + kWaterLevels * sizeof(GpuWaterLevel);
 constexpr uint64_t kDrawListsOffset = kCullViewsOffset + kCullViewCount * sizeof(GpuCullView);
 constexpr uint64_t kInstanceUpdatesOffset = kDrawListsOffset + kDrawListCount * sizeof(GpuDrawList);
 
@@ -541,6 +568,15 @@ struct SceneRendererState {
     shader::ProgramHandle grass_gbuffer;
     shader::ProgramHandle grass_scatter;
     bool fog_low_camera = true;
+    // Water: the world's, its programs, and its mesh's indices (water.h), uploaded once.
+    SceneWater water;
+    shader::ProgramHandle water_behind;
+    shader::ProgramHandle water_program;
+    rhi::Uploader* uploader = nullptr;
+    rhi::BufferHandle water_indices;
+    uint64_t water_index_ticket = 0;
+    std::optional<Ocean> ocean; // the sea's waves
+    GpuWaterLevel water_levels_now[kWaterLevels]; // this frame's, as written into its constants
 
     // How much of the height fog is left where the frame's camera is.
     [[nodiscard]] float fog_low_camera_share(const SceneFog& fog, const world::RenderFrame& frame) const {
@@ -574,8 +610,13 @@ struct SceneRendererState {
                                                     terrain_shadow,
                                                     terrain_select,
                                                     grass_gbuffer,
-                                                    grass_scatter}) {
+                                                    grass_scatter,
+                                                    water_behind,
+                                                    water_program}) {
             shaders->destroy(program);
+        }
+        if (water_indices.is_valid()) {
+            device->destroy(water_indices);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
             device->destroy(buffer);
@@ -748,6 +789,22 @@ struct SceneRendererState {
         rhi::GraphicsPipelineDesc mask{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "shadow mask"};
         mask.color_formats[0] = kShadowMaskFormat;
         shadow_mask = make("scene.shadow_mask", mask);
+
+        rhi::GraphicsPipelineDesc behind{.color_count = 2, .cull = rhi::CullMode::None, .debug_name = "water behind"};
+        behind.color_formats[0] = kHdrFormat;
+        behind.color_formats[1] = kWaterBehindDepthFormat;
+        water_behind = make("scene.water_behind", behind);
+        // Seen from above and below.
+        rhi::GraphicsPipelineDesc surface{.color_count = 2,
+                                          .depth_format = kDepthFormat,
+                                          .depth_test = true,
+                                          .depth_write = true,
+                                          .depth_compare = rhi::CompareOp::Greater,
+                                          .cull = rhi::CullMode::None,
+                                          .debug_name = "water"};
+        surface.color_formats[0] = kHdrFormat;
+        surface.color_formats[1] = kMotionFormat;
+        water_program = make("scene.water", surface);
     }
 
     // The tonemap writes the caller's target: made again when its format changes.
@@ -1258,6 +1315,12 @@ struct SceneRendererState {
             scene.terrain_light[1] = 1;
         }
         std::memcpy(mapped.data(), &scene, sizeof(scene));
+        if (water.sea) {
+            const DVec3 camera = frame.origin + DVec3(frame.camera.transform[3], frame.camera.transform[7],
+                                                      frame.camera.transform[11]);
+            water_levels(camera, frame.origin, water_levels_now);
+            std::memcpy(mapped.data() + kWaterLevelsOffset, water_levels_now, sizeof(water_levels_now));
+        }
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
         write_cull_data(mapped, frame, scene, cascades, height, plan);
         device->flush_mapped(buffer, 0, frame_bytes(plan.updates));
@@ -1303,6 +1366,11 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
                      .gust_mps = environment.wind_gust_mps,
                      .gust_size_m = environment.wind_gust_size_m,
                      .turbulence = environment.wind_turbulence};
+    lighting.sea = {.swell_height_m = environment.sea_swell_height_m,
+                    .swell_period_s = environment.sea_swell_period_s,
+                    .swell_direction = {environment.sea_swell_direction[0], environment.sea_swell_direction[1]},
+                    .fetch_m = environment.sea_fetch_m,
+                    .choppiness = environment.sea_choppiness};
     return lighting;
 }
 
@@ -1608,6 +1676,31 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     }
     state->part_dispatch = *part_dispatch;
     state->part_dispatch_address = desc.device->buffer_address(*part_dispatch);
+    if (desc.uploader != nullptr) {
+        // The water's mesh: one index buffer for every level (water.h). Without an uploader, no water.
+        const core::Array<uint16_t> indices = water_mesh_indices(render_heap());
+        const core::Result<rhi::BufferHandle> water_indices =
+            desc.device->create_buffer({.size = indices.size() * sizeof(uint16_t),
+                                        .usage = rhi::BufferUsage::Index | rhi::BufferUsage::CopyDst,
+                                        .debug_name = "water indices"});
+        if (!water_indices) {
+            return core::fail(water_indices.error());
+        }
+        state->water_indices = *water_indices;
+        if (const core::Result<void> queued = desc.uploader->upload_buffer(
+                state->water_indices, 0, std::as_bytes(indices.span()), rhi::ResourceState::IndexBuffer,
+                rhi::ShaderStages::All, rhi::BufferRange::Unread);
+            !queued) {
+            return core::fail(queued.error());
+        }
+        state->water_index_ticket = desc.uploader->buffer_upload_ticket();
+        state->uploader = desc.uploader;
+        core::Result<Ocean> ocean = Ocean::create(*desc.device, *desc.shaders);
+        if (!ocean) {
+            return core::fail(ocean.error());
+        }
+        state->ocean.emplace(std::move(*ocean));
+    }
     state->make_scene_programs();
     return renderer;
 }
@@ -1627,6 +1720,10 @@ SceneRenderer& SceneRenderer::operator=(SceneRenderer&& other) noexcept {
         const SceneRenderer discarded(std::exchange(state_, std::exchange(other.state_, nullptr)));
     }
     return *this;
+}
+
+void SceneRenderer::set_water(const SceneWater& water) {
+    state_->water = water;
 }
 
 void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::Format target_format,
@@ -2284,6 +2381,99 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.draw(3);
             context.list.end_rendering();
         });
+
+    // Water: what's behind it kept, then its surface drawn onto the lit image, with its depth and motion, before the
+    // fog, which then takes it as any surface. Only in the lit view; without its shaders or its mesh, no water.
+    const rhi::PipelineHandle water_behind = state.shaders->pipeline(state.water_behind);
+    const rhi::PipelineHandle water = state.shaders->pipeline(state.water_program);
+    if (view == SceneView::Lit && state.water.sea && water_behind.is_valid() && water.is_valid() &&
+        state.uploader != nullptr && state.uploader->recorded(state.water_index_ticket)) {
+        struct WaterBehindPass {
+            GraphTexture color;
+            GraphTexture depth;
+        };
+        const auto& behind = graph.add_pass<WaterBehindPass>(
+            "water behind",
+            [&](PassBuilder& pass, WaterBehindPass& data) {
+                data.color = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+                data.depth = pass.create_texture({.desc = {.format = kWaterBehindDepthFormat}, .reference_scale = 1.0f});
+                pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(data.color, rhi::ResourceState::RenderTarget);
+                pass.use(data.depth, rhi::ResourceState::RenderTarget);
+            },
+            [targets, water_behind](const WaterBehindPass& data, PassContext& context) {
+                DE_PROFILE_ZONE("water behind pass");
+                const rhi::ColorAttachment colors[2] = {
+                    {.texture = context.texture(data.color), .load = rhi::LoadOp::DontCare},
+                    {.texture = context.texture(data.depth), .load = rhi::LoadOp::DontCare}};
+                context.list.begin_rendering({.colors = std::span(colors)});
+                context.list.bind_pipeline(water_behind);
+                context.list.push_constants(
+                    WaterBehindPush{.hdr = context.device.texture_index(context.texture(targets.hdr)),
+                                    .depth = context.device.texture_index(context.texture(targets.depth))});
+                context.list.draw(3);
+                context.list.end_rendering();
+            });
+        const GraphTexture behind_color = behind.color;
+        const GraphTexture behind_depth = behind.depth;
+        const auto sea_level = static_cast<float>(state.water.sea_level_m - frame.origin.y);
+        // The waves, brought to this frame's time. Without them (their shaders missing), a flat sea.
+        OceanFrame ocean;
+        if (state.ocean) {
+            ocean = state.ocean->add_pass(graph, lighting.sea, lighting.wind.speed_mps, lighting.wind.direction,
+                                          frame.time_s, frame.time_s - frame.previous_time_s, frame.origin);
+        }
+        WaterPush water_push{.frame = frame_address,
+                             .levels = frame_address + kWaterLevelsOffset,
+                             .sea_level = sea_level,
+                             .has_waves = ocean.valid ? 1U : 0U};
+        for (uint32_t c = 0; c < kOceanCascades; ++c) {
+            water_push.tile_offset[c][0] = ocean.tile_offset[c][0];
+            water_push.tile_offset[c][1] = ocean.tile_offset[c][1];
+        }
+        graph.add_pass(
+            "water",
+            [&](PassBuilder& pass) {
+                pass.use(behind_color, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(behind_depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
+                pass.use(targets.motion, rhi::ResourceState::RenderTarget);
+                pass.use(targets.depth, rhi::ResourceState::DepthWrite);
+                if (ocean.valid) {
+                    pass.use(ocean.waves, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+                    if (ocean.has_previous) {
+                        pass.use(ocean.previous_waves, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+                    }
+                    pass.use(ocean.slopes, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
+            },
+            [targets, behind_color, behind_depth, water, water_push, ocean, renderer = &state](PassContext& context) {
+                DE_PROFILE_ZONE("water pass");
+                const rhi::ColorAttachment colors[2] = {
+                    {.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load},
+                    {.texture = context.texture(targets.motion), .load = rhi::LoadOp::Load}};
+                const rhi::DepthAttachment depth{.texture = context.texture(targets.depth), .load = rhi::LoadOp::Load};
+                context.list.begin_rendering({.colors = std::span(colors), .depth = &depth});
+                context.list.bind_pipeline(water);
+                WaterPush push = water_push;
+                push.behind_color = context.device.texture_index(context.texture(behind_color));
+                push.behind_depth = context.device.texture_index(context.texture(behind_depth));
+                if (ocean.valid) {
+                    push.waves = context.device.texture_index(context.texture(ocean.waves));
+                    push.previous_waves = context.device.texture_index(context.texture(ocean.previous_waves));
+                    push.slopes = context.device.texture_index(context.texture(ocean.slopes));
+                }
+                context.list.push_constants(push);
+                context.list.bind_index_buffer(renderer->water_indices, 0, rhi::IndexType::Uint16);
+                // A draw per level: each has its own hole. The instance says which level it is.
+                for (uint32_t level = 0; level < kWaterLevels; ++level) {
+                    const uint32_t hole = renderer->water_levels_now[level].hole;
+                    context.list.draw_indexed(water_index_count(hole), 1, water_first_index(hole), 0, level);
+                }
+                context.list.end_rendering();
+            });
+    }
 
     // The froxel grid, near the camera: each froxel's fog and light, then each column walked front to
     // back (so the composite reads the fog from the camera to any depth with one sample).

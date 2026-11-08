@@ -106,6 +106,7 @@ struct Engine {
     bool taa = false;                  // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
     asset::AssetHandle terrain;        // the ground, a .deterrain the application keeps loaded; none: no ground
     asset::AssetHandle terrain_layers; // how it looks, a .delayers the application keeps loaded; none: a plain look
+    render::SceneWater water;          // the world's water: none at first
     bool fog_low_camera = true;        // SceneRenderer::set_fog_low_camera
 #if DE_BUILD_DEV
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen

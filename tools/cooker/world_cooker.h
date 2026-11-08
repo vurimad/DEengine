@@ -23,6 +23,8 @@ struct WorldBuild {
     asset::AssetRef environment;                       // the first dependency
     asset::AssetRef terrain;                           // the second, if it has one (its ID valid)
     asset::AssetRef terrain_layers;                    // next, if it has them (their ID valid)
+    bool sea = false;
+    float sea_level_m = 0.0f;
     core::Array<SourcePath> read{tools_heap()};        // the sources it names: environment, terrain, layers, cells
 };
 
@@ -31,6 +33,7 @@ struct WorldBuild {
 //       "environment": "evening.environment",          // how it's lit
 //       "terrain": "land.terrain",                      // optional: what it stands on
 //       "terrain_layers": "land.terrainlayers",         // optional, with a terrain: how that looks
+//       "sea": {"level_m": 0},                          // optional: a sea to the horizon, its surface's height
 //       "start": {"position": [64, 2, 74],              // where the player starts, meters
 //                 "yaw_deg": 0, "pitch_deg": -7},       // optional: the view (0 yaw looks down -Z)
 //       "cells": ["cell_0_0.cell", "cell_1_0.cell"]     // its cells; each one's coord is read from

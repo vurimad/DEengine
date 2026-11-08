@@ -40,6 +40,16 @@ struct WindLimits {
     static constexpr float kMaxGustSizeM = 10000.0f;
 };
 
+// The range of each sea setting (render::SceneSea), as for the wind.
+struct SeaLimits {
+    static constexpr float kMaxSwellHeightM = 15.0f;
+    static constexpr float kMinSwellPeriodS = 3.0f;
+    static constexpr float kMaxSwellPeriodS = 25.0f;
+    static constexpr float kMinFetchM = 1000.0f;
+    static constexpr float kMaxFetchM = 2000000.0f;
+    static constexpr float kMaxChoppiness = 1.5f;
+};
+
 // .deenv: the binary form of a .environment text source. How a place is lit (docs/design.md,
 // Rendering; Sky, atmosphere & weather): the sun, the ambient from sky and ground, the tint of
 // shadowed sunlight, exposure, the sun's shadows and the fog. Colors are linear, multiplied by their
@@ -47,7 +57,7 @@ struct WindLimits {
 // reads it as render::SceneLighting (render::scene_lighting()).
 struct EnvironmentAsset {
     static constexpr AssetType kType = AssetType::Environment;
-    static constexpr uint16_t kFormatVersion = 5; // 5: wind
+    static constexpr uint16_t kFormatVersion = 6; // 5: wind; 6: the sea
 
     AssetHeader header;
     float sun_direction[3] = {0, 1, 0}; // toward the sun, unit length
@@ -89,11 +99,18 @@ struct EnvironmentAsset {
     float wind_gust_mps = 0.0f;             // what a gust adds to it
     float wind_gust_size_m = 40.0f;         // across a patch of gusting air, which travels with the wind
     float wind_turbulence = 0.0f;           // 0 to 1: how far it swirls off its way
+    // The sea (render::SceneSea): the swell come in from far off, and the waves the wind raises over its fetch.
+    float sea_swell_height_m = 0.0f;              // significant height; 0: no swell
+    float sea_swell_period_s = 10.0f;             // its peak period
+    float sea_swell_direction[2] = {0.0f, -1.0f}; // toward where it travels (x, z), unit length
+    float sea_fetch_m = 100000.0f;                // how far the wind has blown over open water
+    float sea_choppiness = 0.8f;                  // how far crests sharpen, 0 (round) to SeaLimits::kMaxChoppiness
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
-    // within ShadowLimits, the fog's within FogLimits, the wind's within WindLimits and its direction unit length.
+    // within ShadowLimits, the fog's within FogLimits, the wind's within WindLimits and its direction unit length, the
+    // sea's within SeaLimits and its swell's direction unit length.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(EnvironmentAsset) == 280);
+static_assert(sizeof(EnvironmentAsset) == 304);
 
 } // namespace de::asset

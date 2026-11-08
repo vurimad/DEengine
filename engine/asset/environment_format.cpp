@@ -71,6 +71,17 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
     if (!wind) {
         return core::fail(ErrorCode::CorruptData, "environment's wind settings are out of range");
     }
+    using S = SeaLimits;
+    const float swell_length_squared =
+        sea_swell_direction[0] * sea_swell_direction[0] + sea_swell_direction[1] * sea_swell_direction[1];
+    const bool sea = std::isfinite(swell_length_squared) && std::abs(swell_length_squared - 1.0f) <= 1e-3f &&
+                     within(sea_swell_height_m, 0.0f, S::kMaxSwellHeightM) &&
+                     within(sea_swell_period_s, S::kMinSwellPeriodS, S::kMaxSwellPeriodS) &&
+                     within(sea_fetch_m, S::kMinFetchM, S::kMaxFetchM) &&
+                     within(sea_choppiness, 0.0f, S::kMaxChoppiness);
+    if (!sea) {
+        return core::fail(ErrorCode::CorruptData, "environment's sea settings are out of range");
+    }
     return {};
 }
 

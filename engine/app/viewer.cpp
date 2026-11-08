@@ -116,6 +116,7 @@ void Viewer::apply_world(Engine& engine) {
         world->terrain_layers == asset::WorldAsset::kNone
             ? asset::AssetHandle{}
             : engine.assets.find(world->header.dependencies.get(file.data())[world->terrain_layers]);
+    engine.water = {.sea = world->sea != 0, .sea_level_m = world->sea_level_m};
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
 }

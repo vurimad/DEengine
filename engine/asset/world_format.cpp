@@ -36,6 +36,9 @@ core::Result<void> WorldAsset::validate(std::span<const std::byte> file) const {
     if (!finite) {
         return core::fail(ErrorCode::CorruptData, "world's start isn't finite");
     }
+    if (sea > 1 || !std::isfinite(sea_level_m) || std::abs(sea_level_m) > kMostSeaLevelM) {
+        return core::fail(ErrorCode::CorruptData, "world's sea is out of range");
+    }
     return {};
 }
 

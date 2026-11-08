@@ -8,6 +8,8 @@ add_library(de_render_scene STATIC
     scene_renderer.cpp
     scene_renderer.h
     terrain.cpp
+    ocean.cpp
+    water.cpp
     terrain.h)
 add_library(de::render_scene ALIAS de_render_scene)
 

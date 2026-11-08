@@ -6,6 +6,7 @@
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
 #include "render/scene/terrain.h"
+#include "render/scene/water.h"
 #include "render/shader/shader_library.h"
 
 #include <cstdint>
@@ -88,6 +89,7 @@ struct SceneLighting {
     SceneShadows shadows{}; // the sun's
     SceneFog fog{};
     SceneWind wind{}; // not light, but the environment says it with the rest
+    SceneSea sea{};   // nor this
 };
 
 // An environment asset (.deenv) as the renderer's lighting.
@@ -184,6 +186,8 @@ struct SceneRendererState;
 //   shadow mask     a full-screen pass resolving the cascades: how much sun each pixel sees
 //   deferred light  a full-screen pass adding the sun (through the mask) and the ambient onto the
 //                   HDR target, and the sky where nothing was drawn
+//   water behind    with a sea: the lit image and the depth kept, for the water to see through
+//   water           the sea's surface onto the lit image, with its depth and motion (shaders/scene/water.slang)
 //   tonemap         exposure and a filmic curve into the target (or a G-buffer channel: SceneView)
 // It looks through the frame's camera (down its -Z). Per-frame data (view, light, instance
 // transforms) goes through a mapped buffer per frame in flight, grown as needed: no allocation
@@ -249,6 +253,9 @@ public:
     void set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
     // How the ground looks from now on; null gives it a plain look. Copied: the file needn't stay.
     void set_terrain_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file);
+
+    // The world's water, from now on (none at first).
+    void set_water(const SceneWater& water);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).

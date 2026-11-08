@@ -1,7 +1,7 @@
 // Terrain into the G-buffer. With layers (asset/terrain_layers_format.h), each ground pixel finds what its height, its
 // slope and the map's masks ask for, and blends the textures of at most three layers by their surfaces' own heights, so
 // sand settles between stones rather than fading over them. With none, one plain look: rock where it's steep, snow up
-// high, sand by the sea. Below the sea, a dark blue stands in for water either way.
+// high, sand by the sea. Water is drawn over it, in its own pass (water.slang).
 //
 // This runs on most of the screen, so it reads only what it uses: fields of the tables rather than whole entries (every
 // word through a pointer is a memory read, per pixel), anisotropic filtering only for color, and past where a layer's
@@ -708,11 +708,7 @@ GBufferOutput fragment_main(VertexOutput input)
     float3 n = ground;
     float occlusion = 1.0;
     float roughness = 0.92;
-    if (input.height_m < 0.0)
-    {
-        base = float3(0.015, 0.04, 0.06);
-    }
-    else if (push.layer_count == 0)
+    if (push.layer_count == 0)
     {
         base = plain_color(input.height_m, broad);
     }
@@ -734,7 +730,7 @@ GBufferOutput fragment_main(VertexOutput input)
     // How much sky the land around lets this place see: valleys and the feet of cliffs darken, at any distance.
     occlusion *= lerp(1.0, terrain_light(push.frame, input.from_origin).sky, 0.9);
     GBufferOutput output;
-    output.gb0 = float4(base, input.height_m < 0.0 ? 0.0 : float(kLightingGroupGround) / 255.0);
+    output.gb0 = float4(base, float(kLightingGroupGround) / 255.0);
     output.gb1 = octahedral_encode(n) * 0.5 + 0.5;
     output.gb2 = float4(roughness, 0.0, occlusion, 0.0);
     output.emissive = float4(0.0, 0.0, 0.0, 1.0);

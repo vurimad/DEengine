@@ -197,7 +197,7 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the world has errors");
     }
-    static constexpr const char* kKeys[] = {"environment", "terrain", "terrain_layers", "start", "cells"};
+    static constexpr const char* kKeys[] = {"environment", "terrain", "terrain_layers", "sea", "start", "cells"};
     reader.check_keys(kKeys, "world");
 
     const Source* environment = find_relative(tree, path, reader.string("environment", ""), SourceKind::Environment,
@@ -223,6 +223,23 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         if (layers != nullptr) {
             build.terrain_layers = {.id = layers->id, .type = asset::AssetType::TerrainLayers};
             build.read.push(layers->path);
+        }
+    }
+
+    if (reader.has("sea")) {
+        yyjson_val* sea = yyjson_obj_get(doc->root(), "sea");
+        const JsonReader sea_reader{.object = sea, .path = path, .diagnostics = &diagnostics};
+        double level_m = 0.0;
+        if (!yyjson_is_obj(sea)) {
+            diagnostics.error(path, "sea should be an object: {\"level_m\": 0}");
+        } else {
+            static constexpr const char* kSeaKeys[] = {"level_m"};
+            sea_reader.check_keys(kSeaKeys, "sea");
+            const auto most = static_cast<double>(asset::WorldAsset::kMostSeaLevelM);
+            if (required(sea_reader, "level_m", -most, most, level_m)) {
+                build.sea = true;
+                build.sea_level_m = static_cast<float>(level_m);
+            }
         }
     }
 
@@ -285,6 +302,8 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     std::copy_n(build.start_position, 3, asset.start_position);
     asset.start_yaw_rad = build.start_yaw_rad;
     asset.start_pitch_rad = build.start_pitch_rad;
+    asset.sea = build.sea ? 1U : 0U;
+    asset.sea_level_m = build.sea_level_m;
     asset.environment = 0;
     asset::AssetRef dependencies[3] = {build.environment};
     uint32_t dependency_count = 1;
@@ -597,7 +616,7 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
     }
     const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
     static constexpr const char* kKeys[] = {"sun",         "sky",     "ground", "shadow_color",
-                                            "exposure_ev", "shadows", "fog",    "wind"};
+                                            "exposure_ev", "shadows", "fog",    "wind", "sea"};
     reader.check_keys(kKeys, "environment");
     asset::EnvironmentAsset environment;
 
@@ -691,6 +710,42 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
             environment.wind_gust_mps = static_cast<float>(gust);
             environment.wind_gust_size_m = static_cast<float>(gust_size);
             environment.wind_turbulence = static_cast<float>(turbulence);
+        }
+    }
+    if (yyjson_val* sea = yyjson_obj_get(doc->root(), "sea"); sea != nullptr) {
+        const JsonReader sea_reader{.object = sea, .path = path, .diagnostics = &diagnostics};
+        static constexpr const char* kSeaKeys[] = {"swell_height_m", "swell_period_s", "swell_from_deg", "fetch_km",
+                                                   "choppiness"};
+        if (!yyjson_is_obj(sea)) {
+            diagnostics.error(path,
+                              "sea should be an object: swell_height_m, swell_period_s, swell_from_deg, fetch_km, "
+                              "choppiness");
+        } else {
+            sea_reader.check_keys(kSeaKeys, "sea");
+            using S = asset::SeaLimits;
+            double height = environment.sea_swell_height_m;
+            double period = environment.sea_swell_period_s;
+            double from_deg = 180.0;
+            double fetch_km = environment.sea_fetch_m / 1000.0;
+            double choppiness = environment.sea_choppiness;
+            const auto optional = [&](const char* key, double least, double most, double& out) {
+                if (sea_reader.has(key)) {
+                    required(sea_reader, key, least, most, out);
+                }
+            };
+            optional("swell_height_m", 0.0, S::kMaxSwellHeightM, height);
+            optional("swell_period_s", S::kMinSwellPeriodS, S::kMaxSwellPeriodS, period);
+            optional("swell_from_deg", -360.0, 360.0, from_deg);
+            optional("fetch_km", S::kMinFetchM / 1000.0, S::kMaxFetchM / 1000.0, fetch_km);
+            optional("choppiness", 0.0, S::kMaxChoppiness, choppiness);
+            // It travels away from where it comes from: across from north (-Z) toward east (+X), half a turn on.
+            const double toward = (from_deg + 180.0) * kRadPerDeg;
+            environment.sea_swell_direction[0] = static_cast<float>(std::sin(toward));
+            environment.sea_swell_direction[1] = static_cast<float>(-std::cos(toward));
+            environment.sea_swell_height_m = static_cast<float>(height);
+            environment.sea_swell_period_s = static_cast<float>(period);
+            environment.sea_fetch_m = static_cast<float>(fetch_km * 1000.0);
+            environment.sea_choppiness = static_cast<float>(choppiness);
         }
     }
     if (diagnostics.error_count() != errors_before) {

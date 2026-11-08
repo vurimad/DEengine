@@ -242,6 +242,8 @@ def main():
     environment['sun']['azimuth_deg'] = SUN_AZIMUTH_DEG
     environment['sun']['elevation_deg'] = SUN_ELEVATION_DEG
     environment['wind'] = {'toward_deg': 20, 'speed_mps': 5, 'gust_mps': 5, 'gust_size_m': 60, 'turbulence': 0.35}
+    # A moderate swell rolling in from the south onto the cliffs, under the onshore wind's own chop.
+    environment['sea'] = {'swell_height_m': 1.5, 'swell_period_s': 11, 'swell_from_deg': 190, 'fetch_km': 200, 'choppiness': 0.9}
     with open(f'{out}/{NAME}.environment', 'w', encoding='utf-8') as f:
         json.dump(environment, f, indent=1)
 
@@ -272,11 +274,15 @@ def main():
               'm_ridge 10325.3 2704.3 1785.7 88.0 -21.3',   # high on the range, west along its snow
               'm_far 6692.0 1500.0 16000.0 0.0 1.5',        # 14 km off over the sea, as far as the photo
               'm_photo 6692.0 1500.0 16000.0 0.0 4.2']      # the same with a long lens (--fov 14), framed as the photo
+    # The sea, from 10 m above it half a kilometer out: into the low sun, and away from it toward the cliffs.
+    views += [f'sea_sun {mid:.1f} 10.0 {edge_mid + 500.0:.1f} 105.0 -3.0',
+              f'sea_cliffs {mid:.1f} 10.0 {edge_mid + 500.0:.1f} -20.0 4.0']
     with open(f'{out}/{NAME}.views', 'w', encoding='utf-8') as f:
         f.write('\n'.join(views) + '\n')
     start = views[0].split()
     with open(f'{out}/{NAME}.world', 'w', encoding='utf-8') as f:
         json.dump({'environment': f'{NAME}.environment', 'terrain': f'{NAME}.terrain', 'terrain_layers': f'{NAME}.terrainlayers',
+                   'sea': {'level_m': 0.0},
                    'start': {'position': [float(start[1]), float(start[2]), float(start[3])], 'yaw_deg': float(start[4]),
                              'pitch_deg': float(start[5])}, 'cells': []}, f, indent=1)
     print('\n'.join(views))
