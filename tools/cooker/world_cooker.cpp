@@ -528,7 +528,8 @@ core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, c
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the terrain layers have errors");
     }
-    static constexpr const char* kKeys[] = {"masks", "details", "lighting", "normals", "blend", "layers", "grass"};
+    static constexpr const char* kKeys[] = {"masks",  "details", "lighting", "normals",
+                                            "colors", "blend",   "layers",   "grass"};
     reader.check_keys(kKeys, "terrain layers");
     const auto map = [&](const char* key, uint32_t& out) {
         if (reader.has(key)) {
@@ -543,6 +544,7 @@ core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, c
     map("details", build.details);
     map("lighting", build.lighting);
     map("normals", build.normals);
+    map("colors", build.colors);
     double blend = build.blend;
     if (reader.has("blend") && required(reader, "blend", 0.0, 1.0, blend)) {
         build.blend = static_cast<float>(blend);
@@ -573,6 +575,7 @@ core::Array<std::byte> cook_terrain_layers(const TerrainLayersBuild& build, asse
     asset.details = build.details;
     asset.lighting = build.lighting;
     asset.normals = build.normals;
+    asset.colors = build.colors;
     asset.blend = build.blend;
     asset.grass = build.grass;
     BlobWriter writer(sizeof(asset::TerrainLayersAsset));

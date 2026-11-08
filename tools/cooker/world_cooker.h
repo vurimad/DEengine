@@ -52,6 +52,7 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //       "details": "details.material",   // the same, for what the generator found in the land's shape
 //       "lighting": "light.material",    // the same, for light baked for the environment's sun
 //       "normals": "normals.material",   // its normal texture: the ground's own normal over the whole map (x, z)
+//       "colors": "paint.material",      // its metallic_roughness texture: masks the ground is painted from per pixel
 //       "blend": 0.25,                   // how soft blending by height is, 0 to 1
 //       "layers": [{                     // required
 //         "material": "sand.material",   // required: metallic_roughness holds occlusion, roughness, height
@@ -89,6 +90,7 @@ struct TerrainLayersBuild {
     uint32_t details = asset::TerrainLayersAsset::kNone;
     uint32_t lighting = asset::TerrainLayersAsset::kNone;
     uint32_t normals = asset::TerrainLayersAsset::kNone;
+    uint32_t colors = asset::TerrainLayersAsset::kNone;
     float blend = 0.25f;
     asset::TerrainGrass grass;
     core::Array<SourcePath> read{tools_heap()}; // the sources it names

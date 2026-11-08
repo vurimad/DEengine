@@ -76,7 +76,7 @@ static_assert(sizeof(TerrainGrass) == 112);
 // .delayers: the binary form of a .terrainlayers text source. Its materials are its dependencies, loaded with it.
 struct TerrainLayersAsset {
     static constexpr AssetType kType = AssetType::TerrainLayers;
-    static constexpr uint16_t kFormatVersion = 4;
+    static constexpr uint16_t kFormatVersion = 5;
     static constexpr uint32_t kNone = UINT32_MAX;
 
     AssetHeader header;
@@ -92,10 +92,14 @@ struct TerrainLayersAsset {
                                // mesh is coarse, it still shades every rib. kNone: the mesh's normals
     float blend = 0.25f;       // how soft height blending is: the share of a surface's height range that shows through
     TerrainGrass grass;
-    uint32_t reserved = 0;
+    uint32_t colors = kNone; // a material whose metallic-roughness texture holds masks over the whole map the ground's
+                             // color is painted from per pixel (shaders/scene/terrain.slang, paint_ground): ridges (r),
+                             // drainage (g), scree (b), and as far as alpha says, it takes the layers' color's place;
+                             // they still give their normals and roughness. A test for now. kNone: the layers' color
 
     // The layers inside the file, and no more than kTerrainMaxLayers; each one's material, and the masks, details,
-    // lighting and normals, a Material among the dependencies; every number finite, in range and each rule in order.
+    // lighting, normals and colors, a Material among the dependencies; every number finite, in range and each rule in
+    // order.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
 static_assert(sizeof(TerrainLayersAsset) == 208);

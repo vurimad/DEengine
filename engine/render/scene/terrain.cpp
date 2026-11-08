@@ -106,6 +106,8 @@ struct TerrainDrawPush {
     uint32_t has_details = 0;
     uint32_t normals_material = 0;
     uint32_t has_normals = 0;
+    uint32_t colors_material = 0;
+    uint32_t has_colors = 0;
 };
 static_assert(sizeof(TerrainDrawPush) <= 128);
 
@@ -338,6 +340,9 @@ struct TerrainState {
     asset::AssetId normals_material;
     uint32_t normals_slot = 0;
     bool normals_ready = false; // its texture is in: until then the mesh's normals, not the default flat one
+    asset::AssetId colors_material;
+    uint32_t colors_slot = 0;
+    bool colors_ready = false; // the same: until then the layers' colors, not the default white
     float blend = 0.0f;
     asset::TerrainGrass grass;
     rhi::BufferHandle grass_blades;
@@ -977,6 +982,8 @@ void Terrain::set_layers(const asset::TerrainLayersAsset* layers, std::span<cons
     state.lighting_material = {};
     state.normals_material = {};
     state.normals_ready = false;
+    state.colors_material = {};
+    state.colors_ready = false;
     state.grass = {};
     ++state.layer_table_version;
     if (layers == nullptr) {
@@ -994,6 +1001,9 @@ void Terrain::set_layers(const asset::TerrainLayersAsset* layers, std::span<cons
     }
     if (layers->normals != asset::TerrainLayersAsset::kNone) {
         state.normals_material = dependencies[layers->normals].id;
+    }
+    if (layers->colors != asset::TerrainLayersAsset::kNone) {
+        state.colors_material = dependencies[layers->colors].id;
     }
     state.blend = layers->blend;
     state.grass = layers->grass;
@@ -1058,6 +1068,11 @@ void Terrain::update(const DVec3& camera) {
                               ((state.normals_ready && normals_slot == state.normals_slot) ||
                                state.gpu_assets->material_complete(state.normals_material));
         state.normals_slot = normals_slot;
+        const uint32_t colors_slot =
+            state.colors_material.is_valid() ? state.gpu_assets->material_slot(state.colors_material) : 0;
+        state.colors_ready = colors_slot != 0 && ((state.colors_ready && colors_slot == state.colors_slot) ||
+                                                  state.gpu_assets->material_complete(state.colors_material));
+        state.colors_slot = colors_slot;
     }
     ++state.update_number;
     state.read_drawn();
@@ -1302,7 +1317,9 @@ void Terrain::draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi:
                                .details_material = state.details_slot,
                                .has_details = state.details_material.is_valid() ? 1U : 0U,
                                .normals_material = state.normals_slot,
-                               .has_normals = looks && state.normals_ready ? 1U : 0U};
+                               .has_normals = looks && state.normals_ready ? 1U : 0U,
+                               .colors_material = state.colors_slot,
+                               .has_colors = looks && state.colors_ready ? 1U : 0U};
     context.list.bind_pipeline(pipeline);
     context.list.push_constants(push);
     context.list.bind_index_buffer(state.indices, 0, rhi::IndexType::Uint16);

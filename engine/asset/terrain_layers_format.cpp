@@ -88,6 +88,9 @@ core::Result<void> TerrainLayersAsset::validate(std::span<const std::byte> file)
     if (normals != kNone && !is_material(normals)) {
         return core::fail(ErrorCode::CorruptData, "terrain normals aren't a material among the dependencies");
     }
+    if (colors != kNone && !is_material(colors)) {
+        return core::fail(ErrorCode::CorruptData, "terrain colors aren't a material among the dependencies");
+    }
     if (!within(blend, 0.0f, 1.0f)) {
         return core::fail(ErrorCode::CorruptData, "terrain layers' blend is out of range");
     }

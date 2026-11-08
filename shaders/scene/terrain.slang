@@ -59,6 +59,8 @@ struct TerrainPush
     uint has_details;
     uint normals_material;
     uint has_normals;
+    uint colors_material;
+    uint has_colors;
 };
 
 [[vk::push_constant]]
@@ -150,6 +152,62 @@ float value_noise(float2 at)
     float2 t = at - cell;
     t = t * t * (3.0 - 2.0 * t);
     return lerp(lerp(hash(cell), hash(cell + float2(1.0, 0.0)), t.x), lerp(hash(cell + float2(0.0, 1.0)), hash(cell + float2(1.0, 1.0)), t.x), t.y);
+}
+
+// --- Painted ground ---------------------------------------------------------------------------------------------------
+
+// The ground's color worked out per pixel, as terrain tools paint theirs (the look's "colors": masks over the whole map
+// that tools/worldgen/colorize.py bakes, read here). A test: its colors and rules live here until a look carries them.
+static const float kRidgeScaleM = 6.0; // the masks' red: 0.5 + meters above the land around / this
+static const float3 kRockLow = float3(0.070, 0.062, 0.052);  // dark brown-grey low down
+static const float3 kRockHigh = float3(0.085, 0.090, 0.102); // dark blue-grey high up
+static const float3 kRockRust = float3(0.110, 0.075, 0.055); // iron-stained, here and there
+static const float3 kRidge = float3(0.150, 0.148, 0.145);    // weathered crests
+static const float3 kStreak = float3(0.035, 0.035, 0.032);   // wet rock where water runs
+static const float3 kSediment = float3(0.170, 0.160, 0.140); // scree, moraine and fans
+static const float3 kTussock = float3(0.160, 0.120, 0.060);  // low gentle ground
+static const float3 kSnow = float3(0.850, 0.860, 0.880);
+
+// Noise, 0 to 1, about size_m across, from the sides the ground faces as much as from above, so it doesn't stretch down
+// a cliff; flat where it's finer than the pixel, so it doesn't shimmer.
+float facing_noise(float3 p, float3 facing, float size_m, float footprint_m)
+{
+    const float n = facing.y * value_noise(p.xz / size_m) + facing.z * value_noise(p.xy / size_m) + facing.x * value_noise(p.zy / size_m);
+    return lerp(0.5, n, 1.0 - smoothstep(0.3 * size_m, 0.8 * size_m, footprint_m));
+}
+
+// p: meters from the map's corner, and height; masks: the painted look's (r ridges, g drainage, b scree).
+float3 paint_ground(float3 p, float3 normal, float4 masks, float footprint_m)
+{
+    float3 facing = abs(normal);
+    facing *= facing;
+    facing *= facing;
+    facing /= facing.x + facing.y + facing.z;
+    const float slope_deg = degrees(acos(saturate(normal.y)));
+    const float ridge_m = (masks.r - 0.5) * kRidgeScaleM;
+    const float n180 = facing_noise(p, facing, 180.0, footprint_m);
+    const float n40 = facing_noise(p, facing, 40.0, footprint_m);
+    const float n9 = facing_noise(p, facing, 9.0, footprint_m);
+    const float n2 = facing_noise(p, facing, 2.0, footprint_m);
+    const float n05 = facing_noise(p, facing, 0.5, footprint_m);
+
+    // Rock: browner low, bluer high, rusty in patches, its brightness wandering at every size.
+    float3 color = lerp(kRockLow, kRockHigh, smoothstep(700.0, 2600.0, p.y));
+    color = lerp(color, kRockRust, 0.6 * smoothstep(0.55, 0.8, n180 * 0.7 + n40 * 0.3));
+    color *= 0.8 + 0.4 * (0.6 * n40 + 0.4 * n9);
+    // Crests weathered pale, hollows and cracks dark, steep faces darker.
+    color = lerp(color, kRidge, 0.7 * smoothstep(0.3, 2.5, ridge_m));
+    color *= 1.0 - 0.35 * smoothstep(0.3, 2.5, -ridge_m);
+    color *= 1.0 - 0.25 * smoothstep(45.0, 70.0, slope_deg);
+    // Channels: wet and dark where water runs down steep rock; sediment where it slows, and scree, on ground that holds it.
+    const float channel = smoothstep(0.4, 0.65, masks.g);
+    color = lerp(color, kStreak, 0.6 * channel * smoothstep(20.0, 35.0, slope_deg));
+    const float holds = 1.0 - smoothstep(34.0, 42.0, slope_deg);
+    color = lerp(color, kSediment * (0.85 + 0.3 * n9), max(smoothstep(0.3, 0.8, masks.b), 0.5 * channel) * holds);
+    // Tussock on low gentle ground.
+    color = lerp(color, kTussock * (0.8 + 0.4 * n9), (1.0 - smoothstep(1000.0, 1300.0, p.y)) * (1.0 - smoothstep(22.0, 32.0, slope_deg)));
+    // Grain, as fine as the pixel lets it be.
+    return color * (0.82 + 0.36 * (0.6 * n2 + 0.4 * n05));
 }
 
 // --- A layer's textures ----------------------------------------------------------------------------------------------
@@ -624,6 +682,28 @@ GBufferOutput fragment_main(VertexOutput input)
         details_width = fwidth(details);
         details_far = saturate(details_texture.CalculateLevelOfDetail(clamped, uv));
     }
+    // The painted ground, where the look has it: its color per pixel, and the snow over it, its edge broken up close by
+    // noise finer than the 2 m snow map, so it's crisp rather than stepped.
+    float4 painted = float4(0.0);
+    if (push.has_colors != 0u && push.layer_count != 0u)
+    {
+        const Texture2D paint_texture = texture_2d(push.materials[push.colors_material].metallic_roughness_texture);
+        const float4 masks = paint_texture.SampleGrad(sampler_state(kSamplerLinearClamp), uv, uv_dx, uv_dy);
+        const float3 p = float3(from_corner.x, input.height_m, from_corner.y);
+        const float footprint_m = max(max(length(ddx(input.from_origin)), length(ddy(input.from_origin))), 1e-3);
+        painted.rgb = paint_ground(p, ground, masks, footprint_m);
+        painted.a = masks.a;
+        float3 facing = abs(ground);
+        facing *= facing;
+        facing *= facing;
+        facing /= facing.x + facing.y + facing.z;
+        const float distance_m = length(input.from_origin - push.frame.camera_position.xyz);
+        const float near = 1.0 - smoothstep(200.0, 900.0, distance_m);
+        const float edge = (0.55 * facing_noise(p, facing, 3.0, footprint_m) + 0.45 * facing_noise(p, facing, 0.8, footprint_m) - 0.5) * 0.8 * near;
+        const float cover = details.r + edge;
+        const float snow = saturate(0.5 + (cover - 0.5) / max(max(fwidth(cover) * 1.5, details_far), 1e-3));
+        painted.rgb = lerp(painted.rgb, kSnow * (0.96 + 0.08 * facing_noise(p, facing, 6.0, footprint_m)), snow);
+    }
     float3 base;
     float3 n = ground;
     float occlusion = 1.0;
@@ -640,6 +720,7 @@ GBufferOutput fragment_main(VertexOutput input)
     {
         const Surface surface = layered_surface(input, ground, broad, geometric, details, details_width, details_far);
         base = surface.color;
+        base = lerp(base, painted.rgb, painted.a);
         n = surface.normal;
         occlusion = surface.occlusion;
         roughness = surface.roughness;
