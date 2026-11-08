@@ -185,16 +185,25 @@ float shoaling(Shore shore)
 
 struct Surf
 {
-    float height;     // m
-    float push;       // m, toward land
-    float2 slope;     // x, z
-    float crest;      // 0 to 1: 1 on a crest
-    float phase;      // in turns: 0 on a crest, rising seaward behind it
-    float strength;   // 0 to 1: how much surf there is here
+    float height;   // m
+    float push;     // m, toward land
+    float2 slope;   // x, z
+    float crest;    // 0 to 1: 1 on a crest, as high as the trains there make it
+    float trail;    // 0 to 1: the foam the crests that passed have left
+    float strength; // 0 to 1: how much surf there is here
 };
 
-// The swell's sets running in toward the land: one long wave along the way to land, its crests sharpened, rising out
-// of the open sea's from kSurfFromM in and breaking up against the shore; its time rounded to repeat with the wind's.
+// The surf is three trains of the swell's waves, a little apart in period, length and way, so their crests bunch up,
+// cross and leave uneven gaps rather than coming in step; the swell comes in sets, big waves then a lull; each crest
+// runs only so far along the shore before it fades, and its line wanders off the shore's. A crest is sharp and its
+// trough wide. Every train's frequency is rounded to repeat with the wind's period.
+static const uint kSurfTrains = 3;
+static const float kTrainPeriod[3] = {1.0, 0.82, 1.21};   // of the swell's
+static const float kTrainLength[3] = {1.0, 0.74, 1.27};   // of kSurfWavelengthM
+static const float kTrainHeight[3] = {1.0, 0.6, 0.5};
+static const float kTrainTurn[3] = {0.0, 0.32, -0.27};    // radians off the way to land, toward the swell's side
+static const float kSetPeriods = 7.0;                     // a set comes every this many of the swell's periods
+
 Surf surf_at(float2 xz, Shore shore, float time_s)
 {
     Surf surf;
@@ -202,26 +211,51 @@ Surf surf_at(float2 xz, Shore shore, float time_s)
     surf.push = 0.0;
     surf.slope = float2(0.0);
     surf.crest = 0.0;
-    surf.phase = 1.0;
+    surf.trail = 0.0;
     surf.strength = smoothstep(kSurfFromM, kSurfFullM, shore.distance_m);
     if (surf.strength <= 0.0 || push.surf_height_m <= 0.0)
     {
         return surf;
     }
     const float base = kTwoPi / kPeriodS;
-    const float omega = max(round(kTwoPi / max(push.surf_period_s, 1.0) / base), 1.0) * base;
-    const float k = kTwoPi / kSurfWavelengthM;
-    // Along the shore the sets come and go, and arrive a little out of step.
-    const float along = value_noise(xz / 260.0);
-    const float phase = k * shore.distance_m + omega * time_s + along * 2.5;
-    const float c = 0.5 + 0.5 * cos(phase);
-    const float amplitude = push.surf_height_m * surf.strength * (0.55 + 0.45 * along);
-    surf.height = amplitude * (c * c - 0.33);
-    surf.push = amplitude * 0.6 * sin(phase);
-    // d(height)/d(phase) times d(phase)/d(xz): the phase grows away from land.
-    surf.slope = (-amplitude * c * sin(phase)) * k * -shore.to_land;
-    surf.crest = c * c * c * c;
-    surf.phase = frac(phase / kTwoPi);
+    const float omega_swell = kTwoPi / max(push.surf_period_s, 1.0);
+    // The crests' lines wander off the shore's by a few meters, over a hundred or so.
+    const float wander_m = (value_noise(xz / 120.0) - 0.5) * 14.0 + (value_noise(xz / 35.0 + 7.3) - 0.5) * 4.0;
+    const float distance_m = shore.distance_m + wander_m;
+    // Across the way to land: a fixed way, so its phase is smooth (the way to land turns from place to place).
+    const float2 sideways_way = float2(-push.frame.wind.y, push.frame.wind.x);
+    const float sideways_m = dot(xz, sideways_way);
+    // The sets: the swell's height swells and falls over kSetPeriods of its periods, on its way in.
+    const float set_omega = max(round(omega_swell / kSetPeriods / base), 1.0) * base;
+    const float sets = 0.55 + 0.45 * sin(set_omega * time_s + distance_m * omega_swell / kSetPeriods / 9.0 +
+                                         value_noise(xz / 400.0) * 3.0);
+    float push_m = 0.0;
+    for (uint i = 0; i < kSurfTrains; ++i)
+    {
+        const float omega = max(round(omega_swell / kTrainPeriod[i] / base), 1.0) * base;
+        const float k = kTwoPi / (kSurfWavelengthM * kTrainLength[i]);
+        const float turn = sin(kTrainTurn[i]);
+        const float phase = k * (distance_m + turn * sideways_m) + omega * time_s + value_noise(xz / 300.0 + float(i) * 13.1) * 2.5;
+        // Each crest runs so far along the shore, then fades; the segments drift slowly along it.
+        const float segment = smoothstep(0.3, 0.7, value_noise(float2(sideways_m / 160.0 + float(i) * 5.7, distance_m / 90.0) +
+                                                               time_s * 0.004));
+        const float amplitude = push.surf_height_m * surf.strength * kTrainHeight[i] * segment * sets;
+        // Sharp crests, wide troughs.
+        const float c = 0.5 + 0.5 * cos(phase);
+        const float c2 = c * c;
+        const float shape = c2 * c - 0.3125;
+        surf.height += amplitude * shape;
+        push_m += amplitude * 0.6 * sin(phase);
+        // d(height)/d(phase) times d(phase)/d(xz): the phase grows away from land, and sideways by the turn.
+        const float dh_dphase = amplitude * 3.0 * c2 * -0.5 * sin(phase);
+        surf.slope += dh_dphase * k * (-shore.to_land + turn * sideways_way);
+        const float share = kTrainHeight[i] * segment * sets;
+        surf.crest = max(surf.crest, c2 * c2 * share);
+        // Foam behind each crest as it passes, rising over a few meters and thinning seaward.
+        const float behind = frac(phase / kTwoPi);
+        surf.trail = max(surf.trail, exp(-behind * 3.0) * smoothstep(0.0, 0.06, behind) * share);
+    }
+    surf.push = push_m;
     return surf;
 }
 
@@ -454,9 +488,7 @@ WaterOutput fragment_main(VertexOutput input)
     const float patches = 0.45 + 0.9 * value_noise(input.grid / 90.0);
     const float breaking = saturate(1.0 - shore.depth_m / 4.0) * surf.crest;
     const float wall = exp(-shore.distance_m / kWallFoamM) * (0.25 + 0.5 * surf.crest) * surf.strength * patches;
-    // Rising over a few meters behind each crest, not cut at it.
-    const float trail = exp(-surf.phase * 3.0) * smoothstep(0.0, 0.06, surf.phase) * exp(-shore.distance_m / kTrailFoamM) *
-                        surf.strength * patches;
+    const float trail = surf.trail * exp(-shore.distance_m / kTrailFoamM) * surf.strength * patches;
     const float edge = 1.0 - smoothstep(0.05, 0.3, column_m);
     const float coverage = min(max(max(whitecaps * shoal, breaking * 0.8), max(wall + trail * 0.85, edge * 0.6)), kMostFoam);
     // Read in streaks along the wind, as foam lies on the sea, drifting with it.
