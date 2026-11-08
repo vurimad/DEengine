@@ -37,6 +37,10 @@ ALPINE_RELIEF = 0.8
 ENDS_M = 2600.0                  # behind the start, the mountains come down to the sea this far in from the east end
 WEST_END_M = 4200.0              # in front of it, the land sinks to a low point over this much of the west end
 SUN_AZIMUTH_DEG, SUN_ELEVATION_DEG = 255.0, 11.0
+# The user's World Creator export of the summit and its south faces (a 4,096 m square at 1 m), and the cut it was made
+# from, which says where it lies. Used if both are there.
+WC_EXPORT = 'C:/Users/Ark/Documents/World Creator/Export/Project_Height Map_4096x4096_0_0.tif'
+WC_CUT = 'C:/Users/Ark/Documents/World Creator/RealData/Aoraki_South_4096m/Aoraki_South_4096m.json'
 # Snow (snow.py, after study 12): a winter's, from the real mountain's snow line (the mean winter line near Aoraki is
 # about 1,263 m), loaded by the prevailing north-westerlies and thinned on the faces a midwinter sun at 43.6 degrees
 # south sees most, low in the north. The real mountains' north is the map's -Z.
@@ -146,6 +150,17 @@ def main():
     # data blown up holds none. Vertex i lies where the window's sample i does: 4 m sample k's centre is 2 m past 4 k,
     # and 1 m sample c's is half a meter past the 1 m data's own origin plus c.
     fine, fine_meta = fine_detail.load('D:/DE/build/terrain_raw/aoraki_1m', 'aoraki_1m')
+    # The big mountain as World Creator left it, where the user's export covers it (local, never committed): its own
+    # units fitted back to metres against the real heights under it.
+    if os.path.exists(WC_EXPORT) and os.path.exists(WC_CUT):
+        import tifffile
+        with open(WC_CUT, encoding='utf-8') as f:
+            extent = json.load(f)['extent_nztm2000']
+        with open('D:/DE/build/terrain_raw/aoraki/aoraki.json', encoding='utf-8') as f:
+            box_west, box_north = json.load(f)['box_corners_nztm2000_en']['north_west']
+        scale, offset, stray = fine_detail.paste_heights(fine, fine_meta, box_west, box_north, tifffile.imread(WC_EXPORT),
+                                                         extent['E_min'], extent['N_max'])
+        print('world creator', f'{scale:.3f} m a unit, {offset:.1f} m offset, {stray:.1f} m from the real heights (rms)')
     fine_col0 = center_x - COLS / 2.0 * SPACING_M + aoraki_m / 2.0 - fine_meta['origin_in_aoraki_box_m'][0] - 0.5
     fine_row0 = center_z - ROWS / 2.0 * SPACING_M + aoraki_m / 2.0 - fine_meta['origin_in_aoraki_box_m'][1] - 0.5
     fine_vertices = fine_detail.vertex_heights(fine, fine_col0, fine_row0, COLS, ROWS)

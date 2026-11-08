@@ -79,3 +79,34 @@ def write_normal_map(path, heights, spacing_m, fine=None, fine_vertices=None, co
             out[t0:t1, :, channel] = np.clip(value * 127.5 + 128.0, 0.0, 255.0).astype(np.uint8)
     Image.fromarray(out).save(path, format='PNG', compress_level=1)
     return out.shape[1], out.shape[0]
+
+
+def paste_heights(fine, fine_meta, box_west_e, box_north_n, heights, west_e, north_n, blend_m=200.0):
+    """Puts heights from elsewhere (a terrain tool's export, say) over the 1 m data where they lie, in place, fading
+    into what's there over blend_m from their edges. heights: 1 m samples, row 0 north, sample (c, r) centred on
+    (west_e + c + 0.5, north_n - r - 0.5) in the same projection as the box (the 1 m data's origin is in metres from the
+    box's north-west corner, box_west_e and box_north_n). Their units needn't be metres: they're fitted to what the 1 m
+    data has under them (a scale and an offset, least squares), so an export in a tool's own units comes back in metres.
+    Returns the scale and offset found, and how far the pasted heights stray from what was there (rms, metres)."""
+    p0, q0 = fine_meta['origin_in_aoraki_box_m']
+    col = int(round(west_e - box_west_e - p0))
+    row = int(round(box_north_n - north_n - q0))
+    rows, cols = heights.shape
+    r0, r1 = max(row, 0), min(row + rows, fine.shape[0])
+    c0, c1 = max(col, 0), min(col + cols, fine.shape[1])
+    assert r1 > r0 and c1 > c0, 'the heights lie outside the 1 m data'
+    under = fine[r0:r1, c0:c1]
+    patch = heights[r0 - row:r1 - row, c0 - col:c1 - col].astype(np.float64)
+    known = np.isfinite(under)
+    a = np.vstack([patch[known], np.ones(int(known.sum()))]).T
+    (scale, offset), *_ = np.linalg.lstsq(a, under[known].astype(np.float64), rcond=None)
+    metres = (patch * scale + offset).astype(np.float32)
+    stray = float(np.sqrt(np.mean((metres[known] - under[known]) ** 2)))
+    # Fading in from the heights' own edges.
+    rr = np.arange(r0 - row, r1 - row, dtype=np.float32)[:, None]
+    cc = np.arange(c0 - col, c1 - col, dtype=np.float32)[None, :]
+    inside = np.minimum(np.minimum(rr, rows - 1 - rr), np.minimum(cc, cols - 1 - cc))
+    t = np.clip(inside / blend_m, 0.0, 1.0)
+    weight = t * t * (3.0 - 2.0 * t)
+    fine[r0:r1, c0:c1] = np.where(known, under + (metres - under) * weight, metres)
+    return float(scale), float(offset), stray
