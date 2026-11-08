@@ -21,6 +21,8 @@ add_library(de_asset STATIC
     shader_format.h
     terrain_format.cpp
     terrain_format.h
+    terrain_layers_format.cpp
+    terrain_layers_format.h
     texture_format.cpp
     texture_format.h
     world_format.cpp

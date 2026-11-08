@@ -116,7 +116,8 @@ float4 fragment_main(VertexOutput input) : SV_Target
     // Sun: specular, then diffuse (wrapped around the terminator for translucent surfaces), then
     // light seen through a translucent surface when the sun is behind it.
     const float3 fresnel = f_schlick(f0, v_dot_h);
-    const float3 specular = d_ggx(n_dot_h, a) * v_smith(n_dot_v, n_dot_l, a) * fresnel * n_dot_l;
+    const float specular_share = s.lighting_group == kLightingGroupGround ? kGroundSpecularShare : 1.0;
+    const float3 specular = d_ggx(n_dot_h, a) * v_smith(n_dot_v, n_dot_l, a) * fresnel * n_dot_l * specular_share;
     const float wrap = s.translucency * 0.5;
     const float diffuse_term = saturate((n_dot_l_raw + wrap) / (1.0 + wrap)) / (1.0 + wrap);
     const float3 diffuse = albedo * (1.0 - fresnel) * diffuse_term / kPi;
@@ -131,7 +132,7 @@ float4 fragment_main(VertexOutput input) : SV_Target
 
     // Ambient: the hemisphere for diffuse, and in the reflected direction for specular.
     const float3 r = reflect(-v, n);
-    const float3 ambient = (albedo * hemisphere(frame, n) + env_brdf(f0, s.roughness, n_dot_v) * hemisphere(frame, r)) *
+    const float3 ambient = (albedo * hemisphere(frame, n) + env_brdf(f0, s.roughness, n_dot_v) * specular_share * hemisphere(frame, r)) *
                            s.occlusion;
     // Mirror-smooth highlights overflow half floats (+inf, then NaN in the tonemap): kept finite.
     return float4(min(sun + ambient, kHalfMax), 1.0);

@@ -27,7 +27,7 @@ struct ActionId {
 
 // One action's state for the current simulation tick (docs/design.md, Input).
 struct ActionState {
-    // Axis: the sum of its bindings, clamped to [-1, 1]; mouse motion adds pixels x scale on top.
+    // Axis: the sum of its bindings, clamped to [-1, 1]; mouse motion adds pixels x scale on top, the wheel notches.
     // Button: 1 while down, else 0.
     float value = 0.0f;
     bool down = false;            // held when the tick was sampled
@@ -42,6 +42,7 @@ enum class InputSource : uint8_t {
     MouseButton,
     MouseMotionX,
     MouseMotionY,
+    MouseWheel, // relative, like motion: notches turned since the last sample, up positive
     GamepadButton,
     GamepadAxis,
 };
@@ -51,14 +52,14 @@ enum class InputSource : uint8_t {
 struct RawInput {
     InputSource source = InputSource::Key;
     int32_t code = 0;
-    float value = 0.0f; // buttons: 1 down / 0 up; gamepad axes: [-1, 1]; mouse motion: delta in pixels
+    float value = 0.0f; // buttons: 1 down / 0 up; gamepad axes: [-1, 1]; mouse motion: delta in pixels; wheel: notches
     uint64_t timestamp_ns = 0;
     uint32_t device = 0; // which gamepad sent it (an OS instance id); 0 for keyboard and mouse
 };
 
 // Maps physical inputs to named actions: game code reads actions, never device codes
 // (docs/design.md, Input). Bindings are text, so they can live in data files:
-//     "key:Space"  "key:W"  "mouse:left"  "mouse:x"  "gamepad:a"  "gamepad:righttrigger"  "gamepad:leftx"
+//     "key:Space"  "key:W"  "mouse:left"  "mouse:x"  "mouse:wheel"  "gamepad:a"  "gamepad:righttrigger"  "gamepad:leftx"
 // Key names are SDL scancode names; gamepad names are SDL gamepad button and axis names.
 //
 // Device events are applied as they arrive (pump_events, once per rendered frame). sample()

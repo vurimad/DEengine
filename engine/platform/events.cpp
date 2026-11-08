@@ -89,6 +89,12 @@ void pump_events(Window& window, Input& input) {
                                 .value = event.motion.yrel,
                                 .timestamp_ns = event.motion.timestamp});
             break;
+        case SDL_EVENT_MOUSE_WHEEL:
+            // Up is away from the user whatever the system's "natural scrolling" says.
+            input.push(RawInput{.source = InputSource::MouseWheel,
+                                .value = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y,
+                                .timestamp_ns = event.wheel.timestamp});
+            break;
 
         case SDL_EVENT_GAMEPAD_ADDED:
             if (SDL_Gamepad* gamepad = SDL_OpenGamepad(event.gdevice.which)) {

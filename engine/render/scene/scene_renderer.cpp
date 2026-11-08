@@ -53,8 +53,59 @@ struct SceneFrame {
     float unjittered_view_proj[16] = {};  // view_proj without TAA's sub-pixel offset
     float taa_params[4] = {};             // last frame's near, TAA's sample (0 without TAA), its offset in NDC
     uint32_t render_origin_steps[4] = {}; // world::render_position_steps of the origin, per axis
+    // The wind (shaders/scene/wind.slang).
+    float wind[4] = {};        // toward where it blows (x, z, unit), its speed, what a gust adds (m/s)
+    float wind_field[4] = {};  // a gust's size (m), turbulence, the time and last frame's, wrapped to kWindPeriodS
+    float wind_offset[4] = {}; // the gust field's offset from the render origin (m, x, z), and last frame's
+    // The terrain's light map (shaders/scene/terrain_light.slang): the material table, the map's slot in it and 1 if
+    // there is one, and where the terrain lies, in render steps.
+    uint64_t materials = 0;
+    uint32_t terrain_light[2] = {};
+    uint32_t terrain_origin_steps[2] = {};
+    uint32_t terrain_size_steps[2] = {};
+    uint32_t padding[2] = {};
 };
 static_assert(sizeof(SceneFrame) <= 1024);
+
+// Wind rhythms repeat within this, so its time can wrap without a jump; shaders/scene/wind.slang's kWindPeriodS.
+constexpr double kWindPeriodS = 256.0;
+// The gust field repeats every this many patches; wind.slang's kWindCells.
+constexpr double kWindCells = 64.0;
+
+// A value wrapped into [0, period), as a float.
+float wrapped(double value, double period) {
+    const double inside = value - period * std::floor(value / period);
+    return inside < period ? static_cast<float>(inside) : 0.0f; // it can round up to the period
+}
+
+// The wind into the frame: its times wrapped to kWindPeriodS, and where the gust field lies (it travels with the wind)
+// as an offset from the render origin, wrapped to the field's size. In double, however long the world has run and
+// wherever the origin is. Lighting made in code is held to the asset's limits here.
+void write_wind(const SceneWind& wind, const world::RenderFrame& frame, SceneFrame& scene) {
+    using W = asset::WindLimits;
+    const double length = std::hypot(static_cast<double>(wind.direction[0]), static_cast<double>(wind.direction[1]));
+    const double dx = length > 1e-6 ? wind.direction[0] / length : 1.0;
+    const double dz = length > 1e-6 ? wind.direction[1] / length : 0.0;
+    const float speed = std::clamp(wind.speed_mps, 0.0f, W::kMaxSpeedMps);
+    const float gust = std::clamp(wind.gust_mps, 0.0f, W::kMaxSpeedMps);
+    const double size = std::clamp(static_cast<double>(wind.gust_size_m), static_cast<double>(W::kMinGustSizeM),
+                                   static_cast<double>(W::kMaxGustSizeM));
+    scene.wind[0] = static_cast<float>(dx);
+    scene.wind[1] = static_cast<float>(dz);
+    scene.wind[2] = speed;
+    scene.wind[3] = gust;
+    scene.wind_field[0] = static_cast<float>(size);
+    scene.wind_field[1] = std::clamp(wind.turbulence, 0.0f, 1.0f);
+    scene.wind_field[2] = wrapped(frame.time_s, kWindPeriodS);
+    scene.wind_field[3] = wrapped(frame.previous_time_s, kWindPeriodS);
+    // Gusts ride along about as fast as the air between them.
+    const double travel = static_cast<double>(speed) + 0.5 * static_cast<double>(gust);
+    const double period_m = size * kWindCells;
+    scene.wind_offset[0] = wrapped(frame.origin.x - dx * travel * frame.time_s, period_m);
+    scene.wind_offset[1] = wrapped(frame.origin.z - dz * travel * frame.time_s, period_m);
+    scene.wind_offset[2] = wrapped(frame.origin.x - dx * travel * frame.previous_time_s, period_m);
+    scene.wind_offset[3] = wrapped(frame.origin.z - dz * travel * frame.previous_time_s, period_m);
+}
 
 // Matches GBufferPush in shaders/scene/gbuffer.slang.
 struct GBufferPush {
@@ -487,6 +538,8 @@ struct SceneRendererState {
     shader::ProgramHandle terrain_gbuffer;
     shader::ProgramHandle terrain_shadow;
     shader::ProgramHandle terrain_select;
+    shader::ProgramHandle grass_gbuffer;
+    shader::ProgramHandle grass_scatter;
     bool fog_low_camera = true;
 
     // How much of the height fog is left where the frame's camera is.
@@ -501,10 +554,27 @@ struct SceneRendererState {
     }
 
     ~SceneRendererState() {
-        for (const shader::ProgramHandle program :
-             {gbuffer_opaque, gbuffer_masked, gbuffer_opaque_fading, gbuffer_masked_fading, deferred_light, tonemap,
-              shadow_caster_opaque, shadow_caster_masked, shadow_mask, fog_program, fog_inject, fog_integrate, cull,
-              cull_assign, instance_update, taa_program, terrain_gbuffer, terrain_shadow, terrain_select}) {
+        for (const shader::ProgramHandle program : {gbuffer_opaque,
+                                                    gbuffer_masked,
+                                                    gbuffer_opaque_fading,
+                                                    gbuffer_masked_fading,
+                                                    deferred_light,
+                                                    tonemap,
+                                                    shadow_caster_opaque,
+                                                    shadow_caster_masked,
+                                                    shadow_mask,
+                                                    fog_program,
+                                                    fog_inject,
+                                                    fog_integrate,
+                                                    cull,
+                                                    cull_assign,
+                                                    instance_update,
+                                                    taa_program,
+                                                    terrain_gbuffer,
+                                                    terrain_shadow,
+                                                    terrain_select,
+                                                    grass_gbuffer,
+                                                    grass_scatter}) {
             shaders->destroy(program);
         }
         for (const rhi::BufferHandle buffer : frame_buffers) {
@@ -627,6 +697,10 @@ struct SceneRendererState {
         gbuffer_masked_fading = make("scene.gbuffer", gbuffer, "fragment_masked_fading");
         gbuffer.debug_name = "terrain";
         terrain_gbuffer = make("scene.terrain", gbuffer);
+        rhi::GraphicsPipelineDesc grass = gbuffer;
+        grass.cull = rhi::CullMode::None; // a blade is seen from both sides
+        grass.debug_name = "grass";
+        grass_gbuffer = make("scene.grass", grass);
 
         rhi::GraphicsPipelineDesc light{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "deferred light"};
         light.color_formats[0] = kHdrFormat;
@@ -645,6 +719,9 @@ struct SceneRendererState {
         const core::Result<shader::ProgramHandle> select =
             shaders->create_compute({.module = "scene.terrain_select", .debug_name = "terrain select"});
         terrain_select = select ? *select : shader::ProgramHandle{};
+        const core::Result<shader::ProgramHandle> scatter =
+            shaders->create_compute({.module = "scene.grass_scatter", .debug_name = "grass scatter"});
+        grass_scatter = scatter ? *scatter : shader::ProgramHandle{};
         const core::Result<shader::ProgramHandle> cull_program =
             shaders->create_compute({.module = "scene.cull", .debug_name = "gpu cull"});
         cull = cull_program ? *cull_program : shader::ProgramHandle{};
@@ -1173,6 +1250,13 @@ struct SceneRendererState {
         scene.fog_range[1] = froxel_reach;
         scene.fog_range[2] = kFroxelSliceOffsetM;
         scene.fog_range[3] = static_cast<float>(kFroxelSlices);
+        write_wind(lighting.wind, frame, scene);
+        if (uint32_t slot = 0; terrain && gpu_assets != nullptr &&
+                               terrain->light_map(slot, scene.terrain_origin_steps, scene.terrain_size_steps)) {
+            scene.materials = gpu_assets->material_table_address();
+            scene.terrain_light[0] = slot;
+            scene.terrain_light[1] = 1;
+        }
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         write_fog_volumes(mapped, frame, froxel_reach, aspect);
         write_cull_data(mapped, frame, scene, cascades, height, plan);
@@ -1214,6 +1298,11 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
     fog.low_camera_keep = environment.fog_low_camera_keep;
     fog.low_camera_below_m = environment.fog_low_camera_below_m;
     fog.low_camera_above_m = environment.fog_low_camera_above_m;
+    lighting.wind = {.direction = {environment.wind_direction[0], environment.wind_direction[1]},
+                     .speed_mps = environment.wind_speed_mps,
+                     .gust_mps = environment.wind_gust_mps,
+                     .gust_size_m = environment.wind_gust_size_m,
+                     .turbulence = environment.wind_turbulence};
     return lighting;
 }
 
@@ -1468,8 +1557,8 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     state->mesh_instances.resize(desc.gpu_assets->mesh_kinds().size(), 0);
     SceneRenderer renderer(state);
     if (desc.uploader != nullptr && desc.vfs != nullptr) {
-        core::Result<Terrain> terrain =
-            Terrain::create({.device = desc.device, .uploader = desc.uploader, .vfs = desc.vfs});
+        core::Result<Terrain> terrain = Terrain::create(
+            {.device = desc.device, .uploader = desc.uploader, .vfs = desc.vfs, .gpu_assets = desc.gpu_assets});
         if (!terrain) {
             return core::fail(terrain.error());
         }
@@ -1580,6 +1669,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle terrain_gbuffer = state.shaders->pipeline(state.terrain_gbuffer);
     const rhi::PipelineHandle terrain_shadow = state.shaders->pipeline(state.terrain_shadow);
     const rhi::PipelineHandle terrain_select = state.shaders->pipeline(state.terrain_select);
+    const rhi::PipelineHandle grass_gbuffer = state.shaders->pipeline(state.grass_gbuffer);
+    const rhi::PipelineHandle grass_scatter = state.shaders->pipeline(state.grass_scatter);
     // Fog only in the lit view, if there is any; if its shaders are broken, no fog rather than no
     // scene. The grid likewise (the closed form goes on alone). What it adds over the closed form is
     // the sun's shadows, so it reaches no farther than they do.
@@ -1907,6 +1998,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         state.stats.terrain = state.terrain->stats();
         terrain_frame =
             state.terrain->add_select_passes(graph, terrain_select, frame_address, frame_address + kCullViewsOffset);
+        if (view == SceneView::Lit) {
+            state.terrain->add_grass_passes(graph, grass_scatter, frame_address, frame_address + kCullViewsOffset,
+                                            terrain_frame);
+        }
     }
 
     // The sun's shadow atlas: four cascades, each a tile, every instance drawn into each.
@@ -1999,6 +2094,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         SceneRendererState* state = nullptr;
         TerrainFrame terrain;
         rhi::PipelineHandle terrain_pipeline;
+        rhi::PipelineHandle grass_pipeline;
+        uint32_t screen_height = 0;
         bool terrain_levels = false;
         Targets targets;
         rhi::PipelineHandle opaque;
@@ -2016,6 +2113,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             data = {.state = &state,
                     .terrain = terrain_frame,
                     .terrain_pipeline = terrain_gbuffer,
+                    .grass_pipeline = grass_gbuffer,
+                    .screen_height = graph.reference_height(),
                     .terrain_levels = view == SceneView::TerrainLevel,
                     .targets = {},
                     .opaque = gbuffer_opaque,
@@ -2044,6 +2143,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
             if (state.terrain) {
                 state.terrain->use_draws(pass, terrain_frame);
+                state.terrain->use_grass(pass, terrain_frame);
             }
         },
         [](const GBufferPass& data, PassContext& context) {
@@ -2057,8 +2157,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             colors[4] = {.texture = context.texture(data.targets.motion)};
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
             context.list.begin_rendering({.colors = colors, .depth = &depth});
-            // The ground first: it hides the most, so what's behind a hill fails early depth.
+            // Grass, then the ground: blades are cheap to shade and the ground isn't, so what they cover isn't shaded.
+            // The ground next: it hides the most, so what's behind a hill fails early depth.
             if (renderer.terrain) {
+                renderer.terrain->draw_grass(context, data.terrain, data.grass_pipeline, data.frame_address,
+                                             data.screen_height);
                 renderer.terrain->draw_gbuffer(context, data.terrain, data.terrain_pipeline, data.frame_address,
                                                data.terrain_levels);
             }
@@ -2462,6 +2565,12 @@ void SceneRenderer::set_fog_low_camera(bool on) {
 void SceneRenderer::set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file) {
     if (state_->terrain) {
         state_->terrain->set(terrain, file);
+    }
+}
+
+void SceneRenderer::set_terrain_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file) {
+    if (state_->terrain) {
+        state_->terrain->set_layers(layers, file);
     }
 }
 

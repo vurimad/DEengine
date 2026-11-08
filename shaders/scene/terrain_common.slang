@@ -11,6 +11,7 @@ public static const uint kTerrainBlockSamples = 133;
 public static const uint kTerrainBlockWords = (kTerrainBlockSamples * kTerrainBlockSamples * 2 + 3) / 4;
 public static const uint kTerrainNoSlot = 0xffffffffu;
 public static const uint kTerrainMaxLevels = 8;
+public static const uint kTerrainNodeQuads = 128;
 
 // One level of the pyramid.
 public struct TerrainLevelInfo
@@ -50,7 +51,7 @@ public struct TerrainPoint
     public float height_m;  // in the world
 };
 
-float block_sample(uint* heights, uint block_word, int2 at)
+public float block_sample(uint* heights, uint block_word, int2 at)
 {
     const uint index = uint(at.y) * kTerrainBlockSamples + uint(at.x);
     const uint word = heights[block_word + index / 2];

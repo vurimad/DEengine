@@ -48,6 +48,7 @@ bool parse_binding(const char* binding, ParsedBinding& out) {
             {.name = "x2", .source = InputSource::MouseButton, .code = SDL_BUTTON_X2},
             {.name = "x", .source = InputSource::MouseMotionX, .code = 0},
             {.name = "y", .source = InputSource::MouseMotionY, .code = 0},
+            {.name = "wheel", .source = InputSource::MouseWheel, .code = 0},
         };
         for (const NamedCode& entry : kMouse) {
             if (std::strcmp(name, entry.name) == 0) {
@@ -73,8 +74,10 @@ bool parse_binding(const char* binding, ParsedBinding& out) {
     return false;
 }
 
+// What's relative and adds up between samples: mouse motion, and the wheel.
 bool is_motion(InputSource source) {
-    return source == InputSource::MouseMotionX || source == InputSource::MouseMotionY;
+    return source == InputSource::MouseMotionX || source == InputSource::MouseMotionY ||
+           source == InputSource::MouseWheel;
 }
 
 bool is_gamepad(InputSource source) {

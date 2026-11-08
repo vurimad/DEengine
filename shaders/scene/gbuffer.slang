@@ -4,6 +4,7 @@
 
 import common.bindless;
 import scene.scene_common;
+import scene.wind;
 
 struct GBufferPush
 {
@@ -46,18 +47,31 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     const GpuDraw draw = push.draws[draw_id];
     const GpuInstance instance = push.instances[draw.instance];
     const uint3 origin_steps = push.frame.render_origin_steps.xyz;
-    const float4 world = float4(instance_point(instance.transform, origin_steps, vertex.position), 1.0);
+    float3 world = instance_point(instance.transform, origin_steps, vertex.position);
+    float3 previous_world = instance_point(instance.previous_transform, origin_steps, vertex.position);
     // The inverse transpose would be exact under non-uniform scale; renormalized in the pixel
     // shader, the 3x3 is close for the uniform scales cells use.
     const float3x3 linear =
         float3x3(instance.transform.row0.linear, instance.transform.row1.linear, instance.transform.row2.linear);
+    const float3 normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
+    // Plants move in the wind, about their own root; the same for every vertex of a draw, so no divergence.
+    if ((push.materials[draw.material].flags & kMaterialWind) != 0u)
+    {
+        const float bend = push.materials[draw.material].wind_bend_m;
+        const float flutter = push.materials[draw.material].wind_flutter_m;
+        const float4 color = unorm8x4(vertex.color);
+        const float3 unit_normal = normalize(normal);
+        world += plant_sway(push.frame, instance_point(instance.transform, origin_steps, float3(0.0)), world, unit_normal,
+                            color, bend, flutter, false);
+        previous_world += plant_sway(push.frame, instance_point(instance.previous_transform, origin_steps, float3(0.0)),
+                                     previous_world, unit_normal, color, bend, flutter, true);
+    }
 
     VertexOutput output;
-    output.position = mul_rows(push.frame.view_proj, world);
-    output.clip = mul_rows(push.frame.unjittered_view_proj, world); // TAA's offset is no motion
-    const float4 previous_world = float4(instance_point(instance.previous_transform, origin_steps, vertex.position), 1.0);
-    output.previous_clip = mul_rows(push.frame.previous_view_proj, previous_world);
-    output.normal = mul(linear, octahedral_decode(snorm16x2(vertex.normal)));
+    output.position = mul_rows(push.frame.view_proj, float4(world, 1.0));
+    output.clip = mul_rows(push.frame.unjittered_view_proj, float4(world, 1.0)); // TAA's offset is no motion
+    output.previous_clip = mul_rows(push.frame.previous_view_proj, float4(previous_world, 1.0));
+    output.normal = normal;
     const float4 tangent = snorm8x4(vertex.tangent);
     output.tangent = float4(mul(linear, tangent.xyz), tangent.w);
     output.uv = vertex.uv;

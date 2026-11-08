@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset/environment_format.h"
+#include "asset/terrain_layers_format.h"
 #include "asset/world_format.h"
 #include "cooker/common.h"
 #include "core/function_ref.h"
@@ -21,13 +22,15 @@ struct WorldBuild {
     core::Array<asset::WorldCell> cells{tools_heap()}; // sorted by coord, z then x
     asset::AssetRef environment;                       // the first dependency
     asset::AssetRef terrain;                           // the second, if it has one (its ID valid)
-    core::Array<SourcePath> read{tools_heap()};        // the sources it names: environment, terrain, cells
+    asset::AssetRef terrain_layers;                    // next, if it has them (their ID valid)
+    core::Array<SourcePath> read{tools_heap()};        // the sources it names: environment, terrain, layers, cells
 };
 
 // A .world text source (JSON): what a world is made of. Paths are relative to the world file.
 //     {
 //       "environment": "evening.environment",          // how it's lit
 //       "terrain": "land.terrain",                      // optional: what it stands on
+//       "terrain_layers": "land.terrainlayers",         // optional, with a terrain: how that looks
 //       "start": {"position": [64, 2, 74],              // where the player starts, meters
 //                 "yaw_deg": 0, "pitch_deg": -7},       // optional: the view (0 yaw looks down -Z)
 //       "cells": ["cell_0_0.cell", "cell_1_0.cell"]     // its cells; each one's coord is read from
@@ -37,8 +40,62 @@ using SourceReader = core::FunctionRef<core::Result<core::Array<std::byte>>(std:
 core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& source, std::span<const std::byte> bytes,
                                       SourceReader read, Diagnostics& diagnostics);
 
-// The .deworld; its environment and its terrain are its dependencies.
+// The .deworld; its environment, its terrain and its layers are its dependencies.
 core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
+
+// A .terrainlayers text source (JSON): how the ground looks. Layers run from the bottom of the stack up, and each
+// covers what's below as far as its rules say. A rule is four numbers: nothing up to the first, rising to all of it at
+// the second, all of it to the third, falling to nothing at the fourth. A channel rule is two: nothing and all of it,
+// rising, or falling for where the channel is low. Paths are relative to this file. Optional but for those marked.
+//     {
+//       "masks": "masks.material",       // its metallic_roughness texture: four channels over the whole map
+//       "details": "details.material",   // the same, for what the generator found in the land's shape
+//       "lighting": "light.material",    // the same, for light baked for the environment's sun
+//       "normals": "normals.material",   // its normal texture: the ground's own normal over the whole map (x, z)
+//       "blend": 0.25,                   // how soft blending by height is, 0 to 1
+//       "layers": [{                     // required
+//         "material": "sand.material",   // required: metallic_roughness holds occlusion, roughness, height
+//         "tile_m": 3,                   // required: how far apart its textures repeat
+//         "height_m": [-5, -5, 4, 12],   // over height above the sea
+//         "slope_deg": [0, 0, 20, 30],   // over the ground's slope, 0 to 90
+//         "mask": "r",                   // r, g, b or a: only as far as this channel of the masks says
+//         "mask_range": [0.4, 0.6],      // that channel's rule
+//         "detail": "g",                 // r, g, b or a: only as far as this channel of the details says too
+//         "detail_range": [0.2, 0.5],    // that channel's rule
+//         "detail_coverage": true,       // that channel is how much of each texel it covers: far off, it takes the share
+//         "noise": 0.5,                  // how far noise breaks up where these rules fade
+//         "noise_large": 0,              // 0 breaks it up at about 30 m, 1 at about 300 m
+//         "variation": 0.1,              // how far its brightness wanders across the land
+//         "tint": [1, 0.9, 0.8],         // multiplies its color, linear
+//         "projection": "sides"          // "top" (the default) or "sides", for steep ground
+//       }],
+//       "grass": {                       // blades made around the camera
+//         "density_per_m2": 120,         // required: up close, where it all grows
+//         "height_m": [0.3, 0.7],        // required: its lowest and tallest blades
+//         "width_m": 0.03,               // required: at the root, up close
+//         "where_height_m": [2, 8, 500, 700], // over height above the sea
+//         "where_slope_deg": [0, 0, 24, 34],  // over the ground's slope
+//         "not_where": "rb",             // channels of the masks where it doesn't grow
+//         "patches": 0.3,                // how far noise thins it into tufts, 0 to 1
+//         "base": [0.04, 0.07, 0.02],    // required: its color at the root, linear
+//         "tip": [0.2, 0.28, 0.07],      // required: and at the tip
+//         "other": {"mask": "a", "base": [0.09, 0.05, 0.01], "tip": [0.4, 0.25, 0.05]} // where that channel says
+//       }
+//     }
+struct TerrainLayersBuild {
+    core::Array<asset::TerrainLayer> layers{tools_heap()};
+    core::Array<asset::AssetRef> dependencies{tools_heap()}; // its materials, each once
+    uint32_t masks = asset::TerrainLayersAsset::kNone;
+    uint32_t details = asset::TerrainLayersAsset::kNone;
+    uint32_t lighting = asset::TerrainLayersAsset::kNone;
+    uint32_t normals = asset::TerrainLayersAsset::kNone;
+    float blend = 0.25f;
+    asset::TerrainGrass grass;
+    core::Array<SourcePath> read{tools_heap()}; // the sources it names
+};
+core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, const Source& source,
+                                                       std::span<const std::byte> bytes, Diagnostics& diagnostics);
+core::Array<std::byte> cook_terrain_layers(const TerrainLayersBuild& build, asset::AssetId id);
 
 // A .environment text source (JSON): how a place is lit. Every setting but the intensities (1 when
 // left out) and the fog's low_camera is required, so a file says all of its look; colors are linear. Shadow settings

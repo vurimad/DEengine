@@ -21,6 +21,7 @@ enum class GpuMaterialFlags : uint32_t {
     None = 0,
     Masked = 1U << 0U,      // alpha test against alpha_cutoff
     DoubleSided = 1U << 1U, // lit from both sides
+    Wind = 1U << 2U,        // moves in the wind (wind_bend_m, wind_flutter_m)
 };
 DE_ENUM_FLAGS(GpuMaterialFlags)
 
@@ -42,7 +43,8 @@ struct GpuMaterial {
     uint32_t occlusion_texture = 0;          // r
     uint32_t emissive_texture = 0;           // srgb, rgb
     GpuMaterialFlags flags = GpuMaterialFlags::None;
-    uint32_t reserved[2] = {};
+    float wind_bend_m = 0.0f;    // how far a point 10 m up moves in a 10 m/s wind
+    float wind_flutter_m = 0.0f; // how far leaves move at full vertex red, in an 8 m/s wind
 
     constexpr bool operator==(const GpuMaterial&) const = default;
 };
@@ -168,6 +170,11 @@ public:
     // Null unless the mesh is uploaded (or for a stale handle).
     const GpuMesh* mesh(asset::AssetHandle mesh) const;
     uint64_t material_table_address() const;
+    // A material's index in that table, for as long as it's loaded; 0, the default, if it isn't.
+    uint32_t material_slot(asset::AssetId material) const;
+    // Whether that entry has every texture the material names, rather than defaults standing in while they upload: for
+    // a map a default would misread, such as a flat normal over ground that isn't flat.
+    bool material_complete(asset::AssetId material) const;
     // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
     uint64_t pool_vertex_address() const;
     rhi::BufferHandle pool_index_buffer() const;

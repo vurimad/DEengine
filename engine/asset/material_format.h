@@ -77,6 +77,10 @@ inline constexpr core::StringId kRoughness = name("roughness");
 inline constexpr core::StringId kNormalScale = name("normal_scale");
 inline constexpr core::StringId kOcclusionStrength = name("occlusion_strength");
 inline constexpr core::StringId kAlphaCutoff = name("alpha_cutoff");
+// Wind (shaders/scene/wind.slang): a plant's sway, meters at 10 m up in a 10 m/s wind, and its leaves' flutter, meters
+// at full vertex red in an 8 m/s wind. Without them it stands still.
+inline constexpr core::StringId kWindBend = name("wind_bend");
+inline constexpr core::StringId kWindFlutter = name("wind_flutter");
 
 // Texture slots (base_color and emissive are sRGB; the others are linear data).
 inline constexpr core::StringId kBaseColorTexture = name("base_color");

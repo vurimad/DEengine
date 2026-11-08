@@ -382,6 +382,10 @@ struct GpuAssetsState {
         param(m::kNormalScale, &gpu.normal_scale, 1);
         param(m::kOcclusionStrength, &gpu.occlusion_strength, 1);
         param(m::kAlphaCutoff, &gpu.alpha_cutoff, 1);
+        param(m::kWindBend, &gpu.wind_bend_m, 1);
+        param(m::kWindFlutter, &gpu.wind_flutter_m, 1);
+        gpu.wind_bend_m = std::clamp(gpu.wind_bend_m, 0.0f, 100.0f);
+        gpu.wind_flutter_m = std::clamp(gpu.wind_flutter_m, 0.0f, 10.0f);
         bool waiting = false;
         bool missing = false;
         const auto texture = [&](core::StringId slot, DefaultTexture fallback) {
@@ -396,7 +400,8 @@ struct GpuAssetsState {
         gpu.flags =
             (asset->alpha_mode == asset::AlphaMode::Masked ? GpuMaterialFlags::Masked : GpuMaterialFlags::None) |
             (core::has_any(asset->flags, asset::MaterialFlags::DoubleSided) ? GpuMaterialFlags::DoubleSided
-                                                                            : GpuMaterialFlags::None);
+                                                                            : GpuMaterialFlags::None) |
+            (gpu.wind_bend_m > 0.0f || gpu.wind_flutter_m > 0.0f ? GpuMaterialFlags::Wind : GpuMaterialFlags::None);
         draw_kinds_changed = draw_kinds_changed || table[entry.slot].flags != gpu.flags;
         set_material(entry.slot, gpu);
         return !waiting;
@@ -989,6 +994,18 @@ void GpuAssets::update() {
         }
     }
     state.pending_meshes.resize(kept);
+}
+
+uint32_t GpuAssets::material_slot(asset::AssetId material) const {
+    const asset::AssetHandle handle = state_->assets->find({.id = material, .type = asset::AssetType::Material});
+    const MaterialEntry* entry = handle.is_valid() ? state_->materials.find(key_of(handle)) : nullptr;
+    return entry != nullptr ? entry->slot : 0;
+}
+
+bool GpuAssets::material_complete(asset::AssetId material) const {
+    const asset::AssetHandle handle = state_->assets->find({.id = material, .type = asset::AssetType::Material});
+    const MaterialEntry* entry = handle.is_valid() ? state_->materials.find(key_of(handle)) : nullptr;
+    return entry != nullptr && !entry->queued && !entry->missing;
 }
 
 uint32_t GpuAssets::mesh_slot(asset::AssetHandle mesh) {

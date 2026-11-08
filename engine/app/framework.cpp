@@ -3,6 +3,7 @@
 #include "app/frame_clock.h"
 #include "asset/registry.h"
 #include "asset/terrain_format.h"
+#include "asset/terrain_layers_format.h"
 #include "core/array.h"
 #include "core/fixed_string.h"
 #include "core/job_system.h"
@@ -121,6 +122,9 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     }
     out.src_dir = flag_value(out, "--src-dir");
     out.vsync = !has_flag(out, "--no-vsync");
+    if (const char* cap = flag_value(out, "--fps-cap")) {
+        out.fps_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 10));
+    }
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
     out.fullscreen = has_flag(out, "--fullscreen");
@@ -375,6 +379,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .terrain = {}};
     asset::AssetHandle shown_terrain;
     uint32_t shown_terrain_revision = 0;
+    asset::AssetHandle shown_layers;
+    uint32_t shown_layers_revision = 0;
 
     // --- Dev tools: the debug UI (F1: frame stats) and the raw stick readout ---------------------
 #if DE_BUILD_DEV
@@ -420,9 +426,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         const uint64_t frame_start_ns = platform::time_ns();
         const double measured_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
         // What the camera and the world move by.
-        // Minimized, nothing is presented: there are no refreshes to count.
-        const double clock_s =
-            frame_clock.step(measured_s, device->vsync() && !window->minimized() ? window->refresh_hz() : 0.0);
+        // Minimized, nothing is presented: there are no refreshes to count. Capped, frames aren't paced by them either.
+        const double clock_s = frame_clock.step(
+            measured_s, device->vsync() && !window->minimized() && args.fps_cap == 0 ? window->refresh_hz() : 0.0);
 #if DE_BUILD_DEV
         const double frame_s = eyes.frame_s(clock_s);
         engine.camera_pose = eyes.begin_frame();
@@ -489,6 +495,14 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 scene_renderer->set_terrain(terrain, terrain != nullptr ? engine.assets.file(engine.terrain)
                                                                         : std::span<const std::byte>{});
             }
+            const uint32_t layers_revision = engine.assets.revision(engine.terrain_layers);
+            if (engine.terrain_layers != shown_layers || layers_revision != shown_layers_revision) {
+                shown_layers = engine.terrain_layers;
+                shown_layers_revision = layers_revision;
+                const auto* layers = engine.assets.get<asset::TerrainLayersAsset>(engine.terrain_layers);
+                scene_renderer->set_terrain_layers(layers, layers != nullptr ? engine.assets.file(engine.terrain_layers)
+                                                                             : std::span<const std::byte>{});
+            }
         }
         uploader->record(); // uploads land at the start of the frame
         const rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
@@ -549,6 +563,12 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (!backbuffer.is_valid()) {
             world->resync_render_instances();           // what changes while nothing's drawn would be lost
             platform::sleep_ns(5 * platform::kNsPerMs); // minimized: nothing to show, don't spin a core
+        }
+        if (args.fps_cap > 0) {
+            const uint64_t period_ns = platform::kNsPerSecond / args.fps_cap;
+            if (const uint64_t spent_ns = platform::time_ns() - frame_start_ns; spent_ns < period_ns) {
+                platform::sleep_ns(period_ns - spent_ns);
+            }
         }
 
         // Frame rate in the title, once a second.

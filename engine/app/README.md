@@ -41,6 +41,7 @@ image_diff build/eyes/before.png build/eyes/camp.png --out build/eyes/diff.png
 | `--still PATH` | A settled, repeatable picture and exit: `--screenshot` at the settle frame, the fixed step, no vsync |
 | `--screenshot PATH`, `--screenshot-frame N` | The frame's final image as a PNG at frame N (the first is 1; by default the settle frame), then exit, unless `--frames` says go on |
 | `--settle N` | How many frames settling takes, if not the 96 measured below |
+| `--fov DEG` | The camera's vertical field of view in degrees, for a longer or wider lens than the default 57: a long lens frames a far mountain as a photo would. Works with or without a picture |
 | `--fixed-step S` | The frame clock advances by S seconds a frame, whatever time passes. A still or a path gets 1/60 unless this says otherwise |
 | `--camera-path PATH`, `--path-speed M/S` | Flies a path file: holds at its start for the settle frames, flies its waypoints (straight lines, at 13 m/s, or its `speed` line, or this flag), exits at its end. No vsync |
 | `--path-shots PREFIX`, `--path-every N` | A picture every N frames (default 30) from where the flight starts, as `PREFIX_0000.png`, `_0001` and so on |

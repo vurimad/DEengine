@@ -26,6 +26,7 @@ enum class SourceKind : uint8_t {
     World,       // .world: a world's cells, start and environment (JSON)
     Environment, // .environment: how a place is lit (JSON)
     Terrain,     // .terrain: a height image and how to read it (JSON)
+    TerrainLayers, // .terrainlayers: how the ground looks, as rules over layers (JSON)
 };
 
 const char* source_kind_name(SourceKind kind);

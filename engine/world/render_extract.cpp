@@ -260,6 +260,9 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
     ecs.system("de::ExtractRenderView").kind(phase).run([desc](flecs::iter& it) {
         DE_PROFILE_ZONE("render extract view");
         extract_camera(it.world(), *desc.alpha, *desc.frame);
+        // What moves with the world's time has no motion across a cut, as the camera has none.
+        desc.frame->previous_time_s = desc.frame->camera.previous_valid ? desc.frame->time_s : *desc.time_s;
+        desc.frame->time_s = *desc.time_s;
         desc.frame->instances.clear(); // keeps its capacity: no allocation once the world has settled
         desc.frame->fog_volumes.clear();
         desc.frame->instance_out_of_reach = false;

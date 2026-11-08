@@ -26,6 +26,16 @@ public struct SceneFrame
     public float4 unjittered_view_proj[4]; // view_proj without TAA's sub-pixel offset: what motion is measured with
     public float4 taa_params;              // x: last frame's near (m), y: TAA's sample, 0 without TAA, zw: its offset in NDC
     public uint4 render_origin_steps;      // xyz: the origin, as an instance's position is kept
+    // The wind (scene.wind).
+    public float4 wind;        // xy: toward where it blows (x, z, unit), z: its speed, w: what a gust adds (m/s)
+    public float4 wind_field;  // x: a gust's size (m), y: turbulence, z: the time, w: last frame's, wrapped to kWindPeriodS
+    public float4 wind_offset; // xy: the gust field's offset from the render origin (m), zw: last frame's
+    // The terrain's light map (scene.terrain_light).
+    public GpuMaterial* materials;
+    public uint2 terrain_light;        // x: the map's material slot, y: 1 if there is one
+    public uint2 terrain_origin_steps; // the terrain's corner, in render steps
+    public uint2 terrain_size_steps;
+    public uint2 light_padding;
 };
 
 public static const uint kCascadeCount = 4;
@@ -187,11 +197,18 @@ public struct GpuMaterial
     public uint occlusion_texture;
     public uint emissive_texture;
     public uint flags;
-    public uint2 reserved;
+    public float wind_bend_m;    // how far a point 10 m up moves in a 10 m/s wind (scene.wind's plant_sway)
+    public float wind_flutter_m; // how far leaves move at full vertex red, in an 8 m/s wind
 };
 
 public static const uint kMaterialMasked = 1u;
 public static const uint kMaterialDoubleSided = 2u;
+public static const uint kMaterialWind = 4u; // moves in the wind: wind_bend_m or wind_flutter_m above 0
+
+public float4 unorm8x4(uint packed)
+{
+    return float4(float(packed & 0xffu), float((packed >> 8u) & 0xffu), float((packed >> 16u) & 0xffu), float(packed >> 24u)) / 255.0;
+}
 
 public float2 snorm16x2(uint packed)
 {
@@ -336,6 +353,11 @@ public FroxelRay froxel_ray(SceneFrame* frame, float2 at, uint2 grid_size)
     ray.view_per_ray = max(dot(ray.direction, frame.camera_forward.xyz), 1e-3);
     return ray;
 }
+
+// Ground and what grows on it: rough, bumpy surfaces whose small shadows hide most of the sun's highlight at low angles.
+// Nothing models those shadows, so without this, dark soil looking toward the sun flares white.
+public static const uint kLightingGroupGround = 1;
+public static const float kGroundSpecularShare = 0.2;
 
 public GBufferSample unpack_gbuffer(float4 gb0, float2 gb1, float4 gb2)
 {

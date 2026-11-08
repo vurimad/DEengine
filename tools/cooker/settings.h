@@ -36,6 +36,11 @@ struct TextureSettings {
 };
 
 // The "mesh" section.
+// What a mesh's vertex colors say to the wind (shaders/scene/wind.slang: red is how far a vertex flutters, green its
+// phase). Keep: whatever the source has, white without. Height: up the plant, for grass tufts and small plants. Bake:
+// worked out from its connected pieces (mesh_cooker.h), for anything with leaves and branches.
+enum class MeshWind : uint8_t { Keep, Height, Bake };
+
 struct MeshSettings {
     float scale = 1.0f;     // applied on top of the importer's conversion to meters
     uint32_t lod_count = 8; // LOD 0 included; the chain stops early when a mesh won't simplify
@@ -44,6 +49,7 @@ struct MeshSettings {
     bool optimize = true;   // vertex cache, overdraw and fetch order
     // Its .dephys is the finest LOD with at most this many triangles.
     uint32_t collision_triangles = 2048;
+    MeshWind wind = MeshWind::Keep;
 };
 
 // The defaults a usage implies, as a "texture" section (the bottom layer of a texture's settings).

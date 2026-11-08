@@ -47,6 +47,7 @@ inline constexpr double kEyesFrameS = 1.0 / 60.0;
 //   --screenshot PATH         write the frame's final image as a PNG, then exit unless --frames says go on
 //   --screenshot-frame N      at this frame, the first being 1 (default: the settle frame)
 //   --settle N                what the settle frame is (default kSettleFrames)
+//   --fov DEG                 the camera's vertical field of view, as a longer or wider lens (default: the app's)
 //   --fixed-step S            the frame clock advances by S seconds a frame, whatever time passes
 //   --camera-path PATH        fly a path file: hold at its start for the settle frames, fly, exit at its end. A
 //                             fixed step of kEyesFrameS unless --fixed-step says otherwise, no vsync
@@ -68,6 +69,7 @@ struct EyesFlags {
     const char* path_shots = nullptr;
     uint32_t path_every = 30;
     double path_speed_mps = 0.0; // 0: the path file's
+    double fov_deg = 0.0;        // --fov; 0: the application's own
     bool no_vsync = false;       // a still or a path has no reason to wait for the screen
 
     bool scripted() const { return screenshot != nullptr || path_file != nullptr; }

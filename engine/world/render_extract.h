@@ -133,8 +133,10 @@ struct RenderFogVolume {
 // changed since the last frame, for it to keep: all of them only when the renderer asks
 // (World::resync_render_instances).
 struct RenderFrame {
-    uint64_t number = 0; // counts extractions: a frame not drawn (minimized) leaves a gap
-    DVec3 origin{0.0};   // the render origin: what the GPU's floats are relative to
+    uint64_t number = 0;          // counts extractions: a frame not drawn (minimized) leaves a gap
+    DVec3 origin{0.0};            // the render origin: what the GPU's floats are relative to
+    double time_s = 0.0;          // the world's time at this frame's interpolation point: what wind moves by
+    double previous_time_s = 0.0; // and at the frame drawn before it; after a cut, or at first, this frame's
     RenderView camera;
     flecs::entity_t camera_entity = 0; // whose view it is: another's next frame is a cut
     core::Array<RenderInstance> instances{core::heap_allocator(core::MemoryTag::Render)};

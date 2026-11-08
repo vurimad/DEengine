@@ -32,6 +32,7 @@ namespace {
 constexpr uint64_t kMostFlightFrames = 1'000'000;
 constexpr uint64_t kMostSceneWaitNs = 120 * platform::kNsPerSecond;
 constexpr double kMostFixedStepS = 1.0;
+constexpr double kMostFovDeg = 170.0;
 
 // A flag's value. False (logged) if the flag is there without one.
 bool read_value(const FrameworkArgs& args, const char* flag, const char*& out) {
@@ -138,7 +139,8 @@ bool parse_eyes_flags(const FrameworkArgs& args, EyesFlags& out) {
         !read_whole<uint32_t>(args, "--settle", 1, out.settle_frames) ||
         !read_whole<uint32_t>(args, "--path-every", 1, out.path_every) ||
         !read_positive(args, "--fixed-step", kMostFixedStepS, out.fixed_step_s) ||
-        !read_positive(args, "--path-speed", 1e6, out.path_speed_mps)) {
+        !read_positive(args, "--path-speed", 1e6, out.path_speed_mps) ||
+        !read_positive(args, "--fov", kMostFovDeg, out.fov_deg)) {
         return false;
     }
     if (!apart(args, "--camera", "--view") || !apart(args, "--still", "--screenshot") ||

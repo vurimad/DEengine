@@ -3,7 +3,7 @@
 # user:/input.bindings, in the same form, is read after this file: its lines replace these for the
 # actions they name.
 #
-# Bindings: key:<SDL key name> (in quotes when it has a space), mouse:left|right|middle|x|y,
+# Bindings: key:<SDL key name> (in quotes when it has a space), mouse:left|right|middle|x|y|wheel,
 # gamepad:<SDL button or axis>. On an axis, the scale weights the input (-1 for the opposite way).
 
 # Game
@@ -28,6 +28,7 @@ free_camera.mouse_y         mouse:y
 free_camera.look_hold       mouse:right
 free_camera.fast            "key:Left Shift"
 free_camera.fast            gamepad:leftstick
+free_camera.speed           mouse:wheel                    # each notch flies 25% faster or slower
 
 # Debug views (dev builds)
 debug.toggle_stats          key:F1

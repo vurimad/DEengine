@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset/terrain_format.h"
+#include "asset/terrain_layers_format.h"
 #include "core/array.h"
 #include "core/math.h"
 #include "core/result.h"
@@ -22,6 +23,8 @@ class Uploader;
 } // namespace de::rhi
 
 namespace de::render {
+
+class GpuAssets;
 
 // A level's patches are drawn this many of its spacings from the camera at most, which keeps about 4 pixels to a square
 // at 2560 x 1440, and morphing starts at this share of that (docs/design.md, Terrain & vegetation).
@@ -53,6 +56,7 @@ struct TerrainDesc {
     rhi::Device* device = nullptr;
     rhi::Uploader* uploader = nullptr;
     platform::Vfs* vfs = nullptr;
+    GpuAssets* gpu_assets = nullptr; // whose materials layers name. Null: the plain look, whatever set_layers says
     // Blocks on the GPU at once, made once at about 35 KB each (1,024: 36 MiB). Enough for what's near the camera: the
     // roots of the map, and about 64 nodes per other level.
     uint32_t max_blocks = 1024;
@@ -79,6 +83,9 @@ struct TerrainFrame {
     GraphBuffer args;
     GraphBuffer draws;
     bool valid = false;
+    GraphBuffer grass_args;
+    GraphBuffer grass_blades;
+    bool grass = false;
 };
 
 struct TerrainState;
@@ -101,6 +108,13 @@ public:
     // unchanged until the next call. Reads in flight are waited for: not for every frame.
     void set(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
 
+    // How the ground looks from now on; null gives it a plain look. Copied: the file needn't stay.
+    void set_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file);
+
+    // The light map the frame carries (shaders/scene/terrain_light.slang): its material's slot, and the terrain's corner
+    // and size in render steps. False while there is none, or it hasn't loaded.
+    bool light_map(uint32_t& slot, uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const;
+
     // A frame's streaming: collects what's been read, publishes what's been uploaded, and starts what's wanted most.
     // No allocation per frame once it's settled.
     void update(const DVec3& camera);
@@ -108,6 +122,14 @@ public:
     // Picks this frame's patches. frame and views are SceneFrame and GpuCullView[] addresses. Nothing is added while
     // there's nothing to show, or the select pipeline is missing (a shader that failed).
     TerrainFrame add_select_passes(RenderGraph& graph, rhi::PipelineHandle select, uint64_t frame, uint64_t views);
+
+    // Makes this frame's grass around the camera, if the look has any, after the select passes. frame and views as those.
+    void add_grass_passes(RenderGraph& graph, rhi::PipelineHandle scatter, uint64_t frame, uint64_t views,
+                          TerrainFrame& out);
+    // For the pass that calls draw_grass(); before its use_draws() or after, it doesn't matter.
+    void use_grass(PassBuilder& pass, const TerrainFrame& frame) const;
+    void draw_grass(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline,
+                    uint64_t frame_address, uint32_t screen_height) const;
 
     // Draws into a pass that declared use_draws().
     void use_draws(PassBuilder& pass, const TerrainFrame& frame) const;

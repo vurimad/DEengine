@@ -67,6 +67,17 @@ struct SceneFog {
 // The scene's light, linear: what an environment asset gives (scene_lighting()).
 // Values are relative to exposure: a sun of 4 with an exposure of 1 is a bright day. The defaults
 // are a late afternoon, for tests and tools without an environment.
+// The wind (docs/design.md, Vegetation and Weather; shaders/scene/wind.slang has the field): a steady push one way,
+// gusts in patches that travel with it, and turbulence that swirls it about. Grass and plants with wind in their
+// materials move in it. The default is still air.
+struct SceneWind {
+    float direction[2] = {1.0f, 0.0f}; // toward where it blows, on the ground (x, z), normalized when used
+    float speed_mps = 0.0f;
+    float gust_mps = 0.0f;     // what a gust adds
+    float gust_size_m = 40.0f; // across a patch of gusting air
+    float turbulence = 0.0f;   // 0 to 1
+};
+
 struct SceneLighting {
     float sun_direction[3] = {-0.55f, 0.32f, -0.75f}; // toward the sun, normalized when used: low, ahead
     float sun_color[3] = {4.6f, 3.6f, 2.4f};          // late afternoon gold
@@ -76,6 +87,7 @@ struct SceneLighting {
     float exposure_ev = 0.0f;
     SceneShadows shadows{}; // the sun's
     SceneFog fog{};
+    SceneWind wind{}; // not light, but the environment says it with the rest
 };
 
 // An environment asset (.deenv) as the renderer's lighting.
@@ -235,6 +247,8 @@ public:
     // The terrain to show, or null for none. file holds it, and must stay valid and unchanged until the next call.
     // Waits for what's in flight: only when the terrain changes.
     void set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
+    // How the ground looks from now on; null gives it a plain look. Copied: the file needn't stay.
+    void set_terrain_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file);
 
     // Whether some frame's changes never reached the instances here, because it wasn't drawn, or was drawn with no
     // camera or with shaders missing. The next frame has to hold all of them (RenderFrame::all_instances).

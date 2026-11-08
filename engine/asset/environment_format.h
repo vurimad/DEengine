@@ -33,6 +33,13 @@ struct FogLimits {
     static constexpr float kMaxVolumeDistanceM = 2000.0f; // the froxel grid's reach (0: no grid)
 };
 
+// The range of each wind setting (render::SceneWind), as for the shadows.
+struct WindLimits {
+    static constexpr float kMaxSpeedMps = 60.0f; // the steady wind, and what a gust adds to it
+    static constexpr float kMinGustSizeM = 1.0f;
+    static constexpr float kMaxGustSizeM = 10000.0f;
+};
+
 // .deenv: the binary form of a .environment text source. How a place is lit (docs/design.md,
 // Rendering; Sky, atmosphere & weather): the sun, the ambient from sky and ground, the tint of
 // shadowed sunlight, exposure, the sun's shadows and the fog. Colors are linear, multiplied by their
@@ -40,7 +47,7 @@ struct FogLimits {
 // reads it as render::SceneLighting (render::scene_lighting()).
 struct EnvironmentAsset {
     static constexpr AssetType kType = AssetType::Environment;
-    static constexpr uint16_t kFormatVersion = 4;
+    static constexpr uint16_t kFormatVersion = 5; // 5: wind
 
     AssetHeader header;
     float sun_direction[3] = {0, 1, 0}; // toward the sun, unit length
@@ -76,11 +83,17 @@ struct EnvironmentAsset {
     float fog_low_camera_keep = 1.0f; // 0 to 1
     float fog_low_camera_below_m = 0.0f;
     float fog_low_camera_above_m = 0.0f; // at least fog_low_camera_below_m
+    // The wind (render::SceneWind): what grass and plants move in.
+    float wind_direction[2] = {1.0f, 0.0f}; // toward where it blows, on the ground (x, z), unit length
+    float wind_speed_mps = 0.0f;            // the steady wind. 0 and no gusts: still air
+    float wind_gust_mps = 0.0f;             // what a gust adds to it
+    float wind_gust_size_m = 40.0f;         // across a patch of gusting air, which travels with the wind
+    float wind_turbulence = 0.0f;           // 0 to 1: how far it swirls off its way
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
-    // within ShadowLimits, the fog's within FogLimits.
+    // within ShadowLimits, the fog's within FogLimits, the wind's within WindLimits and its direction unit length.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(EnvironmentAsset) == 256);
+static_assert(sizeof(EnvironmentAsset) == 280);
 
 } // namespace de::asset

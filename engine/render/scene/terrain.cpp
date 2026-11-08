@@ -7,6 +7,7 @@
 #include "render/rhi/command_list.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
+#include "render/scene/gpu_assets.h"
 #include "render/scene/scene_renderer.h"
 #include "world/render_extract.h"
 
@@ -93,8 +94,99 @@ struct TerrainDrawPush {
     uint32_t size_steps[2] = {};
     uint32_t cascade = 0;
     uint32_t show_levels = 0;
+    // Only shaders/scene/terrain.slang goes on to read these.
+    uint64_t layers = 0;
+    uint64_t materials = 0;
+    uint32_t layer_count = 0;
+    uint32_t masks_material = 0;
+    float blend = 0.0f;
+    uint32_t has_masks = 0;
+    uint64_t grass = 0;
+    uint32_t details_material = 0;
+    uint32_t has_details = 0;
+    uint32_t normals_material = 0;
+    uint32_t has_normals = 0;
 };
 static_assert(sizeof(TerrainDrawPush) <= 128);
+
+// Matches GrassScatterPush in shaders/scene/grass_scatter.slang.
+struct GrassScatterPush {
+    uint64_t frame = 0;
+    uint64_t views = 0;
+    uint64_t levels = 0;
+    uint64_t nodes = 0;
+    uint64_t slots = 0;
+    uint64_t heights = 0;
+    uint64_t blades = 0;
+    uint64_t args = 0;
+    uint64_t grass = 0;
+    uint64_t materials = 0;
+    uint32_t origin_steps[2] = {};
+    uint32_t size_steps[2] = {};
+    uint32_t level = 0;
+    uint32_t masks_material = 0;
+    uint32_t has_masks = 0;
+};
+static_assert(sizeof(GrassScatterPush) <= 128);
+
+// Matches GrassDrawPush in shaders/scene/grass.slang.
+struct GrassDrawPush {
+    uint64_t frame = 0;
+    uint64_t blades = 0;
+    float color_base[3] = {};
+    float width_m = 0.0f;
+    float color_tip[3] = {};
+    float height_low_m = 0.0f;
+    float height_high_m = 0.0f;
+    float screen_height = 0.0f;
+    float padding0[2] = {}; // a float3 in the shader's block starts on 16 bytes
+    float other_base[3] = {};
+    float padding1 = 0.0f;
+    float other_tip[3] = {};
+    float padding2 = 0.0f;
+};
+static_assert(sizeof(GrassDrawPush) <= 128);
+
+// Matches shaders/scene/grass_common.slang.
+struct GpuGrassBlade {
+    float root[3] = {};
+    uint32_t packed = 0;
+};
+static_assert(sizeof(GpuGrassBlade) == 16);
+constexpr uint32_t kGrassLods = 3;
+constexpr uint32_t kGrassLodFirst[kGrassLods] = {0U, 192U * 1024U, 448U * 1024U};
+constexpr uint32_t kGrassBladeCapacity = 960U * 1024U;
+constexpr uint32_t kGrassArgsWords = 5;
+constexpr uint32_t kGrassCellsSide = 224; // threads per side: 8 to a group
+
+// A blade's triangles at each level of detail. Vertex numbers say where along it and which side: every level uses some
+// of the same ones, so one shape function serves them all.
+constexpr uint16_t kGrassIndices[] = {0, 1, 2, 2, 1, 3, 2, 3, 4, 4, 3, 5, 4, 5, 6, 6, 5, 7, 6, 7, 8, // 7 triangles
+                                      0, 1, 4, 4, 1, 5, 4, 5, 8,                                     // 3
+                                      0, 1, 8};                                                      // 1
+constexpr uint32_t kGrassLodFirstIndex[kGrassLods] = {0, 21, 30};
+constexpr uint32_t kGrassLodIndices[kGrassLods] = {21, 9, 3};
+
+// One layer as shaders/scene/terrain.slang reads it.
+struct GpuTerrainLayer {
+    uint32_t material = 0; // in the material table
+    uint32_t tile_steps = 1;
+    uint32_t projection = 0;
+    uint32_t mask = 0;
+    float height_m[4] = {};
+    float slope_cos[4] = {};
+    float mask_from = 0.0f;
+    float mask_scale = 1.0f;
+    float noise = 0.0f;
+    float noise_large = 0.0f;
+    float variation = 0.0f;
+    float tint[3] = {};
+    uint32_t detail = 0;
+    float detail_from = 0.0f;
+    float detail_scale = 1.0f;
+    uint32_t flags = 0; // asset::TerrainLayerFlags
+};
+static_assert(sizeof(GpuTerrainLayer) == 96);
 
 enum class NodeState : uint8_t { Unloaded, Reading, Uploading, Resident, Failed };
 
@@ -176,6 +268,7 @@ struct TerrainState {
     rhi::Device* device = nullptr;
     rhi::Uploader* uploader = nullptr;
     platform::Vfs* vfs = nullptr;
+    GpuAssets* gpu_assets = nullptr;
     uint32_t max_blocks = 0;
 
     rhi::BufferHandle heights; // the pool: max_blocks blocks
@@ -228,6 +321,30 @@ struct TerrainState {
 
     TerrainStats counters;
     TerrainStats drawn;
+
+    // How it looks. The table holds materials by where they are now, so it's looked over every frame.
+    rhi::BufferHandle
+        layer_buffers[rhi::kFramesInFlight]; // room for kTerrainMaxLayers and the grass, by frame in flight
+    uint64_t layer_buffers_version[rhi::kFramesInFlight] = {};
+    core::Array<GpuTerrainLayer> layer_table{render_heap()};
+    core::Array<asset::AssetId> layer_materials{render_heap()}; // by layer
+    uint64_t layer_table_version = 1;
+    asset::AssetId masks_material;
+    uint32_t masks_slot = 0;
+    asset::AssetId details_material;
+    uint32_t details_slot = 0;
+    asset::AssetId lighting_material;
+    uint32_t lighting_slot = 0;
+    asset::AssetId normals_material;
+    uint32_t normals_slot = 0;
+    bool normals_ready = false; // its texture is in: until then the mesh's normals, not the default flat one
+    float blend = 0.0f;
+    asset::TerrainGrass grass;
+    rhi::BufferHandle grass_blades;
+    rhi::BufferHandle grass_args;
+    rhi::BufferHandle grass_indices;
+    uint64_t grass_index_ticket = 0;
+    bool grass_buffers_read = false;
 
     [[nodiscard]] bool tables_ready() const {
         return terrain != nullptr && header_ok && uploader->recorded(tables_ticket) && uploader->recorded(index_ticket);
@@ -291,6 +408,18 @@ struct TerrainState {
             if (buffer.is_valid()) {
                 device->destroy(buffer);
                 buffer = {};
+            }
+        }
+        for (rhi::BufferHandle& buffer : layer_buffers) {
+            if (buffer.is_valid()) {
+                device->destroy(buffer);
+                buffer = {};
+            }
+        }
+        for (rhi::BufferHandle* buffer : {&grass_blades, &grass_args, &grass_indices}) {
+            if (buffer->is_valid()) {
+                device->destroy(*buffer);
+                *buffer = {};
             }
         }
     }
@@ -529,6 +658,7 @@ core::Result<Terrain> Terrain::create(const TerrainDesc& desc) {
     Terrain terrain(state);
     state->device = desc.device;
     state->uploader = desc.uploader;
+    state->gpu_assets = desc.gpu_assets;
     state->vfs = desc.vfs;
     state->max_blocks = desc.max_blocks;
 
@@ -575,6 +705,42 @@ core::Result<Terrain> Terrain::create(const TerrainDesc& desc) {
             return core::fail(made.error());
         }
     }
+    for (rhi::BufferHandle& buffer : state->layer_buffers) {
+        if (auto made = make(
+                buffer, {.size = (asset::kTerrainMaxLayers * sizeof(GpuTerrainLayer)) + sizeof(asset::TerrainGrass),
+                         .usage = BufferUsage::Storage,
+                         .memory = rhi::MemoryLocation::Upload,
+                         .debug_name = "terrain layers"});
+            !made) {
+            return core::fail(made.error());
+        }
+    }
+    if (auto made = make(state->grass_blades, {.size = uint64_t{kGrassBladeCapacity} * sizeof(GpuGrassBlade),
+                                               .usage = BufferUsage::Storage,
+                                               .debug_name = "grass blades"});
+        !made) {
+        return core::fail(made.error());
+    }
+    if (auto made =
+            make(state->grass_args, {.size = uint64_t{kGrassLods} * kGrassArgsWords * sizeof(uint32_t),
+                                     .usage = BufferUsage::Storage | BufferUsage::Indirect | BufferUsage::CopyDst,
+                                     .debug_name = "grass args"});
+        !made) {
+        return core::fail(made.error());
+    }
+    if (auto made = make(state->grass_indices, {.size = sizeof(kGrassIndices),
+                                                .usage = BufferUsage::Index | BufferUsage::CopyDst,
+                                                .debug_name = "grass indices"});
+        !made) {
+        return core::fail(made.error());
+    }
+    if (const core::Result<void> queued = desc.uploader->upload_buffer(
+            state->grass_indices, 0, std::as_bytes(std::span(kGrassIndices)), rhi::ResourceState::IndexBuffer,
+            rhi::ShaderStages::All, rhi::BufferRange::Unread);
+        !queued) {
+        return core::fail(queued.error());
+    }
+    state->grass_index_ticket = desc.uploader->buffer_upload_ticket();
     state->heights_address = desc.device->buffer_address(state->heights);
     state->draws_address = desc.device->buffer_address(state->draws);
     state->args_address = desc.device->buffer_address(state->args);
@@ -802,11 +968,96 @@ void Terrain::set(const asset::TerrainAsset* terrain, std::span<const std::byte>
     state.header_reading = true;
 }
 
+void Terrain::set_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file) {
+    TerrainState& state = *state_;
+    state.layer_table.clear();
+    state.layer_materials.clear();
+    state.masks_material = {};
+    state.details_material = {};
+    state.lighting_material = {};
+    state.normals_material = {};
+    state.normals_ready = false;
+    state.grass = {};
+    ++state.layer_table_version;
+    if (layers == nullptr) {
+        return;
+    }
+    const std::span<const asset::AssetRef> dependencies = layers->header.dependencies.get(file.data());
+    if (layers->masks != asset::TerrainLayersAsset::kNone) {
+        state.masks_material = dependencies[layers->masks].id;
+    }
+    if (layers->details != asset::TerrainLayersAsset::kNone) {
+        state.details_material = dependencies[layers->details].id;
+    }
+    if (layers->lighting != asset::TerrainLayersAsset::kNone) {
+        state.lighting_material = dependencies[layers->lighting].id;
+    }
+    if (layers->normals != asset::TerrainLayersAsset::kNone) {
+        state.normals_material = dependencies[layers->normals].id;
+    }
+    state.blend = layers->blend;
+    state.grass = layers->grass;
+    for (const asset::TerrainLayer& layer : layers->layers.get(file.data())) {
+        GpuTerrainLayer gpu;
+        gpu.tile_steps = std::max<uint32_t>(
+            static_cast<uint32_t>(std::lround(static_cast<double>(layer.tile_m) * world::kRenderStepsPerM)), 1);
+        gpu.projection = static_cast<uint32_t>(layer.projection);
+        gpu.mask = layer.mask;
+        std::copy_n(layer.height_m, 4, gpu.height_m);
+        std::copy_n(layer.slope_cos, 4, gpu.slope_cos);
+        gpu.mask_from = layer.mask_from;
+        gpu.mask_scale = 1.0f / (layer.mask_to - layer.mask_from); // the asset's validate keeps them apart
+        gpu.noise = layer.noise;
+        gpu.noise_large = layer.noise_large;
+        gpu.variation = layer.variation;
+        std::copy_n(layer.tint, 3, gpu.tint);
+        gpu.detail = layer.detail;
+        gpu.detail_from = layer.detail_from;
+        gpu.detail_scale = 1.0f / (layer.detail_to - layer.detail_from); // kept apart by validate, as the mask's
+        gpu.flags = static_cast<uint32_t>(layer.flags);
+        state.layer_table.push(gpu);
+        state.layer_materials.push(dependencies[layer.material].id);
+    }
+}
+
+bool Terrain::light_map(uint32_t& slot, uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const {
+    const TerrainState& state = *state_;
+    if (state.terrain == nullptr || !state.lighting_material.is_valid() || state.lighting_slot == 0) {
+        return false;
+    }
+    slot = state.lighting_slot;
+    std::copy_n(state.origin_steps, 2, origin_steps);
+    std::copy_n(state.size_steps, 2, size_steps);
+    return true;
+}
+
 void Terrain::update(const DVec3& camera) {
     DE_PROFILE_ZONE("Terrain::update");
     TerrainState& state = *state_;
     if (state.terrain == nullptr) {
         return;
+    }
+    // Materials get their place in the table as they load.
+    if (state.gpu_assets != nullptr) {
+        for (size_t i = 0; i < state.layer_table.size(); ++i) {
+            const uint32_t material = state.gpu_assets->material_slot(state.layer_materials[i]);
+            if (state.layer_table[i].material != material) {
+                state.layer_table[i].material = material;
+                ++state.layer_table_version;
+            }
+        }
+        state.masks_slot = state.masks_material.is_valid() ? state.gpu_assets->material_slot(state.masks_material) : 0;
+        state.details_slot =
+            state.details_material.is_valid() ? state.gpu_assets->material_slot(state.details_material) : 0;
+        state.lighting_slot =
+            state.lighting_material.is_valid() ? state.gpu_assets->material_slot(state.lighting_material) : 0;
+        const uint32_t normals_slot =
+            state.normals_material.is_valid() ? state.gpu_assets->material_slot(state.normals_material) : 0;
+        // Once in, it stays in for as long as it keeps its place, even while the table writes it again.
+        state.normals_ready = normals_slot != 0 &&
+                              ((state.normals_ready && normals_slot == state.normals_slot) ||
+                               state.gpu_assets->material_complete(state.normals_material));
+        state.normals_slot = normals_slot;
     }
     ++state.update_number;
     state.read_drawn();
@@ -844,6 +1095,14 @@ TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle 
         std::memcpy(mapped.data(), state.slot_table.data(), state.slot_table.size() * sizeof(uint32_t));
         state.device->flush_mapped(state.slots[slot]);
         state.slots_version[slot] = state.slot_table_version;
+    }
+    if (state.layer_buffers_version[slot] != state.layer_table_version && !state.layer_table.empty()) {
+        const std::span<std::byte> mapped = state.device->mapped(state.layer_buffers[slot]);
+        std::memcpy(mapped.data(), state.layer_table.data(), state.layer_table.size() * sizeof(GpuTerrainLayer));
+        std::memcpy(mapped.data() + (asset::kTerrainMaxLayers * sizeof(GpuTerrainLayer)), &state.grass,
+                    sizeof(state.grass));
+        state.device->flush_mapped(state.layer_buffers[slot]);
+        state.layer_buffers_version[slot] = state.layer_table_version;
     }
 
     const rhi::ResourceState was_args =
@@ -909,6 +1168,104 @@ TerrainFrame Terrain::add_select_passes(RenderGraph& graph, rhi::PipelineHandle 
     return out;
 }
 
+void Terrain::add_grass_passes(RenderGraph& graph, rhi::PipelineHandle scatter, uint64_t frame, uint64_t views,
+                               TerrainFrame& out) {
+    TerrainState& state = *state_;
+    if (!out.valid || !scatter.is_valid() || state.gpu_assets == nullptr || state.grass.density_per_m2 <= 0.0f ||
+        !state.uploader->recorded(state.grass_index_ticket)) {
+        return;
+    }
+    const rhi::ResourceState was_args =
+        state.grass_buffers_read ? rhi::ResourceState::IndirectArgument : rhi::ResourceState::Undefined;
+    const rhi::ResourceState was_blades =
+        state.grass_buffers_read ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined;
+    state.grass_buffers_read = true;
+    out.grass_args = graph.import_buffer({.buffer = state.grass_args,
+                                          .name = "grass args",
+                                          .state = was_args,
+                                          .final_state = rhi::ResourceState::IndirectArgument});
+    out.grass_blades = graph.import_buffer({.buffer = state.grass_blades,
+                                            .name = "grass blades",
+                                            .state = was_blades,
+                                            .final_state = rhi::ResourceState::ShaderRead});
+    out.grass = true;
+    graph.add_pass(
+        "grass clear", [&](PassBuilder& pass) { pass.use(out.grass_args, rhi::ResourceState::CopyDst); },
+        [args = out.grass_args](PassContext& context) {
+            const rhi::BufferHandle buffer = context.buffer(args);
+            for (uint32_t lod = 0; lod < kGrassLods; ++lod) {
+                const uint32_t words[kGrassArgsWords] = {kGrassLodIndices[lod], 0, kGrassLodFirstIndex[lod], 0,
+                                                         kGrassLodFirst[lod]};
+                for (uint32_t w = 0; w < kGrassArgsWords; ++w) {
+                    context.list.fill_buffer(buffer, uint64_t{(lod * kGrassArgsWords) + w} * sizeof(uint32_t),
+                                             sizeof(uint32_t), words[w]);
+                }
+            }
+        });
+    graph.add_pass(
+        "grass scatter",
+        [&](PassBuilder& pass) {
+            pass.use(out.grass_args, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            pass.use(out.grass_blades, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+        },
+        [&state, scatter, frame, views](PassContext& context) {
+            DE_PROFILE_ZONE("grass scatter pass");
+            const auto slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
+            const GrassScatterPush push{.frame = frame,
+                                        .views = views,
+                                        .levels = state.device->buffer_address(state.levels),
+                                        .nodes = state.device->buffer_address(state.nodes_buffer),
+                                        .slots = state.device->buffer_address(state.slots[slot]),
+                                        .heights = state.heights_address,
+                                        .blades = state.device->buffer_address(state.grass_blades),
+                                        .args = state.device->buffer_address(state.grass_args),
+                                        .grass = state.device->buffer_address(state.layer_buffers[slot]) +
+                                                 (asset::kTerrainMaxLayers * sizeof(GpuTerrainLayer)),
+                                        .materials = state.gpu_assets->material_table_address(),
+                                        .origin_steps = {state.origin_steps[0], state.origin_steps[1]},
+                                        .size_steps = {state.size_steps[0], state.size_steps[1]},
+                                        .level = state.level_count - 1,
+                                        .masks_material = state.masks_slot,
+                                        .has_masks = state.masks_material.is_valid() ? 1U : 0U};
+            context.list.bind_pipeline(scatter);
+            context.list.push_constants(push);
+            context.list.dispatch((kGrassCellsSide + 7) / 8, (kGrassCellsSide + 7) / 8);
+        });
+}
+
+void Terrain::use_grass(PassBuilder& pass, const TerrainFrame& frame) const {
+    if (frame.grass) {
+        pass.use(frame.grass_args, rhi::ResourceState::IndirectArgument);
+        pass.use(frame.grass_blades, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+    }
+}
+
+void Terrain::draw_grass(PassContext& context, const TerrainFrame& frame, rhi::PipelineHandle pipeline,
+                         uint64_t frame_address, uint32_t screen_height) const {
+    const TerrainState& state = *state_;
+    if (!frame.grass || !pipeline.is_valid()) {
+        return;
+    }
+    const asset::TerrainGrass& grass = state.grass;
+    GrassDrawPush push{.frame = frame_address,
+                       .blades = state.device->buffer_address(state.grass_blades),
+                       .width_m = grass.width_m,
+                       .height_low_m = grass.height_m[0],
+                       .height_high_m = grass.height_m[1],
+                       .screen_height = static_cast<float>(screen_height)};
+    std::copy_n(grass.color_base, 3, push.color_base);
+    std::copy_n(grass.color_tip, 3, push.color_tip);
+    std::copy_n(grass.other_base, 3, push.other_base);
+    std::copy_n(grass.other_tip, 3, push.other_tip);
+    context.list.bind_pipeline(pipeline);
+    context.list.push_constants(push);
+    context.list.bind_index_buffer(state.grass_indices, 0, rhi::IndexType::Uint16);
+    for (uint32_t lod = 0; lod < kGrassLods; ++lod) {
+        context.list.draw_indexed_indirect(context.buffer(frame.grass_args),
+                                           uint64_t{lod * kGrassArgsWords} * sizeof(uint32_t), 1);
+    }
+}
+
 void Terrain::use_draws(PassBuilder& pass, const TerrainFrame& frame) const {
     if (frame.valid) {
         pass.use(frame.args, rhi::ResourceState::IndirectArgument);
@@ -922,6 +1279,8 @@ void Terrain::draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi:
     if (!frame.valid || !pipeline.is_valid()) {
         return;
     }
+    const auto slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
+    const bool looks = state.gpu_assets != nullptr && !state.layer_table.empty();
     const TerrainDrawPush push{.frame = frame_address,
                                .draws = state.draws_address,
                                .levels = state.device->buffer_address(state.levels),
@@ -929,7 +1288,21 @@ void Terrain::draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi:
                                .origin_steps = {state.origin_steps[0], state.origin_steps[1]},
                                .size_steps = {state.size_steps[0], state.size_steps[1]},
                                .cascade = 0,
-                               .show_levels = show_levels ? 1U : 0U};
+                               .show_levels = show_levels ? 1U : 0U,
+                               .layers = looks ? state.device->buffer_address(state.layer_buffers[slot]) : 0,
+                               .materials = looks ? state.gpu_assets->material_table_address() : 0,
+                               .layer_count = looks ? static_cast<uint32_t>(state.layer_table.size()) : 0,
+                               .masks_material = state.masks_slot,
+                               .blend = state.blend,
+                               .has_masks = state.masks_material.is_valid() ? 1U : 0U,
+                               .grass = looks && state.grass.density_per_m2 > 0.0f
+                                            ? state.device->buffer_address(state.layer_buffers[slot]) +
+                                                  (asset::kTerrainMaxLayers * sizeof(GpuTerrainLayer))
+                                            : 0,
+                               .details_material = state.details_slot,
+                               .has_details = state.details_material.is_valid() ? 1U : 0U,
+                               .normals_material = state.normals_slot,
+                               .has_normals = looks && state.normals_ready ? 1U : 0U};
     context.list.bind_pipeline(pipeline);
     context.list.push_constants(push);
     context.list.bind_index_buffer(state.indices, 0, rhi::IndexType::Uint16);

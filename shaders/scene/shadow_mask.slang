@@ -13,6 +13,7 @@
 
 import common.bindless;
 import scene.scene_common;
+import scene.terrain_light;
 
 struct ShadowMaskPush
 {
@@ -62,11 +63,17 @@ float2 fragment_main(VertexOutput input) : SV_Target
     float3 position = position_from_depth(frame, input.ndc, depth);
     const float distance = dot(position - frame.camera_position.xyz, frame.camera_forward.xyz);
 
+    // The terrain's baked shadow, at any distance. Near the camera the cascades draw the small shadows, so it keeps only
+    // the deep ones (a cliff's across a valley, which the cascades don't reach); far off, all of them.
+    const float far_share = smoothstep(0.4, 1.0, distance / max(frame.cascade_far[kCascadeCount - 1], 1.0));
+    const float depth_m = terrain_light(frame, position).shadow_depth_m;
+    const float baked = 1.0 - smoothstep(lerp(8.0, 0.3, far_share), lerp(24.0, 4.0, far_share), depth_m);
+
     // The cascade: the first that reaches this far; the dithered band hands some pixels on.
     uint cascade = cascade_at(frame, distance);
     if (cascade == kCascadeCount)
     {
-        return float2(1.0, 1.0); // beyond the shadow distance: lit
+        return float2(baked, 1.0); // beyond the shadow distance: the baked shadow alone
     }
     // With TAA, the noise changes every frame (IGN's own step per frame), and TAA averages it away.
     const float noise_step = 5.588238 * frame.taa_params.y;
@@ -125,5 +132,5 @@ float2 fragment_main(VertexOutput input) : SV_Target
         lit += sample_shadow(push.atlas, uv, compare);
     }
     lit /= 16.0;
-    return float2(lerp(lit, 1.0, fade_out), (float(cascade) + 1.0) / 5.0);
+    return float2(min(lerp(lit, 1.0, fade_out), baked), (float(cascade) + 1.0) / 5.0);
 }

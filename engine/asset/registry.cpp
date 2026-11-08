@@ -7,6 +7,7 @@
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/terrain_format.h"
+#include "asset/terrain_layers_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "core/allocator.h"
@@ -76,6 +77,8 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<CollisionAsset>(file));
     case AssetType::Terrain:
         return checked(load_in_place<TerrainAsset>(file));
+    case AssetType::TerrainLayers:
+        return checked(load_in_place<TerrainLayersAsset>(file));
     case AssetType::TerrainHeights: // start_read refuses these before reading them
     case AssetType::Unknown:
         break;

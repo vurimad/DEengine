@@ -10,6 +10,8 @@
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <limits>
 #include <utility>
 
 namespace de::cooker {
@@ -119,6 +121,126 @@ uint32_t encode_unorm8x4(const float (&value)[4]) {
     return packed;
 }
 
+namespace {
+
+// Wind for plants, into the vertex color (MeshWind; shaders/scene/wind.slang's plant_sway). Red is how far a vertex
+// flutters, green its piece's phase, blue how far that piece is from being the plant's main stem; alpha is the
+// source's. A piece is what's connected: a leaf, a twig, a branch, joined across vertex splits by position. It moves
+// about its lowest point, more toward its far end. One that's most of the plant's height (a trunk, a stem) hardly
+// flutters and leaves that to the whole plant's sway. Baked once, here on the full mesh, so the LOD chain carries the
+// colors along and nothing jumps at a switch; leaves welded into one blob come out as one piece, and want Height
+// instead.
+void bake_wind(std::span<ModelVertex> vertices, std::span<const uint32_t> indices, MeshWind wind) {
+    if (wind == MeshWind::Keep || vertices.empty()) {
+        return;
+    }
+    float low = std::numeric_limits<float>::max();
+    float high = std::numeric_limits<float>::lowest();
+    for (const ModelVertex& vertex : vertices) {
+        low = std::min(low, vertex.position[1]);
+        high = std::max(high, vertex.position[1]);
+    }
+    const float height = std::max(high - low, 1e-4f);
+    const auto phase = [](uint32_t key) {
+        uint32_t h = key * 0x9e3779b9U;
+        h ^= h >> 16U;
+        h *= 0x85ebca6bU;
+        h ^= h >> 13U;
+        return static_cast<float>(h >> 8U) / static_cast<float>(1U << 24U);
+    };
+    if (wind == MeshWind::Height) {
+        for (ModelVertex& vertex : vertices) {
+            const float up = (vertex.position[1] - low) / height;
+            vertex.color[0] = up * up;
+            vertex.color[1] =
+                phase(static_cast<uint32_t>(std::lround(vertex.position[0] * 7.0f + vertex.position[2] * 13.0f)));
+            vertex.color[2] = 1.0f;
+        }
+        return;
+    }
+
+    // Pieces: joined by triangles, and across splits where two vertices share a position.
+    const size_t count = vertices.size();
+    core::Array<uint32_t> parent(tools_heap());
+    parent.resize_uninit(count);
+    for (size_t i = 0; i < count; ++i) {
+        parent[i] = static_cast<uint32_t>(i);
+    }
+    const auto find = [&](uint32_t i) {
+        while (parent[i] != i) {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        return i;
+    };
+    const auto unite = [&](uint32_t a, uint32_t b) {
+        a = find(a);
+        b = find(b);
+        if (a != b) {
+            parent[std::max(a, b)] = std::min(a, b);
+        }
+    };
+    for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+        unite(indices[t], indices[t + 1]);
+        unite(indices[t + 1], indices[t + 2]);
+    }
+    core::Array<uint32_t> by_position(tools_heap());
+    by_position.resize_uninit(count);
+    for (size_t i = 0; i < count; ++i) {
+        by_position[i] = static_cast<uint32_t>(i);
+    }
+    const auto same_place = [&](uint32_t a, uint32_t b) {
+        return std::memcmp(vertices[a].position, vertices[b].position, sizeof(vertices[a].position)) == 0;
+    };
+    std::ranges::sort(by_position, [&](uint32_t a, uint32_t b) {
+        return std::ranges::lexicographical_compare(vertices[a].position, vertices[b].position);
+    });
+    for (size_t i = 1; i < count; ++i) {
+        if (same_place(by_position[i - 1], by_position[i])) {
+            unite(by_position[i - 1], by_position[i]);
+        }
+    }
+
+    // Each piece's lowest vertex, its top, and how far it reaches from that lowest vertex.
+    core::Array<uint32_t> lowest(tools_heap());
+    core::Array<float> top(tools_heap());
+    core::Array<float> reach(tools_heap());
+    lowest.resize(count, UINT32_MAX);
+    top.resize(count, std::numeric_limits<float>::lowest());
+    reach.resize(count, 0.0f);
+    const auto distance = [&](uint32_t a, uint32_t b) {
+        const float dx = vertices[a].position[0] - vertices[b].position[0];
+        const float dy = vertices[a].position[1] - vertices[b].position[1];
+        const float dz = vertices[a].position[2] - vertices[b].position[2];
+        return std::sqrt(dx * dx + dy * dy + dz * dz);
+    };
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t piece = find(i);
+        if (lowest[piece] == UINT32_MAX || vertices[i].position[1] < vertices[lowest[piece]].position[1]) {
+            lowest[piece] = i;
+        }
+        top[piece] = std::max(top[piece], vertices[i].position[1]);
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t piece = find(i);
+        reach[piece] = std::max(reach[piece], distance(i, lowest[piece]));
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t piece = find(i);
+        const float along = distance(i, lowest[piece]) / std::max(reach[piece], 1e-4f);
+        const float tall = (top[piece] - vertices[lowest[piece]].position[1]) / height;
+        const float t = std::clamp((tall - 0.35f) / 0.35f, 0.0f, 1.0f);
+        const float stem = t * t * (3.0f - 2.0f * t);
+        const float up = (vertices[i].position[1] - low) / height;
+        ModelVertex& vertex = vertices[i];
+        vertex.color[0] = std::clamp(along * (1.0f - 0.85f * stem) * (0.4f + 0.6f * up), 0.0f, 1.0f);
+        vertex.color[1] = phase(piece);
+        vertex.color[2] = 1.0f - stem;
+    }
+}
+
+} // namespace
+
 core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span<const asset::AssetId> material_ids,
                                                const MeshSettings& settings, asset::AssetId id, std::string_view path,
                                                Diagnostics& diagnostics) {
@@ -183,6 +305,7 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
     meshopt_remapVertexBuffer(merged.data(), vertices.data(), vertices.size(), sizeof(ModelVertex), remap.data());
     meshopt_remapIndexBuffer(indices.data(), indices.data(), indices.size(), remap.data());
     vertices = std::move(merged);
+    bake_wind(vertices.span(), indices.span(), settings.wind);
 
     const float* positions = &vertices[0].position[0];
     if (settings.optimize) {

@@ -197,7 +197,7 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the world has errors");
     }
-    static constexpr const char* kKeys[] = {"environment", "terrain", "start", "cells"};
+    static constexpr const char* kKeys[] = {"environment", "terrain", "terrain_layers", "start", "cells"};
     reader.check_keys(kKeys, "world");
 
     const Source* environment = find_relative(tree, path, reader.string("environment", ""), SourceKind::Environment,
@@ -212,6 +212,17 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         if (terrain != nullptr) {
             build.terrain = {.id = terrain->id, .type = asset::AssetType::Terrain};
             build.read.push(terrain->path);
+        }
+    }
+    if (reader.has("terrain_layers")) {
+        if (!reader.has("terrain")) {
+            diagnostics.error(path, "terrain_layers needs a terrain to look like that");
+        }
+        const Source* layers = find_relative(tree, path, reader.string("terrain_layers", ""), SourceKind::TerrainLayers,
+                                             "terrain layers (.terrainlayers)", diagnostics);
+        if (layers != nullptr) {
+            build.terrain_layers = {.id = layers->id, .type = asset::AssetType::TerrainLayers};
+            build.read.push(layers->path);
         }
     }
 
@@ -275,12 +286,298 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     asset.start_yaw_rad = build.start_yaw_rad;
     asset.start_pitch_rad = build.start_pitch_rad;
     asset.environment = 0;
-    const bool has_terrain = build.terrain.id.is_valid();
-    asset.terrain = has_terrain ? 1 : asset::WorldAsset::kNone;
+    asset::AssetRef dependencies[3] = {build.environment};
+    uint32_t dependency_count = 1;
+    if (build.terrain.id.is_valid()) {
+        asset.terrain = dependency_count;
+        dependencies[dependency_count++] = build.terrain;
+    }
+    if (build.terrain_layers.id.is_valid()) {
+        asset.terrain_layers = dependency_count;
+        dependencies[dependency_count++] = build.terrain_layers;
+    }
     BlobWriter writer(sizeof(asset::WorldAsset));
     asset.cells = writer.append(build.cells.span());
-    const asset::AssetRef dependencies[] = {build.environment, build.terrain};
-    return writer.finish(asset, id, std::span(dependencies).first(has_terrain ? 2 : 1));
+    return writer.finish(asset, id, std::span(dependencies).first(dependency_count));
+}
+
+namespace {
+
+// A rule of four numbers in order, from an array; false (reported) otherwise.
+bool read_rule(const JsonReader& reader, const char* key, double least, double most, double (&out)[4]) {
+    if (!read_numbers(yyjson_obj_get(reader.object, key), out, 4) ||
+        !std::ranges::all_of(out,
+                             [&](double value) { return std::isfinite(value) && value >= least && value <= most; }) ||
+        !(out[0] <= out[1] && out[1] <= out[2] && out[2] <= out[3])) {
+        reader.diagnostics->error(reader.path, "%s should be four numbers in order, from %g to %g", key, least, most);
+        return false;
+    }
+    return true;
+}
+
+// Flat ground is the end of the range of slopes, and so is a sheer face: past either, the rule says all of it.
+void slope_rule(const double (&slope_deg)[4], float (&out)[4]) {
+    const auto cos_deg = [](double degrees) { return static_cast<float>(std::cos(degrees * kRadPerDeg)); };
+    out[0] = slope_deg[1] <= 0.0 ? 2.0f : cos_deg(slope_deg[0]);
+    out[1] = cos_deg(slope_deg[1]);
+    out[2] = slope_deg[2] >= 90.0 ? -1.0f : cos_deg(slope_deg[2]);
+    out[3] = slope_deg[2] >= 90.0 ? -2.0f : cos_deg(slope_deg[3]);
+}
+
+void read_terrain_grass(std::string_view path, yyjson_val* object, asset::TerrainGrass& grass,
+                        Diagnostics& diagnostics) {
+    const JsonReader reader{.object = object, .path = path, .diagnostics = &diagnostics};
+    if (!yyjson_is_obj(object)) {
+        diagnostics.error(path, "grass should be an object");
+        return;
+    }
+    static constexpr const char* kKeys[] = {
+        "density_per_m2", "height_m", "width_m", "where_height_m", "where_slope_deg", "not_where",
+        "patches",        "base",     "tip",     "other"};
+    reader.check_keys(kKeys, "grass");
+    double density = 0.0;
+    double width = 0.0;
+    if (required(reader, "density_per_m2", 0.0, 2048.0, density)) {
+        grass.density_per_m2 = static_cast<float>(density);
+    }
+    if (required(reader, "width_m", 0.0, 2.0, width)) {
+        grass.width_m = static_cast<float>(width);
+    }
+    double height[2] = {};
+    if (!read_numbers(yyjson_obj_get(object, "height_m"), height, 2) || !(height[0] >= 0.0) ||
+        !(height[0] <= height[1]) || !(height[1] <= 16.0)) {
+        diagnostics.error(path, "grass height_m should be its lowest and tallest, from 0 to 16");
+    } else {
+        grass.height_m[0] = static_cast<float>(height[0]);
+        grass.height_m[1] = static_cast<float>(height[1]);
+    }
+    double where_height[4] = {-1e6, -1e6, 1e6, 1e6};
+    if (reader.has("where_height_m")) {
+        read_rule(reader, "where_height_m", -1e6, 1e6, where_height);
+    }
+    for (int i = 0; i < 4; ++i) {
+        grass.where_height_m[i] = static_cast<float>(where_height[i]);
+    }
+    double where_slope[4] = {0.0, 0.0, 90.0, 90.0};
+    if (reader.has("where_slope_deg")) {
+        read_rule(reader, "where_slope_deg", 0.0, 90.0, where_slope);
+    }
+    slope_rule(where_slope, grass.where_slope_cos);
+    for (const char channel : reader.string("not_where", "")) {
+        const size_t index = std::string_view("rgba").find(channel);
+        if (index == std::string_view::npos) {
+            diagnostics.error(path, "grass not_where should be channels of the masks: r, g, b, a");
+        } else {
+            grass.excluded_masks |= 1U << index;
+        }
+    }
+    double patches = 0.0;
+    if (reader.has("patches") && required(reader, "patches", 0.0, 1.0, patches)) {
+        grass.patches = static_cast<float>(patches);
+    }
+    const auto color = [&](yyjson_val* from, const char* key, float (&out)[3]) {
+        double rgb[3] = {};
+        if (!read_numbers(yyjson_obj_get(from, key), rgb, 3) ||
+            !std::ranges::all_of(rgb, [](double c) { return c >= 0.0 && c <= 16.0; })) {
+            diagnostics.error(path, "grass %s should be [r, g, b], linear, from 0 to 16", key);
+        } else {
+            std::ranges::transform(rgb, out, [](double c) { return static_cast<float>(c); });
+        }
+    };
+    color(object, "base", grass.color_base);
+    color(object, "tip", grass.color_tip);
+    if (reader.has("other")) {
+        yyjson_val* other = yyjson_obj_get(object, "other");
+        const JsonReader other_reader{.object = other, .path = path, .diagnostics = &diagnostics};
+        const std::string_view mask = other_reader.string("mask", "");
+        const size_t channel = std::string_view("rgba").find(mask);
+        if (mask.size() != 1 || channel == std::string_view::npos) {
+            diagnostics.error(path, "grass other's mask should be one of r, g, b, a");
+        } else {
+            grass.other_mask = static_cast<uint32_t>(channel);
+        }
+        color(other, "base", grass.other_base);
+        color(other, "tip", grass.other_tip);
+    }
+}
+
+// Where a material is among the dependencies, adding it the first time.
+uint32_t dependency_of(TerrainLayersBuild& build, const Source& material) {
+    const asset::AssetRef ref{.id = material.id, .type = asset::AssetType::Material};
+    for (uint32_t i = 0; i < build.dependencies.size(); ++i) {
+        if (build.dependencies[i] == ref) {
+            return i;
+        }
+    }
+    build.dependencies.push(ref);
+    build.read.push(material.path);
+    return static_cast<uint32_t>(build.dependencies.size() - 1);
+}
+
+void read_terrain_layer(const SourceTree& tree, std::string_view path, yyjson_val* object, TerrainLayersBuild& build,
+                        Diagnostics& diagnostics) {
+    const JsonReader reader{.object = object, .path = path, .diagnostics = &diagnostics};
+    if (!yyjson_is_obj(object)) {
+        diagnostics.error(path, "a layer should be an object");
+        return;
+    }
+    static constexpr const char* kKeys[] = {"material",    "tile_m",          "height_m", "slope_deg", "mask",
+                                            "mask_range",  "detail",          "detail_range", "detail_coverage",
+                                            "noise",       "noise_large",     "variation", "tint",      "projection"};
+    reader.check_keys(kKeys, "terrain layer");
+    asset::TerrainLayer layer;
+
+    const Source* material = find_relative(tree, path, reader.string("material", ""), SourceKind::Material,
+                                           "a material source (.material)", diagnostics);
+    if (material != nullptr) {
+        layer.material = dependency_of(build, *material);
+    }
+    double tile_m = 0.0;
+    if (required(reader, "tile_m", 1.0 / 16.0, 4096.0, tile_m)) {
+        layer.tile_m = static_cast<float>(tile_m);
+    }
+
+    double height_m[4] = {-1e6, -1e6, 1e6, 1e6};
+    if (reader.has("height_m")) {
+        read_rule(reader, "height_m", -1e6, 1e6, height_m);
+    }
+    double slope_deg[4] = {0.0, 0.0, 90.0, 90.0};
+    if (reader.has("slope_deg")) {
+        read_rule(reader, "slope_deg", 0.0, 90.0, slope_deg);
+    }
+    for (int i = 0; i < 4; ++i) {
+        layer.height_m[i] = static_cast<float>(height_m[i]);
+    }
+    slope_rule(slope_deg, layer.slope_cos);
+
+    // A channel of the masks or the details, and what it has to be.
+    const auto channel_rule = [&](const char* key, const char* range_key, uint32_t& channel, float& from, float& to) {
+        if (reader.has(key)) {
+            const std::string_view name = reader.string(key, "");
+            const size_t index = std::string_view("rgba").find(name);
+            if (name.size() != 1 || index == std::string_view::npos) {
+                diagnostics.error(path, "%s should be one of r, g, b, a", key);
+            } else {
+                channel = static_cast<uint32_t>(index);
+            }
+        }
+        if (reader.has(range_key)) {
+            double range[2] = {};
+            if (!read_numbers(yyjson_obj_get(object, range_key), range, 2) ||
+                !std::ranges::all_of(range, [](double v) { return v >= 0.0 && v <= 1.0; }) ||
+                !(std::abs(range[1] - range[0]) >= 1e-3)) {
+                diagnostics.error(
+                    path, "%s should be two different numbers from 0 to 1: rising, or falling for where it's low",
+                    range_key);
+            } else {
+                from = static_cast<float>(range[0]);
+                to = static_cast<float>(range[1]);
+            }
+        }
+    };
+    channel_rule("mask", "mask_range", layer.mask, layer.mask_from, layer.mask_to);
+    channel_rule("detail", "detail_range", layer.detail, layer.detail_from, layer.detail_to);
+    if (reader.boolean("detail_coverage", false)) {
+        if (layer.detail == asset::kTerrainNoMask) {
+            diagnostics.error(path, "detail_coverage needs a detail channel");
+        }
+        layer.flags |= asset::TerrainLayerFlags::DetailCoverage;
+    }
+    const auto optional = [&](const char* key, double most, float& out) {
+        double value = 0.0;
+        if (reader.has(key) && required(reader, key, 0.0, most, value)) {
+            out = static_cast<float>(value);
+        }
+    };
+    optional("noise", 16.0, layer.noise);
+    optional("noise_large", 1.0, layer.noise_large);
+    optional("variation", 1.0, layer.variation);
+    if (reader.has("tint")) {
+        double tint[3] = {};
+        if (!read_numbers(yyjson_obj_get(object, "tint"), tint, 3) ||
+            !std::ranges::all_of(tint, [](double c) { return c >= 0.0 && c <= 16.0; })) {
+            diagnostics.error(path, "tint should be [r, g, b], linear, from 0 to 16");
+        } else {
+            std::ranges::transform(tint, layer.tint, [](double c) { return static_cast<float>(c); });
+        }
+    }
+    if (reader.has("projection")) {
+        const std::string_view projection = reader.string("projection", "");
+        if (projection == "sides") {
+            layer.projection = asset::TerrainProjection::Sides;
+        } else if (projection != "top") {
+            diagnostics.error(path, "projection should be top or sides");
+        }
+    }
+    build.layers.push(layer);
+}
+
+} // namespace
+
+core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, const Source& source,
+                                                       std::span<const std::byte> bytes, Diagnostics& diagnostics) {
+    const std::string_view path = source.path.view();
+    const size_t errors_before = diagnostics.error_count();
+    const core::Result<JsonDoc> doc = JsonDoc::parse(bytes, path, diagnostics);
+    if (!doc) {
+        return core::fail(doc.error());
+    }
+    TerrainLayersBuild build;
+    const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
+    if (!yyjson_is_obj(doc->root())) {
+        diagnostics.error(path, "should be a JSON object");
+        return core::fail(core::ErrorCode::InvalidArgument, "the terrain layers have errors");
+    }
+    static constexpr const char* kKeys[] = {"masks", "details", "lighting", "normals", "blend", "layers", "grass"};
+    reader.check_keys(kKeys, "terrain layers");
+    const auto map = [&](const char* key, uint32_t& out) {
+        if (reader.has(key)) {
+            const Source* material = find_relative(tree, path, reader.string(key, ""), SourceKind::Material,
+                                                   "a material source (.material)", diagnostics);
+            if (material != nullptr) {
+                out = dependency_of(build, *material);
+            }
+        }
+    };
+    map("masks", build.masks);
+    map("details", build.details);
+    map("lighting", build.lighting);
+    map("normals", build.normals);
+    double blend = build.blend;
+    if (reader.has("blend") && required(reader, "blend", 0.0, 1.0, blend)) {
+        build.blend = static_cast<float>(blend);
+    }
+    yyjson_val* layers = yyjson_obj_get(doc->root(), "layers");
+    if (!yyjson_is_arr(layers) || yyjson_arr_size(layers) == 0 || yyjson_arr_size(layers) > asset::kTerrainMaxLayers) {
+        diagnostics.error(path, "layers should be an array of 1 to %u layers", asset::kTerrainMaxLayers);
+    } else {
+        size_t i = 0;
+        size_t n = 0;
+        yyjson_val* layer = nullptr;
+        yyjson_arr_foreach(layers, i, n, layer) {
+            read_terrain_layer(tree, path, layer, build, diagnostics);
+        }
+    }
+    if (reader.has("grass")) {
+        read_terrain_grass(path, yyjson_obj_get(doc->root(), "grass"), build.grass, diagnostics);
+    }
+    if (diagnostics.error_count() != errors_before) {
+        return core::fail(core::ErrorCode::InvalidArgument, "the terrain layers have errors");
+    }
+    return build;
+}
+
+core::Array<std::byte> cook_terrain_layers(const TerrainLayersBuild& build, asset::AssetId id) {
+    asset::TerrainLayersAsset asset;
+    asset.masks = build.masks;
+    asset.details = build.details;
+    asset.lighting = build.lighting;
+    asset.normals = build.normals;
+    asset.blend = build.blend;
+    asset.grass = build.grass;
+    BlobWriter writer(sizeof(asset::TerrainLayersAsset));
+    asset.layers = writer.append(build.layers.span());
+    return writer.finish(asset, id, build.dependencies.span());
 }
 
 core::Result<asset::EnvironmentAsset> import_environment(const Source& source, std::span<const std::byte> bytes,
@@ -296,7 +593,8 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }
     const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
-    static constexpr const char* kKeys[] = {"sun", "sky", "ground", "shadow_color", "exposure_ev", "shadows", "fog"};
+    static constexpr const char* kKeys[] = {"sun",         "sky",     "ground", "shadow_color",
+                                            "exposure_ev", "shadows", "fog",    "wind"};
     reader.check_keys(kKeys, "environment");
     asset::EnvironmentAsset environment;
 
@@ -356,6 +654,42 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         environment.shadow_max_penumbra_texels = static_cast<float>(values[6]);
     }
     read_fog(reader, environment);
+    // Optional: still air without it.
+    if (yyjson_val* wind = yyjson_obj_get(doc->root(), "wind"); wind != nullptr) {
+        const JsonReader wind_reader{.object = wind, .path = path, .diagnostics = &diagnostics};
+        static constexpr const char* kWindKeys[] = {"toward_deg", "speed_mps", "gust_mps", "gust_size_m", "turbulence"};
+        if (!yyjson_is_obj(wind)) {
+            diagnostics.error(path,
+                              "wind should be an object: toward_deg, speed_mps, gust_mps, gust_size_m, turbulence");
+        } else {
+            wind_reader.check_keys(kWindKeys, "wind");
+            using W = asset::WindLimits;
+            double toward_deg = 0.0;
+            double speed = 0.0;
+            double gust = 0.0;
+            double gust_size = environment.wind_gust_size_m;
+            double turbulence = 0.0;
+            if (required(wind_reader, "toward_deg", -360.0, 360.0, toward_deg)) {
+                // Across from north (-Z) toward east (+X), as the sun's azimuth.
+                environment.wind_direction[0] = static_cast<float>(std::sin(toward_deg * kRadPerDeg));
+                environment.wind_direction[1] = static_cast<float>(-std::cos(toward_deg * kRadPerDeg));
+            }
+            required(wind_reader, "speed_mps", 0.0, W::kMaxSpeedMps, speed);
+            if (wind_reader.has("gust_mps")) {
+                required(wind_reader, "gust_mps", 0.0, W::kMaxSpeedMps, gust);
+            }
+            if (wind_reader.has("gust_size_m")) {
+                required(wind_reader, "gust_size_m", W::kMinGustSizeM, W::kMaxGustSizeM, gust_size);
+            }
+            if (wind_reader.has("turbulence")) {
+                required(wind_reader, "turbulence", 0.0, 1.0, turbulence);
+            }
+            environment.wind_speed_mps = static_cast<float>(speed);
+            environment.wind_gust_mps = static_cast<float>(gust);
+            environment.wind_gust_size_m = static_cast<float>(gust_size);
+            environment.wind_turbulence = static_cast<float>(turbulence);
+        }
+    }
     if (diagnostics.error_count() != errors_before) {
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }

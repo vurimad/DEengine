@@ -25,6 +25,10 @@ core::Result<void> WorldAsset::validate(std::span<const std::byte> file) const {
     if (terrain != kNone && (terrain >= dependencies.size() || dependencies[terrain].type != AssetType::Terrain)) {
         return core::fail(ErrorCode::CorruptData, "world's terrain isn't one of its dependencies");
     }
+    if (terrain_layers != kNone &&
+        (terrain_layers >= dependencies.size() || dependencies[terrain_layers].type != AssetType::TerrainLayers)) {
+        return core::fail(ErrorCode::CorruptData, "world's terrain layers aren't one of its dependencies");
+    }
     bool finite = std::isfinite(start_yaw_rad) && std::isfinite(start_pitch_rad);
     for (const double value : start_position) {
         finite = finite && std::isfinite(value);

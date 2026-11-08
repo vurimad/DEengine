@@ -51,7 +51,10 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
 
     quit_ = engine.input.add_action("quit"_sid, platform::ActionKind::Button);
     camera_actions_ = tools::add_free_camera_actions(engine.input);
-    camera_ = engine.world.ecs().entity("free_camera").set(world::Camera{.vertical_fov_rad = 1.0f});
+    // About 57 degrees up and down, unless --fov asks for another lens (a long one to frame a far mountain as a photo).
+    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
+    const float fov_rad = args.eyes.fov_deg > 0.0 ? static_cast<float>(args.eyes.fov_deg * kDegToRad) : 1.0f;
+    camera_ = engine.world.ecs().entity("free_camera").set(world::Camera{.vertical_fov_rad = fov_rad});
     engine.world.ecs().set(world::ActiveCamera{.entity = camera_.id()});
 #if DE_BUILD_DEV
     next_view_ = engine.input.add_action("debug.next_view"_sid, platform::ActionKind::Button);
@@ -109,6 +112,10 @@ void Viewer::apply_world(Engine& engine) {
     engine.terrain = world->terrain == asset::WorldAsset::kNone
                          ? asset::AssetHandle{}
                          : engine.assets.find(world->header.dependencies.get(file.data())[world->terrain]);
+    engine.terrain_layers =
+        world->terrain_layers == asset::WorldAsset::kNone
+            ? asset::AssetHandle{}
+            : engine.assets.find(world->header.dependencies.get(file.data())[world->terrain_layers]);
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
 }

@@ -7,6 +7,7 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <algorithm>
+#include <cmath>
 
 namespace de::tools {
 
@@ -24,6 +25,7 @@ FreeCameraActions add_free_camera_actions(platform::Input& input) {
         .mouse_y = input.add_action("free_camera.mouse_y"_sid, ActionKind::Axis),
         .look_hold = input.add_action("free_camera.look_hold"_sid, ActionKind::Button),
         .fast = input.add_action("free_camera.fast"_sid, ActionKind::Button),
+        .speed = input.add_action("free_camera.speed"_sid, ActionKind::Axis),
     };
 }
 
@@ -50,6 +52,10 @@ void FreeCamera::update(const platform::Input& input, const FreeCameraActions& a
     const Vec3 forward = rotation * Vec3(0.0f, 0.0f, -1.0f);
     const Vec3 move =
         right * axis(actions.move_right) + forward * axis(actions.move_forward) + kWorldUp * axis(actions.move_up);
+    // A big world wants a walk and a flight on the same camera: each notch of the wheel is a step faster or slower.
+    if (const float notches = axis(actions.speed); notches != 0.0f) {
+        speed_mps = std::clamp(speed_mps * std::pow(kSpeedStep, notches), kMinSpeedMps, kMaxSpeedMps);
+    }
     const float speed = speed_mps * (input.state(actions.fast).down ? 6.0f : 1.0f);
     position_ += DVec3(move) * static_cast<double>(speed * frame_s);
     world::place(camera, world::Transform{.position = position_, .rotation = rotation});

@@ -28,6 +28,8 @@ const char* asset_type_extension(AssetType type) {
         return ".deheights";
     case AssetType::Collision:
         return ".dephys";
+    case AssetType::TerrainLayers:
+        return ".delayers";
     case AssetType::Unknown:
         break;
     }
@@ -56,6 +58,8 @@ const char* asset_type_name(AssetType type) {
         return "terrain heights";
     case AssetType::Collision:
         return "collision";
+    case AssetType::TerrainLayers:
+        return "terrain layers";
     case AssetType::Unknown:
         break;
     }

@@ -62,6 +62,15 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
     if (!fog) {
         return core::fail(ErrorCode::CorruptData, "environment's fog settings are out of range");
     }
+    using W = WindLimits;
+    const float wind_length_squared = wind_direction[0] * wind_direction[0] + wind_direction[1] * wind_direction[1];
+    const bool wind = std::isfinite(wind_length_squared) && std::abs(wind_length_squared - 1.0f) <= 1e-3f &&
+                      within(wind_speed_mps, 0.0f, W::kMaxSpeedMps) && within(wind_gust_mps, 0.0f, W::kMaxSpeedMps) &&
+                      within(wind_gust_size_m, W::kMinGustSizeM, W::kMaxGustSizeM) &&
+                      within(wind_turbulence, 0.0f, 1.0f);
+    if (!wind) {
+        return core::fail(ErrorCode::CorruptData, "environment's wind settings are out of range");
+    }
     return {};
 }
 

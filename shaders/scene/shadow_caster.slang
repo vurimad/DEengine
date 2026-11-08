@@ -3,6 +3,7 @@
 
 import common.bindless;
 import scene.scene_common;
+import scene.wind;
 
 struct ShadowCasterPush
 {
@@ -30,8 +31,17 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
 {
     const MeshVertex vertex = push.vertices[vertex_id];
     const GpuDraw draw = push.draws[draw_id];
-    const float3 world =
-        instance_point(push.instances[draw.instance].transform, push.frame.render_origin_steps.xyz, vertex.position);
+    const InstanceTransform transform = push.instances[draw.instance].transform;
+    const uint3 origin_steps = push.frame.render_origin_steps.xyz;
+    float3 world = instance_point(transform, origin_steps, vertex.position);
+    // Moving in the wind as the G-buffer has it, or a plant would shade itself where it isn't.
+    if ((push.materials[draw.material].flags & kMaterialWind) != 0u)
+    {
+        const float3x3 linear = float3x3(transform.row0.linear, transform.row1.linear, transform.row2.linear);
+        world += plant_sway(push.frame, instance_point(transform, origin_steps, float3(0.0)), world,
+                            normalize(mul(linear, octahedral_decode(snorm16x2(vertex.normal)))), unorm8x4(vertex.color),
+                            push.materials[draw.material].wind_bend_m, push.materials[draw.material].wind_flutter_m, false);
+    }
     VertexOutput output;
     output.position = cascade_clip(push.frame, push.cascade, world);
     output.uv = vertex.uv;

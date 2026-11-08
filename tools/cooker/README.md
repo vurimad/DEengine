@@ -71,6 +71,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `lod_error` | largest error a LOD may add, relative to the mesh's size. The renderer picks a LOD only where its error stays under a pixel, so a large error costs nothing up close | 0.5 |
 | `optimize` | vertex cache, overdraw and fetch order | true |
 | `collision_triangles` | its `.dephys` is the finest LOD with at most this many triangles | 2048 |
+| `wind` | what the vertex colors tell the wind (`shaders/scene/wind.slang`): `keep` the source's; `height`, up the plant, for grass tufts and small plants; `bake`, from its connected pieces (a leaf, a twig, a branch, each about its lowest point; a piece most of the plant's height hardly flutters), for anything with leaves and branches. Red is how far a vertex flutters, green its piece's phase, blue how far that piece is from being the main stem. Baked on the full mesh, so the LOD chain carries it | `keep` |
 
 ## What a source cooks to
 

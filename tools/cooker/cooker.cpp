@@ -7,6 +7,7 @@
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
 #include "asset/terrain_format.h"
+#include "asset/terrain_layers_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "cooker/cell_cooker.h"
@@ -127,6 +128,8 @@ private:
                 cook_environment_source(source);
             } else if (source.kind == SourceKind::Terrain) {
                 cook_terrain_source(source);
+            } else if (source.kind == SourceKind::TerrainLayers) {
+                cook_terrain_layers_source(source);
             }
         }
         for (const Source& source : tree_.sources()) {
@@ -857,6 +860,43 @@ private:
     }
 
     // --- Terrain -----------------------------------------------------------------------------
+
+    // Layers name their materials: the IDs are inputs (a re-minted one changes them), the materials' bytes aren't.
+    void cook_terrain_layers_source(const Source& source) {
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        const auto input_hash = [&](std::span<const SourcePath> read) {
+            Hasher hasher("terrain layers");
+            hasher.add(source.id.value());
+            hasher.add(asset::TerrainLayersAsset::kFormatVersion);
+            hasher.add(source_hash);
+            hash_source_ids(hasher, read);
+            return hasher.value();
+        };
+        if (const CookRecord* last = previous_.find(path); last != nullptr) {
+            if (const CookRecord* same = unchanged(path, input_hash(last->dependencies.span())); same != nullptr) {
+                keep(*same);
+                return;
+            }
+        }
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
+        const core::Result<TerrainLayersBuild> build =
+            import_terrain_layers(tree_, source, bytes->span(), diagnostics_);
+        if (!build ||
+            !write(record, source.id, asset::AssetType::TerrainLayers, cook_terrain_layers(*build, source.id))) {
+            failed(path, &record);
+            return;
+        }
+        record.dependencies.assign(build->read.span());
+        record.input_hash = input_hash(record.dependencies.span());
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
 
     // What a terrain's outputs depend on: its GUID, its text (which says which image), its image's bytes, its format.
     static uint64_t terrain_input_hash(const Source& source, uint64_t source_hash, uint64_t height_hash) {

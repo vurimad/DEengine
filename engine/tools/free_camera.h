@@ -19,11 +19,12 @@ struct FreeCameraActions {
     platform::ActionId mouse_y;
     platform::ActionId look_hold; // mouse look only while held; the right stick always looks
     platform::ActionId fast;
+    platform::ActionId speed; // the wheel: notches, each a step faster or slower
 };
 
 // Adds the free camera's actions ("free_camera.move_right"...). Their bindings are text, in
 // config/input.bindings: WASD and the left stick move, Q/E and the triggers go down and up, the
-// mouse (right button held) and the right stick look, Shift goes fast.
+// mouse (right button held) and the right stick look, Shift goes fast, the wheel changes how fast it flies.
 FreeCameraActions add_free_camera_actions(platform::Input& input);
 
 // A fly camera for looking around a scene (a debug tool, not the game's camera). Each frame,
@@ -49,7 +50,11 @@ public:
     const DVec3& position() const { return position_; }
     Quat rotation() const;
 
-    float speed_mps = 6.0f;          // walking pace; fast is 6 times this
+    static constexpr float kSpeedStep = 1.25f; // per notch of the wheel
+    static constexpr float kMinSpeedMps = 0.5f;
+    static constexpr float kMaxSpeedMps = 3000.0f;
+
+    float speed_mps = 6.0f;          // walking pace at first, changed by the wheel; fast is 6 times this
     float mouse_rad_per_px = 0.003f; // look sensitivity
     float stick_rad_per_s = 2.5f;
 
