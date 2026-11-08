@@ -287,7 +287,7 @@ def main():
     start = views[0].split()
     with open(f'{out}/{NAME}.world', 'w', encoding='utf-8') as f:
         json.dump({'environment': f'{NAME}.environment', 'terrain': f'{NAME}.terrain', 'terrain_layers': f'{NAME}.terrainlayers',
-                   'sea': {'level_m': 0.0, 'shore': f'layers/masks/{NAME}_shore.material'},
+                   'sea': {'level_m': 0.0, 'shore': f'layers/masks/{NAME}_shore.material', 'foam': '../water/sea_foam.material'},
                    'start': {'position': [float(start[1]), float(start[2]), float(start[3])], 'yaw_deg': float(start[4]),
                              'pitch_deg': float(start[5])}, 'cells': []}, f, indent=1)
     print('\n'.join(views))

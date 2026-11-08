@@ -21,7 +21,7 @@ static_assert(sizeof(WorldCell) == 16);
 // cells are not (they stream), only named.
 struct WorldAsset {
     static constexpr AssetType kType = AssetType::World;
-    static constexpr uint16_t kFormatVersion = 5; // 2: terrain; 3: terrain layers; 4: the sea; 5: its shore
+    static constexpr uint16_t kFormatVersion = 6; // 2: terrain; 3: terrain layers; 4: the sea; 5: its shore; 6: foam
     static constexpr uint32_t kNone = UINT32_MAX;
     static constexpr float kMostSeaLevelM = 100000.0f;
 
@@ -37,12 +37,15 @@ struct WorldAsset {
     float sea_level_m = 0.0f;        // world space
     uint32_t sea_shore = kNone; // into the dependencies, with a sea: a material whose metallic-roughness texture is the
                                 // shore map over the terrain (tools/worldgen/shore.py); kNone: none
+    uint32_t sea_foam = kNone; // the same, a material whose base color texture is the sea's foam, tiling: color, and in
+                               // alpha how much of each texel is foam; kNone: foam drawn from noise
+    uint32_t reserved = 0;
 
     // Cells inside the file, sorted and unique by coord; the environment, the terrain and its layers
     // each one of the dependencies (and of its type); a finite start; a sea 0 or 1, its level within
-    // kMostSeaLevelM of 0, and its shore map, with a sea only, a Material among the dependencies.
+    // kMostSeaLevelM of 0, and its shore map and foam, with a sea only, Materials among the dependencies.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(WorldAsset) == 128);
+static_assert(sizeof(WorldAsset) == 136);
 
 } // namespace de::asset

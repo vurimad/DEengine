@@ -43,6 +43,10 @@ core::Result<void> WorldAsset::validate(std::span<const std::byte> file) const {
         (sea == 0 || sea_shore >= dependencies.size() || dependencies[sea_shore].type != AssetType::Material)) {
         return core::fail(ErrorCode::CorruptData, "world's shore map isn't a material among its dependencies, or has no sea");
     }
+    if (sea_foam != kNone &&
+        (sea == 0 || sea_foam >= dependencies.size() || dependencies[sea_foam].type != AssetType::Material)) {
+        return core::fail(ErrorCode::CorruptData, "world's sea foam isn't a material among its dependencies, or has no sea");
+    }
     return {};
 }
 

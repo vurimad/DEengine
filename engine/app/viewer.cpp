@@ -120,7 +120,10 @@ void Viewer::apply_world(Engine& engine) {
                     .sea_level_m = world->sea_level_m,
                     .shore = world->sea_shore == asset::WorldAsset::kNone
                                  ? asset::AssetId{}
-                                 : world->header.dependencies.get(file.data())[world->sea_shore].id};
+                                 : world->header.dependencies.get(file.data())[world->sea_shore].id,
+                    .foam = world->sea_foam == asset::WorldAsset::kNone
+                                ? asset::AssetId{}
+                                : world->header.dependencies.get(file.data())[world->sea_foam].id};
     DE_LOG_INFO("world", "%zu cells, environment %s", listed.size(),
                 engine.assets.state(environment_) == asset::AssetState::Ready ? "ready" : "missing");
 }

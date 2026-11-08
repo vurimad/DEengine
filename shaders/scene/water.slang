@@ -15,6 +15,7 @@
 // crests white where they break and against cliffs, leaving foam that thins seaward; the water's edge foams.
 
 import common.bindless;
+import common.fog;
 import scene.brdf;
 import scene.scene_common;
 import scene.sky;
@@ -45,7 +46,8 @@ struct WaterPush
     uint has_shore;
     float surf_period_s; // the surf's sets: the swell's period
     float surf_height_m; // their height, out where they start to feel the bottom
-    uint padding;
+    uint foam_material;     // the sea's foam texture's material slot; 0: foam drawn from noise
+    float2 swell_direction; // toward where the swell travels: its crests lie across it
 };
 
 [[vk::push_constant]]
@@ -322,6 +324,171 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint level_id: SV_Vu
     return output;
 }
 
+// --- The foam texture ------------------------------------------------------------------------------------------------
+
+// The sea's foam texture (alpha: how much of each texel is foam), read twice: over kFoamTileM for the streaks and patches,
+// over kFoamDetailTileM, turned, for what's in them, so neither repeat shows; stretched kFoamStretch times along a way
+// (the wind for whitecaps, the crests for surf). Coverage 0 to 1 into how much of the pixel is white; shade: how bright
+// the foam there is. Up close the texture is cut where it's thinner than the coverage asks, so foam opens up as it
+// thins; farther off, where the mips have blurred it and a cut would eat it away, it's taken in proportion.
+static const float kFoamTileM = 18.0;
+static const float kFoamDetailTileM = 5.0;
+static const float kFoamTexels = 1024.0;
+static const float kFoamStretch = 2.2;
+static const float kFoamDensityTop = 0.45; // the texture's alpha this high is all foam
+
+float foam_textured(float2 xz, float2 xz_dx, float2 xz_dy, float2 along, float coverage, float footprint_m, float time_s,
+                    out float shade)
+{
+    shade = 1.0;
+    if (coverage <= 0.02)
+    {
+        return 0.0;
+    }
+    const Texture2D texture = texture_2d(push.frame.materials[push.foam_material].base_color_texture);
+    const SamplerState wrap = sampler_state(kSamplerAnisotropicWrap);
+    const float2 across = float2(-along.y, along.x);
+    // Into the texture: along the way, stretched; drifting slowly with the wind.
+    const float2x2 to_local = float2x2(along.x / kFoamStretch, along.y / kFoamStretch, across.x, across.y);
+    const float2 drift = push.frame.wind.xy * time_s * 0.25;
+    const float2 local = mul(to_local, xz - drift);
+    const float2 local_dx = mul(to_local, xz_dx);
+    const float2 local_dy = mul(to_local, xz_dy);
+    const float scale_a = 1.0 / kFoamTileM;
+    const float scale_b = 1.0 / kFoamDetailTileM;
+    const float2x2 turn = float2x2(0.62, -0.78, 0.78, 0.62);
+    const float4 a = texture.SampleGrad(wrap, local * scale_a, local_dx * scale_a, local_dy * scale_a);
+    const float4 b = texture.SampleGrad(wrap, mul(turn, local) * scale_b + 0.37, mul(turn, local_dx) * scale_b,
+                                        mul(turn, local_dy) * scale_b);
+    const float density = saturate((0.6 * a.a + 0.4 * b.a) / kFoamDensityTop);
+    shade = 0.72 + 0.28 * density;
+    const float texels = footprint_m / kFoamTileM * kFoamTexels;
+    const float detail = 1.0 - smoothstep(1.0, 4.0, log2(max(texels, 1.0)));
+    const float cut = smoothstep(1.0 - coverage - 0.15, 1.0 - coverage + 0.15, density);
+    const float in_proportion = saturate(density * coverage * 1.6);
+    return lerp(in_proportion, cut, detail);
+}
+
+// --- Reflections -----------------------------------------------------------------------------------------------------
+
+// Screen-space reflections: the reflected ray marched through the depth of what was drawn before the water, in steps
+// that grow with distance (a cliff a kilometer off is found in a few dozen), then narrowed down where it went behind
+// something. What's off the screen, or hidden behind something nearer, it can't see: there the sky stands in, faded
+// toward it near the screen's edges so nothing pops.
+static const uint kReflectionSteps = 40;
+static const uint kReflectionRefine = 6;
+static const float kReflectionGrowth = 1.22;
+static const float kReflectionEdge = 0.12; // of the screen, either side, where reflections fade into the sky's
+
+struct ScreenHit
+{
+    float3 color;
+    float distance_m;
+    float confidence; // 0: nothing found, the sky's
+};
+
+// Where a point lands on the screen, and how its depth compares with what's there: above 0, the point is behind it, by
+// that many meters (view depth).
+struct RayProbe
+{
+    float2 ndc;
+    int2 texel;
+    float behind_m;
+    bool on_screen;
+    bool sky;
+};
+
+RayProbe probe(SceneFrame* frame, float3 q, int2 size)
+{
+    RayProbe out;
+    out.ndc = float2(0.0);
+    out.texel = int2(0);
+    out.behind_m = -1e9;
+    out.on_screen = false;
+    out.sky = false;
+    const float4 clip = mul_rows(frame.view_proj, float4(q, 1.0));
+    if (clip.w <= 1e-3)
+    {
+        return out;
+    }
+    out.ndc = clip.xy / clip.w;
+    if (any(abs(out.ndc) > 1.0))
+    {
+        return out;
+    }
+    out.on_screen = true;
+    const float2 uv = float2(out.ndc.x * 0.5 + 0.5, 0.5 - out.ndc.y * 0.5);
+    out.texel = clamp(int2(uv * float2(size)), int2(0), size - 1);
+    const float scene = load_texture(push.behind_depth, out.texel).r;
+    if (scene <= 0.0)
+    {
+        out.sky = true; // nothing drawn there: the sky, which the ray can't hit
+        return out;
+    }
+    // Reverse Z with an infinite far plane: depth is near / view depth, so the scene's view depth is the ray's scaled
+    // by their depths' ratio.
+    const float ray = clip.z / clip.w;
+    const float scene_w = ray * clip.w / scene;
+    out.behind_m = clip.w - scene_w;
+    return out;
+}
+
+ScreenHit screen_reflection(SceneFrame* frame, float3 p, float3 r, float distance_m, int2 size)
+{
+    ScreenHit hit;
+    hit.color = float3(0.0);
+    hit.distance_m = 0.0;
+    hit.confidence = 0.0;
+    float t = max(0.5, distance_m * 0.004);
+    float last_t = 0.0;
+    for (uint i = 0; i < kReflectionSteps; ++i)
+    {
+        const RayProbe here = probe(frame, p + r * t, size);
+        if (!here.on_screen)
+        {
+            break;
+        }
+        const float step_m = t - last_t;
+        if (!here.sky && here.behind_m > 0.0)
+        {
+            // Gone behind something: narrow down where, then keep it only if it's the thing's surface, not far behind it.
+            float lo = last_t;
+            float hi = t;
+            RayProbe found = here;
+            for (uint k = 0; k < kReflectionRefine; ++k)
+            {
+                const float mid = 0.5 * (lo + hi);
+                const RayProbe at = probe(frame, p + r * mid, size);
+                if (at.on_screen && !at.sky && at.behind_m > 0.0)
+                {
+                    hi = mid;
+                    found = at;
+                }
+                else
+                {
+                    lo = mid;
+                }
+            }
+            const float thickness = max(0.6, (hi - lo) * 4.0 + 0.004 * t);
+            if (found.behind_m < thickness)
+            {
+                const float2 edge = saturate((1.0 - abs(found.ndc)) / kReflectionEdge);
+                hit.color = load_texture(push.behind_color, found.texel).rgb;
+                hit.distance_m = hi;
+                hit.confidence = edge.x * edge.y;
+                return hit;
+            }
+            if (here.behind_m > step_m * 2.0 + 2.0)
+            {
+                break; // far behind something nearer: what the ray would hit is hidden from the camera
+            }
+        }
+        last_t = t;
+        t *= kReflectionGrowth;
+    }
+    return hit;
+}
+
 // --- Shading ---------------------------------------------------------------------------------------------------------
 
 // Cell noise: the distance to the nearest of points scattered one to a cell, and to the next nearest. Their difference
@@ -395,7 +562,9 @@ WaterOutput fragment_main(VertexOutput input)
     const float3 v = to_camera / distance_m;
     const float3 l = frame.sun_direction.xyz;
     const float time_s = frame.wind_field.z;
-    const float footprint_m = max(length(ddx(input.grid)), length(ddy(input.grid)));
+    const float2 grid_dx = ddx(input.grid);
+    const float2 grid_dy = ddy(input.grid);
+    const float footprint_m = max(length(grid_dx), length(grid_dy));
     const Shore shore = shore_at(input.grid);
     if (shore.land)
     {
@@ -469,7 +638,18 @@ WaterOutput fragment_main(VertexOutput input)
     const float fresnel = f_schlick(float3(0.02), n_dot_v).x;
     float3 r = reflect(-v, n);
     r.y = abs(r.y);
-    const float3 reflected = sky_gradient(frame, r);
+    // What it reflects: the scene where the ray finds it on the screen, else the sky; each hazed by the fog along the
+    // reflected ray as it would be seen along a ray of the camera's, since the fog pass hazes the water only as far as
+    // its own surface.
+    const ScreenHit seen = screen_reflection(frame, p, r, distance_m, size);
+    const FogResult sky_fog = fog_between(frame.fog, p, r, 0.0, frame.fog.range.x, frame.sun_direction.xyz, frame.sun_color.rgb);
+    const float3 sky_reflected = sky_gradient(frame, r) * sky_fog.transmittance + sky_fog.in_scatter;
+    float3 reflected = sky_reflected;
+    if (seen.confidence > 0.0)
+    {
+        const FogResult fog = fog_between(frame.fog, p, r, 0.0, seen.distance_m, frame.sun_direction.xyz, frame.sun_color.rgb);
+        reflected = lerp(sky_reflected, seen.color * fog.transmittance + fog.in_scatter, seen.confidence);
+    }
     const float3 h = normalize(l + v);
     const float n_dot_l = saturate(dot(n, l));
     const float3 glitter = sun * d_ggx(saturate(dot(n, h)), a) * v_smith(n_dot_v, n_dot_l, a) *
@@ -490,17 +670,37 @@ WaterOutput fragment_main(VertexOutput input)
     const float wall = exp(-shore.distance_m / kWallFoamM) * (0.25 + 0.5 * surf.crest) * surf.strength * patches;
     const float trail = surf.trail * exp(-shore.distance_m / kTrailFoamM) * surf.strength * patches;
     const float edge = 1.0 - smoothstep(0.05, 0.3, column_m);
-    const float coverage = min(max(max(whitecaps * shoal, breaking * 0.8), max(wall + trail * 0.85, edge * 0.6)), kMostFoam);
-    // Read in streaks along the wind, as foam lies on the sea, drifting with it.
+    const float sea_coverage = min(max(whitecaps * shoal, breaking * 0.8), kMostFoam);
+    const float shore_coverage = min(max(wall + trail * 0.85, edge * 0.6), kMostFoam);
+    const float coverage = max(sea_coverage, shore_coverage);
     const float2 wind = frame.wind.xy;
-    const float2 across = float2(-wind.y, wind.x);
-    const float2 streaks = float2(dot(input.grid, wind) / 2.5, dot(input.grid, across)) - wind * time_s * 0.3;
-    const float foam = foam_pattern(streaks, coverage, footprint_m, time_s);
+    float foam = 0.0;
+    float foam_shade = 1.0;
+    if (push.foam_material != 0u)
+    {
+        // From the foam texture: whitecaps streaked along the wind, the surf's foam along its crests.
+        const float2 swell = dot(push.swell_direction, push.swell_direction) > 1e-6 ? normalize(push.swell_direction) : wind;
+        const float2 along_crests = float2(-swell.y, swell.x);
+        float sea_shade;
+        float shore_shade;
+        const float on_sea = foam_textured(input.grid, grid_dx, grid_dy, wind, sea_coverage, footprint_m, time_s, sea_shade);
+        const float on_shore =
+            foam_textured(input.grid + 17.3, grid_dx, grid_dy, along_crests, shore_coverage, footprint_m, time_s, shore_shade);
+        foam = max(on_sea, on_shore);
+        foam_shade = on_sea > on_shore ? sea_shade : shore_shade;
+    }
+    else
+    {
+        // From noise, read in streaks along the wind, drifting with it.
+        const float2 across = float2(-wind.y, wind.x);
+        const float2 streaks = float2(dot(input.grid, wind) / 2.5, dot(input.grid, across)) - wind * time_s * 0.3;
+        foam = foam_pattern(streaks, coverage, footprint_m, time_s);
+    }
     const float3 foam_light = frame.sky_color.rgb + sun * saturate(dot(n, l) * 0.6 + 0.4);
     // Under and around the foam the water is churned full of air: milky, pale green-blue, hiding what's below.
     const float churned = saturate(coverage * 1.4) * 0.6;
     color = lerp(color, kChurnedColor * foam_light, churned * (1.0 - fresnel));
-    color = lerp(color, kFoamColor * foam_light, foam);
+    color = lerp(color, kFoamColor * foam_light * foam_shade, foam);
 
     WaterOutput output;
     output.color = float4(min(color, kHalfMax), 1.0);

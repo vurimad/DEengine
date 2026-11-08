@@ -23,6 +23,7 @@ struct SceneWater {
     bool sea = false;
     double sea_level_m = 0.0; // world space
     asset::AssetId shore;     // the sea's shore map, a material (tools/worldgen/shore.py); none: open water everywhere
+    asset::AssetId foam;      // its foam, a material (base color; alpha how much is foam); none: foam drawn from noise
 };
 
 // The water's mesh: kWaterLevels square grids around the camera, each kWaterLevelQuads squares across, the first

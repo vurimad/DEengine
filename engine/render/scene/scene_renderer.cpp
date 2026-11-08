@@ -296,7 +296,8 @@ struct WaterPush {
     uint32_t has_shore = 0;
     float surf_period_s = 0.0f; // the surf's sets: the swell's period
     float surf_height_m = 0.0f; // their height, where they start to feel the bottom
-    uint32_t padding = 0;
+    uint32_t foam_material = 0;  // the foam's material slot; 0: foam drawn from noise
+    float swell_direction[2] = {}; // toward where the swell travels (x, z): its crests lie across it
 };
 static_assert(sizeof(WaterPush) <= 128);
 
@@ -2442,6 +2443,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         if (state.water.shore.is_valid() && state.gpu_assets->material_complete(state.water.shore)) {
             shore_slot = state.gpu_assets->material_slot(state.water.shore);
         }
+        uint32_t foam_slot = 0;
+        if (state.water.foam.is_valid() && state.gpu_assets->material_complete(state.water.foam)) {
+            foam_slot = state.gpu_assets->material_slot(state.water.foam);
+        }
         // The surf: the swell's sets, about half its height where they start to feel the bottom; with no swell, the
         // wind's own waves breaking.
         const SceneSea& sea = lighting.sea;
@@ -2453,7 +2458,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                              .shore_material = shore_slot,
                              .has_shore = shore_slot != 0 ? 1U : 0U,
                              .surf_period_s = sea.swell_height_m > 0.0f ? sea.swell_period_s : 6.0f,
-                             .surf_height_m = std::max(0.5f * sea.swell_height_m, 0.4f * wind_waves_m)};
+                             .surf_height_m = std::max(0.5f * sea.swell_height_m, 0.4f * wind_waves_m),
+                             .foam_material = foam_slot,
+                             .swell_direction = {sea.swell_direction[0], sea.swell_direction[1]}};
         for (uint32_t c = 0; c < kOceanCascades; ++c) {
             water_push.tile_offset[c][0] = ocean.tile_offset[c][0];
             water_push.tile_offset[c][1] = ocean.tile_offset[c][1];

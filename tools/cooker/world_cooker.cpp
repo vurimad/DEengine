@@ -233,21 +233,25 @@ core::Result<WorldBuild> import_world(const SourceTree& tree, const Source& sour
         if (!yyjson_is_obj(sea)) {
             diagnostics.error(path, "sea should be an object: {\"level_m\": 0}");
         } else {
-            static constexpr const char* kSeaKeys[] = {"level_m", "shore"};
+            static constexpr const char* kSeaKeys[] = {"level_m", "shore", "foam"};
             sea_reader.check_keys(kSeaKeys, "sea");
             const auto most = static_cast<double>(asset::WorldAsset::kMostSeaLevelM);
             if (required(sea_reader, "level_m", -most, most, level_m)) {
                 build.sea = true;
                 build.sea_level_m = static_cast<float>(level_m);
             }
-            if (sea_reader.has("shore")) {
-                const Source* shore = find_relative(tree, path, sea_reader.string("shore", ""), SourceKind::Material,
-                                                    "a material source (.material)", diagnostics);
-                if (shore != nullptr) {
-                    build.sea_shore = {.id = shore->id, .type = asset::AssetType::Material};
-                    build.read.push(shore->path);
+            const auto material = [&](const char* key, asset::AssetRef& out) {
+                if (sea_reader.has(key)) {
+                    const Source* found = find_relative(tree, path, sea_reader.string(key, ""), SourceKind::Material,
+                                                        "a material source (.material)", diagnostics);
+                    if (found != nullptr) {
+                        out = {.id = found->id, .type = asset::AssetType::Material};
+                        build.read.push(found->path);
+                    }
                 }
-            }
+            };
+            material("shore", build.sea_shore);
+            material("foam", build.sea_foam);
         }
     }
 
@@ -313,7 +317,7 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     asset.sea = build.sea ? 1U : 0U;
     asset.sea_level_m = build.sea_level_m;
     asset.environment = 0;
-    asset::AssetRef dependencies[4] = {build.environment};
+    asset::AssetRef dependencies[5] = {build.environment};
     uint32_t dependency_count = 1;
     if (build.terrain.id.is_valid()) {
         asset.terrain = dependency_count;
@@ -326,6 +330,10 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id) {
     if (build.sea_shore.id.is_valid()) {
         asset.sea_shore = dependency_count;
         dependencies[dependency_count++] = build.sea_shore;
+    }
+    if (build.sea_foam.id.is_valid()) {
+        asset.sea_foam = dependency_count;
+        dependencies[dependency_count++] = build.sea_foam;
     }
     BlobWriter writer(sizeof(asset::WorldAsset));
     asset.cells = writer.append(build.cells.span());
