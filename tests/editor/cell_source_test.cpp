@@ -242,3 +242,16 @@ TEST_CASE("cell sources: paths from one folder to another") {
     REQUIRE(de::editor::relative_path("src:/content/w/deep/er", "src:/content/props/p.gltf", out, length));
     CHECK((path() == "../../../props/p.gltf"));
 }
+
+TEST_CASE("cell sources: a key comes out of an entity with the comma that set it apart") {
+    CellSource source(heap());
+    REQUIRE(source.parse(
+        R"({"entities": [{"name": "a", "parent": "b", "mesh": "m.gltf"}, {"name": "c", "parent": "d"}]})"));
+    REQUIRE(source.remove_entity_member(0, "parent"));
+    CHECK((source.entity_text(0) == R"({"name": "a", "mesh": "m.gltf"})"));
+    REQUIRE(source.remove_entity_member(1, "parent"));
+    CHECK((source.entity_text(1) == R"({"name": "c"})"));
+    REQUIRE(source.remove_entity_member(1, "name"));
+    CHECK((source.entity_text(1) == R"({})"));
+    CHECK_FALSE(source.remove_entity_member(0, "scale"));
+}

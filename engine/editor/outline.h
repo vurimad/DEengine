@@ -2,6 +2,7 @@
 
 #include "core/allocator.h"
 #include "core/array.h"
+#include "core/function_ref.h"
 
 #include <flecs.h>
 
@@ -52,6 +53,11 @@ private:
 // The entity's name for people, into out (terminated, cut short if it doesn't fit): its flecs name, its name in its
 // cell's file, "cell [x, z]" for a cell, or what it is and its number ("Mesh 1234"); "(gone)" if it's no longer there.
 void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std::span<char> out);
+
+// A name that isn't taken, from base, into out (terminated): base itself if it's free; else a trailing number counts
+// up, keeping its width ("boulder_1" to "boulder_5" if 2 to 4 are taken, "rock_01" to "rock_02"), and a name without
+// one gets "_2", "_3"...
+void free_name(std::string_view base, core::FunctionRef<bool(std::string_view name)> taken, std::span<char> out);
 
 // What the entity is, for people: "Cell", "Camera", "Fog volume", "Body", "Mesh" or "Entity".
 const char* entity_kind(flecs::entity entity);

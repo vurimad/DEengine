@@ -7,6 +7,7 @@
 #include "editor/cell_map_panel.h"
 #include "editor/cell_saver.h"
 #include "editor/commands.h"
+#include "editor/entity_record.h"
 #include "editor/gizmo.h"
 #include "editor/hierarchy_panel.h"
 #include "editor/icons.h"
@@ -45,7 +46,7 @@ namespace de::editor {
 //   --drag H,AMOUNT show a drag under way on handle H (0-2 an axis, 3-5 a plane, 6 the middle), gone AMOUNT (meters,
 //                   or radians turning), changing nothing
 // A scripted run (a picture) keeps nothing: not the layout, not the settings.
-class Editor final : public app::Application {
+class Editor final : public app::Application, public EntityMaker {
 public:
     static constexpr const char* kPlayground = "Playground";
 
@@ -56,6 +57,11 @@ public:
     void shutdown(app::Engine& engine) override;
     // The window's close button with unsaved edits: asked first (Save, Don't Save, Cancel).
     bool may_close(app::Engine& engine) override;
+
+    // The commands' maker (undo and redo make and take away entities): entity_record.h.
+    flecs::entity make(const EntityRecord& record) override;
+    void record(flecs::entity entity, EntityRecord& out) override;
+    void unmake(flecs::entity entity) override;
 
 private:
     void header_row(app::Engine& engine);
@@ -94,12 +100,44 @@ private:
     // File > Save, Ctrl+S: the edits into the cells' text sources (cell_saver.h), then the cooker in the background,
     // so hot reload swaps the cooked cells in.
     void save(app::Engine& engine);
+    // Undo and redo, the selection following what they make and take away.
+    void undo(app::Engine& engine);
+    void redo(app::Engine& engine);
+    // Delete: the selected entity away, as a command. Ctrl+D: a copy of it where it stands, made in the editor (saved
+    // into its cell at the next save), selected.
+    void delete_selection(app::Engine& engine);
+    void duplicate_selection(app::Engine& engine);
+    // A model from the resources (src:/ path) dropped on the Playground at screen: made where the ray from the camera
+    // meets the ground, as a command, selected.
+    void place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen);
+    // The same at a place in the world: true if it was placed.
+    bool place_model_at(app::Engine& engine, std::string_view path, const DVec3& point);
+    // A name no entity in the world has, from base: a trailing number counts up, keeping its width ("boulder_1" to
+    // "boulder_5" if 2 to 4 are taken, "rock_01" to "rock_02"), and a name without one gets "_2", "_3"...
+    void unique_name(const app::Engine& engine, std::string_view base, std::span<char> out) const;
+    // An entry's name, in its object's "name" too.
+    static bool rename_entry(EditorEntry& entry, std::string_view name);
+    // The first entity with that label, or none.
+    flecs::entity find_named(const app::Engine& engine, std::string_view name) const;
+    // A cell member's entry in its file, as an entry of its own (no parent: it's a root where it stands): false if its
+    // file couldn't be found or read.
+    bool entry_from_file(const EntityRecord& record, EditorEntry& out);
+    // What the made entities draw with, held while the editor runs (or until another world opens).
+    asset::AssetHandle hold(const asset::AssetRef& ref);
+    void release_holds();
     // The cooker over what the last save wrote, in the background (unless it's running).
     void start_cook(app::Engine& engine);
     // editor.save, in the console: the same.
     static void save_command(void* user, const console::Args& args, console::Output& out);
     // editor.move NAME X Y Z: that entity to there (world meters), as a command, selected.
     static void move_command(void* user, const console::Args& args, console::Output& out);
+    // editor.place PATH X Y Z, editor.duplicate NAME, editor.delete NAME: as dropping, Ctrl+D and Delete do.
+    static void place_command(void* user, const console::Args& args, console::Output& out);
+    static void duplicate_command(void* user, const console::Args& args, console::Output& out);
+    static void delete_command(void* user, const console::Args& args, console::Output& out);
+    // editor.undo, editor.redo: as Ctrl+Z and Ctrl+Y.
+    static void undo_command(void* user, const console::Args& args, console::Output& out);
+    static void redo_command(void* user, const console::Args& args, console::Output& out);
     bool unsaved() const { return commands_.changes() != saved_changes_; }
     // Each frame: the cooker's end, and the members of a cell spawned again (hot reload): the commands and the
     // selection follow them, by their place in the cell's source.
@@ -154,11 +192,12 @@ private:
     CellSources cell_sources_;
     platform::Process cooker_;
     Pending pending_ = Pending::None;
-    core::Array<platform::PathString> cooking_; // what the last save wrote, which the cooker's cooking
-    uint64_t saved_changes_ = 0;                // commands_.changes() at the last save
-    app::Engine* engine_ = nullptr;             // for the console's commands
-    MemberTracker members_;                     // what the commands and the selection name, through respawns
-    uint64_t keyed_changes_ = UINT64_MAX;       // commands_.changes() when their keys were noted
+    core::Array<platform::PathString> cooking_;         // what the last save wrote, which the cooker's cooking
+    uint64_t saved_changes_ = 0;                        // commands_.changes() at the last save
+    app::Engine* engine_ = nullptr;                     // for the console's commands and the maker
+    core::HashMap<uint64_t, asset::AssetHandle> holds_; // by asset ID
+    MemberTracker members_;                             // what the commands and the selection name, through respawns
+    uint64_t keyed_changes_ = UINT64_MAX;               // commands_.changes() when their keys were noted
     core::Array<flecs::entity_t> scratch_entities_;
     bool quit_ = false;
 };

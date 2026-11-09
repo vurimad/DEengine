@@ -5,10 +5,12 @@
 #include "core/log.h"
 #include "core/profile.h"
 #include "core/text.h"
+#include "editor/cell_source.h"
 #include "editor/outline.h"
 #include "editor/source_files.h"
 #include "editor/theme.h"
 #include "editor/widgets.h"
+#include "physics/physics.h"
 #include "platform/input.h"
 #include "platform/process.h"
 #include "platform/vfs.h"
@@ -247,8 +249,8 @@ void snap_step(const char* id, float& step, const float (&steps)[N], const char*
 Editor::Editor()
     : commands_(editor_heap()), hierarchy_(editor_heap()), icons_(editor_heap()), selected_meshes_(editor_heap()),
       selected_entities_(editor_heap()), properties_(editor_heap()), browser_(editor_heap()),
-      cell_sources_(editor_heap()), cooking_(editor_heap()), members_(editor_heap()), scratch_entities_(editor_heap()) {
-}
+      cell_sources_(editor_heap()), cooking_(editor_heap()), holds_(editor_heap()), members_(editor_heap()),
+      scratch_entities_(editor_heap()) {}
 
 bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     if (!viewer_.startup(engine, args)) {
@@ -256,12 +258,23 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     }
     viewer_.set_quit_on_escape(false);
     engine_ = &engine;
+    commands_.set_maker(this);
     engine.console.add_command("editor.save", "",
                                "Save the edits into the cells' text sources, then cook them (as Ctrl+S does).",
                                &Editor::save_command, this);
     engine.console.add_command("editor.move", "<name> <x> <y> <z>",
                                "Move the entity of that name to a place in meters (undoable), and select it.",
                                &Editor::move_command, this);
+    engine.console.add_command("editor.place", "<src:/content/...model> <x> <y> <z>",
+                               "Place a model there (meters), as dropping it on the Playground does.",
+                               &Editor::place_command, this);
+    engine.console.add_command("editor.duplicate", "<name>", "Duplicate the entity of that name (as Ctrl+D does).",
+                               &Editor::duplicate_command, this);
+    engine.console.add_command("editor.delete", "<name>", "Delete the entity of that name (as the Delete key does).",
+                               &Editor::delete_command, this);
+    engine.console.add_command("editor.undo", "", "Undo the last edit (as Ctrl+Z does).", &Editor::undo_command, this);
+    engine.console.add_command("editor.redo", "", "Do again what was undone (as Ctrl+Y does).", &Editor::redo_command,
+                               this);
     // A click on the editor while another window is in front is a click, not only a way back to it.
     platform::Window::set_focus_clicks(true);
     engine.frame_stats = app::has_flag(args, "--stats"); // hidden until F1 or View > Frame Stats, unless asked for
@@ -337,6 +350,8 @@ void Editor::shutdown(app::Engine& engine) {
                                    .snap = snap_,
                                    .drawer_share = drawer_share_});
     }
+    commands_.clear();
+    release_holds();
     viewer_.shutdown(engine);
 }
 
@@ -596,17 +611,28 @@ void Editor::header_row(app::Engine& engine) {
     }
     prepare_menu_popup();
     if (ImGui::BeginMenu("Edit")) {
-        char undo[128];
-        char redo[128];
+        char undo_label[128];
+        char redo_label[128];
         const char* undo_name = commands_.undo_name(ecs);
         const char* redo_name = commands_.redo_name(ecs);
-        static_cast<void>(std::snprintf(undo, sizeof(undo), "Undo %s", undo_name != nullptr ? undo_name : ""));
-        static_cast<void>(std::snprintf(redo, sizeof(redo), "Redo %s", redo_name != nullptr ? redo_name : ""));
-        if (ImGui::MenuItem(undo, "Ctrl+Z", false, commands_.can_undo())) {
-            static_cast<void>(commands_.undo(ecs));
+        static_cast<void>(
+            std::snprintf(undo_label, sizeof(undo_label), "Undo %s", undo_name != nullptr ? undo_name : ""));
+        static_cast<void>(
+            std::snprintf(redo_label, sizeof(redo_label), "Redo %s", redo_name != nullptr ? redo_name : ""));
+        if (ImGui::MenuItem(undo_label, "Ctrl+Z", false, commands_.can_undo())) {
+            undo(engine);
         }
-        if (ImGui::MenuItem(redo, "Ctrl+Y", false, commands_.can_redo())) {
-            static_cast<void>(commands_.redo(ecs));
+        if (ImGui::MenuItem(redo_label, "Ctrl+Y", false, commands_.can_redo())) {
+            redo(engine);
+        }
+        ImGui::Separator();
+        const bool an_entity =
+            selection_.kind == Selection::Kind::Entity && engine.world.ecs().is_alive(selection_.entity);
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, an_entity)) {
+            duplicate_selection(engine);
+        }
+        if (ImGui::MenuItem("Delete", "Del", false, an_entity)) {
+            delete_selection(engine);
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Frame Selected", "F", false, selection_.kind == Selection::Kind::Entity)) {
@@ -882,13 +908,12 @@ void Editor::playground_toolbar(app::Engine& engine) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(2.0f), 0.0f));
     if (ImGui::BeginChild("##playground_toolbar", ImVec2(0.0f, height), ImGuiChildFlags_AlwaysUseWindowPadding,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
-        const flecs::world& ecs = engine.world.ecs();
         if (icon_button(icons_, "##undo", Icon::Undo, "Undo (Ctrl+Z)", false, commands_.can_undo())) {
-            static_cast<void>(commands_.undo(ecs));
+            undo(engine);
         }
         ImGui::SameLine();
         if (icon_button(icons_, "##redo", Icon::Redo, "Redo (Ctrl+Y)", false, commands_.can_redo())) {
-            static_cast<void>(commands_.redo(ecs));
+            redo(engine);
         }
         toolbar_rule();
         struct ToolButton {
@@ -1048,6 +1073,15 @@ void Editor::playground(app::Engine& engine) {
                                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
                                    ImGuiButtonFlags_MouseButtonMiddle);
         playground_hovered_ = ImGui::IsItemHovered();
+        // A model dragged from the resources and let go over the scene: placed there.
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(AssetBrowser::kSourceFilePayload)) {
+                const std::string_view dropped(static_cast<const char*>(payload->Data),
+                                               static_cast<size_t>(std::max(payload->DataSize - 1, 0)));
+                place_model(engine, dropped, playground_view(corner, size), io.MousePos);
+            }
+            ImGui::EndDragDropTarget();
+        }
         ImDrawList* draw = ImGui::GetWindowDrawList();
         if (engine.viewport.texture_id != 0) {
             draw->AddImage(ImTextureRef(static_cast<ImTextureID>(engine.viewport.texture_id)), corner, far_corner);
@@ -1120,16 +1154,21 @@ void Editor::playground(app::Engine& engine) {
 }
 
 void Editor::shortcuts(app::Engine& engine) {
-    const flecs::world& ecs = engine.world.ecs();
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
         save(engine);
     }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_D, ImGuiInputFlags_RouteGlobal)) {
+        duplicate_selection(engine);
+    }
+    if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_Delete, ImGuiInputFlags_RouteGlobal)) {
+        delete_selection(engine);
+    }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
-        static_cast<void>(commands_.undo(ecs));
+        undo(engine);
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Y, ImGuiInputFlags_RouteGlobal) ||
         ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
-        static_cast<void>(commands_.redo(ecs));
+        redo(engine);
     }
     // Ctrl+Space: the Resources drawer (Unreal's content drawer).
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Space, ImGuiInputFlags_RouteGlobal)) {
@@ -1159,9 +1198,21 @@ void Editor::save(app::Engine& engine) {
     keyed_changes_ = UINT64_MAX;
     cooking_.clear();
     core::Array<MemberMove> moves(editor_heap());
-    const CellSaveReport report =
-        save_cells(engine.world.ecs(), engine.assets, engine.vfs, cell_sources_, viewer_.world_id(), &cooking_, &moves);
+    core::Array<MemberRemoval> removed(editor_heap());
+    commands_.each_taken_member(engine.world.ecs(), [&removed](const EntityRecord& record) {
+        removed.push({.key = record.key, .name = record.cooked_name});
+    });
+    core::Array<PlacedMember> placed(editor_heap());
+    const CellSaveReport report = save_cells(engine.world.ecs(), engine.assets, engine.vfs, cell_sources_,
+                                             viewer_.world_id(), &cooking_, &moves, removed.span(), &placed);
     members_.apply(moves.span()); // what moved in the files: the cook will spawn it there
+    for (const PlacedMember& made : placed) {
+        // In its file now: the member its cell comes back with takes its place.
+        if (auto* entry = engine.world.ecs().entity(made.entity).try_get_mut<EditorEntry>()) {
+            entry->saved = true;
+        }
+        members_.note_replaced(engine.world.ecs(), made.entity, made.key);
+    }
     if (report.cells_failed > 0) {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "%u %s couldn't be saved (the Output says why)",
                                         report.cells_failed, report.cells_failed == 1 ? "file" : "files"));
@@ -1180,10 +1231,19 @@ void Editor::save(app::Engine& engine) {
                     report.outside_cell);
     }
     start_cook(engine);
-    char moved[96] = "";
-    if (report.refiled > 0) {
-        static_cast<void>(std::snprintf(moved, sizeof(moved), ", %u filed into another cell%s", report.refiled,
-                                        report.cells_made > 0 ? " (a new one)" : ""));
+    char moved[160] = "";
+    int written = 0;
+    if (report.added > 0) {
+        written +=
+            std::snprintf(moved + written, sizeof(moved) - static_cast<size_t>(written), ", %u added", report.added);
+    }
+    if (report.removed > 0 && written >= 0 && static_cast<size_t>(written) < sizeof(moved)) {
+        written += std::snprintf(moved + written, sizeof(moved) - static_cast<size_t>(written), ", %u deleted",
+                                 report.removed);
+    }
+    if (report.refiled > 0 && written >= 0 && static_cast<size_t>(written) < sizeof(moved)) {
+        static_cast<void>(std::snprintf(moved + written, sizeof(moved) - static_cast<size_t>(written),
+                                        ", %u filed into another cell", report.refiled));
     }
     static_cast<void>(std::snprintf(message_, sizeof(message_), "Saved %u %s (%u %s%s)%s", report.files_written,
                                     report.files_written == 1 ? "file" : "files", report.entities_changed,
@@ -1206,6 +1266,400 @@ void Editor::start_cook(app::Engine& engine) {
             cooker_ = std::move(*started);
         }
     }
+}
+
+asset::AssetHandle Editor::hold(const asset::AssetRef& ref) {
+    if (const asset::AssetHandle* held = holds_.find(ref.id.value()); held != nullptr) {
+        return *held;
+    }
+    const asset::AssetHandle handle = engine_->assets.load(ref);
+    holds_.set(ref.id.value(), handle);
+    return handle;
+}
+
+void Editor::release_holds() {
+    if (engine_ == nullptr) {
+        return;
+    }
+    for (auto [id, handle] : holds_) {
+        engine_->assets.release(handle);
+    }
+    holds_.clear();
+}
+
+flecs::entity Editor::make(const EntityRecord& record) {
+    const flecs::world& ecs = engine_->world.ecs();
+    const flecs::entity entity = ecs.entity();
+    // Its cell's member again while the cell is as it was (its file still has it); else one the editor made.
+    bool member = false;
+    if (record.cell != 0 && ecs.is_alive(record.cell)) {
+        const auto* contents = ecs.entity(record.cell).try_get<world::CellContents>();
+        if (contents != nullptr && contents->revision == record.revision) {
+            entity.add<world::InCell>(ecs.entity(record.cell)).set(world::CellMember{.index = record.member_index});
+            member = true;
+        }
+    }
+    if (!member) {
+        EditorEntry entry = record.entry;
+        entry.saved = false;
+        entity.set(entry);
+    }
+    if (record.is_static) {
+        entity.add<world::StaticTransform>();
+    }
+    if (record.mesh.is_valid()) {
+        entity.set(world::MeshInstance{.mesh = hold({.id = record.mesh, .type = asset::AssetType::Mesh})});
+    }
+    if (record.collision.is_valid()) {
+        entity.set(
+            world::MeshCollider{.collision = hold({.id = record.collision, .type = asset::AssetType::Collision})});
+    }
+    if (record.has_fog) {
+        entity.set(record.fog);
+    }
+    world::place(entity, record.transform);
+    return entity;
+}
+
+void Editor::record(flecs::entity entity, EntityRecord& out) {
+    out = EntityRecord{};
+    if (const auto* where = entity.try_get<world::WorldTransform>()) {
+        out.transform = {.position = where->position, .rotation = where->rotation, .scale = where->scale};
+    } else if (const auto* local = entity.try_get<world::Transform>()) {
+        out.transform = *local;
+    }
+    const asset::AssetRegistry& assets = engine_->assets;
+    if (const auto* mesh = entity.try_get<world::MeshInstance>(); mesh != nullptr && mesh->mesh.is_valid()) {
+        out.mesh = assets.asset(mesh->mesh).id;
+    }
+    if (const auto* collider = entity.try_get<world::MeshCollider>();
+        collider != nullptr && collider->collision.is_valid()) {
+        out.collision = assets.asset(collider->collision).id;
+    }
+    if (const auto* fog = entity.try_get<world::FogVolume>()) {
+        out.has_fog = true;
+        out.fog = *fog;
+    }
+    out.is_static = entity.has<world::StaticTransform>();
+    if (const auto* made = entity.try_get<EditorEntry>()) {
+        out.entry = *made;
+        out.has_entry = true;
+    }
+    const auto* member = entity.try_get<world::CellMember>();
+    const flecs::entity cell = member != nullptr ? entity.target<world::InCell>() : flecs::entity();
+    const auto* held = cell.is_valid() ? cell.try_get<world::Cell>() : nullptr;
+    const auto* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
+    if (cooked == nullptr || member->index >= cooked->entities.count) {
+        return;
+    }
+    const asset::CellEntity& entry = cooked->entities.get(cooked)[member->index];
+    out.cell = cell.id();
+    out.member_index = member->index;
+    if (const auto* contents = cell.try_get<world::CellContents>()) {
+        out.revision = contents->revision;
+    }
+    out.key = {.x = cooked->coord_x, .z = cooked->coord_z, .source_index = entry.source_index};
+    const std::string_view name = cooked->name(cooked, entry);
+    static_cast<void>(
+        std::snprintf(out.cooked_name, sizeof(out.cooked_name), "%.*s", static_cast<int>(name.size()), name.data()));
+    // As an entry of its own, from its file, for when it's put back after a save took it out.
+    out.has_entry = entry_from_file(out, out.entry);
+}
+
+void Editor::unmake(flecs::entity entity) {
+    members_.forget(entity.id()); // gone on purpose: whatever spawns where it was isn't it
+    if (selection_.kind == Selection::Kind::Entity && selection_.entity == entity.id()) {
+        selection_.select_entity(0);
+    }
+    entity.destruct();
+}
+
+bool Editor::entry_from_file(const EntityRecord& record, EditorEntry& out) {
+    const uint32_t world_index = cell_sources_.size() > 0 ? cell_sources_.world_index(viewer_.world_id()) : UINT32_MAX;
+    const CellSources::Cell* cell =
+        world_index != UINT32_MAX ? cell_sources_.cell_at(world_index, record.key.x, record.key.z) : nullptr;
+    if (cell == nullptr) {
+        // Looked through again: the sources may be new since.
+        static_cast<void>(cell_sources_.scan(engine_->vfs));
+        const uint32_t again = cell_sources_.world_index(viewer_.world_id());
+        cell = again != UINT32_MAX ? cell_sources_.cell_at(again, record.key.x, record.key.z) : nullptr;
+    }
+    if (cell == nullptr) {
+        return false;
+    }
+    const auto bytes = engine_->vfs.read_whole_file(cell->path.c_str(), editor_heap());
+    if (!bytes) {
+        return false;
+    }
+    CellSource file(editor_heap());
+    if (!file.parse({reinterpret_cast<const char*>(bytes->data()), bytes->size()}) ||
+        record.key.source_index >= file.entity_count() || file.name(record.key.source_index) != record.cooked_name) {
+        return false;
+    }
+    // A root of its own: no parent (where it stands is written at the save).
+    const std::string_view object = file.entity_text(record.key.source_index);
+    core::Array<char> wrapped(editor_heap());
+    constexpr std::string_view kOpen = R"({"entities": [)";
+    constexpr std::string_view kClose = "]}";
+    wrapped.resize(kOpen.size() + object.size() + kClose.size());
+    std::memcpy(wrapped.data(), kOpen.data(), kOpen.size());
+    std::memcpy(wrapped.data() + kOpen.size(), object.data(), object.size());
+    std::memcpy(wrapped.data() + kOpen.size() + object.size(), kClose.data(), kClose.size());
+    CellSource alone(editor_heap());
+    if (!alone.parse({wrapped.data(), wrapped.size()})) {
+        return false;
+    }
+    static_cast<void>(alone.remove_entity_member(0, "parent"));
+    const std::string_view root = alone.entity_text(0);
+    if (root.size() >= sizeof(out.object)) {
+        return false;
+    }
+    out = EditorEntry{};
+    std::memcpy(out.object, root.data(), root.size());
+    const std::string_view path = cell->path.view();
+    const std::string_view folder = path.substr(0, path.rfind('/'));
+    static_cast<void>(
+        std::snprintf(out.folder, sizeof(out.folder), "%.*s", static_cast<int>(folder.size()), folder.data()));
+    static_cast<void>(std::snprintf(out.name, sizeof(out.name), "%s", record.cooked_name));
+    return true;
+}
+
+void Editor::undo(app::Engine& engine) {
+    static_cast<void>(commands_.undo(engine.world.ecs()));
+    if (commands_.last_made() != 0) {
+        selection_.select_entity(commands_.last_made());
+    } else if (selection_.kind == Selection::Kind::Entity && !engine.world.ecs().is_alive(selection_.entity)) {
+        selection_.select_entity(0);
+    }
+}
+
+void Editor::redo(app::Engine& engine) {
+    static_cast<void>(commands_.redo(engine.world.ecs()));
+    if (commands_.last_made() != 0) {
+        selection_.select_entity(commands_.last_made());
+    } else if (selection_.kind == Selection::Kind::Entity && !engine.world.ecs().is_alive(selection_.entity)) {
+        selection_.select_entity(0);
+    }
+}
+
+void Editor::delete_selection(app::Engine& engine) {
+    const flecs::world& ecs = engine.world.ecs();
+    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
+        return;
+    }
+    const flecs::entity entity = ecs.entity(selection_.entity);
+    if (!entity.has<world::Transform>() || entity.has<world::Cell>() || entity.id() == viewer_.camera_entity().id()) {
+        return; // only what's placed: not a cell, not the editor's camera
+    }
+    char label[128];
+    entity_label(engine.assets, entity, label);
+    if (commands_.remove(entity)) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Deleted %s (Ctrl+Z puts it back)", label));
+    }
+}
+
+void Editor::duplicate_selection(app::Engine& engine) {
+    const flecs::world& ecs = engine.world.ecs();
+    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
+        return;
+    }
+    const flecs::entity source = ecs.entity(selection_.entity);
+    if (!source.has<world::Transform>() || source.has<world::Cell>() || source.id() == viewer_.camera_entity().id()) {
+        return;
+    }
+    EntityRecord copy;
+    record(source, copy);
+    if (!copy.has_entry) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                        "Can't duplicate it: its cell's file wasn't found (cook, then try again)"));
+        return;
+    }
+    copy.cell = 0; // a new one: made in the editor, saved into the cell it stands in
+    char name[128];
+    unique_name(engine, copy.entry.name, name);
+    static_cast<void>(rename_entry(copy.entry, name));
+    const flecs::entity made = make(copy);
+    commands_.created(made);
+    selection_.select_entity(made.id());
+    static_cast<void>(
+        std::snprintf(message_, sizeof(message_), "Duplicated %s: move it where it goes", copy.entry.name));
+}
+
+void Editor::place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen) {
+    // Where the ray under the mouse meets the ground: something solid, else the level of the world's zero.
+    const Vec3 direction = view.ray(screen);
+    DVec3 point = view.position + (DVec3(direction) * 20.0);
+    physics::QueryHit hit;
+    if (engine.physics.ray_cast(view.position, direction, 5000.0f, hit)) {
+        point = hit.position;
+    } else if (direction.y < -1e-4f) {
+        const double along = -view.position.y / static_cast<double>(direction.y);
+        if (along > 0.0 && along < 5000.0) {
+            point = view.position + (DVec3(direction) * along);
+        }
+    }
+    static_cast<void>(place_model_at(engine, path, point));
+}
+
+bool Editor::place_model_at(app::Engine& engine, std::string_view path, const DVec3& point) {
+    if (file_kind(path) != "Model") {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Only models (.gltf, .glb, .fbx) can be placed"));
+        return false;
+    }
+    asset::Guid guid;
+    asset::AssetId mesh;
+    if (!source_asset_id(engine.vfs, path, guid, mesh)) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "%.*s has no meta: run the cooker first",
+                                        static_cast<int>(path.size()), path.data()));
+        return false;
+    }
+    // Its entry: named after its file, the model by its name from its own folder, solid as props are.
+    const size_t slash = path.rfind('/');
+    const std::string_view file = path.substr(slash + 1);
+    const std::string_view stem = file.substr(0, file.rfind('.'));
+    EntityRecord placed;
+    placed.transform = {.position = point};
+    placed.mesh = mesh;
+    placed.is_static = true;
+    placed.has_entry = true;
+    static_cast<void>(std::snprintf(
+        placed.entry.object, sizeof(placed.entry.object), R"({"name": "%.*s", "mesh": "%.*s", "collision": "mesh"})",
+        static_cast<int>(stem.size()), stem.data(), static_cast<int>(file.size()), file.data()));
+    const std::string_view folder = path.substr(0, slash);
+    const size_t folder_length = std::min(folder.size(), sizeof(placed.entry.folder) - 1);
+    std::memcpy(placed.entry.folder, folder.data(), folder_length);
+    placed.entry.folder[folder_length] = 0;
+    static_cast<void>(std::snprintf(placed.entry.name, sizeof(placed.entry.name), "%.*s", static_cast<int>(stem.size()),
+                                    stem.data()));
+    char name[128];
+    unique_name(engine, placed.entry.name, name);
+    static_cast<void>(rename_entry(placed.entry, name));
+    const flecs::entity made = make(placed);
+    commands_.created(made);
+    selection_.select_entity(made.id());
+    static_cast<void>(
+        std::snprintf(message_, sizeof(message_), "Placed %s (saved into its cell with Ctrl+S)", placed.entry.name));
+    return true;
+}
+
+void Editor::unique_name(const app::Engine& engine, std::string_view base, std::span<char> out) const {
+    // The names there are now.
+    core::Array<core::FixedString<128>> names(editor_heap());
+    char label[128];
+    engine.world.ecs().each([&](flecs::entity entity, const world::Transform&) {
+        entity_label(engine.assets, entity, label);
+        names.push(core::FixedString<128>(std::string_view(label)));
+    });
+    const auto taken = [&names](std::string_view name) {
+        return std::ranges::any_of(names, [name](const core::FixedString<128>& had) { return had.view() == name; });
+    };
+    free_name(base, taken, out);
+}
+
+bool Editor::rename_entry(EditorEntry& entry, std::string_view name) {
+    constexpr std::string_view kOpen = R"({"entities": [)";
+    constexpr std::string_view kClose = "]}";
+    const std::string_view object(entry.object);
+    core::Array<char> wrapped(editor_heap());
+    wrapped.resize(kOpen.size() + object.size() + kClose.size());
+    std::memcpy(wrapped.data(), kOpen.data(), kOpen.size());
+    std::memcpy(wrapped.data() + kOpen.size(), object.data(), object.size());
+    std::memcpy(wrapped.data() + kOpen.size() + object.size(), kClose.data(), kClose.size());
+    CellSource alone(editor_heap());
+    char quoted[160];
+    const int length = std::snprintf(quoted, sizeof(quoted), "\"%.*s\"", static_cast<int>(name.size()), name.data());
+    if (!alone.parse({wrapped.data(), wrapped.size()}) || length <= 0 ||
+        !alone.set_entity_member(0, "name", {quoted, static_cast<size_t>(length)})) {
+        return false;
+    }
+    const std::string_view renamed = alone.entity_text(0);
+    if (renamed.size() >= sizeof(entry.object)) {
+        return false;
+    }
+    std::memcpy(entry.object, renamed.data(), renamed.size());
+    entry.object[renamed.size()] = '\0';
+    const size_t name_length = std::min(name.size(), sizeof(entry.name) - 1);
+    std::memcpy(entry.name, name.data(), name_length);
+    entry.name[name_length] = '\0';
+    return true;
+}
+
+flecs::entity Editor::find_named(const app::Engine& engine, std::string_view name) const {
+    flecs::entity found;
+    char label[128];
+    engine.world.ecs().each([&](flecs::entity entity, const world::Transform&) {
+        entity_label(engine.assets, entity, label);
+        if (!found.is_valid() && name == label) {
+            found = entity;
+        }
+    });
+    return found;
+}
+
+void Editor::place_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    double place[3] = {};
+    bool numbers = args.size() == 4;
+    for (size_t i = 0; numbers && i < 3; ++i) {
+        const std::string_view word = args[i + 1];
+        const std::from_chars_result parsed = std::from_chars(word.data(), word.data() + word.size(), place[i]);
+        numbers = parsed.ec == std::errc() && parsed.ptr == word.data() + word.size();
+    }
+    if (!numbers) {
+        out.error("editor.place takes a model's src:/ path and x y z");
+        return;
+    }
+    if (!editor->place_model_at(*editor->engine_, args[0], DVec3(place[0], place[1], place[2]))) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("%s", editor->message_);
+}
+
+void Editor::duplicate_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
+    if (!found.is_valid()) {
+        out.error("editor.duplicate: name an entity that's there");
+        return;
+    }
+    editor->selection_.select_entity(found.id());
+    editor->duplicate_selection(*editor->engine_);
+    out.info("%s", editor->message_);
+}
+
+void Editor::undo_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const char* what = editor->commands_.undo_name(editor->engine_->world.ecs());
+    if (what == nullptr) {
+        out.error("nothing to undo");
+        return;
+    }
+    out.info("undo %s", what);
+    editor->undo(*editor->engine_);
+}
+
+void Editor::redo_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const char* what = editor->commands_.redo_name(editor->engine_->world.ecs());
+    if (what == nullptr) {
+        out.error("nothing to redo");
+        return;
+    }
+    out.info("redo %s", what);
+    editor->redo(*editor->engine_);
+}
+
+void Editor::delete_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
+    if (!found.is_valid()) {
+        out.error("editor.delete: name an entity that's there");
+        return;
+    }
+    editor->selection_.select_entity(found.id());
+    editor->delete_selection(*editor->engine_);
+    out.info("%s", editor->message_);
 }
 
 bool Editor::may_close(app::Engine& /*engine*/) {
@@ -1291,14 +1745,7 @@ void Editor::move_command(void* user, const console::Args& args, console::Output
         }
     }
     const std::string_view name = args[0];
-    flecs::entity found;
-    char label[128];
-    engine.world.ecs().each([&](flecs::entity entity, const world::Transform&) {
-        entity_label(engine.assets, entity, label);
-        if (!found.is_valid() && name == label) {
-            found = entity;
-        }
-    });
+    const flecs::entity found = editor->find_named(engine, name);
     if (!found.is_valid()) {
         out.error("editor.move: nothing is called %.*s", static_cast<int>(name.size()), name.data());
         return;
@@ -1353,8 +1800,11 @@ void Editor::follow_saves(app::Engine& engine) {
             members_.note(ecs, engine.assets, entity);
         }
     }
-    members_.follow(ecs, engine.assets, [this](flecs::entity_t from, flecs::entity_t to) {
+    members_.follow(ecs, engine.assets, [this, &engine](flecs::entity_t from, flecs::entity_t to) {
         commands_.remap(from, to);
+        if (engine.world.ecs().is_alive(from)) {
+            engine.world.ecs().entity(from).destruct(); // made in the editor, and now its cell's member
+        }
         if (selection_.kind == Selection::Kind::Entity && selection_.entity == from) {
             selection_.entity = to;
         }
@@ -1425,6 +1875,7 @@ void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     }
     DE_LOG_INFO("editor", "opening %s (%s)", selection_.file.c_str(), asset::format_asset_id(id).c_str());
     commands_.clear(); // their entities go with the world
+    release_holds();
     saved_changes_ = commands_.changes();
     selection_.entity = 0; // the file stays selected
     hierarchy_.reset();

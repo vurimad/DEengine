@@ -15,6 +15,7 @@ add_library(de_editor STATIC
     commands.h
     editor.cpp
     editor.h
+    entity_record.h
     gizmo.cpp
     gizmo.h
     hierarchy_panel.cpp

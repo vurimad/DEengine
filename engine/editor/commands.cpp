@@ -2,6 +2,7 @@
 
 #include "core/hash.h"
 #include "core/profile.h"
+#include "world/cell.h"
 #include "world/transform.h"
 
 #include <cstring>
@@ -65,6 +66,22 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
             return true;
         }
     }
+    Command command{.kind = Kind::Set,
+                    .entity = entity.id(),
+                    .component = component,
+                    .merge_key = merge_key,
+                    .before = core::Array<std::byte>(*allocator_),
+                    .after = core::Array<std::byte>(*allocator_),
+                    .record = core::Array<EntityRecord>(*allocator_)};
+    command.before.assign(current); // before apply_component: it may move the component's storage
+    command.after.assign(value);
+    apply_component(entity, component, value);
+    push(std::move(command));
+    open_merge_key_ = merge_key;
+    return true;
+}
+
+void CommandStack::push(Command&& command) {
     // A new command: whatever was undone can't be redone any more.
     while (commands_.size() > done_) {
         commands_.pop();
@@ -73,19 +90,126 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
         commands_.remove_ordered(0);
         --done_;
     }
-    Command command{.entity = entity.id(),
-                    .component = component,
-                    .merge_key = merge_key,
-                    .before = core::Array<std::byte>(*allocator_),
-                    .after = core::Array<std::byte>(*allocator_)};
-    command.before.assign(current); // before apply_component: it may move the component's storage
-    command.after.assign(value);
-    apply_component(entity, component, value);
     commands_.push(std::move(command));
     done_ = commands_.size();
-    open_merge_key_ = merge_key;
+    open_merge_key_ = 0;
     ++changes_;
+}
+
+void CommandStack::created(flecs::entity entity) {
+    if (maker_ == nullptr || !entity.is_alive()) {
+        return;
+    }
+    Command command{.kind = Kind::Create,
+                    .entity = entity.id(),
+                    .before = core::Array<std::byte>(*allocator_),
+                    .after = core::Array<std::byte>(*allocator_),
+                    .record = core::Array<EntityRecord>(*allocator_)};
+    maker_->record(entity, command.record.push(EntityRecord{}));
+    command.record[0].was = entity.id();
+    push(std::move(command));
+}
+
+bool CommandStack::remove(flecs::entity entity) {
+    if (maker_ == nullptr || !entity.is_alive()) {
+        return false;
+    }
+    Command command{.kind = Kind::Remove,
+                    .entity = entity.id(),
+                    .before = core::Array<std::byte>(*allocator_),
+                    .after = core::Array<std::byte>(*allocator_),
+                    .record = core::Array<EntityRecord>(*allocator_)};
+    take_away(command, entity.world());
+    push(std::move(command));
     return true;
+}
+
+void CommandStack::take_away(Command& command, const flecs::world& ecs) {
+    if (!ecs.is_alive(command.entity)) {
+        return;
+    }
+    // The entity, then what's attached to it (flecs::Parent), each after what it hangs on: as they are now, since later
+    // commands may have changed them.
+    command.record.clear();
+    const flecs::entity root = ecs.entity(command.entity);
+    maker_->record(root, command.record.push(EntityRecord{}));
+    command.record[0].was = root.id();
+    for (size_t at = 0; at < command.record.size(); ++at) {
+        const flecs::entity_t holder = command.record[at].was;
+        ecs.each([&](flecs::entity attached, const flecs::Parent& parent) {
+            if (parent.value != holder) {
+                return;
+            }
+            EntityRecord& record = command.record.push(EntityRecord{});
+            maker_->record(attached, record);
+            record.was = attached.id();
+            record.attached_to = static_cast<uint32_t>(at);
+        });
+    }
+    // Away, the ones furthest down first.
+    for (size_t i = command.record.size(); i-- > 0;) {
+        if (ecs.is_alive(command.record[i].was)) {
+            maker_->unmake(ecs.entity(command.record[i].was));
+        }
+    }
+}
+
+void CommandStack::make_again(Command& command) {
+    if (command.record.empty()) {
+        return;
+    }
+    // Each made where it stood, then put on what it hangs on (made before it), where it is.
+    core::Array<flecs::entity_t> made(*allocator_);
+    for (const EntityRecord& record : command.record) {
+        const flecs::entity entity = maker_->make(record);
+        if (record.attached_to < made.size()) {
+            world::attach(entity, entity.world().entity(made[record.attached_to]));
+        }
+        made.push(entity.id());
+    }
+    // Every command naming one names the new one (this one, by its first).
+    for (size_t i = 0; i < command.record.size(); ++i) {
+        const flecs::entity_t was = i == 0 ? command.entity : command.record[i].was;
+        remap(was, made[i]);
+        command.record[i].was = made[i];
+    }
+    last_made_ = made[0];
+}
+
+void CommandStack::each_taken_member(const flecs::world& ecs,
+                                     core::FunctionRef<void(const EntityRecord& record)> visit) const {
+    for (size_t i = 0; i < commands_.size(); ++i) {
+        const Command& command = commands_[i];
+        if (command.kind == Kind::Set || command.record.empty()) {
+            continue;
+        }
+        // Taken away now: a Remove that's done, or a Create that's undone; with what was attached to it.
+        const bool away = command.kind == Kind::Remove ? i < done_ : i >= done_;
+        if (!away) {
+            continue;
+        }
+        for (const EntityRecord& record : command.record) {
+            if (record.cell == 0 || !ecs.is_alive(record.cell) || ecs.is_alive(record.was)) {
+                continue;
+            }
+            const auto* contents = ecs.entity(record.cell).try_get<world::CellContents>();
+            if (contents != nullptr && contents->revision == record.revision) {
+                visit(record);
+            }
+        }
+    }
+}
+
+const char* CommandStack::name_of(const Command& command, const flecs::world& ecs) const {
+    switch (command.kind) {
+    case Kind::Create:
+        return "Create";
+    case Kind::Remove:
+        return "Delete";
+    case Kind::Set:
+        break;
+    }
+    return ecs_get_name(ecs.c_ptr(), command.component);
 }
 
 bool CommandStack::undo(const flecs::world& ecs) {
@@ -93,7 +217,21 @@ bool CommandStack::undo(const flecs::world& ecs) {
     if (!can_undo()) {
         return false;
     }
-    const Command& command = commands_[done_ - 1];
+    last_made_ = 0;
+    Command& command = commands_[done_ - 1];
+    if (command.kind != Kind::Set) {
+        if (maker_ == nullptr) {
+            return false;
+        }
+        if (command.kind == Kind::Create) {
+            take_away(command, ecs);
+        } else {
+            make_again(command);
+        }
+        --done_;
+        ++changes_;
+        return true;
+    }
     const flecs::entity entity = ecs.entity(command.entity);
     if (!ecs.is_alive(command.entity) || component_bytes(entity, command.component).size() != command.before.size()) {
         commands_.remove_ordered(--done_); // its entity went (a cell reloaded): nothing to put back
@@ -110,7 +248,21 @@ bool CommandStack::redo(const flecs::world& ecs) {
     if (!can_redo()) {
         return false;
     }
-    const Command& command = commands_[done_];
+    last_made_ = 0;
+    Command& command = commands_[done_];
+    if (command.kind != Kind::Set) {
+        if (maker_ == nullptr) {
+            return false;
+        }
+        if (command.kind == Kind::Create) {
+            make_again(command);
+        } else {
+            take_away(command, ecs);
+        }
+        ++done_;
+        ++changes_;
+        return true;
+    }
     const flecs::entity entity = ecs.entity(command.entity);
     if (!ecs.is_alive(command.entity) || component_bytes(entity, command.component).size() != command.after.size()) {
         commands_.remove_ordered(done_);
@@ -123,11 +275,11 @@ bool CommandStack::redo(const flecs::world& ecs) {
 }
 
 const char* CommandStack::undo_name(const flecs::world& ecs) const {
-    return can_undo() ? ecs_get_name(ecs.c_ptr(), commands_[done_ - 1].component) : nullptr;
+    return can_undo() ? name_of(commands_[done_ - 1], ecs) : nullptr;
 }
 
 const char* CommandStack::redo_name(const flecs::world& ecs) const {
-    return can_redo() ? ecs_get_name(ecs.c_ptr(), commands_[done_].component) : nullptr;
+    return can_redo() ? name_of(commands_[done_], ecs) : nullptr;
 }
 
 const std::byte* CommandStack::saved_value(flecs::entity_t entity, flecs::id_t component) const {
@@ -143,11 +295,22 @@ void CommandStack::clear() {
 }
 
 void CommandStack::remap(flecs::entity_t from, flecs::entity_t to) {
+    // What a command took away with its entity names them too.
+    for (Command& command : commands_) {
+        for (EntityRecord& record : command.record) {
+            if (record.was == from) {
+                record.was = to;
+            }
+        }
+    }
     for (Command& command : commands_) {
         if (command.entity != from) {
             continue;
         }
         command.entity = to;
+        if (command.kind != Kind::Set) {
+            continue;
+        }
         // Its saved value goes with it (each saved value has the command its first edit made).
         if (core::Array<std::byte>* saved = saved_.find(saved_key(from, command.component)); saved != nullptr) {
             core::Array<std::byte> moved = std::move(*saved);

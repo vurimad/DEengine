@@ -584,6 +584,53 @@ bool CellSource::set_in_object(Span object, std::string_view key, std::string_vi
     return true;
 }
 
+bool CellSource::remove_entity_member(uint32_t index, std::string_view key) {
+    if (index >= entities_.size()) {
+        return false;
+    }
+    const Span object = entities_[index].object;
+    const std::string_view source(text_.data(), text_.size());
+    Scanner scan(source.substr(0, object.end));
+    scan.jump(object.begin + 1); // past its brace
+    uint32_t previous_end = 0;   // past the member before it: where a comma before it would be
+    while (scan.skip() && !scan.done() && scan.peek() != '}') {
+        const uint32_t quote = scan.at();
+        uint32_t key_begin = 0;
+        uint32_t key_end = 0;
+        if (!scan.string(key_begin, key_end) || !scan.skip() || scan.peek() != ':') {
+            return false;
+        }
+        scan.step();
+        Span value;
+        if (!scan.skip() || !scan.value(value.begin, value.end)) {
+            return false;
+        }
+        const uint32_t after_value = value.end;
+        if (!scan.skip()) {
+            return false;
+        }
+        const bool comma = scan.peek() == ',';
+        if (comma) {
+            scan.step();
+        }
+        if (source.substr(key_begin, key_end - key_begin) == key) {
+            if (comma) {
+                // "key": value, | the next: up to where the next starts.
+                const bool more = scan.skip();
+                replace(quote, more ? scan.at() : after_value + 1, {});
+            } else if (previous_end != 0) {
+                // The last: from the end of the one before it, its comma with it.
+                replace(previous_end, after_value, {});
+            } else {
+                replace(quote, after_value, {}); // the only one
+            }
+            return true;
+        }
+        previous_end = after_value;
+    }
+    return false;
+}
+
 bool CellSource::coord(int32_t& x, int32_t& z) const {
     double values[2] = {};
     if (!coord_value_.found() || !parse_numbers(slice(coord_value_), values, 2)) {

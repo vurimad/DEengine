@@ -3,14 +3,17 @@
 #include "asset/cell_format.h"
 #include "asset/registry.h"
 #include "core/profile.h"
+#include "editor/entity_record.h"
 #include "physics/physics.h"
 #include "world/cell.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string_view>
 
 namespace de::editor {
@@ -64,6 +67,43 @@ std::span<const Outline::Item> Outline::range(flecs::entity_t parent, flecs::ent
     return {first, static_cast<size_t>(last - first)};
 }
 
+void free_name(std::string_view base, core::FunctionRef<bool(std::string_view name)> taken, std::span<char> out) {
+    if (out.empty()) {
+        return;
+    }
+    const auto put = [&out](std::string_view name) {
+        const size_t length = std::min(name.size(), out.size() - 1);
+        std::memcpy(out.data(), name.data(), length);
+        out[length] = 0;
+    };
+    if (!taken(base)) {
+        put(base);
+        return;
+    }
+    // "stem_digits": the number counts up, as wide as it was; otherwise "_2" on.
+    size_t digits = base.size();
+    while (digits > 0 && base[digits - 1] >= '0' && base[digits - 1] <= '9') {
+        --digits;
+    }
+    const bool numbered = digits < base.size() && digits > 0 && base[digits - 1] == '_';
+    const std::string_view stem = numbered ? base.substr(0, digits - 1) : base;
+    const int width = numbered ? static_cast<int>(base.size() - digits) : 1;
+    int number = 1;
+    if (numbered) {
+        static_cast<void>(std::from_chars(base.data() + digits, base.data() + base.size(), number));
+    }
+    char candidate[160];
+    for (int n = number + 1; n < number + 100000; ++n) {
+        const int length = std::snprintf(candidate, sizeof(candidate), "%.*s_%0*d", static_cast<int>(stem.size()),
+                                         stem.data(), width, n);
+        if (length > 0 && !taken({candidate, static_cast<size_t>(length)})) {
+            put({candidate, static_cast<size_t>(length)});
+            return;
+        }
+    }
+    put(base);
+}
+
 void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std::span<char> out) {
     if (out.empty()) {
         return;
@@ -80,6 +120,11 @@ void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std:
     }
     if (const auto* cell = entity.try_get<world::Cell>()) {
         static_cast<void>(std::snprintf(out.data(), out.size(), "cell [%d, %d]", cell->coord.x, cell->coord.z));
+        return;
+    }
+    // One the editor made: the name it was given.
+    if (const auto* made = entity.try_get<EditorEntry>(); made != nullptr && made->name[0] != 0) {
+        static_cast<void>(std::snprintf(out.data(), out.size(), "%s", made->name));
         return;
     }
     // A cell's member: its name in the cell's file.

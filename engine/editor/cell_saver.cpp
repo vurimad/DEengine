@@ -7,6 +7,7 @@
 #include "core/log.h"
 #include "core/profile.h"
 #include "editor/cell_source.h"
+#include "editor/entity_record.h"
 #include "editor/source_files.h"
 #include "platform/vfs.h"
 #include "world/cell.h"
@@ -69,6 +70,11 @@ bool read_text(const platform::Vfs& vfs, const char* path, core::Array<char>& ou
     out.resize(bytes->size());
     std::memcpy(out.data(), bytes->data(), bytes->size());
     return true;
+}
+
+uint64_t pack_key(const MemberKey& key) {
+    return (static_cast<uint64_t>(static_cast<uint16_t>(key.x)) << 48U) |
+           (static_cast<uint64_t>(static_cast<uint16_t>(key.z)) << 32U) | key.source_index;
 }
 
 // A member of a loaded cell: which of the cooked cell's entities it is.
@@ -245,6 +251,15 @@ const CellSources::Cell* CellSources::find(asset::AssetId id) const {
     return index != nullptr ? &cells_[*index] : nullptr;
 }
 
+uint32_t CellSources::world_index(asset::AssetId id) const {
+    for (size_t i = 0; i < worlds_.size(); ++i) {
+        if (worlds_[i].id == id) {
+            return static_cast<uint32_t>(i);
+        }
+    }
+    return UINT32_MAX;
+}
+
 uint32_t CellSources::world_of(std::string_view cell_path, asset::AssetId wanted) const {
     uint32_t first = UINT32_MAX;
     for (const Listing& listing : listed_) {
@@ -273,7 +288,8 @@ const CellSources::Cell* CellSources::cell_at(uint32_t world, int32_t x, int32_t
 
 CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& assets, const platform::Vfs& vfs,
                           const CellSources& sources, asset::AssetId world, core::Array<platform::PathString>* written,
-                          core::Array<MemberMove>* moves) {
+                          core::Array<MemberMove>* moves, std::span<const MemberRemoval> removed,
+                          core::Array<PlacedMember>* placed_out) {
     DE_PROFILE_ZONE("save_cells");
     CellSaveReport report;
 
@@ -288,6 +304,18 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
     std::ranges::sort(members, [](const Member& a, const Member& b) {
         return a.cell != b.cell ? a.cell < b.cell : a.index < b.index;
     });
+    // And by where each is in its file.
+    core::HashMap<uint64_t, flecs::entity_t> by_key(saver_heap());
+    for (const Member& member : members) {
+        const auto* held = ecs.entity(member.cell).try_get<world::Cell>();
+        const auto* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
+        if (cooked != nullptr && member.index < cooked->entities.count) {
+            by_key.set(pack_key({.x = cooked->coord_x,
+                                 .z = cooked->coord_z,
+                                 .source_index = cooked->entities.get(cooked)[member.index].source_index}),
+                       member.entity);
+        }
+    }
 
     core::Array<OpenFile> files(saver_heap());
     core::Array<char> text(saver_heap());
@@ -444,6 +472,93 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
         }
     }
 
+    // A world's file for the cell at x, z: the one open, the one it lists, or a new one in folder (made, not written
+    // yet).
+    const auto file_for = [&](uint32_t world_index, int32_t x, int32_t z, std::string_view folder) -> uint32_t {
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (files[i].world == world_index && files[i].x == x && files[i].z == z &&
+                (files[i].made || sources.cell_at(world_index, x, z) != nullptr)) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        if (const CellSources::Cell* there = sources.cell_at(world_index, x, z)) {
+            return open_file(there->path.c_str());
+        }
+        platform::PathString path;
+        for (int n = 1; n < 100; ++n) {
+            char name[64];
+            static_cast<void>(n == 1 ? std::snprintf(name, sizeof(name), "/cell_%d_%d.cell", x, z)
+                                     : std::snprintf(name, sizeof(name), "/cell_%d_%d_%d.cell", x, z, n));
+            if (!path.assign(folder) || !path.append(name)) {
+                return UINT32_MAX;
+            }
+            bool taken = vfs.exists(path.c_str());
+            for (const OpenFile& open : files) {
+                taken = taken || open.path.view() == path.view();
+            }
+            if (!taken) {
+                break;
+            }
+        }
+        OpenFile& made = files.push(OpenFile(saver_heap()));
+        made.path = path;
+        new_cell_text(x, z, text);
+        static_cast<void>(made.source.parse({text.data(), text.size()}));
+        made.x = x;
+        made.z = z;
+        made.world = world_index;
+        made.made = true;
+        made.changed = true;
+        ++report.cells_made;
+        return static_cast<uint32_t>(files.size() - 1);
+    };
+    // An entry just put into a file: named apart from what's there (its new name returned), and its mesh found from
+    // the file's folder rather than from_folder.
+    const auto settle = [&](OpenFile& to, uint32_t placed, const Name& name, std::string_view from_folder) {
+        Name unique = name;
+        if (!name.empty()) {
+            for (int n = 2; n < 1000; ++n) {
+                bool taken = false;
+                for (uint32_t i = 0; i < to.source.entity_count() && !taken; ++i) {
+                    taken = i != placed && to.source.name(i) == unique.view();
+                }
+                if (!taken) {
+                    break;
+                }
+                char suffixed[160];
+                static_cast<void>(std::snprintf(suffixed, sizeof(suffixed), "%s_%d", name.c_str(), n));
+                static_cast<void>(unique.assign(suffixed));
+            }
+            if (unique.view() != name.view() || to.source.name(placed) != unique.view()) {
+                char quoted[160];
+                static_cast<void>(std::snprintf(quoted, sizeof(quoted), "\"%s\"", unique.c_str()));
+                static_cast<void>(to.source.set_entity_member(placed, "name", quoted));
+                if (unique.view() != name.view()) {
+                    DE_LOG_INFO("editor", "%s is %s in %s: the name was taken there", name.c_str(), unique.c_str(),
+                                to.path.c_str());
+                }
+            }
+        }
+        const std::string_view mesh = to.source.mesh(placed);
+        const std::string_view to_folder = folder_of(to.path.view());
+        if (!mesh.empty() && from_folder != to_folder) {
+            char full[platform::kMaxPathLength];
+            char relative[platform::kMaxPathLength + 2];
+            size_t full_length = 0;
+            size_t relative_length = 0;
+            if (joined_path(from_folder, mesh, full, full_length) &&
+                relative_path(to_folder, {full, full_length}, {relative + 1, sizeof(relative) - 2}, relative_length)) {
+                relative[0] = '"';
+                relative[relative_length + 1] = '"';
+                static_cast<void>(to.source.set_entity_member(placed, "mesh", {relative, relative_length + 2}));
+            }
+        }
+        to.changed = true;
+        to.received = true;
+        return unique;
+    };
+    const uint32_t open_world = sources.world_index(world);
+
     // 2. What stands in another cell's square goes to that cell's file, with everything under it.
     core::Array<Moving> moving(saver_heap());
     for (const Refile& refile : refiles) {
@@ -452,48 +567,8 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             continue;
         }
         // Its target: the world's cell there, else a file made for it next to the one it leaves.
-        const uint32_t world_index = files[refile.file].world;
-        uint32_t target = UINT32_MAX;
-        for (size_t i = 0; i < files.size(); ++i) {
-            if (files[i].world == world_index && files[i].x == refile.x && files[i].z == refile.z &&
-                (files[i].made || sources.cell_at(world_index, refile.x, refile.z) != nullptr)) {
-                target = static_cast<uint32_t>(i);
-            }
-        }
-        if (target == UINT32_MAX) {
-            if (const CellSources::Cell* there = sources.cell_at(world_index, refile.x, refile.z)) {
-                target = open_file(there->path.c_str());
-            } else {
-                platform::PathString path;
-                for (int n = 1; n < 100; ++n) {
-                    char name[64];
-                    static_cast<void>(
-                        n == 1 ? std::snprintf(name, sizeof(name), "/cell_%d_%d.cell", refile.x, refile.z)
-                               : std::snprintf(name, sizeof(name), "/cell_%d_%d_%d.cell", refile.x, refile.z, n));
-                    if (!path.assign(folder_of(files[refile.file].path.view())) || !path.append(name)) {
-                        break;
-                    }
-                    bool taken = vfs.exists(path.c_str());
-                    for (const OpenFile& open : files) {
-                        taken = taken || open.path.view() == path.view();
-                    }
-                    if (!taken) {
-                        break;
-                    }
-                }
-                OpenFile& made = files.push(OpenFile(saver_heap()));
-                made.path = path;
-                new_cell_text(refile.x, refile.z, text);
-                static_cast<void>(made.source.parse({text.data(), text.size()}));
-                made.x = refile.x;
-                made.z = refile.z;
-                made.world = world_index;
-                made.made = true;
-                made.changed = true;
-                target = static_cast<uint32_t>(files.size() - 1);
-                ++report.cells_made;
-            }
-        }
+        const uint32_t target =
+            file_for(files[refile.file].world, refile.x, refile.z, folder_of(files[refile.file].path.view()));
         if (target == UINT32_MAX) {
             ++report.cells_failed;
             continue;
@@ -536,6 +611,49 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
         ++report.refiled;
     }
 
+    // What was deleted: out of its file. What its file hangs on it becomes a root where it stands (it already was one,
+    // in the world: a static child spawns as one).
+    for (const MemberRemoval& removal : removed) {
+        const CellSources::Cell* cell =
+            open_world != UINT32_MAX ? sources.cell_at(open_world, removal.key.x, removal.key.z) : nullptr;
+        const uint32_t file_index = cell != nullptr ? open_file(cell->path.c_str()) : UINT32_MAX;
+        if (file_index == UINT32_MAX) {
+            DE_LOG_ERROR("editor", "%.*s was deleted, but its cell [%d, %d]'s file wasn't found",
+                         static_cast<int>(removal.name.size()), removal.name.data(), removal.key.x, removal.key.z);
+            ++report.cells_failed;
+            continue;
+        }
+        OpenFile& file = files[file_index];
+        const uint32_t index = removal.key.source_index;
+        if (index >= file.source.entity_count() || file.source.name(index) != removal.name) {
+            DE_LOG_ERROR("editor", "%s changed since it was cooked: cook it, then save again", file.path.c_str());
+            ++report.cells_failed;
+            continue;
+        }
+        if (std::ranges::find(file.removed, index) != file.removed.end()) {
+            continue;
+        }
+        file.removed.push(index);
+        ++report.removed;
+        if (removal.name.empty()) {
+            continue;
+        }
+        for (uint32_t i = 0; i < file.source.entity_count(); ++i) {
+            if (file.source.parent(i) != removal.name || std::ranges::find(file.removed, i) != file.removed.end()) {
+                continue;
+            }
+            const flecs::entity_t* child = by_key.find(pack_key({.x = file.x, .z = file.z, .source_index = i}));
+            const auto* where = child != nullptr && ecs.is_alive(*child)
+                                    ? ecs.entity(*child).try_get<world::WorldTransform>()
+                                    : nullptr;
+            if (where != nullptr) {
+                static_cast<void>(file.source.remove_entity_member(i, "parent"));
+                static_cast<void>(file.source.set_transform(
+                    i, {.position = where->position, .rotation = where->rotation, .scale = where->scale}));
+            }
+        }
+    }
+
     // Out of the files they leave, the last first, so the places of the others hold while they go.
     for (OpenFile& file : files) {
         if (file.removed.empty()) {
@@ -551,7 +669,7 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             const auto total = static_cast<uint32_t>(file.source.entity_count() + file.removed.size());
             for (uint32_t index = 0; index < total; ++index) {
                 const auto gone_before = static_cast<uint32_t>(
-                    std::ranges::count_if(file.removed, [index](uint32_t removed) { return removed < index; }));
+                    std::ranges::count_if(file.removed, [index](uint32_t removed_at) { return removed_at < index; }));
                 const bool gone = std::ranges::find(file.removed, index) != file.removed.end();
                 if (!gone && gone_before > 0) {
                     moves->push({.from = {.x = file.x, .z = file.z, .source_index = index},
@@ -563,66 +681,62 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
     // Into the files they go to, named apart from what's there, their meshes found from the new folder.
     for (size_t m = 0; m < moving.size(); ++m) {
         Moving& entry = moving[m];
-        OpenFile& to = files[entry.to_file];
-        const OpenFile& from = files[entry.from_file];
-        const uint32_t placed = to.source.add_entity({entry.text.data(), entry.text.size()});
-        to.changed = true;
-        to.received = true;
-        if (!entry.name.empty()) {
-            Name unique = entry.name;
-            for (int n = 2; n < 1000; ++n) {
-                bool taken = false;
-                for (uint32_t i = 0; i < to.source.entity_count() && !taken; ++i) {
-                    taken = i != placed && to.source.name(i) == unique.view();
-                }
-                if (!taken) {
-                    break;
-                }
-                char suffixed[160];
-                static_cast<void>(std::snprintf(suffixed, sizeof(suffixed), "%s_%d", entry.name.c_str(), n));
-                static_cast<void>(unique.assign(suffixed));
-            }
-            if (unique.view() != entry.name.view()) {
-                char quoted[160];
-                static_cast<void>(std::snprintf(quoted, sizeof(quoted), "\"%s\"", unique.c_str()));
-                static_cast<void>(to.source.set_entity_member(placed, "name", quoted));
-                DE_LOG_INFO("editor", "%s is %s in %s: the name was taken there", entry.name.c_str(), unique.c_str(),
-                            to.path.c_str());
-                // What names it as a parent, coming with it, follows.
-                for (size_t c = m + 1; c < moving.size(); ++c) {
-                    if (moving[c].to_file == entry.to_file && moving[c].parent.view() == entry.name.view()) {
-                        static_cast<void>(moving[c].parent.assign(unique.view()));
-                        moving[c].parent_renamed = true;
-                    }
+        const uint32_t placed = files[entry.to_file].source.add_entity({entry.text.data(), entry.text.size()});
+        const Name unique =
+            settle(files[entry.to_file], placed, entry.name, folder_of(files[entry.from_file].path.view()));
+        if (unique.view() != entry.name.view()) {
+            // What names it as a parent, coming with it, follows.
+            for (size_t c = m + 1; c < moving.size(); ++c) {
+                if (moving[c].to_file == entry.to_file && moving[c].parent.view() == entry.name.view()) {
+                    static_cast<void>(moving[c].parent.assign(unique.view()));
+                    moving[c].parent_renamed = true;
                 }
             }
         }
+        OpenFile& to = files[entry.to_file];
         if (entry.parent_renamed) {
             char quoted[160];
             static_cast<void>(std::snprintf(quoted, sizeof(quoted), "\"%s\"", entry.parent.c_str()));
             static_cast<void>(to.source.set_entity_member(placed, "parent", quoted));
         }
-        // A mesh by a path from the old file's folder, from the new one's.
-        const std::string_view mesh = to.source.mesh(placed);
-        const std::string_view from_folder = folder_of(from.path.view());
-        const std::string_view to_folder = folder_of(to.path.view());
-        if (!mesh.empty() && from_folder != to_folder) {
-            char full[platform::kMaxPathLength];
-            char relative[platform::kMaxPathLength + 2];
-            size_t full_length = 0;
-            size_t relative_length = 0;
-            if (joined_path(from_folder, mesh, full, full_length) &&
-                relative_path(to_folder, {full, full_length}, {relative + 1, sizeof(relative) - 2}, relative_length)) {
-                relative[0] = '"';
-                relative[relative_length + 1] = '"';
-                static_cast<void>(to.source.set_entity_member(placed, "mesh", {relative, relative_length + 2}));
-            }
-        }
         if (moves != nullptr) {
+            const OpenFile& from = files[entry.from_file];
             moves->push({.from = {.x = from.x, .z = from.z, .source_index = entry.from_index},
                          .to = {.x = to.x, .z = to.z, .source_index = placed}});
         }
     }
+
+    // What the editor made: into the file of the cell it stands in, in the world open (a new file beside the world's
+    // if that cell has none).
+    ecs.each([&](flecs::entity entity, const EditorEntry& made, const world::WorldTransform& where) {
+        if (made.saved) {
+            return; // in a file already: its cell comes back cooked with it
+        }
+        if (open_world == UINT32_MAX) {
+            DE_LOG_ERROR("editor", "%s can't be saved: no world under src:/content is the one open", made.name);
+            ++report.cells_failed;
+            return;
+        }
+        const auto x = static_cast<int32_t>(std::floor(where.position.x / world::kCellSize));
+        const auto z = static_cast<int32_t>(std::floor(where.position.z / world::kCellSize));
+        const uint32_t target = file_for(open_world, x, z, folder_of(sources.world(open_world).path.view()));
+        if (target == UINT32_MAX) {
+            ++report.cells_failed;
+            return;
+        }
+        const uint32_t placed = files[target].source.add_entity(made.object);
+        static_cast<void>(files[target].source.set_transform(
+            placed, {.position = where.position, .rotation = where.rotation, .scale = where.scale}));
+        Name name;
+        static_cast<void>(name.assign(made.name));
+        static_cast<void>(settle(files[target], placed, name, made.folder));
+        ++report.added;
+        ++report.entities_changed;
+        if (placed_out != nullptr) {
+            placed_out->push(
+                {.entity = entity.id(), .key = {.x = files[target].x, .z = files[target].z, .source_index = placed}});
+        }
+    });
 
     // 3. Every file that changed: first those things moved into, then the rest. If one of the first can't be written,
     // the files things left aren't either, so nothing is in neither.
@@ -702,8 +816,7 @@ bool cook_report_has_error(std::string_view report, std::string_view source) {
 // ---- MemberTracker ----
 
 uint64_t MemberTracker::pack(const MemberKey& key) {
-    return (static_cast<uint64_t>(static_cast<uint16_t>(key.x)) << 48U) |
-           (static_cast<uint64_t>(static_cast<uint16_t>(key.z)) << 32U) | key.source_index;
+    return pack_key(key);
 }
 
 void MemberTracker::note(const flecs::world& ecs, const asset::AssetRegistry& assets, flecs::entity_t id) {
@@ -720,66 +833,92 @@ void MemberTracker::note(const flecs::world& ecs, const asset::AssetRegistry& as
     }
     const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
     if (member->index < entities.size()) {
-        keys_.set(id,
-                  {.x = cooked->coord_x, .z = cooked->coord_z, .source_index = entities[member->index].source_index});
+        keys_.set(id, {.key = {.x = cooked->coord_x,
+                               .z = cooked->coord_z,
+                               .source_index = entities[member->index].source_index}});
     }
 }
 
 void MemberTracker::apply(std::span<const MemberMove> moves) {
-    for (auto [entity, key] : keys_) {
+    for (auto [entity, noted] : keys_) {
+        if (noted.replaced) {
+            continue; // its key is where the save put it
+        }
         for (const MemberMove& move : moves) {
-            if (move.from == key) {
-                key = move.to;
+            if (move.from == noted.key) {
+                noted.key = move.to;
                 break;
             }
         }
     }
 }
 
-void MemberTracker::follow(const flecs::world& ecs, const asset::AssetRegistry& assets,
-                           core::FunctionRef<void(flecs::entity_t from, flecs::entity_t to)> moved) {
-    bool spawned = false;
-    ecs.each([&](flecs::entity cell, const world::CellContents& contents) {
-        uint32_t* known = revisions_.find(cell.id());
-        if (known == nullptr) {
-            revisions_.set(cell.id(), contents.revision);
-            spawned = spawned || contents.revision != 0; // a cell loaded since: it may hold what moved there
-        } else if (*known != contents.revision) {
-            *known = contents.revision;
-            spawned = true;
+void MemberTracker::note_replaced(const flecs::world& ecs, flecs::entity_t entity, const MemberKey& key) {
+    // Its cell as it is now: the member comes with the cell spawned after this.
+    uint32_t revision = 0;
+    ecs.each([&](const world::Cell& cell, const world::CellContents& contents) {
+        if (cell.coord.x == key.x && cell.coord.z == key.z) {
+            revision = contents.revision;
         }
     });
-    if (!spawned || keys_.empty()) {
+    keys_.set(entity, {.key = key, .replaced = true, .revision = revision});
+}
+
+void MemberTracker::follow(const flecs::world& ecs, const asset::AssetRegistry& assets,
+                           core::FunctionRef<void(flecs::entity_t from, flecs::entity_t to)> moved) {
+    // The cells spawned since the last call (again, or for the first time), by their place.
+    spawned_.clear();
+    ecs.each([&](flecs::entity cell, const world::Cell& held, const world::CellContents& contents) {
+        uint32_t* known = revisions_.find(cell.id());
+        const bool first = known == nullptr;
+        if (first) {
+            revisions_.set(cell.id(), contents.revision);
+        } else if (*known != contents.revision) {
+            *known = contents.revision;
+        } else {
+            return;
+        }
+        if (contents.revision != 0) {
+            spawned_.set(pack_key({.x = held.coord.x, .z = held.coord.z, .source_index = 0}), contents.revision);
+        }
+    });
+    if (spawned_.empty() || keys_.empty()) {
         return;
     }
-    // Every member by its key, then each noted entity that's gone finds its own.
+    // Their members by key, then each noted entity that's gone (or saved, made in the editor) finds its own there.
     members_.clear();
     ecs.each([&](flecs::entity entity, const world::CellMember& member) {
         const flecs::entity cell = entity.target<world::InCell>();
         const auto* held = cell.is_valid() ? cell.try_get<world::Cell>() : nullptr;
         const auto* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
-        if (cooked == nullptr) {
+        if (cooked == nullptr || member.index >= cooked->entities.count ||
+            !spawned_.contains(pack_key({.x = cooked->coord_x, .z = cooked->coord_z, .source_index = 0}))) {
             return;
         }
-        const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
-        if (member.index < entities.size()) {
-            members_.set(
-                pack({.x = cooked->coord_x, .z = cooked->coord_z, .source_index = entities[member.index].source_index}),
-                entity.id());
-        }
+        members_.set(pack({.x = cooked->coord_x,
+                           .z = cooked->coord_z,
+                           .source_index = cooked->entities.get(cooked)[member.index].source_index}),
+                     entity.id());
     });
     moved_.clear();
-    for (auto [entity, key] : keys_) {
-        if (ecs.is_alive(entity)) {
+    for (auto [entity, noted] : keys_) {
+        if (ecs.is_alive(entity) && !noted.replaced) {
             continue;
         }
-        if (const flecs::entity_t* now = members_.find(pack(key)); now != nullptr) {
-            moved_.push({.from = entity, .to = *now, .key = key});
+        if (noted.replaced) {
+            // Only by its cell spawned after the save wrote it in.
+            const uint32_t* revision = spawned_.find(pack_key({.x = noted.key.x, .z = noted.key.z, .source_index = 0}));
+            if (revision == nullptr || *revision == noted.revision) {
+                continue;
+            }
+        }
+        if (const flecs::entity_t* now = members_.find(pack(noted.key)); now != nullptr) {
+            moved_.push({.from = entity, .to = *now, .noted = {.key = noted.key}});
         }
     }
     for (const Moved& move : moved_) {
         static_cast<void>(keys_.remove(move.from));
-        keys_.set(move.to, move.key);
+        keys_.set(move.to, move.noted);
         moved(move.from, move.to);
     }
 }

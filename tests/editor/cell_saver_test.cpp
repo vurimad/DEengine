@@ -4,6 +4,9 @@
 #include "core/job_system.h"
 #include "core/math.h"
 #include "editor/cell_saver.h"
+#include "editor/commands.h"
+#include "editor/entity_record.h"
+#include "editor/outline.h"
 #include "editor/source_files.h"
 #include "platform/file.h"
 #include "platform/vfs.h"
@@ -15,6 +18,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -381,4 +385,234 @@ TEST_CASE("saving files what was moved into another cell's square into that cell
     CHECK(scene.member("rock").get<Transform>().position.x == doctest::Approx(300.0));
     // And nothing more to save.
     CHECK(de::editor::save_cells(ecs, scene.assets, scene.vfs, sources, world_id).files_written == 0);
+}
+
+namespace {
+
+// Makes entities for the commands as the editor does, with what tests need: a transform, what it's made from.
+class TestMaker final : public de::editor::EntityMaker {
+public:
+    explicit TestMaker(flecs::world& world) : ecs(&world) {}
+    flecs::entity make(const de::editor::EntityRecord& record) override {
+        const flecs::entity entity = ecs->entity();
+        if (record.has_entry) {
+            entity.set(record.entry);
+        }
+        de::world::place(entity, record.transform);
+        return entity;
+    }
+    void record(flecs::entity entity, de::editor::EntityRecord& out) override {
+        out = {};
+        const auto& where = entity.get<de::world::WorldTransform>();
+        out.transform = {.position = where.position, .rotation = where.rotation, .scale = where.scale};
+        if (const auto* entry = entity.try_get<de::editor::EditorEntry>()) {
+            out.entry = *entry;
+            out.has_entry = true;
+        }
+    }
+    void unmake(flecs::entity entity) override { entity.destruct(); }
+
+    flecs::world* ecs;
+};
+
+} // namespace
+
+TEST_CASE("editor commands: what's made and deleted goes and comes back with undo and redo, its edits with it") {
+    World world = World::create().value();
+    flecs::world& ecs = world.ecs();
+    TestMaker maker(ecs);
+    de::editor::CommandStack commands(heap());
+    commands.set_maker(&maker);
+    const flecs::id_t transform = ecs.component<Transform>().id();
+
+    // Made, then moved.
+    de::editor::EntityRecord placed;
+    placed.transform = {.position = {1.0, 0.0, 0.0}};
+    const flecs::entity made = maker.make(placed);
+    commands.created(made);
+    Transform moved{.position = {5.0, 0.0, 0.0}};
+    REQUIRE(commands.set_component(made, transform, std::as_bytes(std::span(&moved, 1))));
+    CHECK((std::string_view(commands.undo_name(ecs)) == "de.world.Transform" ||
+           std::string_view(commands.undo_name(ecs)).ends_with("Transform")));
+
+    // Undone twice: back where it was made, then gone.
+    REQUIRE(commands.undo(ecs));
+    CHECK(made.get<Transform>().position.x == doctest::Approx(1.0));
+    CHECK((std::string_view(commands.undo_name(ecs)) == "Create"));
+    REQUIRE(commands.undo(ecs));
+    CHECK_FALSE(made.is_alive());
+    // Redone twice: made again (a new entity: the next command follows it), then moved again.
+    REQUIRE(commands.redo(ecs));
+    REQUIRE(commands.last_made() != 0);
+    const flecs::entity again = ecs.entity(commands.last_made());
+    CHECK(again.id() != made.id());
+    CHECK(again.get<Transform>().position.x == doctest::Approx(1.0));
+    REQUIRE(commands.redo(ecs));
+    CHECK(again.get<Transform>().position.x == doctest::Approx(5.0));
+
+    // Deleted: gone; undone, back where it was, and its earlier move still undoes.
+    REQUIRE(commands.remove(again));
+    CHECK_FALSE(again.is_alive());
+    CHECK((std::string_view(commands.undo_name(ecs)) == "Delete"));
+    REQUIRE(commands.undo(ecs));
+    const flecs::entity back = ecs.entity(commands.last_made());
+    CHECK(back.get<Transform>().position.x == doctest::Approx(5.0));
+    REQUIRE(commands.undo(ecs));
+    CHECK(back.get<Transform>().position.x == doctest::Approx(1.0));
+    CHECK(commands.changes() > 0);
+    // Nothing taken from a cell here.
+    int taken = 0;
+    commands.each_taken_member(ecs, [&taken](const de::editor::EntityRecord&) { ++taken; });
+    CHECK(taken == 0);
+}
+
+TEST_CASE("saving takes deleted members out of their files and puts what the editor made into its cell's") {
+    Scene scene;
+    scene.write_source("content/w/e.environment", kEnvironment);
+    scene.write_source("content/w/w.world", R"({
+  "environment": "e.environment",
+  "start": {"position": [64, 2, 64]},
+  "cells": ["a.cell"]
+}
+)");
+    scene.write_source("content/w/a.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "camp", "position": [64, 0, 64]},
+    {"name": "statue", "parent": "camp", "position": [2, 0, 0]},
+    {"name": "rock", "position": [10, 0, 10]}
+  ]
+}
+)");
+    scene.cook();
+    de::editor::CellSources sources(heap());
+    REQUIRE(sources.scan(scene.vfs));
+    const de::asset::AssetId world_id = id_of(scene, "src:/content/w/w.world");
+    static_cast<void>(de::world::load_cell(scene.world.ecs(), id_of(scene, "src:/content/w/a.cell")));
+    scene.settle();
+    const flecs::world& ecs = scene.world.ecs();
+
+    // The camp deleted (the statue it holds in the file stays where it stands); a rock made in the editor at 70, 0, 20.
+    const flecs::entity camp = scene.member("camp");
+    const de::editor::MemberRemoval removal{.key = {.x = 0, .z = 0, .source_index = 0}, .name = "camp"};
+    camp.destruct();
+    de::editor::EditorEntry entry;
+    static_cast<void>(std::snprintf(entry.object, sizeof(entry.object), R"({"name": "rock"})"));
+    static_cast<void>(std::snprintf(entry.folder, sizeof(entry.folder), "src:/content/w"));
+    static_cast<void>(std::snprintf(entry.name, sizeof(entry.name), "rock"));
+    const flecs::entity made = ecs.entity().set(entry);
+    de::world::place(made, Transform{.position = {70.0, 0.0, 20.0}});
+
+    de::core::Array<de::editor::MemberMove> moves(heap());
+    de::core::Array<de::editor::PlacedMember> placed(heap());
+    const de::editor::CellSaveReport report = de::editor::save_cells(ecs, scene.assets, scene.vfs, sources, world_id,
+                                                                     nullptr, &moves, std::span(&removal, 1), &placed);
+    CHECK(report.cells_failed == 0);
+    CHECK(report.removed == 1);
+    CHECK(report.added == 1);
+    CHECK(scene.read_source("src:/content/w/a.cell") == R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "statue", "position": [66, 0, 64]},
+    {"name": "rock", "position": [10, 0, 10]},
+    {"name": "rock_2", "position": [70, 0, 20]}
+  ]
+}
+)");
+    REQUIRE(placed.size() == 1);
+    CHECK(placed[0].entity == made.id());
+    CHECK(placed[0].key == de::editor::MemberKey{.x = 0, .z = 0, .source_index = 2});
+
+    // Cooked: the cell comes back with it, and the member spawned from its entry takes the place of the one made.
+    de::editor::MemberTracker tracker(heap());
+    tracker.note_replaced(ecs, made.id(), placed[0].key);
+    tracker.apply(moves.span());
+    tracker.follow(ecs, scene.assets, [](flecs::entity_t, flecs::entity_t) {});
+    scene.cook();
+    scene.settle();
+    flecs::entity_t replaced_by = 0;
+    tracker.follow(ecs, scene.assets, [&](flecs::entity_t from, flecs::entity_t to) {
+        if (from == made.id()) {
+            replaced_by = to;
+        }
+    });
+    CHECK(replaced_by == scene.member("rock_2").id());
+}
+
+TEST_CASE("the tracker forgets what the editor took away, so what takes its place in the file isn't taken for it") {
+    Scene scene;
+    scene.write_source("content/world/camp.cell", kCell);
+    scene.cook();
+    static_cast<void>(de::world::load_cell(scene.world.ecs(), id_of(scene, "src:/content/world/camp.cell")));
+    scene.settle();
+    const flecs::world& ecs = scene.world.ecs();
+    de::editor::MemberTracker tracker(heap());
+    const flecs::entity boulder = scene.member("boulder");
+    tracker.note(ecs, scene.assets, boulder.id());
+    tracker.follow(ecs, scene.assets, [](flecs::entity_t, flecs::entity_t) {});
+    // Taken away by the editor, then the cell spawned again (as after a save's cook): nothing follows it.
+    tracker.forget(boulder.id());
+    boulder.destruct();
+    scene.write_source("content/world/camp.cell", std::string(kCell) + " ");
+    scene.cook();
+    scene.settle();
+    int followed = 0;
+    tracker.follow(ecs, scene.assets, [&followed](flecs::entity_t, flecs::entity_t) { ++followed; });
+    CHECK(followed == 0);
+}
+
+TEST_CASE("editor commands: deleting takes what's attached with it, and undo brings it all back, attached") {
+    World world = World::create().value();
+    flecs::world& ecs = world.ecs();
+    TestMaker maker(ecs);
+    de::editor::CommandStack commands(heap());
+    commands.set_maker(&maker);
+    de::editor::EntityRecord at;
+    at.transform = {.position = {10.0, 0.0, 0.0}};
+    const flecs::entity holder = maker.make(at);
+    at.transform = {.position = {12.0, 0.0, 0.0}};
+    const flecs::entity held = maker.make(at);
+    de::world::attach(held, holder);
+    at.transform = {.position = {13.0, 0.0, 0.0}};
+    const flecs::entity on_held = maker.make(at);
+    de::world::attach(on_held, held);
+    world.tick();
+
+    REQUIRE(commands.remove(holder));
+    CHECK_FALSE(holder.is_alive());
+    CHECK_FALSE(held.is_alive());
+    CHECK_FALSE(on_held.is_alive());
+    REQUIRE(commands.undo(ecs));
+    const flecs::entity back = ecs.entity(commands.last_made());
+    REQUIRE(back.is_alive());
+    // Everything attached to it is back, attached as it was, where it was.
+    int attached = 0;
+    ecs.each([&](flecs::entity entity, const flecs::Parent& parent) {
+        ++attached;
+        const double x = entity.get<de::world::WorldTransform>().position.x;
+        if (parent.value == back.id()) {
+            CHECK(x == doctest::Approx(12.0));
+        } else {
+            CHECK(x == doctest::Approx(13.0));
+        }
+    });
+    CHECK(attached == 2);
+    REQUIRE(commands.redo(ecs));
+    attached = 0;
+    ecs.each([&](flecs::entity, const flecs::Parent&) { ++attached; });
+    CHECK(attached == 0);
+}
+
+TEST_CASE("names for what's made: free as they are, else a trailing number counts up, keeping its width") {
+    const std::string_view had[] = {"boulder_1", "boulder_2", "boulder_3", "boulder_4", "rock_01", "camp"};
+    const auto taken = [&had](std::string_view name) { return std::ranges::find(had, name) != std::end(had); };
+    char out[64];
+    de::editor::free_name("tree", taken, out);
+    CHECK((std::string_view(out) == "tree"));
+    de::editor::free_name("boulder_1", taken, out);
+    CHECK((std::string_view(out) == "boulder_5"));
+    de::editor::free_name("rock_01", taken, out);
+    CHECK((std::string_view(out) == "rock_02"));
+    de::editor::free_name("camp", taken, out);
+    CHECK((std::string_view(out) == "camp_2"));
 }

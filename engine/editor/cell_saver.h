@@ -52,6 +52,8 @@ public:
     // The world a cell file belongs to: of those listing it, the one with the ID wanted if it's among them, else the
     // first. Its index for world(), or UINT32_MAX if no world lists it.
     uint32_t world_of(std::string_view cell_path, asset::AssetId wanted) const;
+    // The world with that ID, or UINT32_MAX.
+    uint32_t world_index(asset::AssetId id) const;
     const World& world(uint32_t index) const { return worlds_[index]; }
     // The cell a world lists at that place in the grid, or null.
     const Cell* cell_at(uint32_t world, int32_t x, int32_t z) const;
@@ -81,10 +83,23 @@ struct MemberMove {
     MemberKey to;
 };
 
+// A member deleted in the editor: where it is in its file, and its name there (the save checks the file still has it).
+struct MemberRemoval {
+    MemberKey key;
+    std::string_view name;
+};
+// One the editor made, written into a file: where.
+struct PlacedMember {
+    flecs::entity_t entity = 0;
+    MemberKey key;
+};
+
 struct CellSaveReport {
     uint32_t files_written = 0; // cells (and worlds) whose text changed
     uint32_t entities_changed = 0;
     uint32_t refiled = 0;      // moved into the file of the cell they stand in now (with what's under them)
+    uint32_t added = 0;        // made in the editor (placed, duplicated), written into a cell's file
+    uint32_t removed = 0;      // deleted, taken out of their files
     uint32_t cells_made = 0;   // files made for cells that had none, and added to their world
     uint32_t cells_failed = 0; // a source that couldn't be found, read, understood or written (logged)
     uint32_t outside_cell = 0; // out of their cell's square, but no world lists their file to file them by: left
@@ -95,12 +110,15 @@ struct CellSaveReport {
 // fog volume's values, so a file diffs as its edits. A root that now stands in another cell's square goes to that
 // cell's file in the same world (world: the one open, among those listing the file), with everything under it; a file
 // is made for a cell that has none, next to the one it came from, and added to the world. Files whose text changed are
-// written (atomically). written gets each path written; moves, where things went in the files (from where the cooked
-// cells have them).
+// written (atomically). Members deleted (removed) come out of their files, what their files hang on them becoming roots
+// where they stand; what the editor made (EditorEntry, not yet saved) goes into the file of the cell it stands in, in
+// the world open (a new file beside the world's if there's none). written gets each path written; moves, where things
+// went in the files (from where the cooked cells have them); placed, where each one the editor made went.
 CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& assets, const platform::Vfs& vfs,
                           const CellSources& sources, asset::AssetId world,
                           core::Array<platform::PathString>* written = nullptr,
-                          core::Array<MemberMove>* moves = nullptr);
+                          core::Array<MemberMove>* moves = nullptr, std::span<const MemberRemoval> removed = {},
+                          core::Array<PlacedMember>* placed = nullptr);
 
 // Of a cook report's text (game:/cook_report.json): whether it has an error for this source ("src:/content/a.cell").
 bool cook_report_has_error(std::string_view report, std::string_view source);
@@ -110,27 +128,39 @@ bool cook_report_has_error(std::string_view report, std::string_view source);
 class MemberTracker {
 public:
     explicit MemberTracker(core::Allocator& allocator)
-        : keys_(allocator), revisions_(allocator), members_(allocator), moved_(allocator) {}
+        : keys_(allocator), revisions_(allocator), members_(allocator), spawned_(allocator), moved_(allocator) {}
 
     // Notes where an entity came from, while it's alive (a member of a loaded cell; anything else is let be).
     void note(const flecs::world& ecs, const asset::AssetRegistry& assets, flecs::entity_t entity);
     // A save moved things in the files: their keys follow.
     void apply(std::span<const MemberMove> moves);
+    // One the editor made, which a save put into a file at key: once its cell comes back cooked, the member spawned
+    // from that entry takes its place (follow() says so; the editor takes the one it made away).
+    void note_replaced(const flecs::world& ecs, flecs::entity_t entity, const MemberKey& key);
+    // The editor took it away on purpose (deleted, or made and undone): nothing comes back in its place.
+    void forget(flecs::entity_t entity) { static_cast<void>(keys_.remove(entity)); }
     // After cells were spawned again (or for the first time) since the last call: each noted entity that's gone moves
-    // to the member spawned in its place (moved(from, to)), and is known as that from then on.
+    // to the member spawned in its place (moved(from, to)), and is known as that from then on; so does each one noted
+    // as replaced, though it's still there.
     void follow(const flecs::world& ecs, const asset::AssetRegistry& assets,
                 core::FunctionRef<void(flecs::entity_t from, flecs::entity_t to)> moved);
 
 private:
     static uint64_t pack(const MemberKey& key);
 
-    core::HashMap<flecs::entity_t, MemberKey> keys_;
+    struct Noted {
+        MemberKey key;
+        bool replaced = false; // made in the editor and saved: the member at key takes its place
+        uint32_t revision = 0; // replaced: its cell's revision when noted (the member comes with a newer one)
+    };
+    core::HashMap<flecs::entity_t, Noted> keys_;
     core::HashMap<flecs::entity_t, uint32_t> revisions_; // each cell's spawned revision, as last seen
-    core::HashMap<uint64_t, flecs::entity_t> members_;   // every member by its key, while following
+    core::HashMap<uint64_t, flecs::entity_t> members_;   // every member of a cell spawned since, by its key
+    core::HashMap<uint64_t, uint32_t> spawned_;          // cells spawned since the last call, by place: revision
     struct Moved {
         flecs::entity_t from = 0;
         flecs::entity_t to = 0;
-        MemberKey key;
+        Noted noted;
     };
     core::Array<Moved> moved_;
 };

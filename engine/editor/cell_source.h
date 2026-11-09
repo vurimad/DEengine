@@ -89,6 +89,9 @@ public:
     // Writes one key of the entity's own object the same way: value as the source writes it, with its quotes if it's a
     // string ("\"camp\""), compared as text.
     bool set_entity_member(uint32_t index, std::string_view key, std::string_view value);
+    // Takes one key and its value out of the entity's object, with the comma that set it apart. False if it isn't
+    // there.
+    bool remove_entity_member(uint32_t index, std::string_view key);
 
     // The cell's place in the grid, from its "coord"; false without a readable one.
     bool coord(int32_t& x, int32_t& z) const;
