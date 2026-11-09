@@ -28,7 +28,7 @@ public:
     static constexpr size_t kMaxCommands = 512; // past this the oldest are forgotten
 
     explicit CommandStack(core::Allocator& allocator)
-        : allocator_(&allocator), commands_(allocator), saved_(allocator) {}
+        : allocator_(&allocator), commands_(allocator), saved_(allocator), made_(allocator) {}
 
     // Sets the entity's component to value, as a command: what it had is kept for undo, and anything undone is
     // forgotten. Sets with the same nonzero merge key in a row (one drag of a slider) make one command, from the first
@@ -39,6 +39,12 @@ public:
     // Ends a run of merged sets: the next set is a command of its own.
     void seal() { open_merge_key_ = 0; }
 
+    // Commands made between these undo and redo together, as one (an edit of several entities at once: deleting them,
+    // dropping them to the ground). A run of merged sets is a group of its own: one drag of several entities is one
+    // undo, each entity's set merging with its own.
+    void begin_group() { open_group_ = ++next_group_; }
+    void end_group() { open_group_ = 0; }
+
     // Undo and redo make and take away entities through maker (the editor); without one there are no entity commands.
     void set_maker(EntityMaker* maker) { maker_ = maker; }
     // The entity the editor just made, as a command (what it is is taken from it now).
@@ -46,8 +52,9 @@ public:
     // Takes the entity away, as a command, with everything attached to it (what each is is taken from it first; undo
     // makes them all again, attached as they were). False if it's gone, or there's no maker.
     bool remove(flecs::entity entity);
-    // The entity the last undo or redo made (0: none): the one to select.
-    flecs::entity_t last_made() const { return last_made_; }
+    // The entity the last undo or redo made (0: none): the one to select. made(): every one it made (a group's).
+    flecs::entity_t last_made() const { return made_.empty() ? 0 : made_.back(); }
+    std::span<const flecs::entity_t> made() const { return made_.span(); }
     // Each record of a cell's member that's taken away now (deleted, or made and undone after a save filed it), whose
     // cell is as it was then: what a save takes out of the files.
     void each_taken_member(const flecs::world& ecs, core::FunctionRef<void(const EntityRecord& record)> visit) const;
@@ -83,6 +90,7 @@ private:
     enum class Kind : uint8_t { Set, Create, Remove };
     struct Command {
         Kind kind = Kind::Set;
+        uint64_t group = 0; // undone and redone with the commands next to it of the same group (0: alone)
         flecs::entity_t entity = 0;
         flecs::id_t component = 0;
         uint64_t merge_key = 0;
@@ -103,7 +111,13 @@ private:
     uint64_t open_merge_key_ = 0;
     uint64_t changes_ = 0; // the run the last command takes more sets into; 0: none
     EntityMaker* maker_ = nullptr;
-    flecs::entity_t last_made_ = 0;
+    core::Array<flecs::entity_t> made_;
+    uint64_t next_group_ = 0;
+    uint64_t open_group_ = 0; // begin_group()'s, while it's open
+    uint64_t run_group_ = 0;  // the run of merged sets under way
+    // One command undone or redone: false if its entity's gone (dropped).
+    bool undo_one(const flecs::world& ecs);
+    bool redo_one(const flecs::world& ecs);
 };
 
 // Writes value as the entity's component, as the commands do: a Transform is placed (world::place), so the entity and

@@ -109,6 +109,15 @@ private:
     // Delete: the selected entity away, as a command. Ctrl+D: a copy of it where it stands, made in the editor (saved
     // into its cell at the next save), selected.
     void delete_selection(app::Engine& engine);
+    // What an edit of the selection acts on: each chosen that's placed, not what hangs on another chosen (it goes with
+    // that). editable: placed (not a cell, not the editor's camera).
+    void chosen_roots(const app::Engine& engine, core::Array<flecs::entity_t>& out) const;
+    bool editable(flecs::entity entity) const;
+    // One of them, for the selection's edits (as a command in their group).
+    bool drop_to_ground(app::Engine& engine, flecs::entity entity);
+    flecs::entity duplicate_entity(app::Engine& engine, flecs::entity source);
+    // After an undo or redo: what it made is chosen; what it took away isn't.
+    void keep_living_selection(app::Engine& engine);
     // End: the selection down onto the ground below it, its lowest point (the box round its mesh, as it's turned and
     // scaled) on the nearer of the terrain and something solid (not itself or what hangs on it), as a command. False if
     // there's nothing below it.
@@ -150,6 +159,10 @@ private:
     static void ground_command(void* user, const console::Args& args, console::Output& out);
     // editor.undo, editor.redo: as Ctrl+Z and Ctrl+Y.
     static void undo_command(void* user, const console::Args& args, console::Output& out);
+    // editor.select NAME...: those chosen (none: nothing).
+    static void select_command(void* user, const console::Args& args, console::Output& out);
+    // The names given chosen (false, said, if one isn't there); none given: the selection as it is.
+    bool choose_named(const console::Args& args, console::Output& out);
     static void redo_command(void* user, const console::Args& args, console::Output& out);
     bool unsaved() const { return commands_.changes() != saved_changes_; }
     // Each frame: the cooker's end, and the members of a cell spawned again (hot reload): the commands and the
@@ -175,12 +188,15 @@ private:
     uint32_t pick_answers_ = 0;
     uint32_t pick_wait_frames_ = 0;
     bool pick_flag_ = false; // --pick, until it's answered
+    // What a click in the scene does with what it hits: chooses only it, toggles it (Ctrl), adds it (Shift).
+    enum class PickMode : uint8_t { Replace, Toggle, Add };
+    PickMode pick_mode_ = PickMode::Replace;
     uint32_t pick_flag_x_ = 0;
     uint32_t pick_flag_y_ = 0;
     // The selection's meshes as last gathered: again when it changes, and a few times a second (things get attached).
     core::Array<render::SelectedMesh> selected_meshes_;
     core::Array<flecs::entity_t> selected_entities_; // those with the meshes
-    flecs::entity_t gathered_for_ = 0;
+    uint64_t gathered_for_ = 0;                      // which were chosen when gathered
     float gathered_s_ = 0.0f;
     PropertiesPanel properties_;
     AssetBrowser browser_;

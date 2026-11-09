@@ -413,7 +413,8 @@ world::WorldTransform scaled_about(const world::WorldTransform& start, const DVe
 }
 
 bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, const Snap& snap, flecs::entity entity,
-                   const DVec3& origin, bool mouse_free, CommandStack& commands) {
+                   std::span<const flecs::entity_t> others, const DVec3& origin, bool mouse_free,
+                   CommandStack& commands) {
     if (tool == Tool::Select || !entity.is_valid() || !entity.is_alive() || !entity.has<world::Transform>()) {
         handle_ = -1;
         return false;
@@ -603,6 +604,28 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
         handle_ = hovered;
         entity_ = entity.id();
         start_ = *world_now;
+        // The rest of the selection, as it begins: not what hangs on something dragged too (it follows that).
+        others_.clear();
+        const flecs::world ecs = entity.world();
+        const auto dragged = [&](flecs::entity_t id) {
+            return id == entity.id() || std::ranges::find(others, id) != others.end();
+        };
+        for (const flecs::entity_t id : others) {
+            if (id == entity.id() || !ecs.is_alive(id)) {
+                continue;
+            }
+            const flecs::entity other = ecs.entity(id);
+            const auto* other_now = other.try_get<world::WorldTransform>();
+            bool follows = false;
+            for (const auto* parent = other.try_get<flecs::Parent>(); parent != nullptr && !follows;) {
+                follows = dragged(parent->value);
+                const flecs::entity up = ecs.entity(parent->value);
+                parent = up.is_alive() ? up.try_get<flecs::Parent>() : nullptr;
+            }
+            if (other_now != nullptr && !follows) {
+                others_.push({.entity = id, .start = *other_now});
+            }
+        }
         start_origin_ = at;
         std::ranges::copy(axes, std::begin(axes_));
         start_mouse_ = mouse;
@@ -665,6 +688,10 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
         const Vec3 camera = Vec3(view.position - start_origin_);
         world::WorldTransform moved = start_;
         bool changed = true;
+        // What the drag does, for the rest of the selection.
+        DVec3 shift(0.0);
+        Quat turn(1.0f, 0.0f, 0.0f, 0.0f);
+        Vec3 stretch(1.0f);
         if (tool == Tool::Move) {
             Vec3 delta(0.0f);
             bool in_plane[3] = {};
@@ -707,6 +734,7 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
             }
             moved.position = start_.position + DVec3(delta);
             moved_ = delta;
+            shift = DVec3(delta);
         } else if (tool == Tool::Rotate) {
             const float step = snap.rotate_deg * std::numbers::pi_v<float> / 180.0f;
             if (handle_ == kMiddle) {
@@ -719,7 +747,8 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
                 const float pixels = glm::length(roll);
                 angle_rad_ = snapped(pixels / std::max(sphere_px, 1.0f), snap.rotate, step);
                 if (pixels > 1e-3f) {
-                    moved = turned_about(start_, start_origin_, glm::angleAxis(angle_rad_, roll / pixels));
+                    turn = glm::angleAxis(angle_rad_, roll / pixels);
+                    moved = turned_about(start_, start_origin_, turn);
                 }
             } else {
                 // Along the ring at the grab, a pixel a pixel of arc; snapping lands its turn about the axis on a step.
@@ -727,7 +756,8 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
                     ((mouse.x - start_mouse_.x) * tangent_.x) + ((mouse.y - start_mouse_.y) * tangent_.y);
                 const float angle = pixels / std::max(px(kRingPx), 1.0f);
                 angle_rad_ = snap.rotate ? snapped_turn(start_.rotation, axes_[handle_], angle, step) : angle;
-                moved = turned_about(start_, start_origin_, glm::angleAxis(angle_rad_, axes_[handle_]));
+                turn = glm::angleAxis(angle_rad_, axes_[handle_]);
+                moved = turned_about(start_, start_origin_, turn);
             }
         } else {
             Vec3 factors(1.0f);
@@ -757,6 +787,7 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
                 factors[k] = std::abs(from) > 1e-6f ? to / from : 1.0f;
             }
             scaled_ = factors;
+            stretch = factors;
             moved = scaled_about(start_, start_origin_, axes_, factors);
         }
         if (changed) {
@@ -765,8 +796,30 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
             if (const world::WorldTransform* parent = parent_world(entity)) {
                 local = world::local_of(*parent, moved);
             }
-            static_cast<void>(commands.set_component(entity, entity.world().component<world::Transform>().id(),
-                                                     std::as_bytes(std::span(&local, 1)), merge_key_));
+            const flecs::id_t transform = entity.world().component<world::Transform>().id();
+            static_cast<void>(
+                commands.set_component(entity, transform, std::as_bytes(std::span(&local, 1)), merge_key_));
+            // The rest of the selection the same way, in the same command.
+            for (const Other& other : others_) {
+                const flecs::entity follower = entity.world().entity(other.entity);
+                if (!follower.is_alive()) {
+                    continue;
+                }
+                world::WorldTransform then = other.start;
+                if (tool == Tool::Move) {
+                    then.position = other.start.position + shift;
+                } else if (tool == Tool::Rotate) {
+                    then = turned_about(other.start, start_origin_, turn);
+                } else {
+                    then = scaled_about(other.start, start_origin_, axes_, stretch);
+                }
+                world::Transform its{.position = then.position, .rotation = then.rotation, .scale = then.scale};
+                if (const world::WorldTransform* parent = parent_world(follower)) {
+                    its = world::local_of(*parent, then);
+                }
+                static_cast<void>(
+                    commands.set_component(follower, transform, std::as_bytes(std::span(&its, 1)), merge_key_));
+            }
         }
     } else if (handle_ >= 0) {
         handle_ = -1; // released: the drag is one command

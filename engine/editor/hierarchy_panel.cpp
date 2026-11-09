@@ -229,14 +229,22 @@ void HierarchyPanel::draw(const app::Engine& engine, Selection& selection, flecs
                     entity_label(engine.assets, ecs.entity(entry.entity), label);
                     name = label;
                 }
-                const bool selected = selection.kind == Selection::Kind::Entity && selection.entity == entry.entity;
+                const bool selected = selection.has_entity(entry.entity);
                 ImGui::PushID(i);
                 const ImVec2 min = ImGui::GetCursorScreenPos();
                 const ImVec2 max(min.x + width, min.y + row);
                 // The whole row selects; the disclosure triangle drawn over it takes its own clicks.
                 ImGui::SetNextItemAllowOverlap();
                 if (ImGui::InvisibleButton("##row", ImVec2(width, row)) && alive) {
-                    selection.select_entity(entry.entity);
+                    // Ctrl: this one in or out; Shift: the rows from the one chosen last to this; else only this.
+                    const ImGuiIO& io = ImGui::GetIO();
+                    if (io.KeyCtrl) {
+                        selection.toggle_entity(entry.entity);
+                    } else if (io.KeyShift && selection.kind == Selection::Kind::Entity && selection.entity != 0) {
+                        choose_range(selection, selection.entity, entry.entity);
+                    } else {
+                        selection.select_entity(entry.entity);
+                    }
                     revealed_ = entry.entity; // it's in view already
                 }
                 const bool hovered = ImGui::IsItemHovered();
@@ -302,6 +310,32 @@ void HierarchyPanel::draw(const app::Engine& engine, Selection& selection, flecs
     ImGui::TextColored(color(ThemeColor::TextSecondary), "%s", status_);
     focused_ = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
     ImGui::End();
+}
+
+void HierarchyPanel::choose_range(Selection& selection, flecs::entity_t from, flecs::entity_t to) const {
+    // The rows as listed, from one to the other (either way round): the one clicked ends up the primary.
+    size_t first = rows_.size();
+    size_t last = rows_.size();
+    for (size_t i = 0; i < rows_.size(); ++i) {
+        if (rows_[i].entity == from) {
+            first = i;
+        }
+        if (rows_[i].entity == to) {
+            last = i;
+        }
+    }
+    if (first == rows_.size() || last == rows_.size()) {
+        selection.add_entity(to);
+        return;
+    }
+    const size_t low = std::min(first, last);
+    const size_t high = std::max(first, last);
+    for (size_t i = low; i <= high; ++i) {
+        if (rows_[i].entity != to) {
+            selection.add_entity(rows_[i].entity);
+        }
+    }
+    selection.add_entity(to);
 }
 
 } // namespace de::editor

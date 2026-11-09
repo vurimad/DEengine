@@ -56,15 +56,23 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
         saved.assign(current);
         saved_.set(key, std::move(saved));
     }
-    // Another set in the same run (the same drag): the command's after moves on; its before stays.
-    if (merge_key != 0 && merge_key == open_merge_key_ && done_ == commands_.size() && done_ > 0) {
-        Command& last = commands_[done_ - 1];
-        if (last.entity == entity.id() && last.component == component && last.merge_key == merge_key) {
-            last.after.assign(value);
-            apply_component(entity, component, value);
-            ++changes_;
-            return true;
+    // Another set in the same run (the same drag): the entity's command in it takes the new after; its before stays.
+    if (merge_key != 0 && merge_key == open_merge_key_ && done_ == commands_.size()) {
+        for (size_t i = done_; i > 0; --i) {
+            Command& earlier = commands_[i - 1];
+            if (earlier.group != run_group_ || earlier.merge_key != merge_key) {
+                break; // past the run
+            }
+            if (earlier.entity == entity.id() && earlier.component == component) {
+                earlier.after.assign(value);
+                apply_component(entity, component, value);
+                ++changes_;
+                return true;
+            }
         }
+    }
+    if (merge_key != 0 && merge_key != open_merge_key_) {
+        run_group_ = ++next_group_; // a new run: a group of its own
     }
     Command command{.kind = Kind::Set,
                     .entity = entity.id(),
@@ -75,6 +83,9 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
                     .record = core::Array<EntityRecord>(*allocator_)};
     command.before.assign(current); // before apply_component: it may move the component's storage
     command.after.assign(value);
+    if (merge_key != 0) {
+        command.group = run_group_;
+    }
     apply_component(entity, component, value);
     push(std::move(command));
     open_merge_key_ = merge_key;
@@ -89,6 +100,9 @@ void CommandStack::push(Command&& command) {
     if (commands_.size() == kMaxCommands) {
         commands_.remove_ordered(0);
         --done_;
+    }
+    if (open_group_ != 0) {
+        command.group = open_group_;
     }
     commands_.push(std::move(command));
     done_ = commands_.size();
@@ -173,7 +187,7 @@ void CommandStack::make_again(Command& command) {
         remap(was, made[i]);
         command.record[i].was = made[i];
     }
-    last_made_ = made[0];
+    made_.push(made[0]);
 }
 
 void CommandStack::each_taken_member(const flecs::world& ecs,
@@ -212,12 +226,7 @@ const char* CommandStack::name_of(const Command& command, const flecs::world& ec
     return ecs_get_name(ecs.c_ptr(), command.component);
 }
 
-bool CommandStack::undo(const flecs::world& ecs) {
-    seal();
-    if (!can_undo()) {
-        return false;
-    }
-    last_made_ = 0;
+bool CommandStack::undo_one(const flecs::world& ecs) {
     Command& command = commands_[done_ - 1];
     if (command.kind != Kind::Set) {
         if (maker_ == nullptr) {
@@ -243,12 +252,7 @@ bool CommandStack::undo(const flecs::world& ecs) {
     return true;
 }
 
-bool CommandStack::redo(const flecs::world& ecs) {
-    seal();
-    if (!can_redo()) {
-        return false;
-    }
-    last_made_ = 0;
+bool CommandStack::redo_one(const flecs::world& ecs) {
     Command& command = commands_[done_];
     if (command.kind != Kind::Set) {
         if (maker_ == nullptr) {
@@ -272,6 +276,34 @@ bool CommandStack::redo(const flecs::world& ecs) {
     ++done_;
     ++changes_;
     return true;
+}
+
+bool CommandStack::undo(const flecs::world& ecs) {
+    seal();
+    made_.clear();
+    if (!can_undo()) {
+        return false;
+    }
+    const uint64_t group = commands_[done_ - 1].group;
+    bool any = undo_one(ecs);
+    while (group != 0 && can_undo() && commands_[done_ - 1].group == group) {
+        any = undo_one(ecs) || any;
+    }
+    return any;
+}
+
+bool CommandStack::redo(const flecs::world& ecs) {
+    seal();
+    made_.clear();
+    if (!can_redo()) {
+        return false;
+    }
+    const uint64_t group = commands_[done_].group;
+    bool any = redo_one(ecs);
+    while (group != 0 && can_redo() && commands_[done_].group == group) {
+        any = redo_one(ecs) || any;
+    }
+    return any;
 }
 
 const char* CommandStack::undo_name(const flecs::world& ecs) const {

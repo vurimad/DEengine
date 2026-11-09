@@ -55,6 +55,8 @@ private:
     bool is_open(const Row& row) const { return open_.contains(row.entity); }
     void set_open(const Row& row, bool open);
     void keyboard(Selection& selection);
+    // Shift-click: the rows from one to the other chosen, as they're listed.
+    void choose_range(Selection& selection, flecs::entity_t from, flecs::entity_t to) const;
     // Opens the branches down to an entity chosen elsewhere (a link, --select), and scrolls to it.
     void reveal(const flecs::world& ecs, flecs::entity_t entity);
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/allocator.h"
+#include "core/array.h"
 #include "core/math.h"
 #include "world/transform.h"
 
@@ -77,8 +79,10 @@ public:
     // Draws the tool's handles at origin (the entity's pivot or its geometry's centre: HandlesAt) and runs a drag.
     // mouse_free: the mouse is over the scene and nothing else has it. True while the mouse is on a handle or dragging
     // one: a click there selects nothing else.
+    // others: the rest of the selection, which a drag moves, turns or scales as it does entity (about the same origin),
+    // one command for them all; one attached to another being dragged follows it instead.
     bool update(const View& view, ImDrawList* draw, Tool tool, Space space, const Snap& snap, flecs::entity entity,
-                const DVec3& origin, bool mouse_free, CommandStack& commands);
+                std::span<const flecs::entity_t> others, const DVec3& origin, bool mouse_free, CommandStack& commands);
     bool dragging() const { return handle_ >= 0; }
     // The handle under the mouse in the last update (as kPlane and kMiddle number them), or -1.
     int hovered_handle() const { return hovered_; }
@@ -98,6 +102,11 @@ private:
     int handle_ = -1; // being dragged
     flecs::entity_t entity_ = 0;
     world::WorldTransform start_;
+    struct Other {
+        flecs::entity_t entity = 0;
+        world::WorldTransform start;
+    };
+    core::Array<Other> others_{core::heap_allocator(core::MemoryTag::Editor)}; // the rest dragged, as they began
     DVec3 start_origin_{0.0};
     Vec3 axes_[3] = {}; // the axes at the drag's start
     float start_along_ = 0.0f;

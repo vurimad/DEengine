@@ -5,6 +5,7 @@
 #include "editor/icons.h"
 #include "editor/navigation.h"
 #include "editor/outline.h"
+#include "editor/selection.h"
 #include "editor/source_files.h"
 #include "editor/widgets.h"
 #include "platform/vfs.h"
@@ -355,7 +356,7 @@ void gizmo_frame(de::editor::Gizmo& gizmo, const de::editor::View& view, de::edi
     io.AddMouseButtonEvent(ImGuiMouseButton_Left, down);
     ImGui::NewFrame();
     static_cast<void>(gizmo.update(view, ImGui::GetForegroundDrawList(), tool, de::editor::Space::World, snap, entity,
-                                   entity.get<WorldTransform>().position, true, commands));
+                                   {}, entity.get<WorldTransform>().position, true, commands));
     ImGui::EndFrame();
 }
 
@@ -603,4 +604,123 @@ TEST_CASE("a drawer over the docked panels stays in front of them, and behind it
     }
     CHECK(item_hovered);
     de::tools::destroy_imgui();
+}
+
+TEST_CASE("gizmo: a drag moves the whole selection, as one command; what hangs on a dragged one just follows it") {
+    using de::Vec3;
+    de::tools::create_imgui();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(800.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.Fonts->AddFontDefault();
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity primary = ecs.entity();
+    de::world::place(primary, Transform{.position = {0.0, 0.0, 0.0}});
+    const flecs::entity other = ecs.entity();
+    de::world::place(other, Transform{.position = {0.0, 0.0, -3.0}});
+    const flecs::entity riding = ecs.entity(); // attached to other, and chosen too
+    de::world::place(riding, Transform{.position = {0.0, 1.0, -3.0}});
+    de::world::attach(riding, other);
+    world->tick();
+    const flecs::entity_t chosen[] = {other.id(), riding.id(), primary.id()};
+    CommandStack commands(editor_heap());
+    constexpr float kDeg = std::numbers::pi_v<float> / 180.0f;
+    const de::editor::View view{.position = {0.0, 7.0, 7.0},
+                                .rotation = glm::angleAxis(-45.0f * kDeg, Vec3(1.0f, 0.0f, 0.0f)),
+                                .vertical_fov_rad = 1.0f,
+                                .min = ImVec2(0.0f, 0.0f),
+                                .size = ImVec2(800.0f, 600.0f)};
+    const de::editor::Snap snap{};
+    de::editor::Gizmo gizmo;
+    const auto frame = [&](ImVec2 mouse, bool down) {
+        io.AddMousePosEvent(mouse.x, mouse.y);
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, down);
+        ImGui::NewFrame();
+        static_cast<void>(gizmo.update(view, ImGui::GetForegroundDrawList(), de::editor::Tool::Move,
+                                       de::editor::Space::World, snap, primary, chosen,
+                                       primary.get<WorldTransform>().position, true, commands));
+        ImGui::EndFrame();
+    };
+    // Out along the X arrow until it's under the mouse, then dragged further along X.
+    ImVec2 center;
+    ImVec2 tip;
+    REQUIRE(view.project(DVec3(0.0), center));
+    REQUIRE(view.project(DVec3(1.0, 0.0, 0.0), tip));
+    ImVec2 at = center;
+    for (int step = 10; step < 400 && gizmo.hovered_handle() != 0; ++step) {
+        const auto along = static_cast<float>(step);
+        at = ImVec2(center.x + along, center.y + ((tip.y - center.y) * along / (tip.x - center.x)));
+        frame(at, false);
+    }
+    REQUIRE(gizmo.hovered_handle() == 0);
+    frame(at, true);
+    frame(ImVec2(at.x + 60.0f, at.y), true);
+    frame(ImVec2(at.x + 90.0f, at.y), true);
+    frame(ImVec2(at.x + 90.0f, at.y), false);
+    world->tick();
+    const double moved = primary.get<WorldTransform>().position.x;
+    CHECK(moved > 0.5);
+    CHECK(other.get<WorldTransform>().position.x == doctest::Approx(moved));
+    CHECK(other.get<WorldTransform>().position.z == doctest::Approx(-3.0));
+    // Carried by other, not moved twice.
+    CHECK(riding.get<WorldTransform>().position.x == doctest::Approx(moved));
+    CHECK(riding.get<Transform>().position.x == doctest::Approx(0.0).epsilon(1e-6));
+    // One undo puts them all back.
+    REQUIRE(commands.undo(ecs));
+    world->tick();
+    CHECK(primary.get<WorldTransform>().position.x == doctest::Approx(0.0));
+    CHECK(other.get<WorldTransform>().position.x == doctest::Approx(0.0));
+    CHECK_FALSE(commands.can_undo());
+    de::tools::destroy_imgui();
+}
+
+TEST_CASE("selection: one, toggled, added; the primary is the one chosen last") {
+    de::editor::Selection selection;
+    selection.select_entity(10);
+    selection.add_entity(20);
+    selection.toggle_entity(30);
+    CHECK(selection.entities.size() == 3);
+    CHECK(selection.entity == 30);
+    selection.toggle_entity(30);
+    CHECK(selection.entity == 20);
+    CHECK_FALSE(selection.contains(30));
+    selection.replace_entity(20, 25);
+    CHECK(selection.entity == 25);
+    CHECK(selection.has_entity(25));
+    selection.remove_entity(25);
+    selection.remove_entity(10);
+    CHECK(selection.kind == de::editor::Selection::Kind::None);
+    CHECK(selection.entity == 0);
+    // A file chosen keeps no entity chosen.
+    selection.select_entity(10);
+    selection.select_file("src:/content/a.world");
+    CHECK_FALSE(selection.has_entity(10));
+}
+
+TEST_CASE("editor commands: a group undoes and redoes as one") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity a = ecs.entity();
+    const flecs::entity b = ecs.entity();
+    de::world::place(a, Transform{});
+    de::world::place(b, Transform{});
+    CommandStack commands(editor_heap());
+    const flecs::id_t transform = ecs.component<Transform>().id();
+    const Transform up{.position = {0.0, 1.0, 0.0}};
+    commands.begin_group();
+    REQUIRE(commands.set_component(a, transform, bytes_of(up)));
+    REQUIRE(commands.set_component(b, transform, bytes_of(up)));
+    commands.end_group();
+    REQUIRE(commands.undo(ecs));
+    CHECK(a.get<Transform>().position.y == doctest::Approx(0.0));
+    CHECK(b.get<Transform>().position.y == doctest::Approx(0.0));
+    CHECK_FALSE(commands.can_undo());
+    REQUIRE(commands.redo(ecs));
+    CHECK(a.get<Transform>().position.y == doctest::Approx(1.0));
+    CHECK(b.get<Transform>().position.y == doctest::Approx(1.0));
+    CHECK_FALSE(commands.can_redo());
 }

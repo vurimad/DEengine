@@ -273,13 +273,17 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
         "editor.drop", "<src:/content/...model>",
         "Drop a model at the middle of the Playground, on the ground there (as the mouse would).",
         &Editor::drop_command, this);
-    engine.console.add_command("editor.duplicate", "<name>", "Duplicate the entity of that name (as Ctrl+D does).",
+    engine.console.add_command("editor.duplicate", "[name ...]", "Duplicate the entity of that name (as Ctrl+D does).",
                                &Editor::duplicate_command, this);
-    engine.console.add_command("editor.delete", "<name>", "Delete the entity of that name (as the Delete key does).",
-                               &Editor::delete_command, this);
-    engine.console.add_command("editor.ground", "<name>",
+    engine.console.add_command("editor.delete", "[name ...]",
+                               "Delete the entity of that name (as the Delete key does).", &Editor::delete_command,
+                               this);
+    engine.console.add_command("editor.ground", "[name ...]",
                                "Drop the entity of that name onto the ground below it (as End does).",
                                &Editor::ground_command, this);
+    engine.console.add_command("editor.select", "[name ...]",
+                               "Choose the entities of those names (the last the primary); none: nothing chosen.",
+                               &Editor::select_command, this);
     engine.console.add_command("editor.undo", "", "Undo the last edit (as Ctrl+Z does).", &Editor::undo_command, this);
     engine.console.add_command("editor.redo", "", "Do again what was undone (as Ctrl+Y does).", &Editor::redo_command,
                                this);
@@ -462,6 +466,7 @@ void Editor::ui(app::Engine& engine) {
         frame_selection(engine);
     }
     if (pick_flag_ && picks_waiting_ == 0 && engine.viewport.width > 0 && engine.viewport.height > 0) {
+        pick_mode_ = PickMode::Replace;
         ask_pick(engine, std::min(pick_flag_x_, engine.viewport.width - 1),
                  std::min(pick_flag_y_, engine.viewport.height - 1)); // again if a frame drops it
     }
@@ -501,29 +506,42 @@ void Editor::take_pick(app::Engine& engine) {
             }
         });
     }
-    selection_.select_entity(picked);
+    if (pick_mode_ == PickMode::Toggle) {
+        if (picked != 0) {
+            selection_.toggle_entity(picked);
+        }
+    } else if (pick_mode_ == PickMode::Add) {
+        selection_.add_entity(picked);
+    } else {
+        selection_.select_entity(picked);
+    }
 }
 
 void Editor::gather_selection(app::Engine& engine) {
     const flecs::world& ecs = engine.world.ecs();
-    const flecs::entity_t root =
-        selection_.kind == Selection::Kind::Entity && ecs.is_alive(selection_.entity) ? selection_.entity : 0;
+    // Which are chosen, as one number: gathered again when it changes, and a few times a second.
+    uint64_t chosen = 0;
+    if (selection_.kind == Selection::Kind::Entity) {
+        for (const flecs::entity_t id : selection_.entities) {
+            chosen = core::mix64(chosen ^ id);
+        }
+    }
     gathered_s_ += ImGui::GetIO().DeltaTime;
-    if (root == gathered_for_ && gathered_s_ < 0.25f) {
+    if (chosen == gathered_for_ && gathered_s_ < 0.25f) {
         return;
     }
-    gathered_for_ = root;
+    gathered_for_ = chosen;
     gathered_s_ = 0.0f;
     selected_meshes_.clear();
     selected_entities_.clear();
-    if (root == 0) {
+    if (chosen == 0) {
         return;
     }
-    // It, and whatever hangs from it at any depth (flecs::Parent or ChildOf).
+    // Each, and whatever hangs from it at any depth (flecs::Parent or ChildOf).
     ecs.each([&](flecs::entity entity, const world::MeshInstance& mesh, const world::RenderSlot& slot) {
         flecs::entity at = entity;
         for (uint32_t depth = 0; depth < 64 && at.is_valid(); ++depth) {
-            if (at.id() == root) {
+            if (selection_.contains(at.id())) {
                 selected_meshes_.push({.slot = slot.slot, .mesh = mesh.mesh});
                 selected_entities_.push(entity.id());
                 return;
@@ -1117,7 +1135,7 @@ void Editor::playground(app::Engine& engine) {
         draw->PushClipRect(corner, far_corner, true);
         // Alt keeps the mouse for the camera: no handle takes it then.
         const bool mouse_free = playground_hovered_ && !looking_ && !io.KeyAlt && !navigation_.dragging();
-        const bool on_gizmo = gizmo_.update(view, draw, tool_, space_, snap_, selected,
+        const bool on_gizmo = gizmo_.update(view, draw, tool_, space_, snap_, selected, selection_.entities.span(),
                                             handles_origin(engine, selected), mouse_free, commands_);
         draw->PopClipRect();
 
@@ -1139,6 +1157,7 @@ void Editor::playground(app::Engine& engine) {
                 // The pixel of the scene's texture under the mouse (shown stretched to the panel while it's resized).
                 const float u = std::clamp((io.MousePos.x - corner.x) / size.x, 0.0f, 1.0f);
                 const float v = std::clamp((io.MousePos.y - corner.y) / size.y, 0.0f, 1.0f);
+                pick_mode_ = io.KeyCtrl ? PickMode::Toggle : io.KeyShift ? PickMode::Add : PickMode::Replace;
                 ask_pick(engine,
                          std::min(static_cast<uint32_t>(u * static_cast<float>(engine.viewport.width)),
                                   engine.viewport.width - 1),
@@ -1383,9 +1402,7 @@ void Editor::record(flecs::entity entity, EntityRecord& out) {
 
 void Editor::unmake(flecs::entity entity) {
     members_.forget(entity.id()); // gone on purpose: whatever spawns where it was isn't it
-    if (selection_.kind == Selection::Kind::Entity && selection_.entity == entity.id()) {
-        selection_.select_entity(0);
-    }
+    selection_.remove_entity(entity.id());
     entity.destruct();
 }
 
@@ -1439,37 +1456,80 @@ bool Editor::entry_from_file(const EntityRecord& record, EditorEntry& out) {
     return true;
 }
 
+void Editor::keep_living_selection(app::Engine& engine) {
+    // What an undo or redo made is what's chosen now; what it took away isn't.
+    if (!commands_.made().empty()) {
+        selection_.select_entity(0);
+        for (const flecs::entity_t made : commands_.made()) {
+            selection_.add_entity(made);
+        }
+        return;
+    }
+    for (size_t i = selection_.entities.size(); i-- > 0;) {
+        if (!engine.world.ecs().is_alive(selection_.entities[i])) {
+            selection_.remove_entity(selection_.entities[i]);
+        }
+    }
+}
+
 void Editor::undo(app::Engine& engine) {
     static_cast<void>(commands_.undo(engine.world.ecs()));
-    if (commands_.last_made() != 0) {
-        selection_.select_entity(commands_.last_made());
-    } else if (selection_.kind == Selection::Kind::Entity && !engine.world.ecs().is_alive(selection_.entity)) {
-        selection_.select_entity(0);
-    }
+    keep_living_selection(engine);
 }
 
 void Editor::redo(app::Engine& engine) {
     static_cast<void>(commands_.redo(engine.world.ecs()));
-    if (commands_.last_made() != 0) {
-        selection_.select_entity(commands_.last_made());
-    } else if (selection_.kind == Selection::Kind::Entity && !engine.world.ecs().is_alive(selection_.entity)) {
-        selection_.select_entity(0);
+    keep_living_selection(engine);
+}
+
+bool Editor::editable(flecs::entity entity) const {
+    return entity.is_valid() && entity.is_alive() && entity.has<world::Transform>() && !entity.has<world::Cell>() &&
+           entity.id() != viewer_.camera_entity().id(); // what's placed: not a cell, not the editor's camera
+}
+
+void Editor::chosen_roots(const app::Engine& engine, core::Array<flecs::entity_t>& out) const {
+    // Each chosen that's placed, but not what hangs on another chosen one (it goes with that).
+    out.clear();
+    if (selection_.kind != Selection::Kind::Entity) {
+        return;
+    }
+    const flecs::world& ecs = engine.world.ecs();
+    for (const flecs::entity_t id : selection_.entities) {
+        if (!ecs.is_alive(id) || !editable(ecs.entity(id))) {
+            continue;
+        }
+        bool follows = false;
+        for (const auto* parent = ecs.entity(id).try_get<flecs::Parent>(); parent != nullptr && !follows;) {
+            follows = selection_.contains(parent->value);
+            const flecs::entity up = ecs.entity(parent->value);
+            parent = up.is_alive() ? up.try_get<flecs::Parent>() : nullptr;
+        }
+        if (!follows) {
+            out.push(id);
+        }
     }
 }
 
 void Editor::delete_selection(app::Engine& engine) {
-    const flecs::world& ecs = engine.world.ecs();
-    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
+    core::Array<flecs::entity_t> roots(editor_heap());
+    chosen_roots(engine, roots);
+    if (roots.empty()) {
         return;
     }
-    const flecs::entity entity = ecs.entity(selection_.entity);
-    if (!entity.has<world::Transform>() || entity.has<world::Cell>() || entity.id() == viewer_.camera_entity().id()) {
-        return; // only what's placed: not a cell, not the editor's camera
-    }
     char label[128];
-    entity_label(engine.assets, entity, label);
-    if (commands_.remove(entity)) {
+    entity_label(engine.assets, engine.world.ecs().entity(roots[0]), label);
+    uint32_t deleted = 0;
+    commands_.begin_group();
+    for (const flecs::entity_t id : roots) {
+        if (engine.world.ecs().is_alive(id) && commands_.remove(engine.world.ecs().entity(id))) {
+            ++deleted;
+        }
+    }
+    commands_.end_group();
+    if (deleted == 1) {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "Deleted %s (Ctrl+Z puts it back)", label));
+    } else if (deleted > 1) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Deleted %u (Ctrl+Z puts them back)", deleted));
     }
 }
 
@@ -1514,13 +1574,24 @@ bool Editor::ground_below(app::Engine& engine, const DVec3& start, flecs::entity
 }
 
 bool Editor::drop_selection_to_ground(app::Engine& engine) {
-    const flecs::world& ecs = engine.world.ecs();
-    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
-        return false;
+    core::Array<flecs::entity_t> roots(editor_heap());
+    chosen_roots(engine, roots);
+    uint32_t dropped = 0;
+    commands_.begin_group();
+    for (const flecs::entity_t id : roots) {
+        dropped += drop_to_ground(engine, engine.world.ecs().entity(id)) ? 1U : 0U;
     }
-    const flecs::entity entity = ecs.entity(selection_.entity);
-    const auto* where = entity.try_get<world::WorldTransform>();
-    if (where == nullptr || entity.has<world::Cell>() || entity.id() == viewer_.camera_entity().id()) {
+    commands_.end_group();
+    if (dropped > 1) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Dropped %u to the ground", dropped));
+    }
+    return dropped > 0;
+}
+
+bool Editor::drop_to_ground(app::Engine& engine, flecs::entity entity) {
+    const flecs::world& ecs = engine.world.ecs();
+    const auto* where = editable(entity) ? entity.try_get<world::WorldTransform>() : nullptr;
+    if (where == nullptr) {
         return false;
     }
     // Its lowest and highest points, as it's turned and scaled now: the box round its mesh (its pivot without one).
@@ -1575,20 +1646,42 @@ bool Editor::drop_selection_to_ground(app::Engine& engine) {
 }
 
 void Editor::duplicate_selection(app::Engine& engine) {
-    const flecs::world& ecs = engine.world.ecs();
-    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
+    core::Array<flecs::entity_t> roots(editor_heap());
+    chosen_roots(engine, roots);
+    if (roots.empty()) {
         return;
     }
-    const flecs::entity source = ecs.entity(selection_.entity);
-    if (!source.has<world::Transform>() || source.has<world::Cell>() || source.id() == viewer_.camera_entity().id()) {
+    core::Array<flecs::entity_t> copies(editor_heap());
+    commands_.begin_group();
+    for (const flecs::entity_t id : roots) {
+        if (const flecs::entity made = duplicate_entity(engine, engine.world.ecs().entity(id)); made.is_valid()) {
+            copies.push(made.id());
+        }
+    }
+    commands_.end_group();
+    if (copies.empty()) {
         return;
+    }
+    selection_.select_entity(0);
+    for (const flecs::entity_t made : copies) {
+        selection_.add_entity(made);
+    }
+    if (copies.size() > 1) {
+        static_cast<void>(
+            std::snprintf(message_, sizeof(message_), "Duplicated %zu: move them where they go", copies.size()));
+    }
+}
+
+flecs::entity Editor::duplicate_entity(app::Engine& engine, flecs::entity source) {
+    if (!editable(source)) {
+        return {};
     }
     EntityRecord copy;
     record(source, copy);
     if (!copy.has_entry) {
         static_cast<void>(std::snprintf(message_, sizeof(message_),
                                         "Can't duplicate it: its cell's file wasn't found (cook, then try again)"));
-        return;
+        return {};
     }
     copy.cell = 0; // a new one: made in the editor, saved into the cell it stands in
     char name[128];
@@ -1596,9 +1689,9 @@ void Editor::duplicate_selection(app::Engine& engine) {
     static_cast<void>(rename_entry(copy.entry, name));
     const flecs::entity made = make(copy);
     commands_.created(made);
-    selection_.select_entity(made.id());
     static_cast<void>(
         std::snprintf(message_, sizeof(message_), "Duplicated %s: move it where it goes", copy.entry.name));
+    return made;
 }
 
 void Editor::place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen) {
@@ -1770,12 +1863,9 @@ void Editor::drop_command(void* user, const console::Args& args, console::Output
 
 void Editor::duplicate_command(void* user, const console::Args& args, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
-    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
-    if (!found.is_valid()) {
-        out.error("editor.duplicate: name an entity that's there");
+    if (!editor->choose_named(args, out)) {
         return;
     }
-    editor->selection_.select_entity(found.id());
     editor->duplicate_selection(*editor->engine_);
     out.info("%s", editor->message_);
 }
@@ -1804,28 +1894,57 @@ void Editor::redo_command(void* user, const console::Args& /*args*/, console::Ou
 
 void Editor::ground_command(void* user, const console::Args& args, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
-    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
-    if (!found.is_valid()) {
-        out.error("editor.ground: name an entity that's there");
+    if (!editor->choose_named(args, out)) {
         return;
     }
-    editor->selection_.select_entity(found.id());
     if (!editor->drop_selection_to_ground(*editor->engine_)) {
         out.error("%s", editor->message_);
         return;
     }
-    const DVec3 at = found.get<world::WorldTransform>().position;
-    out.info("%s: at %.3f %.3f %.3f", editor->message_, at.x, at.y, at.z);
+    const flecs::world& ecs = editor->engine_->world.ecs();
+    if (ecs.is_alive(editor->selection_.entity)) {
+        const DVec3 at = ecs.entity(editor->selection_.entity).get<world::WorldTransform>().position;
+        out.info("%s: at %.3f %.3f %.3f", editor->message_, at.x, at.y, at.z);
+    }
+}
+
+bool Editor::choose_named(const console::Args& args, console::Output& out) {
+    if (args.empty()) {
+        return true;
+    }
+    Selection chosen;
+    for (size_t i = 0; i < args.size(); ++i) {
+        const flecs::entity found = find_named(*engine_, args[i]);
+        if (!found.is_valid()) {
+            out.error("nothing is called %.*s", static_cast<int>(args[i].size()), args[i].data());
+            return false;
+        }
+        chosen.add_entity(found.id());
+    }
+    selection_.select_entity(0);
+    for (const flecs::entity_t id : chosen.entities) {
+        selection_.add_entity(id);
+    }
+    return true;
+}
+
+void Editor::select_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.empty()) {
+        editor->selection_.select_entity(0);
+        out.info("nothing chosen");
+        return;
+    }
+    if (editor->choose_named(args, out)) {
+        out.info("%zu chosen", editor->selection_.entities.size());
+    }
 }
 
 void Editor::delete_command(void* user, const console::Args& args, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
-    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
-    if (!found.is_valid()) {
-        out.error("editor.delete: name an entity that's there");
+    if (!editor->choose_named(args, out)) {
         return;
     }
-    editor->selection_.select_entity(found.id());
     editor->delete_selection(*editor->engine_);
     out.info("%s", editor->message_);
 }
@@ -1973,9 +2092,7 @@ void Editor::follow_saves(app::Engine& engine) {
         if (engine.world.ecs().is_alive(from)) {
             engine.world.ecs().entity(from).destruct(); // made in the editor, and now its cell's member
         }
-        if (selection_.kind == Selection::Kind::Entity && selection_.entity == from) {
-            selection_.entity = to;
-        }
+        selection_.replace_entity(from, to);
         gathered_for_ = 0; // the selection's meshes again
     });
 }
@@ -2045,7 +2162,8 @@ void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     commands_.clear(); // their entities go with the world
     release_holds();
     saved_changes_ = commands_.changes();
-    selection_.entity = 0; // the file stays selected
+    selection_.entities.clear(); // the file stays selected
+    selection_.entity = 0;
     hierarchy_.reset();
     if (viewer_.open_world(engine, id)) {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "Opened %s", selection_.file.c_str()));
