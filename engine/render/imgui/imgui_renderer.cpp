@@ -260,7 +260,8 @@ void ImGuiRenderer::update_textures(ImDrawData* draw_data) {
     }
 }
 
-void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Format format, const ImDrawData* draw_data) {
+void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Format format, const ImDrawData* draw_data,
+                             std::span<const GraphTexture> shown) {
     DE_PROFILE_ZONE("imgui pass");
     ImGuiRendererState& state = *state_;
     if (draw_data == nullptr || draw_data->TotalVtxCount == 0 || draw_data->DisplaySize.x <= 0.0f ||
@@ -318,6 +319,9 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
         "imgui",
         [&](PassBuilder& pass, PassData& data) {
             pass.use(target, rhi::ResourceState::RenderTarget);
+            for (const GraphTexture texture : shown) {
+                pass.use(texture, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
             data = PassData{.target = target,
                             .draw_data = draw_data,
                             .state = &state,

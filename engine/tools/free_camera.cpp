@@ -61,4 +61,8 @@ void FreeCamera::update(const platform::Input& input, const FreeCameraActions& a
     world::place(camera, world::Transform{.position = position_, .rotation = rotation});
 }
 
+void FreeCamera::place(flecs::entity camera) const {
+    world::place(camera, world::Transform{.position = position_, .rotation = rotation()});
+}
+
 } // namespace de::tools

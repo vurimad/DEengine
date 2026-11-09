@@ -14,6 +14,8 @@ struct GBufferPush
     GpuMaterial* materials;
     GpuDraw* draws;
     uint sampler;
+    uint depth;      // the editor's selection mask: the scene's depth, to tell what of the selection is hidden
+    uint unjittered; // 1: through the view without TAA's jitter (the selection mask: an outline that keeps still)
 };
 
 [[vk::push_constant]]
@@ -29,6 +31,9 @@ struct VertexOutput
     float4 previous_clip : PREVIOUS_CLIP;
     nointerpolation uint material : MATERIAL;
     nointerpolation float fade : FADE;
+#ifdef EDITOR_IDS
+    nointerpolation uint instance : INSTANCE;
+#endif
 };
 
 struct GBufferOutput
@@ -38,6 +43,9 @@ struct GBufferOutput
     float4 gb2 : SV_Target2;
     float4 emissive : SV_Target3;
     float2 motion : SV_Target4; // uv now minus uv last frame
+#ifdef EDITOR_IDS
+    uint id : SV_Target5; // the editor's: the instance's slot plus one, 0 for none
+#endif
 };
 
 [shader("vertex")]
@@ -70,6 +78,10 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     VertexOutput output;
     output.position = mul_rows(push.frame.view_proj, float4(world, 1.0));
     output.clip = mul_rows(push.frame.unjittered_view_proj, float4(world, 1.0)); // TAA's offset is no motion
+    if (push.unjittered != 0u)
+    {
+        output.position = output.clip;
+    }
     output.previous_clip = mul_rows(push.frame.previous_view_proj, float4(previous_world, 1.0));
     output.normal = normal;
     const float4 tangent = snorm8x4(vertex.tangent);
@@ -77,6 +89,9 @@ VertexOutput vertex_main(uint vertex_id: SV_VulkanVertexID, uint draw_id: SV_Vul
     output.uv = vertex.uv;
     output.material = draw.material;
     output.fade = draw.fade;
+#ifdef EDITOR_IDS
+    output.instance = draw.instance;
+#endif
     return output;
 }
 
@@ -117,6 +132,9 @@ GBufferOutput write_surface(VertexOutput input, bool front_face, GpuMaterial mat
     output.gb2 = float4(saturate(orm.g * material.roughness), saturate(orm.b * material.metallic), occlusion, 0.0);
     output.emissive = float4(emissive, 1.0);
     output.motion = motion_between(input.clip, input.previous_clip);
+#ifdef EDITOR_IDS
+    output.id = input.instance + 1u;
+#endif
     return output;
 }
 
@@ -171,4 +189,23 @@ GBufferOutput fragment_masked_fading(VertexOutput input, bool front_face: SV_IsF
         discard;
     }
     return masked_surface(input, front_face);
+}
+
+// The editor's selection mask: what of the screen the selection covers (x), and where it's seen (y): no nearer surface in
+// the scene's depth. That depth has TAA's jitter and this hasn't, and the selection's far LODs may be what the scene
+// drew: the slack (1% of the distance, reverse Z) covers both.
+[shader("fragment")]
+float2 fragment_selection(VertexOutput input) : SV_Target0
+{
+    const GpuMaterial material = push.materials[input.material];
+    if ((material.flags & kMaterialMasked) != 0u)
+    {
+        const float alpha = sample_texture(material.base_color_texture, push.sampler, input.uv).a * material.base_color.a;
+        if (alpha < material.alpha_cutoff)
+        {
+            discard;
+        }
+    }
+    const float scene = load_texture(push.depth, int2(input.position.xy)).r;
+    return float2(1.0, input.position.z >= scene * 0.99 ? 1.0 : 0.0);
 }

@@ -1511,7 +1511,7 @@ TEST_CASE("terrain: a world names its terrain, which isn't cooked with it, and c
     {
         Cooked file(vfs, world_id, AssetType::World);
         const auto& world = file.load<WorldAsset>();
-        CHECK(world.header.format_version == 2);
+        CHECK(world.header.format_version == WorldAsset::kFormatVersion);
         const auto dependencies = world.header.dependencies.get(file.data());
         REQUIRE(dependencies.size() == 2);
         REQUIRE(world.environment != WorldAsset::kNone);

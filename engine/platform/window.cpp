@@ -76,6 +76,8 @@ void Window::set_title(const char* title) {
 void Window::refresh_display() {
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(window_));
     refresh_hz_ = mode != nullptr ? static_cast<double>(mode->refresh_rate) : 0.0;
+    const float scale = SDL_GetWindowDisplayScale(window_);
+    content_scale_ = scale > 0.0f ? scale : 1.0f;
 }
 
 void Window::refresh_pixel_size() {

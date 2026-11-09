@@ -117,7 +117,27 @@ struct GBufferPush {
     uint64_t materials = 0;
     uint64_t draws = 0;
     uint32_t sampler = 0;
+    uint32_t depth = 0; // the scene's depth: the editor's selection mask tests against it
+    uint32_t unjittered =
+        0; // 1: through the view without TAA's jitter (the selection mask: an outline that keeps still)
 };
+
+#if DE_BUILD_DEV
+// Matches OutlinePush in shaders/scene/outline.slang.
+struct OutlinePush {
+    uint32_t mask = 0;
+    float radius_px = 2.0f;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t srgb_target = 0;
+};
+
+// The editor's instance IDs: an R32 target beside the G-buffer's, the instance's slot plus one (0: none).
+inline constexpr rhi::Format kIdFormat = rhi::Format::R32Uint;
+// The selection's mask: covered, and seen (nothing nearer was drawn there).
+inline constexpr rhi::Format kSelectionMaskFormat = rhi::Format::RG8Unorm;
+inline constexpr uint32_t kMaxSelectionDraws = 1024;
+#endif
 
 // Matches ShadowCasterPush in shaders/scene/shadow_caster.slang.
 struct ShadowCasterPush {
@@ -294,9 +314,9 @@ struct WaterPush {
     uint32_t shore_material = 0; // the shore map's material slot, if has_shore
     float tile_offset[kOceanCascades][2] = {};
     uint32_t has_shore = 0;
-    float surf_period_s = 0.0f; // the surf's sets: the swell's period
-    float surf_height_m = 0.0f; // their height, where they start to feel the bottom
-    uint32_t foam_material = 0;  // the foam's material slot; 0: foam drawn from noise
+    float surf_period_s = 0.0f;    // the surf's sets: the swell's period
+    float surf_height_m = 0.0f;    // their height, where they start to feel the bottom
+    uint32_t foam_material = 0;    // the foam's material slot; 0: foam drawn from noise
     float swell_direction[2] = {}; // toward where the swell travels (x, z): its crests lie across it
 };
 static_assert(sizeof(WaterPush) <= 128);
@@ -519,6 +539,23 @@ struct SceneRendererState {
     core::Array<uint32_t> mesh_instances{render_heap()}; // by mesh slot
     uint32_t live_instances = 0;
     // What each frame slot's cull kept, to read once that slot comes round again and its frame is done.
+#if DE_BUILD_DEV
+    // The editor's (set_editor_overlay): the G-buffer's programs with an instance ID out, made when first asked
+    // (opaque, masked, both fading, terrain, grass); the selection mask's and the outline's; the selection's draws;
+    // picks on their way back.
+    shader::ProgramHandle id_programs[6];
+    bool id_programs_made = false;
+    shader::ProgramHandle selection_program;
+    shader::ProgramHandle outline_program;
+    rhi::Format outline_format = rhi::Format::Unknown;
+    EditorOverlay editor;
+    core::Array<SelectedMesh> selected{core::heap_allocator(core::MemoryTag::Render)};
+    rhi::BufferHandle selection_draws[rhi::kFramesInFlight];
+    rhi::BufferHandle pick_readback[rhi::kFramesInFlight];
+    bool pick_waiting[rhi::kFramesInFlight] = {};
+    bool pick_used[rhi::kFramesInFlight] = {};
+    PickAnswer pick;
+#endif
     rhi::BufferHandle cull_readback[rhi::kFramesInFlight];
     CullPlan cull_readback_plan[rhi::kFramesInFlight];
     bool cull_readback_written[rhi::kFramesInFlight] = {}; // recorded, and not yet read
@@ -580,7 +617,7 @@ struct SceneRendererState {
     rhi::Uploader* uploader = nullptr;
     rhi::BufferHandle water_indices;
     uint64_t water_index_ticket = 0;
-    std::optional<Ocean> ocean; // the sea's waves
+    std::optional<Ocean> ocean;                   // the sea's waves
     GpuWaterLevel water_levels_now[kWaterLevels]; // this frame's, as written into its constants
 
     // How much of the height fog is left where the frame's camera is.
@@ -629,6 +666,19 @@ struct SceneRendererState {
         for (const rhi::BufferHandle buffer : cull_readback) {
             device->destroy(buffer);
         }
+#if DE_BUILD_DEV
+        for (const shader::ProgramHandle program : id_programs) {
+            shaders->destroy(program);
+        }
+        shaders->destroy(selection_program);
+        shaders->destroy(outline_program);
+        for (const rhi::BufferHandle buffer : selection_draws) {
+            device->destroy(buffer);
+        }
+        for (const rhi::BufferHandle buffer : pick_readback) {
+            device->destroy(buffer);
+        }
+#endif
         device->destroy(instance_data);
         device->destroy(instance_meshes);
         device->destroy(part_keys);
@@ -811,6 +861,75 @@ struct SceneRendererState {
         surface.color_formats[1] = kMotionFormat;
         water_program = make("scene.water", surface);
     }
+
+#if DE_BUILD_DEV
+    // The editor's programs: the G-buffer's with an instance ID out (EDITOR_IDS), and the selection mask's. Made the
+    // first time the editor asks; the outline's follows the target's format.
+    void make_editor_programs(rhi::Format target_format) {
+        if (!id_programs_made) {
+            id_programs_made = true;
+            static constexpr shader::ShaderDefine kIds[] = {{.name = "EDITOR_IDS", .value = "1"}};
+            rhi::GraphicsPipelineDesc gbuffer{.color_count = 6,
+                                              .depth_format = kDepthFormat,
+                                              .depth_test = true,
+                                              .depth_write = true,
+                                              .depth_compare = rhi::CompareOp::Greater,
+                                              .debug_name = "gbuffer (ids)"};
+            for (uint32_t i = 0; i < 3; ++i) {
+                gbuffer.color_formats[i] = kGBufferFormats[i];
+            }
+            gbuffer.color_formats[3] = kHdrFormat;
+            gbuffer.color_formats[4] = kMotionFormat;
+            gbuffer.color_formats[5] = kIdFormat;
+            const auto with_ids = [&](const char* module, const rhi::GraphicsPipelineDesc& state, const char* entry) {
+                const core::Result<shader::ProgramHandle> program = shaders->create_graphics(
+                    {.module = module, .fragment_entry = entry, .defines = kIds, .state = state});
+                return program ? *program : shader::ProgramHandle{};
+            };
+            id_programs[0] = with_ids("scene.gbuffer", gbuffer, "fragment_opaque");
+            id_programs[1] = with_ids("scene.gbuffer", gbuffer, "fragment_masked");
+            id_programs[2] = with_ids("scene.gbuffer", gbuffer, "fragment_opaque_fading");
+            id_programs[3] = with_ids("scene.gbuffer", gbuffer, "fragment_masked_fading");
+            id_programs[4] = with_ids("scene.terrain", gbuffer, "fragment_main");
+            rhi::GraphicsPipelineDesc grass = gbuffer;
+            grass.cull = rhi::CullMode::None;
+            id_programs[5] = with_ids("scene.grass", grass, "fragment_main");
+            // The selection mask: its own depth, so only the selection's nearest surface counts at a pixel.
+            rhi::GraphicsPipelineDesc mask{.color_count = 1,
+                                           .depth_format = kDepthFormat,
+                                           .depth_test = true,
+                                           .depth_write = true,
+                                           .depth_compare = rhi::CompareOp::Greater,
+                                           .cull = rhi::CullMode::None,
+                                           .debug_name = "editor selection"};
+            mask.color_formats[0] = kSelectionMaskFormat;
+            selection_program = make("scene.gbuffer", mask, "fragment_selection");
+        }
+        if (target_format != outline_format) {
+            shaders->destroy(outline_program);
+            rhi::GraphicsPipelineDesc outline{
+                .color_count = 1, .cull = rhi::CullMode::None, .debug_name = "editor outline"};
+            outline.color_formats[0] = target_format;
+            outline.blend[0] = rhi::BlendMode::Alpha;
+            outline_program = make("scene.outline", outline);
+            outline_format = target_format;
+        }
+    }
+
+    // The pick this slot's last frame asked for, now that it's done (begin_frame waited for it).
+    void read_pick() {
+        const auto slot = static_cast<uint32_t>(device->frame_index() % rhi::kFramesInFlight);
+        if (!pick_waiting[slot]) {
+            return;
+        }
+        pick_waiting[slot] = false;
+        device->invalidate_mapped(pick_readback[slot]);
+        uint32_t id = 0;
+        std::memcpy(&id, device->mapped(pick_readback[slot]).data(), sizeof(id));
+        pick.slot = id == 0 ? kNothingPicked : id - 1;
+        ++pick.count;
+    }
+#endif
 
     // The tonemap writes the caller's target: made again when its format changes.
     void make_tonemap(rhi::Format target_format) {
@@ -1330,8 +1449,8 @@ struct SceneRendererState {
         }
         std::memcpy(mapped.data(), &scene, sizeof(scene));
         if (water.sea) {
-            const DVec3 camera = frame.origin + DVec3(frame.camera.transform[3], frame.camera.transform[7],
-                                                      frame.camera.transform[11]);
+            const DVec3 camera =
+                frame.origin + DVec3(frame.camera.transform[3], frame.camera.transform[7], frame.camera.transform[11]);
             water_levels(camera, frame.origin, water_levels_now);
             std::memcpy(mapped.data() + kWaterLevelsOffset, water_levels_now, sizeof(water_levels_now));
         }
@@ -1755,6 +1874,12 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     state.make_tonemap(target_format);
     state.stats = {};
     state.read_cull_stats();
+#if DE_BUILD_DEV
+    state.read_pick();
+    if (state.editor.enabled) {
+        state.make_editor_programs(target_format);
+    }
+#endif
     // A frame not drawn left a gap in the numbers (hand-made frames have no numbers).
     state.instances_stale_now = frame.number != 0 && frame.number != state.last_frame_number + 1;
     if (state.waiting_for_mesh_slot && state.gpu_assets->mesh_slots_released() != state.mesh_slots_released_seen) {
@@ -2217,25 +2342,45 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         GraphBuffer draws;
         GraphBuffer counts;
         CullPlan plan;
+        GraphTexture ids; // the editor's: each pixel's instance, if it asked
     };
+    // The editor's IDs: the same draws through the same shaders, with one more output.
+    bool with_ids = false;
+    rhi::PipelineHandle id_pipelines[6];
+#if DE_BUILD_DEV
+    if (state.editor.enabled) {
+        with_ids = true;
+        for (uint32_t i = 0; i < 6; ++i) {
+            id_pipelines[i] = state.shaders->pipeline(state.id_programs[i]);
+            with_ids = with_ids && id_pipelines[i].is_valid();
+        }
+    }
+#endif
     const auto& gbuffer = graph.add_pass<GBufferPass>(
         "gbuffer",
         [&](PassBuilder& pass, GBufferPass& data) {
             data = {.state = &state,
                     .terrain = terrain_frame,
-                    .terrain_pipeline = terrain_gbuffer,
-                    .grass_pipeline = grass_gbuffer,
+                    .terrain_pipeline = with_ids ? id_pipelines[4] : terrain_gbuffer,
+                    .grass_pipeline = with_ids ? id_pipelines[5] : grass_gbuffer,
                     .screen_height = graph.reference_height(),
                     .terrain_levels = view == SceneView::TerrainLevel,
                     .targets = {},
-                    .opaque = gbuffer_opaque,
-                    .masked = gbuffer_masked,
-                    .opaque_fading = gbuffer_opaque_fading,
-                    .masked_fading = gbuffer_masked_fading,
+                    .opaque = with_ids ? id_pipelines[0] : gbuffer_opaque,
+                    .masked = with_ids ? id_pipelines[1] : gbuffer_masked,
+                    .opaque_fading = with_ids ? id_pipelines[2] : gbuffer_opaque_fading,
+                    .masked_fading = with_ids ? id_pipelines[3] : gbuffer_masked_fading,
                     .frame_address = frame_address,
                     .draws = draw_lists,
                     .counts = draw_counts,
-                    .plan = plan};
+                    .plan = plan,
+                    .ids = {}};
+#if DE_BUILD_DEV
+            if (with_ids) {
+                data.ids = pass.create_texture({.desc = {.format = kIdFormat}, .reference_scale = 1.0f});
+                pass.use(data.ids, rhi::ResourceState::RenderTarget);
+            }
+#endif
             pass.use(draw_lists, rhi::ResourceState::IndirectArgument | rhi::ResourceState::ShaderRead,
                      rhi::ShaderStages::Vertex);
             pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
@@ -2260,14 +2405,18 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [](const GBufferPass& data, PassContext& context) {
             DE_PROFILE_ZONE("gbuffer pass");
             SceneRendererState& renderer = *data.state;
-            rhi::ColorAttachment colors[5];
+            rhi::ColorAttachment colors[6];
             for (uint32_t i = 0; i < 3; ++i) {
                 colors[i] = {.texture = context.texture(data.targets.gb[i])};
             }
             colors[3] = {.texture = context.texture(data.targets.hdr)};
             colors[4] = {.texture = context.texture(data.targets.motion)};
+            const bool ids = data.ids.is_valid();
+            if (ids) {
+                colors[5] = {.texture = context.texture(data.ids)}; // cleared to 0: no instance
+            }
             const rhi::DepthAttachment depth{.texture = context.texture(data.targets.depth)};
-            context.list.begin_rendering({.colors = colors, .depth = &depth});
+            context.list.begin_rendering({.colors = std::span(colors, ids ? 6 : 5), .depth = &depth});
             // Grass, then the ground: blades are cheap to shade and the ground isn't, so what they cover isn't shaded.
             // The ground next: it hides the most, so what's behind a hill fails early depth.
             if (renderer.terrain) {
@@ -2307,6 +2456,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     if (state.terrain) {
         state.terrain->add_stats_pass(graph, terrain_frame);
     }
+#if DE_BUILD_DEV
+    const GraphTexture selection_mask = add_editor_passes(graph, gbuffer.ids, targets.depth, frame_address, cull_slot);
+#endif
 
     // The cull's counts, for the stats. Made once: without it the frame goes on, and they stay 0.
     if (!state.cull_readback[cull_slot].is_valid()) {
@@ -2410,7 +2562,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             "water behind",
             [&](PassBuilder& pass, WaterBehindPass& data) {
                 data.color = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-                data.depth = pass.create_texture({.desc = {.format = kWaterBehindDepthFormat}, .reference_scale = 1.0f});
+                data.depth =
+                    pass.create_texture({.desc = {.format = kWaterBehindDepthFormat}, .reference_scale = 1.0f});
                 pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(data.color, rhi::ResourceState::RenderTarget);
@@ -2750,7 +2903,196 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.draw(3);
             context.list.end_rendering();
         });
+#if DE_BUILD_DEV
+    add_editor_outline(graph, selection_mask, target, srgb_target);
+#endif
 }
+
+#if DE_BUILD_DEV
+void SceneRenderer::set_editor_overlay(const EditorOverlay& overlay) {
+    SceneRendererState& state = *state_;
+    state.editor = overlay;
+    state.selected.assign(overlay.selected);
+    state.editor.selected = state.selected.span();
+}
+
+PickAnswer SceneRenderer::pick_answer() const {
+    return state_->pick;
+}
+
+GraphTexture SceneRenderer::add_editor_passes(RenderGraph& graph, GraphTexture ids, GraphTexture depth,
+                                              uint64_t frame_address, uint32_t slot) {
+    SceneRendererState& state = *state_;
+    // A pick: the ID under the pixel, copied to where the CPU reads it once this frame is done.
+    if (ids.is_valid() && state.editor.pick && state.editor.pick_x < graph.reference_width() &&
+        state.editor.pick_y < graph.reference_height()) {
+        if (!state.pick_readback[slot].is_valid()) {
+            const core::Result<rhi::BufferHandle> readback =
+                state.device->create_buffer({.size = sizeof(uint32_t),
+                                             .usage = rhi::BufferUsage::CopyDst,
+                                             .memory = rhi::MemoryLocation::Readback,
+                                             .debug_name = "editor pick readback"});
+            state.pick_readback[slot] = readback ? *readback : rhi::BufferHandle{};
+        }
+        if (state.pick_readback[slot].is_valid()) {
+            const GraphBuffer readback = graph.import_buffer(
+                {.buffer = state.pick_readback[slot],
+                 .name = "editor pick readback",
+                 .state = state.pick_used[slot] ? rhi::ResourceState::HostRead : rhi::ResourceState::Undefined,
+                 .final_state = rhi::ResourceState::HostRead});
+            state.pick_used[slot] = true;
+            const uint32_t x = state.editor.pick_x;
+            const uint32_t y = state.editor.pick_y;
+            graph.add_pass(
+                "editor pick",
+                [&](PassBuilder& pass) {
+                    pass.use(ids, rhi::ResourceState::CopySrc);
+                    pass.use(readback, rhi::ResourceState::CopyDst);
+                },
+                [ids, readback, x, y, waiting = &state.pick_waiting[slot]](PassContext& context) {
+                    context.list.copy_texture_to_buffer(context.texture(ids), context.buffer(readback),
+                                                        {.x = x, .y = y, .width = 1, .height = 1});
+                    *waiting = true;
+                });
+        }
+    }
+    state.editor.pick = false;
+
+    // The selection's mask: its meshes alone (their finest LOD), each pixel covered and whether it's seen.
+    const rhi::PipelineHandle selection = state.shaders->pipeline(state.selection_program);
+    if (!state.editor.enabled || state.selected.empty() || !selection.is_valid()) {
+        return {};
+    }
+    if (!state.selection_draws[slot].is_valid()) {
+        const core::Result<rhi::BufferHandle> buffer =
+            state.device->create_buffer({.size = kMaxSelectionDraws * sizeof(GpuDraw),
+                                         .usage = rhi::BufferUsage::Storage,
+                                         .memory = rhi::MemoryLocation::Upload,
+                                         .debug_name = "editor selection draws"});
+        state.selection_draws[slot] = buffer ? *buffer : rhi::BufferHandle{};
+    }
+    if (!state.selection_draws[slot].is_valid()) {
+        return {};
+    }
+    struct SelectionDraw {
+        uint32_t first_index = 0;
+        uint32_t index_count = 0;
+        int32_t vertex_offset = 0;
+    };
+    struct SelectionPass {
+        GraphTexture mask;
+        GraphTexture own_depth;
+        rhi::PipelineHandle pipeline;
+        GBufferPush push;
+        SelectionDraw draws[kMaxSelectionDraws];
+        uint32_t draw_count = 0;
+    };
+    // Its parts, as draw records the G-buffer's vertex shader reads (written now: this slot's last frame is done).
+    const std::span<std::byte> mapped = state.device->mapped(state.selection_draws[slot]);
+    auto* records = reinterpret_cast<GpuDraw*>(mapped.data());
+    uint32_t count = 0;
+    for (const SelectedMesh& selected : state.selected) {
+        const GpuMesh* mesh = state.gpu_assets->mesh(selected.mesh);
+        if (mesh == nullptr || mesh->lods.empty()) {
+            continue;
+        }
+        for (const GpuMeshPart& part : mesh->lod_parts(0)) {
+            if (count == kMaxSelectionDraws) {
+                break;
+            }
+            records[count] = {.instance = selected.slot, .material = part.material, .fade = 0.0f};
+            ++count;
+        }
+    }
+    if (count == 0) {
+        return {};
+    }
+    state.device->flush_mapped(state.selection_draws[slot], 0, uint64_t{count} * sizeof(GpuDraw));
+    const uint64_t draws_address = state.device->buffer_address(state.selection_draws[slot]);
+    const auto& pass = graph.add_pass<SelectionPass>(
+        "editor selection",
+        [&](PassBuilder& builder, SelectionPass& data) {
+            data.mask = builder.create_texture({.desc = {.format = kSelectionMaskFormat}, .reference_scale = 1.0f});
+            data.own_depth = builder.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
+            builder.use(data.mask, rhi::ResourceState::RenderTarget);
+            builder.use(data.own_depth, rhi::ResourceState::DepthWrite);
+            builder.use(depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            data.pipeline = selection;
+            data.push = {.frame = frame_address,
+                         .instances = state.instance_data_address,
+                         .vertices = state.gpu_assets->pool_vertex_address(),
+                         .materials = state.gpu_assets->material_table_address(),
+                         .draws = draws_address,
+                         .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap),
+                         .depth = 0,
+                         .unjittered = 1};
+            uint32_t at = 0;
+            for (const SelectedMesh& selected : state.selected) {
+                const GpuMesh* mesh = state.gpu_assets->mesh(selected.mesh);
+                if (mesh == nullptr || mesh->lods.empty()) {
+                    continue;
+                }
+                for (const GpuMeshPart& part : mesh->lod_parts(0)) {
+                    if (at == count) {
+                        break;
+                    }
+                    data.draws[at++] = {.first_index = part.first_index,
+                                        .index_count = part.index_count,
+                                        .vertex_offset = static_cast<int32_t>(part.vertex_offset)};
+                }
+            }
+            data.draw_count = at;
+        },
+        [depth, &state](const SelectionPass& data, PassContext& context) {
+            DE_PROFILE_ZONE("editor selection pass");
+            const rhi::ColorAttachment color{.texture = context.texture(data.mask)};
+            const rhi::DepthAttachment own{.texture = context.texture(data.own_depth)};
+            context.list.begin_rendering({.colors = std::span(&color, 1), .depth = &own});
+            context.list.bind_pipeline(data.pipeline);
+            context.list.bind_index_buffer(state.gpu_assets->pool_index_buffer(), 0, rhi::IndexType::Uint32);
+            GBufferPush push = data.push;
+            push.depth = context.device.texture_index(context.texture(depth));
+            context.list.push_constants(push);
+            for (uint32_t i = 0; i < data.draw_count; ++i) {
+                const SelectionDraw& draw = data.draws[i];
+                context.list.draw_indexed(draw.index_count, 1, draw.first_index, draw.vertex_offset, i);
+            }
+            context.list.end_rendering();
+        });
+    return pass.mask;
+}
+
+void SceneRenderer::add_editor_outline(RenderGraph& graph, GraphTexture mask, GraphTexture target,
+                                       uint32_t srgb_target) {
+    const SceneRendererState& state = *state_;
+    const rhi::PipelineHandle outline = state.shaders->pipeline(state.outline_program);
+    if (!mask.is_valid() || !outline.is_valid()) {
+        return;
+    }
+    const OutlinePush push{.mask = 0,
+                           .radius_px = std::clamp(state.editor.outline_px, 1.0f, 8.0f),
+                           .width = graph.reference_width(),
+                           .height = graph.reference_height(),
+                           .srgb_target = srgb_target};
+    graph.add_pass(
+        "editor outline",
+        [&](PassBuilder& pass) {
+            pass.use(mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            pass.use(target, rhi::ResourceState::RenderTarget);
+        },
+        [mask, target, outline, push](PassContext& context) {
+            DE_PROFILE_ZONE("editor outline pass");
+            const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::Load};
+            context.list.begin_rendering({.colors = std::span(&color, 1)});
+            context.list.bind_pipeline(outline);
+            OutlinePush data = push;
+            data.mask = context.device.texture_index(context.texture(mask));
+            context.list.push_constants(data);
+            context.list.draw(3);
+            context.list.end_rendering();
+        });
+}
+#endif
 
 void SceneRenderer::set_lod_error_pixels(float pixels) {
     state_->lod_error_pixels = pixels;

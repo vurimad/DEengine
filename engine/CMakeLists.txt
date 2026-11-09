@@ -8,8 +8,9 @@ add_subdirectory(tools)
 add_subdirectory(world)
 add_subdirectory(physics)
 add_subdirectory(app)
+add_subdirectory(editor)
 
 # The one engine executable: game, editor (--editor) and headless (--headless) are modes of it.
 add_executable(deengine main.cpp)
-target_link_libraries(deengine PRIVATE de::app de::compile_options)
+target_link_libraries(deengine PRIVATE de::app de::editor de::compile_options)
 de_deploy_slang_runtime(deengine)

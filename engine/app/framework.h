@@ -84,6 +84,23 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out);
 const char* flag_value(const FrameworkArgs& args, const char* flag);
 bool has_flag(const FrameworkArgs& args, const char* flag);
 
+#if DE_BUILD_DEV
+// Dev builds: the scene drawn into a texture the application shows in its UI (the editor's viewport panel), instead of
+// over the whole window. The application asks for it in ui() every frame it shows it; a frame that doesn't ask draws
+// the scene to the window as usual.
+struct SceneViewport {
+    // Asked by the application in ui(): the size in pixels. A new size takes effect the next frame (the image is
+    // stretched for that one frame).
+    uint32_t want_width = 0;
+    uint32_t want_height = 0;
+    // Set by the framework before ui(): what shows this frame's scene with ImGui::Image, 0 until there is a texture,
+    // and its size in pixels.
+    uint64_t texture_id = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+#endif
+
 // The running engine, for the application: its systems, and what the frame draws.
 struct Engine {
     core::JobSystem& jobs;
@@ -112,6 +129,13 @@ struct Engine {
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
     // Where the application's camera goes this frame (the agent's eyes), or null to leave it alone.
     const tools::CameraPose* camera_pose = nullptr;
+    SceneViewport viewport{}; // the scene in a panel (the editor), or over the window
+    bool frame_stats = true;  // the frame stats panel shows (F1); off in pictures, and at first in the editor
+    bool scripted = false;    // a picture or a path taken by script (the agent's eyes): no input, and nothing to keep
+    // The editor's selection outline and picks (SceneRenderer::set_editor_overlay): off unless it asks. A pick asked
+    // for is sent once; its answer comes back frames later in pick_answer, whose count grows by one each time.
+    render::EditorOverlay editor_overlay{};
+    render::PickAnswer pick_answer{};
 #endif
 };
 
@@ -138,6 +162,11 @@ public:
     // frame_s is what this frame moves things by (FrameClock): over 0, in even steps while the frame rate
     // holds the refresh rate, otherwise the time measured.
     virtual bool update(Engine& engine, float frame_s) = 0;
+#if DE_BUILD_DEV
+    // Dev builds, every frame that builds a debug UI, after update() and the world's advance: the application's
+    // ImGui windows (the editor's panels). Engine::viewport puts the scene in one of them.
+    virtual void ui(Engine& /*engine*/) {}
+#endif
     // After the last frame (or a failed start: whenever startup() ran), while the engine is still
     // up: let go of what it holds.
     virtual void shutdown(Engine& /*engine*/) {}

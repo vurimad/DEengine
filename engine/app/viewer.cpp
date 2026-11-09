@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <numbers>
 #include <string_view>
 
 namespace de::app {
@@ -37,23 +38,19 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
                      static_cast<int>(text.size()), text.data());
         return false;
     }
-    // Loaded before the first frame (a loading screen's worth), with its environment.
-    world_ = engine.assets.load<asset::WorldAsset>(id, platform::IoPriority::Critical);
-    engine.assets.wait_all();
-    const auto* world = engine.assets.get<asset::WorldAsset>(world_);
-    if (world == nullptr) {
-        DE_LOG_ERROR("world", "world %.*s didn't load (logged)", static_cast<int>(text.size()), text.data());
+    if (!load_world(engine, id)) {
         return false;
     }
-    free_camera_ = tools::FreeCamera({world->start_position[0], world->start_position[1], world->start_position[2]},
-                                     world->start_yaw_rad, world->start_pitch_rad);
-    apply_world(engine);
 
     quit_ = engine.input.add_action("quit"_sid, platform::ActionKind::Button);
     camera_actions_ = tools::add_free_camera_actions(engine.input);
     // About 57 degrees up and down, unless --fov asks for another lens (a long one to frame a far mountain as a photo).
-    constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
-    const float fov_rad = args.eyes.fov_deg > 0.0 ? static_cast<float>(args.eyes.fov_deg * kDegToRad) : 1.0f;
+#if DE_BUILD_DEV
+    const float fov_rad =
+        args.eyes.fov_deg > 0.0 ? static_cast<float>(args.eyes.fov_deg * std::numbers::pi / 180.0) : 1.0f;
+#else
+    const float fov_rad = 1.0f;
+#endif
     camera_ = engine.world.ecs().entity("free_camera").set(world::Camera{.vertical_fov_rad = fov_rad});
     engine.world.ecs().set(world::ActiveCamera{.entity = camera_.id()});
 #if DE_BUILD_DEV
@@ -70,6 +67,41 @@ bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
 #endif
     return true;
 }
+
+bool Viewer::load_world(Engine& engine, asset::AssetId id) {
+    // Loaded before the frame goes on (a loading screen's worth), with its environment.
+    world_id_ = id;
+    world_ = engine.assets.load<asset::WorldAsset>(id, platform::IoPriority::Critical);
+    engine.assets.wait_all();
+    const auto* world = engine.assets.get<asset::WorldAsset>(world_);
+    if (world == nullptr) {
+        DE_LOG_ERROR("world", "world %s didn't load (logged)", asset::format_asset_id(id).c_str());
+        return false;
+    }
+    free_camera_.set_pose({.position = {world->start_position[0], world->start_position[1], world->start_position[2]},
+                           .yaw_rad = world->start_yaw_rad,
+                           .pitch_rad = world->start_pitch_rad});
+    apply_world(engine);
+    return true;
+}
+
+#if DE_BUILD_DEV
+bool Viewer::open_world(Engine& engine, asset::AssetId id) {
+    for (const LoadedCell& cell : cells_) {
+        cell.entity.destruct(); // its members go with it
+    }
+    cells_.clear();
+    if (world_.is_valid()) {
+        engine.assets.release(world_);
+    }
+    world_ = {};
+    environment_ = {};
+    engine.terrain = {};
+    engine.terrain_layers = {};
+    engine.water = {};
+    return load_world(engine, id);
+}
+#endif
 
 void Viewer::apply_world(Engine& engine) {
     world_revision_ = engine.assets.revision(world_);
@@ -130,9 +162,15 @@ void Viewer::apply_world(Engine& engine) {
 
 bool Viewer::update(Engine& engine, float frame_s) {
     DE_PROFILE_ZONE("Viewer::update");
+#if DE_BUILD_DEV
+    if (quit_on_escape_ && engine.input.state(quit_).pressed) {
+        return false;
+    }
+#else
     if (engine.input.state(quit_).pressed) {
         return false;
     }
+#endif
     if (engine.assets.revision(world_) != world_revision_) {
         apply_world(engine); // re-cooked; the camera stays where it is
     }
@@ -148,7 +186,15 @@ bool Viewer::update(Engine& engine, float frame_s) {
         free_camera_.set_pose(*engine.camera_pose);
     }
 #endif
+#if DE_BUILD_DEV
+    if (camera_input_ || engine.camera_pose != nullptr) {
+        free_camera_.update(engine.input, camera_actions_, frame_s, camera_);
+    } else {
+        free_camera_.place(camera_);
+    }
+#else
     free_camera_.update(engine.input, camera_actions_, frame_s, camera_);
+#endif
 #if DE_BUILD_DEV
     if (engine.input.state(next_view_).pressed) {
         engine.view = static_cast<render::SceneView>((static_cast<uint32_t>(engine.view) + 1) %

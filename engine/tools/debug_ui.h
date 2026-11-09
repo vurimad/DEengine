@@ -3,6 +3,8 @@
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
 
+#include <span>
+
 namespace de::platform {
 class Window;
 }
@@ -48,8 +50,10 @@ public:
     bool begin_frame(platform::Window& window, float delta_s);
     // Ends it: ImGui renders, and its texture requests go to the uploader (before its record()).
     void end_frame();
-    // Draws the frame's UI over target, if a UI frame was built.
-    void add_pass(render::RenderGraph& graph, render::GraphTexture target, rhi::Format format);
+    // Draws the frame's UI over target, if a UI frame was built. shown: the graph's textures it shows with
+    // ImGui::Image (ImGuiRenderer::add_pass).
+    void add_pass(render::RenderGraph& graph, render::GraphTexture target, rhi::Format format,
+                  std::span<const render::GraphTexture> shown = {});
 
 private:
     explicit DebugUi(DebugUiState* state) : state_(state) {}

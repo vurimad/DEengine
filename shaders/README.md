@@ -8,7 +8,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | --- | --- |
 | `scene/scene_common.slang` | What the scene passes share: frame constants, vertex and material layouts, G-buffer packing |
 | `scene/shadow_caster.slang` | The sun's shadow casters: depth into one cascade's tile of the shadow atlas, alpha-tested for masked materials |
-| `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test), and `fragment_opaque_fading` and `fragment_masked_fading` for what's fading between LODs |
+| `scene/gbuffer.slang` | The G-buffer pass: surfaces into the G-buffer, emissive into the HDR target; `fragment_opaque` (no discard) and `fragment_masked` (alpha test), and `fragment_opaque_fading` and `fragment_masked_fading` for what's fading between LODs. With `EDITOR_IDS` (the editor's, dev builds) one more target takes each pixel's instance; `fragment_selection` draws the editor's selection mask |
 | `scene/terrain_common.slang` | Terrain: what its passes share, how a patch's vertices come from the heights, and the morph |
 | `scene/terrain_select.slang` | Terrain: which patches draw, each deciding for itself, into a list per view (compute) |
 | `scene/terrain.slang`, `scene/terrain_shadow.slang` | Terrain into the G-buffer (one plain look until there are materials), and into a shadow cascade |
@@ -17,6 +17,7 @@ Every shader in Slang (docs/design.md, Shaders, materials & VFX). The engine com
 | `scene/fog_inject.slang`, `scene/fog_integrate.slang` | The froxel grid (compute): each froxel's extinction and light, with fog volumes, the sun's shadows and last frame's light at the same place; then each column integrated front to back |
 | `scene/fog.slang` | Fog over the lit image and the sky: the grid as far as it reaches, with the share of a slice with fog volumes really in front of the surface, closed form past it (`common.fog`) |
 | `scene/taa.slang` | Temporal anti-aliasing: history reprojected by motion, clipped to the neighbourhood, dropped where object motion or depth says it was about something else; writes the object motion the next frame compares |
+| `scene/outline.slang` | The editor's selection outline: an anti-aliased band around the selection's mask over the finished image, fainter where it's hidden |
 | `scene/tonemap.slang` | Exposure and a filmic curve to the display, or a G-buffer channel, the shadow mask or the cascades (debug views) |
 | `imgui.slang` | Dear ImGui's draw lists (the debug UI) |
 | `common/` | Modules shared by shaders: `common.bindless` (texture and sampler tables), `common.color`, `common.fog` (the fog medium, its light, its integral along a ray, the froxel slices, fog volumes' density and noise) |

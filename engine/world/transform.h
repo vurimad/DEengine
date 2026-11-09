@@ -40,6 +40,9 @@ struct PreviousWorldTransform {
 // parent with a rotated child skews in truth, which this doesn't represent (no shear).
 WorldTransform compose(const WorldTransform& parent, const Transform& local);
 
+// The local transform that composes with parent's back to world: compose()'s inverse.
+Transform local_of(const WorldTransform& parent, const WorldTransform& world);
+
 // Where an entity is in the world right now, from the Transforms up its parents, so it holds for what
 // was made or moved this tick, before WorldTransform catches up. A parent with no transform makes it a
 // root, whichever hierarchy it's in.

@@ -10,6 +10,7 @@ Third-party content in `content/`. Code libraries are listed in `vcpkg.json`.
 | `content/props/forest_ground/textures/` | [Poly Haven: Forest Ground 04](https://polyhaven.com/a/forest_ground_04) | Rob Tuytel, Rico Cilliers | CC0 |
 | `content/props/stone_fire_pit/` | [Poly Haven: Stone Fire Pit](https://polyhaven.com/a/stone_fire_pit) | Sebastian Platen | CC0 |
 | `content/water/sea_foam.png` | [ambientCG: Foam 003](https://ambientcg.com/view?id=Foam003) | ambientCG (Lennart Demes) | CC0 |
+| `engine/editor/fonts/source_sans_3_*.ttf` (the editor's font) | [Adobe: Source Sans 3](https://github.com/adobe-fonts/source-sans) | Adobe | SIL Open Font License 1.1 (`engine/editor/fonts/ofl.txt`) |
 
 The models are Poly Haven's 1k glTF downloads, with the `_1k` dropped from the `.gltf` names. `forest_ground.gltf` is a 128 m plane of our own (made by a script) using the Forest Ground 04 textures.
 

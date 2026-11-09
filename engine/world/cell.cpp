@@ -43,6 +43,7 @@ void register_cells(flecs::world& ecs, asset::AssetRegistry* assets) {
         });
     ecs.component<Cell>().member<asset::AssetHandle>("asset").member<CellCoord>("coord");
     ecs.component<CellContents>("de::CellContents");
+    ecs.component<CellMember>("de::CellMember").member<uint32_t>("index");
     ecs.component<MeshCollider>("de::MeshCollider").member<asset::AssetHandle>("collision");
     ecs.component<CellAssets>("de::CellAssets");
     if (assets != nullptr) {
@@ -92,7 +93,7 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
         scratch.worlds[i] = world;
         const bool is_static = core::has_any(source.flags, asset::CellEntityFlags::Static);
         const bool attached = has_parent && !is_static; // static ones become roots where they are
-        const flecs::entity member = ecs.entity().add<InCell>(cell);
+        const flecs::entity member = ecs.entity().add<InCell>(cell).set(CellMember{.index = static_cast<uint32_t>(i)});
         if (attached) {
             member.set(flecs::Parent{scratch.members[source.parent]});
         }

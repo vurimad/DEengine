@@ -1,6 +1,7 @@
 #pragma once
 
 #include "asset/environment_format.h"
+#include "asset/registry.h"
 #include "core/math.h"
 #include "core/result.h"
 #include "render/graph/render_graph.h"
@@ -192,6 +193,34 @@ struct SceneRendererState;
 // It looks through the frame's camera (down its -Z). Per-frame data (view, light, instance
 // transforms) goes through a mapped buffer per frame in flight, grown as needed: no allocation
 // per frame once settled. The device, shader library and GpuAssets must outlive it. Move-only.
+#if DE_BUILD_DEV
+// One mesh of the editor's selection: its instance's slot (world::RenderSlot) and the mesh it draws.
+struct SelectedMesh {
+    uint32_t slot = 0;
+    asset::AssetHandle mesh;
+};
+
+// What the editor asks of a frame: an instance's ID in every pixel, read back under one pixel to pick what's there;
+// and its selection outlined over the image, brighter where it's in view, dimmer where something hides it.
+struct EditorOverlay {
+    bool enabled = false; // the G-buffer keeps each pixel's instance: the selection and the picks need it
+    std::span<const SelectedMesh> selected;
+    bool pick = false; // read the instance under this pixel (the target's), for pick_answer()
+    uint32_t pick_x = 0;
+    uint32_t pick_y = 0;
+    float outline_px = 2.0f; // how wide the outline is, in the target's pixels
+};
+
+inline constexpr uint32_t kNothingPicked = UINT32_MAX;
+
+// What the last pick found: the instance slot in that pixel (kNothingPicked: none, the ground, the sky), and how many
+// picks have come back, so a new answer can be told from the last.
+struct PickAnswer {
+    uint32_t slot = kNothingPicked;
+    uint32_t count = 0;
+};
+#endif
+
 class SceneRenderer {
 public:
     static core::Result<SceneRenderer> create(const SceneRendererDesc& desc);
@@ -245,6 +274,13 @@ public:
     // SceneRendererStats::visible_shadow_draws and visible_shadow_triangles.
     void set_cull_frozen(bool frozen);
 
+#if DE_BUILD_DEV
+    // The editor's IDs, picks and outline from the next add_passes() on (the selection's span must stay valid until
+    // then). A pick is asked once: it's answered a few frames later, by pick_answer().
+    void set_editor_overlay(const EditorOverlay& overlay);
+    PickAnswer pick_answer() const;
+#endif
+
     // Whether the height fog thins with a low camera (SceneFog::low_camera_keep): on, unless turned off to compare.
     void set_fog_low_camera(bool on);
 
@@ -265,6 +301,13 @@ public:
 
 private:
     explicit SceneRenderer(SceneRendererState* state) : state_(state) {}
+#if DE_BUILD_DEV
+    // The editor's: the pick's copy and the selection's mask (returned: none if nothing's selected), after the
+    // G-buffer; the outline from the mask over the target, after the tonemap.
+    GraphTexture add_editor_passes(RenderGraph& graph, GraphTexture ids, GraphTexture depth, uint64_t frame_address,
+                                   uint32_t slot);
+    void add_editor_outline(RenderGraph& graph, GraphTexture mask, GraphTexture target, uint32_t srgb_target);
+#endif
 
     SceneRendererState* state_ = nullptr;
 };

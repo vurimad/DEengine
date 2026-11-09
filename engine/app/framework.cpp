@@ -22,6 +22,7 @@
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/graph/render_graph.h"
+#include "render/imgui/imgui_renderer.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/scene/gpu_assets.h"
@@ -376,7 +377,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .lighting = {},
                   .view = render::SceneView::Lit,
                   .taa = setting(as_text(settings), "taa") == "on",
-                  .terrain = {}};
+                  .terrain = {},
+                  .terrain_layers = {},
+                  .water = {},
+                  .fog_low_camera = true};
     asset::AssetHandle shown_terrain;
     uint32_t shown_terrain_revision = 0;
     asset::AssetHandle shown_layers;
@@ -386,7 +390,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
     tools::DebugUi debug_ui = tools::DebugUi::create(*window, *device, engine.shaders, *uploader);
     tools::StatsPanel stats_panel;
-    bool show_stats = !scripted; // what it shows changes from run to run: not in a picture to compare
+    engine.frame_stats = !scripted; // what it shows changes from run to run: not in a picture to compare
+    engine.scripted = scripted;
     const platform::ActionId toggle_stats = input.add_action("debug.toggle_stats"_sid, platform::ActionKind::Button);
     // The raw stick readout (--show-sticks), for measuring drift: the deadzone is off, so these show
     // the true resting values.
@@ -399,6 +404,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_INFO("input", "showing raw stick values; leave the sticks alone to measure drift");
     }
     uint64_t next_stick_report_ns = 0;
+    // The application's viewport panel (Engine::viewport): the scene goes into this texture instead of the window.
+    rhi::TextureHandle viewport_texture;
+    rhi::TextureDesc viewport_desc{.width = 0, .height = 0};
+    rhi::ResourceState viewport_state = rhi::ResourceState::Undefined;
+    bool scene_in_viewport = false; // this frame
 #endif
 
     if (!application.startup(engine, args) || !load_bindings(*vfs, input, src_root != nullptr)) {
@@ -459,7 +469,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 
 #if DE_BUILD_DEV
         if (input.state(toggle_stats).pressed) {
-            show_stats = !show_stats;
+            engine.frame_stats = !engine.frame_stats;
         }
         if (args.show_sticks && platform::time_ns() >= next_stick_report_ns) {
             next_stick_report_ns = platform::time_ns() + platform::kNsPerSecond / 2;
@@ -473,13 +483,44 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             scene_renderer->set_cull_frozen(engine.freeze_cull);
         }
         DE_PROFILE_PLOT("cull frozen", static_cast<int64_t>(engine.freeze_cull ? 1 : 0));
+        // The viewport's texture, at the size the application asked for last frame; none if it didn't ask. The old one
+        // goes once the GPU is done with it.
+        if (engine.viewport.want_width != viewport_desc.width || engine.viewport.want_height != viewport_desc.height ||
+            device->swapchain_format() != viewport_desc.format) {
+            device->destroy(viewport_texture);
+            viewport_texture = {};
+            viewport_state = rhi::ResourceState::Undefined;
+            viewport_desc = {.width = engine.viewport.want_width,
+                             .height = engine.viewport.want_height,
+                             .format = device->swapchain_format(),
+                             .usage = rhi::TextureUsage::RenderTarget | rhi::TextureUsage::Sampled |
+                                      rhi::TextureUsage::CopySrc,
+                             .debug_name = "viewport"};
+            if (viewport_desc.width > 0 && viewport_desc.height > 0 && viewport_desc.format != rhi::Format::Unknown) {
+                if (auto made = device->create_texture(viewport_desc); made) {
+                    viewport_texture = *made;
+                } else {
+                    DE_LOG_ERROR("render", "no %ux%u viewport: %s", viewport_desc.width, viewport_desc.height,
+                                 made.error().message);
+                }
+            }
+        }
+        engine.viewport.texture_id = viewport_texture.is_valid()
+                                         ? render::ImGuiRenderer::texture_id(device->texture_index(viewport_texture))
+                                         : 0;
+        engine.viewport.width = viewport_texture.is_valid() ? viewport_desc.width : 0;
+        engine.viewport.height = viewport_texture.is_valid() ? viewport_desc.height : 0;
+        engine.viewport.want_width = 0; // asked again by ui(), every frame it's shown
+        engine.viewport.want_height = 0;
         // The debug UI's frame; its textures go to the uploader before record().
         if (debug_ui.begin_frame(*window, static_cast<float>(measured_s))) {
-            if (show_stats) {
-                stats_panel.draw(&show_stats);
+            application.ui(engine);
+            if (engine.frame_stats) {
+                stats_panel.draw(&engine.frame_stats);
             }
             debug_ui.end_frame();
         }
+        scene_in_viewport = viewport_texture.is_valid() && engine.viewport.want_width > 0;
 #endif
 
         device->begin_frame();
@@ -487,6 +528,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (scene_renderer) {
             scene_renderer->set_fog_low_camera(engine.fog_low_camera);
             scene_renderer->set_water(engine.water);
+#if DE_BUILD_DEV
+            scene_renderer->set_editor_overlay(engine.editor_overlay);
+            engine.editor_overlay.pick = false; // asked once
+#endif
             // The ground: when the application names another, or it's re-cooked.
             const uint32_t terrain_revision = engine.assets.revision(engine.terrain);
             if (engine.terrain != shown_terrain || terrain_revision != shown_terrain_revision) {
@@ -508,31 +553,62 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         uploader->record(); // uploads land at the start of the frame
         const rhi::TextureHandle backbuffer = device->acquire_swapchain_texture();
         if (backbuffer.is_valid()) {
+            const auto clear = [&](render::GraphTexture target) {
+                graph->add_pass(
+                    "clear", [&](render::PassBuilder& pass) { pass.use(target, rhi::ResourceState::RenderTarget); },
+                    [target](render::PassContext& context) {
+                        const rhi::ColorAttachment color{.texture = context.texture(target),
+                                                         .clear = render::kEmptySceneColor};
+                        context.list.begin_rendering({.colors = std::span(&color, 1)});
+                        context.list.end_rendering();
+                    });
+            };
+            // The scene at the window's size, or at the viewport's, into its texture.
+#if DE_BUILD_DEV
+            const bool in_viewport = scene_in_viewport;
+            graph->begin(in_viewport ? viewport_desc.width : device->swapchain_width(),
+                         in_viewport ? viewport_desc.height : device->swapchain_height());
+#else
             graph->begin(device->swapchain_width(), device->swapchain_height());
+#endif
             const render::GraphTexture back = graph->import_texture({.texture = backbuffer,
                                                                      .name = "backbuffer",
                                                                      .state = rhi::ResourceState::Present,
                                                                      .final_state = rhi::ResourceState::Present,
                                                                      .discard = true});
+#if DE_BUILD_DEV
+            render::GraphTexture scene_target = back;
+            if (in_viewport) {
+                // Left where the UI reads it; the window under the UI is cleared.
+                scene_target = graph->import_texture({.texture = viewport_texture,
+                                                      .name = "viewport",
+                                                      .state = viewport_state,
+                                                      .stages = rhi::ShaderStages::Fragment,
+                                                      .final_state = rhi::ResourceState::ShaderRead,
+                                                      .final_stages = rhi::ShaderStages::Fragment,
+                                                      .discard = true});
+                viewport_state = rhi::ResourceState::ShaderRead;
+                clear(back);
+            }
+#else
+            const render::GraphTexture scene_target = back;
+#endif
             if (scene_renderer) {
-                scene_renderer->add_passes(*graph, back, device->swapchain_format(), world->render_frame(),
+                scene_renderer->add_passes(*graph, scene_target, device->swapchain_format(), world->render_frame(),
                                            engine.lighting, engine.view, engine.taa);
                 if (scene_renderer->instances_stale()) {
                     world->resync_render_instances();
                 }
+#if DE_BUILD_DEV
+                engine.pick_answer = scene_renderer->pick_answer();
+#endif
             } else {
-                // No scene renderer: the window is cleared.
-                graph->add_pass(
-                    "clear", [&](render::PassBuilder& pass) { pass.use(back, rhi::ResourceState::RenderTarget); },
-                    [back](render::PassContext& context) {
-                        const rhi::ColorAttachment color{.texture = context.texture(back),
-                                                         .clear = render::kEmptySceneColor};
-                        context.list.begin_rendering({.colors = std::span(&color, 1)});
-                        context.list.end_rendering();
-                    });
+                clear(scene_target); // no scene renderer: cleared
             }
 #if DE_BUILD_DEV
-            debug_ui.add_pass(*graph, back, device->swapchain_format());
+            debug_ui.add_pass(*graph, back, device->swapchain_format(),
+                              in_viewport ? std::span<const render::GraphTexture>(&scene_target, 1)
+                                          : std::span<const render::GraphTexture>{});
             eyes.add_picture_pass(*device, *graph, back, backbuffer);
 #endif
             graph->execute();
@@ -626,6 +702,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 
     // --- Down -------------------------------------------------------------------------------------
     application.shutdown(engine);
+#if DE_BUILD_DEV
+    device->destroy(viewport_texture);
+#endif
 #if DE_BUILD_DEV
     const bool eyes_ok = eyes.finish(*device);
 #else

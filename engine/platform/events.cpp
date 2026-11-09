@@ -53,6 +53,7 @@ void pump_events(Window& window, Input& input) {
             window_changed = true;
             break;
         case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED:
         case SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED:
             display_changed = true;
             break;
@@ -91,9 +92,10 @@ void pump_events(Window& window, Input& input) {
             break;
         case SDL_EVENT_MOUSE_WHEEL:
             // Up is away from the user whatever the system's "natural scrolling" says.
-            input.push(RawInput{.source = InputSource::MouseWheel,
-                                .value = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y,
-                                .timestamp_ns = event.wheel.timestamp});
+            input.push(
+                RawInput{.source = InputSource::MouseWheel,
+                         .value = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -event.wheel.y : event.wheel.y,
+                         .timestamp_ns = event.wheel.timestamp});
             break;
 
         case SDL_EVENT_GAMEPAD_ADDED:

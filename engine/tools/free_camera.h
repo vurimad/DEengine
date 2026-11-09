@@ -40,6 +40,8 @@ public:
         : position_(position), yaw_rad_(yaw_rad), pitch_rad_(pitch_rad) {}
 
     void update(const platform::Input& input, const FreeCameraActions& actions, float frame_s, flecs::entity camera);
+    // Places its entity where it is, without reading input (the editor, while the mouse is over another panel).
+    void place(flecs::entity camera) const;
     // Puts it there, as if it had flown; update() places its entity.
     void set_pose(const CameraPose& pose) {
         position_ = pose.position;

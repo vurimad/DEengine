@@ -5,6 +5,7 @@
 #include "render/rhi/rhi.h"
 
 #include <cstdint>
+#include <span>
 
 struct ImDrawData;
 
@@ -48,8 +49,10 @@ public:
 
     // A pass drawing draw_data over target (a color texture of `format`, contents kept), between
     // graph.begin() and execute(). draw_data must stay valid until execute(): ImGui keeps it until
-    // the next NewFrame().
-    void add_pass(RenderGraph& graph, GraphTexture target, rhi::Format format, const ImDrawData* draw_data);
+    // the next NewFrame(). shown: the graph's textures the UI draws with ImGui::Image this frame (the
+    // editor's viewport), read by the pass so they're in ShaderRead when it draws.
+    void add_pass(RenderGraph& graph, GraphTexture target, rhi::Format format, const ImDrawData* draw_data,
+                  std::span<const GraphTexture> shown = {});
 
     // The ImTextureID that shows an engine texture with ImGui::Image(): its bindless index (a
     // sampled 2D texture, in ShaderRead state for fragment shaders when ImGui draws).

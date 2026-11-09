@@ -29,6 +29,15 @@ WorldTransform compose(const WorldTransform& parent, const Transform& local) {
     };
 }
 
+Transform local_of(const WorldTransform& parent, const WorldTransform& world) {
+    const Quat inverse = glm::inverse(parent.rotation);
+    return {
+        .position = DVec3(inverse * Vec3(world.position - parent.position) / parent.scale),
+        .rotation = glm::normalize(inverse * world.rotation),
+        .scale = world.scale / parent.scale,
+    };
+}
+
 WorldTransform interpolate(const WorldTransform& previous, const WorldTransform& current, float alpha) {
     if (same(previous, current)) {
         return current;
@@ -121,15 +130,8 @@ void attach(flecs::entity entity, flecs::entity parent) {
     if (!placed) {
         return;
     }
-    const WorldTransform* world = &world_value;
-    const WorldTransform* parent_world = &parent_value;
     // The local transform that composes back to where the entity is now.
-    const Quat inverse = glm::inverse(parent_world->rotation);
-    entity.set(Transform{
-        .position = DVec3(inverse * Vec3(world->position - parent_world->position) / parent_world->scale),
-        .rotation = glm::normalize(inverse * world->rotation),
-        .scale = world->scale / parent_world->scale,
-    });
+    entity.set(local_of(parent_value, world_value));
 }
 
 void register_transform(flecs::world& ecs) {

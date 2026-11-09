@@ -45,6 +45,9 @@ public:
 
     // The refresh rate of the display the window is on; 0 if it isn't known.
     double refresh_hz() const { return refresh_hz_; }
+    // How much the OS scales content on the display the window is on (1.5 for 150% in Windows' display settings);
+    // 1 if it isn't known. For UI sizes; window sizes are in pixels on Windows.
+    float content_scale() const { return content_scale_; }
 
     // True during the frame in which the drawable size changed: recreate the swapchain.
     bool resized() const { return resized_; }
@@ -67,6 +70,7 @@ private:
     uint32_t pixel_width_ = 0;
     uint32_t pixel_height_ = 0;
     double refresh_hz_ = 0.0;
+    float content_scale_ = 1.0f;
     bool close_requested_ = false;
     bool minimized_ = false;
     bool focused_ = true;

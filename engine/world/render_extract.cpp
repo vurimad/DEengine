@@ -71,7 +71,15 @@ void register_render_components(flecs::world& ecs) {
         .add(flecs::With, ecs.component<RenderSlot>());
     ecs.component<Camera>("de::Camera").member<float>("vertical_fov_rad").member<float>("near_m");
     ecs.component<ActiveCamera>("de::ActiveCamera").member<flecs::entity_t>("entity");
-    ecs.component<FogVolume>("de::FogVolume");
+    ecs.component<FogVolume>("de::FogVolume")
+        .member<float>("density_per_m")
+        .member<float>("edge_m")
+        .member<float>("tint", 3)
+        .member<bool>("ellipsoid")
+        .member<float>("noise_size_m")
+        .member<float>("noise_amount")
+        .member<float>("drift_mps", 3)
+        .member<float>("height_fade_m");
 }
 
 namespace {

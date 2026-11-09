@@ -107,6 +107,9 @@ struct GBufferOutput
     float4 gb2 : SV_Target2;
     float4 emissive : SV_Target3;
     float2 motion : SV_Target4;
+#ifdef EDITOR_IDS
+    uint id : SV_Target5; // the editor's: the instance's slot plus one, 0 for none
+#endif
 };
 
 [shader("vertex")]
@@ -773,5 +776,8 @@ GBufferOutput fragment_main(VertexOutput input)
     output.gb2 = float4(roughness, 0.0, occlusion, 0.0);
     output.emissive = float4(0.0, 0.0, 0.0, 1.0);
     output.motion = motion_between(input.clip, input.previous_clip);
+#ifdef EDITOR_IDS
+    output.id = 0u; // the ground and its grass aren't picked
+#endif
     return output;
 }

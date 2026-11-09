@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstring>
 #include <new>
+#include <span>
 #include <utility>
 
 namespace de::tools {
@@ -117,12 +118,13 @@ void DebugUi::end_frame() {
     state_->frame_built = true;
 }
 
-void DebugUi::add_pass(render::RenderGraph& graph, render::GraphTexture target, rhi::Format format) {
+void DebugUi::add_pass(render::RenderGraph& graph, render::GraphTexture target, rhi::Format format,
+                       std::span<const render::GraphTexture> shown) {
     if (!state_->frame_built) {
         return;
     }
     state_->frame_built = false;
-    state_->renderer->add_pass(graph, target, format, ImGui::GetDrawData());
+    state_->renderer->add_pass(graph, target, format, ImGui::GetDrawData(), shown);
 }
 
 } // namespace de::tools

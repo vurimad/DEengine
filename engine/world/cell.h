@@ -56,6 +56,12 @@ struct CellContents {
 // entity. An entity is in at most one cell.
 struct InCell {};
 
+// On a member of a cell: which of its cell file's entities it was spawned from (CellAsset::entities), for its name
+// there and for the editor, which saves edits back to the cell's text source.
+struct CellMember {
+    uint32_t index = 0;
+};
+
 // On an entity: a static body in the shape of a mesh's cooked collision (a .dephys), where the entity is, at its world
 // scale. Physics makes it once the asset is loaded, and it goes with this or the entity. It's here and not in
 // de::physics because what spawns cells can't see that. The handle doesn't hold the asset: whatever spawned the entity

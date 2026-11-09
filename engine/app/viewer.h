@@ -7,6 +7,8 @@
 
 #include <flecs.h>
 
+#include <algorithm>
+
 namespace de::app {
 
 // The application deengine runs until the game's own lands: loads a world (every cell of it, until
@@ -23,6 +25,26 @@ public:
     bool update(Engine& engine, float frame_s) override;
     void shutdown(Engine& engine) override;
 
+#if DE_BUILD_DEV
+    // For the editor, which runs a viewer inside it. Escape doesn't quit (the window's close does).
+    void set_quit_on_escape(bool quit) { quit_on_escape_ = quit; }
+    // Whether the free camera reads input this frame (the mouse is over the viewport); otherwise it stays put.
+    void set_camera_input(bool on) { camera_input_ = on; }
+    const tools::FreeCameraActions& camera_actions() const { return camera_actions_; }
+    // Puts the camera there, looking that way (yaw about world up, pitch up from level), as if it had flown.
+    void set_camera_pose(const tools::CameraPose& pose) { free_camera_.set_pose(pose); }
+    void set_camera_speed(float speed_mps) {
+        free_camera_.speed_mps =
+            std::clamp(speed_mps, tools::FreeCamera::kMinSpeedMps, tools::FreeCamera::kMaxSpeedMps);
+    }
+    const tools::FreeCamera& camera() const { return free_camera_; }
+    flecs::entity camera_entity() const { return camera_; }
+    // Lets go of the world shown (its cells unload) and opens another, the camera at its start. False (logged) if it
+    // doesn't load: the old one is gone either way.
+    bool open_world(Engine& engine, asset::AssetId id);
+    asset::AssetId world_id() const { return world_id_; }
+#endif
+
 private:
     struct LoadedCell {
         asset::AssetId id;
@@ -33,7 +55,12 @@ private:
     void apply_world(Engine& engine);
 
     asset::AssetHandle world_;
+    asset::AssetId world_id_;
+    // Loads a world before the first frame (or when the editor opens one), the camera at its start.
+    bool load_world(Engine& engine, asset::AssetId id);
 #if DE_BUILD_DEV
+    bool quit_on_escape_ = true;
+    bool camera_input_ = true;
     // A demo of physics: F6 drops rocks in front of the camera, F7 a shower of rubble.
     void drop_rocks(Engine& engine, uint32_t count, bool rubble);
     platform::ActionId drop_rocks_{};
