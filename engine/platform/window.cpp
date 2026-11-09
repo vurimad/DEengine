@@ -3,6 +3,7 @@
 #include "core/log.h"
 
 #include <SDL3/SDL_error.h>
+#include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_video.h>
 #include <SDL3/SDL_vulkan.h>
 
@@ -71,6 +72,11 @@ Window& Window::operator=(Window&& other) noexcept {
 
 void Window::set_title(const char* title) {
     SDL_SetWindowTitle(window_, title);
+}
+
+void Window::set_focus_clicks(bool pass) {
+    // Read by SDL at each click (on Windows it drops the activating click unless this is set).
+    static_cast<void>(SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, pass ? "1" : "0"));
 }
 
 void Window::refresh_display() {

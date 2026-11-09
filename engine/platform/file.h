@@ -47,6 +47,8 @@ private:
 
 // The process's working directory, for messages about relative paths.
 core::Result<PathString> working_directory();
+// What a program's file name ends in on this OS: ".exe" on Windows, nothing on Linux.
+const char* program_suffix();
 
 // Writes data to path atomically: a uniquely named temporary file next to it, flushed, then
 // renamed over it. A crash leaves either the old file or the new one, never half of one, and

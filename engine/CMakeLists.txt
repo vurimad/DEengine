@@ -1,6 +1,7 @@
 find_package(imgui CONFIG REQUIRED)
 
 add_subdirectory(core)
+add_subdirectory(console)
 add_subdirectory(platform)
 add_subdirectory(asset)
 add_subdirectory(render)

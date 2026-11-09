@@ -51,6 +51,15 @@ public:
 
     // Forgets every command and saved value (another world was opened: their entities are gone).
     void clear();
+    // Forgets the saved values only: a save wrote the world as it is, so that's what's saved now.
+    void forget_saved_values() { saved_.clear(); }
+    // Every set, undo and redo counts one: the editor compares it with the count at its last save.
+    uint64_t changes() const { return changes_; }
+    // The commands and saved values of one entity now go to another: the same thing spawned again (its cell was cooked
+    // again after a save, and hot reload spawned its members anew).
+    void remap(flecs::entity_t from, flecs::entity_t to);
+    // The entity of each command, in order, into out.
+    void entities(core::Array<flecs::entity_t>& out) const;
     size_t size() const { return commands_.size(); }
 
 private:
@@ -66,7 +75,8 @@ private:
     core::Array<Command> commands_;
     core::HashMap<uint64_t, core::Array<std::byte>> saved_; // by entity and component
     size_t done_ = 0;                                       // commands_[0, done_) are applied; the rest were undone
-    uint64_t open_merge_key_ = 0;                           // the run the last command takes more sets into; 0: none
+    uint64_t open_merge_key_ = 0;
+    uint64_t changes_ = 0; // the run the last command takes more sets into; 0: none
 };
 
 // Writes value as the entity's component, as the commands do: a Transform is placed (world::place), so the entity and

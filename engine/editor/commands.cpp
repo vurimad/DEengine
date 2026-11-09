@@ -61,6 +61,7 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
         if (last.entity == entity.id() && last.component == component && last.merge_key == merge_key) {
             last.after.assign(value);
             apply_component(entity, component, value);
+            ++changes_;
             return true;
         }
     }
@@ -83,6 +84,7 @@ bool CommandStack::set_component(flecs::entity entity, flecs::id_t component, st
     commands_.push(std::move(command));
     done_ = commands_.size();
     open_merge_key_ = merge_key;
+    ++changes_;
     return true;
 }
 
@@ -99,6 +101,7 @@ bool CommandStack::undo(const flecs::world& ecs) {
     }
     apply_component(entity, command.component, command.before.span());
     --done_;
+    ++changes_;
     return true;
 }
 
@@ -115,6 +118,7 @@ bool CommandStack::redo(const flecs::world& ecs) {
     }
     apply_component(entity, command.component, command.after.span());
     ++done_;
+    ++changes_;
     return true;
 }
 
@@ -136,6 +140,28 @@ void CommandStack::clear() {
     commands_.clear();
     done_ = 0;
     open_merge_key_ = 0;
+}
+
+void CommandStack::remap(flecs::entity_t from, flecs::entity_t to) {
+    for (Command& command : commands_) {
+        if (command.entity != from) {
+            continue;
+        }
+        command.entity = to;
+        // Its saved value goes with it (each saved value has the command its first edit made).
+        if (core::Array<std::byte>* saved = saved_.find(saved_key(from, command.component)); saved != nullptr) {
+            core::Array<std::byte> moved = std::move(*saved);
+            static_cast<void>(saved_.remove(saved_key(from, command.component)));
+            saved_.set(saved_key(to, command.component), std::move(moved));
+        }
+    }
+}
+
+void CommandStack::entities(core::Array<flecs::entity_t>& out) const {
+    out.clear();
+    for (const Command& command : commands_) {
+        out.push(command.entity);
+    }
 }
 
 } // namespace de::editor

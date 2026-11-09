@@ -427,4 +427,25 @@ void draw_document_glyph(ImVec2 min, float extent, const char* name, bool show_e
         kDocumentText, label);
 }
 
+bool begin_over_panels(const char* name, ImVec2 min, ImVec2 size, ImGuiWindowFlags flags) {
+    ImGui::SetNextWindowPos(min);
+    ImGui::SetNextWindowSize(size);
+    const bool shown = ImGui::Begin(name, nullptr, flags);
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::BringWindowToDisplayFront(ImGui::GetCurrentWindow());
+    }
+    return shown;
+}
+
+void dock_space_with_splitters(ImGuiID id, ImVec2 size, ImGuiDockNodeFlags flags) {
+    // The splitters are made here, before the panels' contents. ImGui marks them overlappable, so a later item under
+    // the mouse would take the hover: what a splitter takes here, it keeps.
+    ImGuiContext& context = *ImGui::GetCurrentContext();
+    const ImGuiID hovered_before = context.HoveredId;
+    ImGui::DockSpace(id, size, flags);
+    if (context.HoveredId != 0 && context.HoveredId != hovered_before) {
+        context.HoveredIdAllowOverlap = false;
+    }
+}
+
 } // namespace de::editor

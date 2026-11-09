@@ -23,7 +23,9 @@ struct ImGuiPlatformState {
     SDL_Window* window = nullptr;
     bool initialized = false;
     bool text_input = false;
-    char* clipboard = nullptr; // the last text handed to ImGui, owned by SDL
+    char* clipboard = nullptr;                        // the last text handed to ImGui, owned by SDL
+    SDL_Cursor* cursors[ImGuiMouseCursor_COUNT] = {}; // the OS's own, by ImGui's shapes
+    ImGuiMouseCursor shown_cursor = ImGuiMouseCursor_Arrow;
 };
 
 ImGuiPlatformState g_imgui;
@@ -155,6 +157,16 @@ void imgui_platform_init(Window& window) {
     platform_io.Platform_GetClipboardTextFn = get_clipboard;
     platform_io.Platform_SetClipboardTextFn = set_clipboard;
     g_imgui = ImGuiPlatformState{.window = window.native_handle(), .initialized = true};
+    // The mouse takes the shape ImGui asks for: arrows over the panels' edges, a bar over text, a hand over links.
+    constexpr SDL_SystemCursor kShapes[ImGuiMouseCursor_COUNT] = {
+        SDL_SYSTEM_CURSOR_DEFAULT,     SDL_SYSTEM_CURSOR_TEXT,       SDL_SYSTEM_CURSOR_MOVE,
+        SDL_SYSTEM_CURSOR_NS_RESIZE,   SDL_SYSTEM_CURSOR_EW_RESIZE,  SDL_SYSTEM_CURSOR_NESW_RESIZE,
+        SDL_SYSTEM_CURSOR_NWSE_RESIZE, SDL_SYSTEM_CURSOR_POINTER,    SDL_SYSTEM_CURSOR_WAIT,
+        SDL_SYSTEM_CURSOR_PROGRESS,    SDL_SYSTEM_CURSOR_NOT_ALLOWED};
+    for (int i = 0; i < ImGuiMouseCursor_COUNT; ++i) {
+        g_imgui.cursors[i] = SDL_CreateSystemCursor(kShapes[i]);
+    }
+    io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
 }
 
 void imgui_platform_shutdown() {
@@ -167,8 +179,17 @@ void imgui_platform_shutdown() {
     if (g_imgui.text_input) {
         SDL_StopTextInput(g_imgui.window); // no input method left open for the game
     }
+    if (g_imgui.shown_cursor != ImGuiMouseCursor_Arrow && g_imgui.cursors[ImGuiMouseCursor_Arrow] != nullptr) {
+        SDL_SetCursor(g_imgui.cursors[ImGuiMouseCursor_Arrow]);
+    }
+    for (SDL_Cursor* cursor : g_imgui.cursors) {
+        if (cursor != nullptr) {
+            SDL_DestroyCursor(cursor);
+        }
+    }
     if (ImGui::GetCurrentContext() != nullptr) {
         ImGui::GetIO().BackendPlatformName = nullptr;
+        ImGui::GetIO().BackendFlags &= ~ImGuiBackendFlags_HasMouseCursors;
         ImGui::GetPlatformIO().Platform_GetClipboardTextFn = nullptr;
         ImGui::GetPlatformIO().Platform_SetClipboardTextFn = nullptr;
     }
@@ -188,6 +209,15 @@ void imgui_platform_new_frame(Window& window, float delta_s) {
                                             static_cast<float>(window.pixel_height()) / static_cast<float>(height));
     }
     io.DeltaTime = delta_s > 0.0f ? delta_s : 1.0f / 60.0f;
+
+    // The shape the last frame asked for (as ImGui's own SDL backend does it). Only the shape: whether the mouse
+    // shows is the game's (the camera's look hides it).
+    const ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
+    if ((io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange) == 0 && cursor > ImGuiMouseCursor_None &&
+        cursor < ImGuiMouseCursor_COUNT && cursor != g_imgui.shown_cursor && g_imgui.cursors[cursor] != nullptr) {
+        SDL_SetCursor(g_imgui.cursors[cursor]);
+        g_imgui.shown_cursor = cursor;
+    }
 
     // Typed text arrives only while text input is on: only while a text field wants it, so the
     // OS input method doesn't pop up during play.

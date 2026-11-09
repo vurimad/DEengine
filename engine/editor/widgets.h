@@ -43,6 +43,15 @@ void draw_clipped_text(ImDrawList* draw, ImVec2 position, float max_x, const cha
 // A label inside [min, max), vertically centred, optionally horizontally; an ellipsis when it doesn't fit.
 void draw_clipped_label(ImVec2 min, ImVec2 max, const char* label, ImU32 color, bool centered);
 
+// ImGui::DockSpace, its splitters grabbed by the margin either side of the gap between panels as well as by the gap
+// itself (ImGui lets the panels' own items take that margin from them).
+void dock_space_with_splitters(ImGuiID id, ImVec2 size, ImGuiDockNodeFlags flags);
+
+// A window over the docked panels (a drawer), at min and size: in front of them from the frame it appears on, as any
+// window clicked is (the panels' host never comes in front), but not pushed in front every frame: that would put it
+// over its own popups and take their clicks. End it with ImGui::End(), as Begin.
+bool begin_over_panels(const char* name, ImVec2 min, ImVec2 size, ImGuiWindowFlags flags);
+
 // A section heading inside a menu: dim capitals, then a rule to the menu's edge.
 void menu_section(const char* caption);
 

@@ -252,14 +252,35 @@ TEST_CASE("the stats panel draws whatever the frame's numbers are") {
                       .gpu_frame_ms = 0.25f});
     }
     ImGui::GetIO().Fonts->Build();
-    bool open = true;
-    for (int frame = 0; frame < 2; ++frame) { // a new window is hidden on its first frame, while it sizes itself
-        ImGui::NewFrame();
-        panel.draw(&open);
-        ImGui::Render();
-    }
-    CHECK(open);
-    CHECK(ImGui::GetDrawData()->TotalVtxCount > 0);
+    ImGui::GetIO().DisplaySize = ImVec2(1280.0f, 720.0f);
+    // Every section, and the default: fewer of them draw less.
+    const auto vertices = [&panel](uint32_t sections) {
+        panel.set_sections(sections);
+        for (int frame = 0; frame < 2; ++frame) { // a new window is hidden on its first frame, while it sizes itself
+            ImGui::NewFrame();
+            panel.draw_overlay(0.0f, 0.0f, 1280.0f, 720.0f);
+            ImGui::Render();
+        }
+        return ImGui::GetDrawData()->TotalVtxCount;
+    };
+    const int all = vertices(de::tools::kStatsAll);
+    CHECK(all > 0);
+    CHECK(vertices(de::tools::kStatsFrame) < all);
+}
+
+TEST_CASE("the frame stats' sections are named on the command line") {
+    uint32_t sections = 0;
+    CHECK(de::tools::parse_stats_sections("frame, gpu", sections));
+    CHECK(sections == (de::tools::kStatsFrame | de::tools::kStatsGpu));
+    CHECK(de::tools::parse_stats_sections("default,device", sections));
+    CHECK(sections == (de::tools::kStatsDefault | de::tools::kStatsDevice));
+    CHECK(de::tools::parse_stats_sections("all", sections));
+    CHECK(sections == de::tools::kStatsAll);
+    CHECK(de::tools::parse_stats_sections("fps", sections)); // Unreal's name for the frame line
+    CHECK(sections == de::tools::kStatsFrame);
+    CHECK(de::tools::parse_stats_sections("all", sections));
+    CHECK_FALSE(de::tools::parse_stats_sections("frame,fsp", sections));
+    CHECK(sections == de::tools::kStatsAll); // left as it was
 }
 
 TEST_CASE("the stats panel says when the cull is frozen, and what it kept for the shadows") {
@@ -273,10 +294,9 @@ TEST_CASE("the stats panel says when the cull is frozen, and what it kept for th
                       .cull_frozen = frozen,
                       .visible_shadow_draws = shadow_draws,
                       .visible_shadow_triangles = shadow_triangles});
-        bool open = true;
         for (int frame = 0; frame < 2; ++frame) { // a new window is hidden on its first frame, while it sizes itself
             ImGui::NewFrame();
-            panel.draw(&open);
+            panel.draw_overlay(0.0f, 0.0f, 1280.0f, 720.0f);
             ImGui::Render();
         }
         return ImGui::GetDrawData()->TotalVtxCount;

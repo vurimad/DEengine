@@ -421,6 +421,7 @@ private:
             if (entity.collision != CellEntity::kNone) {
                 entity.collision += static_cast<uint32_t>(build_.meshes.size());
             }
+            entity.source_index = source_index;
             entity.name_offset = static_cast<uint32_t>(build_.names.size());
             entity.name_length = static_cast<uint16_t>(parsed.name.size());
             for (const char c : parsed.name) {

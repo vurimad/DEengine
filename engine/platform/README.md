@@ -7,15 +7,17 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | Header | What it gives |
 | --- | --- |
 | `platform.h` | `Platform`: SDL init; routes core's fatal errors and logs to the debugger |
-| `window.h` | `Window`: Vulkan-capable window, drawable size in pixels, resize / minimize / focus / close; Vulkan surface creation for the RHI |
+| `window.h` | `Window`: Vulkan-capable window, drawable size in pixels, resize / minimize / focus / close; Vulkan surface creation for the RHI; whether the click that brings it to the front is a click too (`set_focus_clicks`: the editor's on, a game's off) |
 | `events.h` | `pump_events(window, input)`: once per rendered frame |
 | `input.h` | `Input`: named actions bound by text, sampled once per tick |
+| `process.h` | `Process`: a program run beside the engine (the editor's cooker), in the background with no console window, asked each frame whether it's ended; `program_beside_engine` |
 | `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` `src:/` mounts, path rules, blocking and async reads by priority, atomic writes, file info for hot reload |
 | `file.h` | Native files: positional reads, atomic writes, size and write time, folders, the OS user and temp folders |
 | `time.h` | `time_ns()`, `sleep_ns()`: the same clock as input timestamps |
 | `thread.h` | `Thread` (named, joined on destruction), thread names and ids, core count |
 | `cpu.h` | What the CPU has: what links Jolt stops before any static initializer if it lacks AVX2, with a message |
 | `debug.h` | Debugger detection, break, and the debugger output log sink |
+| `socket.h` | `TcpListener` (on 127.0.0.1 only) and `TcpStream`: TCP that never blocks, for the agents' socket (Winsock or BSD sockets, here alone) |
 | `random.h` | Random bytes from the OS: GUIDs for new assets, seeds (not gameplay randomness) |
 | `imgui_platform.h` | Dear ImGui's platform side: display size, time step and input events, so SDL stays here |
 | `imgui_events.h` | Inside `platform/` only: how `pump_events()` hands each SDL event to ImGui |

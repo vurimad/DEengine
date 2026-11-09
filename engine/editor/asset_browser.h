@@ -32,6 +32,7 @@ public:
     explicit AssetBrowser(core::Allocator& allocator);
 
     // True when a file was opened (double-click or Enter): the selection holds it.
+    // Into the window it's drawn in (the editor's Resources drawer).
     bool draw(const platform::Vfs& vfs, Selection& selection);
     // What the status bar shows while the panel has focus: "12 items  1 selected".
     const char* status() const { return status_; }

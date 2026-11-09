@@ -5,6 +5,8 @@
 
 #include <span>
 
+struct ImDrawList;
+
 namespace de::platform {
 class Window;
 }
@@ -25,6 +27,11 @@ namespace de::tools {
 // go through the VFS only). One at a time. DebugUi below uses these; tests use them alone.
 void create_imgui();
 void destroy_imgui();
+
+// What the game's picture says about itself (the frozen cull): dark text on a yellow plate in its top-right corner (x,
+// y and width: the picture in the UI's coordinates). Into draw: a panel's list (covered by whatever covers the panel),
+// or ImGui's background list over a game's window.
+void draw_viewport_notice(ImDrawList* draw, float x, float y, float width, const char* text);
 
 struct DebugUiState;
 

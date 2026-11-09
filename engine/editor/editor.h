@@ -2,8 +2,10 @@
 
 #include "app/framework.h"
 #include "app/viewer.h"
+#include "console/console.h"
 #include "editor/asset_browser.h"
 #include "editor/cell_map_panel.h"
+#include "editor/cell_saver.h"
 #include "editor/commands.h"
 #include "editor/gizmo.h"
 #include "editor/hierarchy_panel.h"
@@ -11,30 +13,35 @@
 #include "editor/navigation.h"
 #include "editor/properties_panel.h"
 #include "editor/selection.h"
+#include "platform/process.h"
 
 #if DE_BUILD_DEV
 namespace de::editor {
 
 // deengine --editor, in dev builds (docs/design.md, Editor & tooling): the viewer's world with the editor's panels
 // around it, in the user's editor design (theme.h): a header row (the name, the menus), the panels docked with thin
-// gaps between them, and a status bar (what the focused panel reports; the camera's speed). The hierarchy, with the
-// cell map in a tab beside it, sits over the properties on the left; the game's view (the Playground) on the right over
-// the resources. The frame stats (F1, or View) start hidden. The camera moves as in Unity's scene view: the right
-// button held over the Playground flies it (WASD, the mouse to look, the wheel its speed), the wheel zooms, a middle
-// drag pans, Alt and a left drag orbits, Alt and a right drag zooms, F frames the selection (navigation.h). The
-// Playground's toolbar: undo and redo, the tools (select, move, rotate, scale: Q W E R), world or local axes, snapping
-// to a grid, to angles and to scale steps, the camera's speed, the view, framing the selection. A click in the scene
-// selects what's under the mouse; the selection's handles move, turn and scale it. Ctrl+Z undoes, Ctrl+Y or
-// Ctrl+Shift+Z redoes, F frames the selected entity, a double-click on a world in the resources opens it. Escape
-// doesn't quit; closing the window does. The layout is kept in user:/editor/layout.ini, the interface scale, the tool
-// and the snapping in user:/editor/editor.settings. Flags: the viewer's (app/viewer.h), and, for pictures of the editor
-// taken from the command line (the agent's eyes):
+// gaps between them, and a status bar (what the focused panel reports). The hierarchy, with the
+// cell map in a tab beside it, sits over the properties on the left; the game's view (the Playground) is the right
+// side. Along the bottom, as Unreal's: the Resources drawer (Ctrl+Space), the Output drawer (the engine's
+// log and the console's), and a console command line. The frame stats (F1, or View) start hidden. The camera moves as
+// in Unity's scene view: the right button held over the Playground flies it (WASD, the mouse to look, the wheel its
+// speed), the wheel zooms, a middle drag pans, Alt and a left drag orbits, Alt and a right drag zooms, F frames the
+// selection (navigation.h). The Playground's toolbar: undo and redo, the tools (select, move, rotate, scale: Q W E R),
+// world or local axes, snapping to a grid, to angles and to scale steps, the camera's speed, the view, framing the
+// selection. A click in the scene selects what's under the mouse; the selection's handles move, turn and scale it.
+// Ctrl+Z undoes, Ctrl+Y or Ctrl+Shift+Z redoes, Ctrl+S saves the edits into the cells' text sources and cooks them in
+// the background (hot reload brings them back), F frames the selected entity, a double-click on a world in the
+// resources opens it. Escape doesn't quit; closing the window does. The layout is kept in user:/editor/layout.ini, the
+// interface scale, the tool and the snapping in user:/editor/editor.settings. Flags: the viewer's (app/viewer.h), and,
+// for pictures of the editor taken from the command line (the agent's eyes):
 //   --select NAME   select the entity of that name once it's in the world
 //   --select-file PATH   select that source file ("src:/content/terrain/wc.world")
 //   --show PANEL    bring that panel's tab to the front ("Cell Map")
 //   --pick X,Y      click that pixel of the Playground's scene, once it's drawn: select what's there
 //   --tool NAME     select, move, rotate or scale
 //   --handles AT    pivot or center
+//   --drawer NAME   resources or output: that drawer open
+//   --cmd TEXT      that text in the command line, the keyboard on it
 //   --drag H,AMOUNT show a drag under way on handle H (0-2 an axis, 3-5 a plane, 6 the middle), gone AMOUNT (meters,
 //                   or radians turning), changing nothing
 // A scripted run (a picture) keeps nothing: not the layout, not the settings.
@@ -47,11 +54,17 @@ public:
     bool update(app::Engine& engine, float frame_s) override;
     void ui(app::Engine& engine) override;
     void shutdown(app::Engine& engine) override;
+    // The window's close button with unsaved edits: asked first (Save, Don't Save, Cancel).
+    bool may_close(app::Engine& engine) override;
 
 private:
     void header_row(app::Engine& engine);
     void dock_space(ImVec2 size);
-    void status_bar(ImVec2 size);
+    void status_bar(app::Engine& engine, ImVec2 size);
+    // The drawer that's open, over the bottom of the panels (min, size: their space): true if a world was asked open.
+    bool drawer(app::Engine& engine, ImVec2 min, ImVec2 size);
+    // A bottom bar button that opens a drawer, lit while it's open.
+    bool drawer_button(const char* id, const char* label, bool content, bool open);
     void playground(app::Engine& engine);
     void playground_toolbar(app::Engine& engine);
     // How the Playground sees the world now (the scene's rectangle on screen).
@@ -63,7 +76,11 @@ private:
     tools::CameraPose camera_pose() const;
     // The camera to a place on the map (X and Z), at its height, looking as it was.
     void go_to_place(const DVec3& place);
-    void open_world(app::Engine& engine);
+    // The world selected in the resources; with unsaved edits, asked first (unsaved_asked: it was).
+    void open_world(app::Engine& engine, bool unsaved_asked = false);
+    // What waits on the unsaved edits' question, and the question.
+    enum class Pending : uint8_t { None, Quit, OpenWorld };
+    void unsaved_prompt(app::Engine& engine);
     // Asks the GPU what's at a pixel of the scene's texture; take_pick selects it once the answer is back
     // (Engine::pick_answer).
     void ask_pick(app::Engine& engine, uint32_t x, uint32_t y);
@@ -74,6 +91,19 @@ private:
     void send_selection(app::Engine& engine);
     // Where the handles sit: the selected entity's pivot, or the centre of its geometry (HandlesAt).
     DVec3 handles_origin(const app::Engine& engine, flecs::entity selected) const;
+    // File > Save, Ctrl+S: the edits into the cells' text sources (cell_saver.h), then the cooker in the background,
+    // so hot reload swaps the cooked cells in.
+    void save(app::Engine& engine);
+    // The cooker over what the last save wrote, in the background (unless it's running).
+    void start_cook(app::Engine& engine);
+    // editor.save, in the console: the same.
+    static void save_command(void* user, const console::Args& args, console::Output& out);
+    // editor.move NAME X Y Z: that entity to there (world meters), as a command, selected.
+    static void move_command(void* user, const console::Args& args, console::Output& out);
+    bool unsaved() const { return commands_.changes() != saved_changes_; }
+    // Each frame: the cooker's end, and the members of a cell spawned again (hot reload): the commands and the
+    // selection follow them, by their place in the cell's source.
+    void follow_saves(app::Engine& engine);
 
     app::Viewer viewer_;
     CommandStack commands_;
@@ -112,7 +142,24 @@ private:
     bool playground_hovered_ = false;   // in the last frame's UI
     bool looking_ = false;              // a mouse look that started over the Playground
     bool reset_layout_ = false;
+    // The drawers, as Unreal's: Resources (Ctrl+Space) and the Output log, up from the bottom bar
+    // over the panels while they're wanted, away again at a click elsewhere.
+    enum class Drawer : uint8_t { None, Resources, Output };
+    Drawer drawer_ = Drawer::None;
+    float drawer_share_ = 0.4f; // of the panels' height
+    bool status_hovered_ = false;
+    char output_filter_[64] = {};
     bool keep_settings_ = true; // the layout and settings are saved at the end: not after a picture
+    // Saving.
+    CellSources cell_sources_;
+    platform::Process cooker_;
+    Pending pending_ = Pending::None;
+    core::Array<platform::PathString> cooking_; // what the last save wrote, which the cooker's cooking
+    uint64_t saved_changes_ = 0;                // commands_.changes() at the last save
+    app::Engine* engine_ = nullptr;             // for the console's commands
+    MemberTracker members_;                     // what the commands and the selection name, through respawns
+    uint64_t keyed_changes_ = UINT64_MAX;       // commands_.changes() when their keys were noted
+    core::Array<flecs::entity_t> scratch_entities_;
     bool quit_ = false;
 };
 

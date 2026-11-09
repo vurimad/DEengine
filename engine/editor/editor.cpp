@@ -1,5 +1,6 @@
 #include "editor/editor.h"
 
+#include "asset/cell_format.h"
 #include "asset/mesh_format.h"
 #include "core/log.h"
 #include "core/profile.h"
@@ -9,9 +10,14 @@
 #include "editor/theme.h"
 #include "editor/widgets.h"
 #include "platform/input.h"
+#include "platform/process.h"
 #include "platform/vfs.h"
 #include "platform/window.h"
 #include "render/scene/scene_renderer.h"
+#include "tools/console_ui.h"
+#include "tools/debug_ui.h"
+#include "tools/stats_panel.h"
+#include "world/cell.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -85,6 +91,7 @@ struct Settings {
     Space space = Space::World;
     HandlesAt handles_at = HandlesAt::Pivot;
     Snap snap;
+    float drawer_share = 0.4f;
 };
 
 float to_number(std::string_view text, float fallback) {
@@ -126,6 +133,8 @@ Settings load_settings(const platform::Vfs& vfs) {
                                                 : Tool::Move;
         } else if (key == "space") {
             settings.space = value == "local" ? Space::Local : Space::World;
+        } else if (key == "drawer") {
+            settings.drawer_share = std::clamp(to_number(value, settings.drawer_share), 0.15f, 0.85f);
         } else if (key == "handles") {
             settings.handles_at = value == "center" ? HandlesAt::Center : HandlesAt::Pivot;
         } else if (key == "snap_move") {
@@ -150,13 +159,13 @@ void save_settings(const platform::Vfs& vfs, const Settings& settings) {
                       "# The editor's interface scale (on top of the display's), its tool, its axes, where its handles "
                       "sit and its snapping.\n"
                       "ui_scale %.2f\ntool %s\nspace %s\nhandles %s\nsnap_move %s %g\nsnap_rotate %s %g\n"
-                      "snap_scale %s %g\n",
+                      "snap_scale %s %g\ndrawer %.2f\n",
                       static_cast<double>(settings.ui_scale), kTools[static_cast<int>(settings.tool)],
                       settings.space == Space::Local ? "local" : "world",
                       settings.handles_at == HandlesAt::Center ? "center" : "pivot", settings.snap.move ? "on" : "off",
                       static_cast<double>(settings.snap.move_m), settings.snap.rotate ? "on" : "off",
                       static_cast<double>(settings.snap.rotate_deg), settings.snap.scale ? "on" : "off",
-                      static_cast<double>(settings.snap.scale_step));
+                      static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share));
     if (length > 0) {
         static_cast<void>(vfs.write_file(kSettingsPath, std::as_bytes(std::span(text, static_cast<size_t>(length)))));
     }
@@ -189,6 +198,21 @@ bool icon_button(const IconSet& icons, const char* id, Icon icon, const char* ti
 }
 
 // A thin rule between toolbar groups.
+// A scene view's name as the editor shows it, each word capitalized: "base color" -> "Base Color".
+struct ViewName {
+    char text[48] = {};
+
+    explicit ViewName(render::SceneView view) {
+        const char* name = render::scene_view_name(view);
+        bool word_start = true;
+        for (size_t i = 0; name[i] != '\0' && i + 1 < sizeof(text); ++i) {
+            const char c = name[i];
+            text[i] = word_start && c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : c;
+            word_start = c == ' ';
+        }
+    }
+};
+
 void toolbar_rule() {
     ImGui::SameLine(0.0f, px(6.0f));
     const ImVec2 at = ImGui::GetCursorScreenPos();
@@ -222,14 +246,25 @@ void snap_step(const char* id, float& step, const float (&steps)[N], const char*
 
 Editor::Editor()
     : commands_(editor_heap()), hierarchy_(editor_heap()), icons_(editor_heap()), selected_meshes_(editor_heap()),
-      selected_entities_(editor_heap()), properties_(editor_heap()), browser_(editor_heap()) {}
+      selected_entities_(editor_heap()), properties_(editor_heap()), browser_(editor_heap()),
+      cell_sources_(editor_heap()), cooking_(editor_heap()), members_(editor_heap()), scratch_entities_(editor_heap()) {
+}
 
 bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     if (!viewer_.startup(engine, args)) {
         return false;
     }
     viewer_.set_quit_on_escape(false);
-    engine.frame_stats = false; // F1, or View > Frame Stats
+    engine_ = &engine;
+    engine.console.add_command("editor.save", "",
+                               "Save the edits into the cells' text sources, then cook them (as Ctrl+S does).",
+                               &Editor::save_command, this);
+    engine.console.add_command("editor.move", "<name> <x> <y> <z>",
+                               "Move the entity of that name to a place in meters (undoable), and select it.",
+                               &Editor::move_command, this);
+    // A click on the editor while another window is in front is a click, not only a way back to it.
+    platform::Window::set_focus_clicks(true);
+    engine.frame_stats = app::has_flag(args, "--stats"); // hidden until F1 or View > Frame Stats, unless asked for
     if (!load_fonts(engine.vfs)) {
         DE_LOG_WARN("editor", "the editor's fonts didn't load: ImGui's own stands in");
     }
@@ -242,6 +277,13 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     space_ = settings.space;
     handles_at_ = settings.handles_at;
     snap_ = settings.snap;
+    drawer_share_ = settings.drawer_share;
+    if (const char* typed = app::flag_value(args, "--cmd"); typed != nullptr && engine.console_ui != nullptr) {
+        engine.console_ui->set_command_line(typed);
+    }
+    if (const char* drawer = app::flag_value(args, "--drawer")) {
+        drawer_ = std::string_view(drawer) == "output" ? Drawer::Output : Drawer::Resources;
+    }
     select_name_ = app::flag_value(args, "--select");
     show_panel_ = app::flag_value(args, "--show");
     if (const char* file = app::flag_value(args, "--select-file")) {
@@ -288,9 +330,12 @@ void Editor::shutdown(app::Engine& engine) {
     if (keep_settings_) {
         save_layout(engine.vfs);
         browser_.save_settings(engine.vfs);
-        save_settings(
-            engine.vfs,
-            {.ui_scale = ui_scale_, .tool = tool_, .space = space_, .handles_at = handles_at_, .snap = snap_});
+        save_settings(engine.vfs, {.ui_scale = ui_scale_,
+                                   .tool = tool_,
+                                   .space = space_,
+                                   .handles_at = handles_at_,
+                                   .snap = snap_,
+                                   .drawer_share = drawer_share_});
     }
     viewer_.shutdown(engine);
 }
@@ -347,13 +392,16 @@ void Editor::ui(app::Engine& engine) {
     const ImVec2 available = ImGui::GetContentRegionAvail();
     const float body = std::max(1.0f, available.y - status - (gap * 2.0f));
     ImGui::SetCursorPos(ImVec2(origin.x + gap, origin.y + gap));
-    dock_space(ImVec2(std::max(1.0f, available.x - (gap * 2.0f)), body));
+    const ImVec2 panels_min = ImGui::GetCursorScreenPos();
+    const ImVec2 panels_size(std::max(1.0f, available.x - (gap * 2.0f)), body);
+    dock_space(panels_size);
     ImGui::SetCursorPos(ImVec2(origin.x, origin.y + gap + body + gap));
-    status_bar(ImVec2(available.x, status));
+    status_bar(engine, ImVec2(available.x, status));
     ImGui::End();
     ImGui::PopStyleVar(3);
 
     take_pick(engine);
+    follow_saves(engine);
     if (select_name_ != nullptr) {
         // --select: the first entity of that name, once its cell has spawned it.
         char label[128];
@@ -373,7 +421,7 @@ void Editor::ui(app::Engine& engine) {
         go_to_place(go_to);
     }
     const bool open_asked = properties_.draw(engine, selection_, commands_);
-    const bool opened = browser_.draw(engine.vfs, selection_);
+    const bool opened = drawer(engine, panels_min, panels_size);
     gather_selection(engine);
     playground(engine);
     shortcuts(engine);
@@ -385,6 +433,7 @@ void Editor::ui(app::Engine& engine) {
         file_kind(selection_.file.view()) == "World") {
         open_world(engine);
     }
+    unsaved_prompt(engine);
     if (selection_.frame_entity) {
         selection_.frame_entity = false;
         frame_selection(engine);
@@ -532,8 +581,16 @@ void Editor::header_row(app::Engine& engine) {
     push_menu_style();
     prepare_menu_popup();
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("Save", "Ctrl+S", false, unsaved())) {
+            save(engine);
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Quit")) {
-            quit_ = true;
+            if (unsaved()) {
+                pending_ = Pending::Quit; // asked first
+            } else {
+                quit_ = true;
+            }
         }
         ImGui::EndMenu();
     }
@@ -559,16 +616,17 @@ void Editor::header_row(app::Engine& engine) {
     }
     prepare_menu_popup();
     if (ImGui::BeginMenu("View")) {
-        menu_section("Scene");
-        for (uint32_t i = 0; i < static_cast<uint32_t>(render::SceneView::Count); ++i) {
-            const auto view = static_cast<render::SceneView>(i);
-            if (ImGui::MenuItem(render::scene_view_name(view), nullptr, engine.view == view)) {
-                engine.view = view;
-            }
-        }
-        ImGui::Separator();
-        ImGui::MenuItem("Temporal Anti-Aliasing", "F3", &engine.taa);
+        // The scene's views are the Playground toolbar's.
         ImGui::MenuItem("Frame Stats", "F1", &engine.frame_stats);
+        ImGui::EndMenu();
+    }
+    prepare_menu_popup();
+    if (ImGui::BeginMenu("Rendering Settings")) {
+        ImGui::MenuItem("Temporal Anti-Aliasing", "F3", &engine.taa);
+        ImGui::EndMenu();
+    }
+    prepare_menu_popup();
+    if (ImGui::BeginMenu("Preferences")) {
         menu_section("Interface Scale");
         for (const float scale : kUiScales) {
             char label[16];
@@ -581,6 +639,13 @@ void Editor::header_row(app::Engine& engine) {
     }
     prepare_menu_popup();
     if (ImGui::BeginMenu("Window")) {
+        if (ImGui::MenuItem("Resources", "Ctrl+Space", drawer_ == Drawer::Resources)) {
+            drawer_ = drawer_ == Drawer::Resources ? Drawer::None : Drawer::Resources;
+        }
+        if (ImGui::MenuItem("Output", nullptr, drawer_ == Drawer::Output)) {
+            drawer_ = drawer_ == Drawer::Output ? Drawer::None : Drawer::Output;
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Reset Layout")) {
             reset_layout_ = true;
         }
@@ -592,10 +657,10 @@ void Editor::header_row(app::Engine& engine) {
 
 void Editor::dock_space(ImVec2 size) {
     // Named with the default layout's version: a new default replaces layouts kept from the old one.
-    const ImGuiID dock = ImGui::GetID("##dock 3");
+    const ImGuiID dock = ImGui::GetID("##dock 4");
     if (reset_layout_ || ImGui::DockBuilderGetNode(dock) == nullptr) {
-        // Left: the hierarchy (the cell map in a tab beside it) over the properties. Right: the Playground over the
-        // resources.
+        // Left: the hierarchy (the cell map in a tab beside it) over the properties. Right: the Playground. Resources
+        // and the output are drawers, out of the way until they're wanted.
         reset_layout_ = false;
         ImGui::DockBuilderRemoveNode(dock);
         ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
@@ -606,44 +671,194 @@ void Editor::dock_space(ImVec2 size) {
         ImGuiID hierarchy = 0;
         ImGuiID properties = 0;
         ImGui::DockBuilderSplitNode(left, ImGuiDir_Up, 0.45f, &hierarchy, &properties);
-        ImGuiID resources = 0;
-        ImGuiID playground = 0;
-        ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, 0.36f, &resources, &playground);
         ImGui::DockBuilderDockWindow(HierarchyPanel::kWindow, hierarchy);
         ImGui::DockBuilderDockWindow(CellMapPanel::kWindow, hierarchy);
         ImGui::DockBuilderDockWindow(PropertiesPanel::kWindow, properties);
-        ImGui::DockBuilderDockWindow(kPlayground, playground);
-        ImGui::DockBuilderDockWindow(AssetBrowser::kWindow, resources);
+        ImGui::DockBuilderDockWindow(kPlayground, right);
         ImGui::DockBuilderFinish(dock);
     }
-    ImGui::DockSpace(dock, size, ImGuiDockNodeFlags_NoWindowMenuButton);
+    dock_space_with_splitters(dock, size, ImGuiDockNodeFlags_NoWindowMenuButton);
 }
 
-void Editor::status_bar(ImVec2 size) {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(ThemeColor::Surface));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
-                        ImVec2(px(10.0f), std::max(0.0f, (size.y - ImGui::GetTextLineHeight()) * 0.5f)));
-    if (ImGui::BeginChild("##status", size, ImGuiChildFlags_AlwaysUseWindowPadding,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
-        // What the focused panel reports, or the editor's last word; the camera's speed at the right.
-        const char* text = hierarchy_.focused()  ? hierarchy_.status()
-                           : cell_map_.focused() ? cell_map_.status()
-                           : browser_.focused()  ? browser_.status()
-                                                 : message_;
-        ImGui::TextColored(color(ThemeColor::TextSecondary), "%s", text);
-        char speed[48];
-        static_cast<void>(
-            std::snprintf(speed, sizeof(speed), "Camera %.1f m/s", static_cast<double>(viewer_.camera().speed_mps)));
-        ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - ImGui::CalcTextSize(speed).x -
-                                                             ImGui::GetStyle().WindowPadding.x));
-        ImGui::TextColored(color(ThemeColor::TextSecondary), "%s", speed);
-        if (ImGui::IsItemHovered()) {
-            tooltip("The mouse wheel over the Playground changes it");
+bool Editor::drawer_button(const char* id, const char* label, bool content, bool open) {
+    const float height = ImGui::GetFrameHeight();
+    const float glyph = std::floor(height * 0.62f);
+    const float pad = px(8.0f);
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 size(pad + glyph + px(6.0f) + ImGui::CalcTextSize(label).x + pad, height);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    if (open || hovered) {
+        draw->AddRectFilled(
+            min, ImVec2(min.x + size.x, min.y + size.y),
+            color_u32(open ? (hovered ? ThemeColor::AccentHovered : ThemeColor::Accent) : ThemeColor::ControlHovered),
+            px(theme().metrics.control_rounding));
+    }
+    const ImVec2 glyph_min(min.x + pad, std::floor(min.y + ((height - glyph) * 0.5f)));
+    const ImU32 ink = color_u32(open || hovered ? ThemeColor::TextEmphasis : ThemeColor::Text);
+    if (content) {
+        draw_folder_glyph(glyph_min, glyph, glyph * 0.82f);
+    } else {
+        // Lines of text: the log.
+        const float line = std::max(1.0f, px(1.5f));
+        for (int i = 0; i < 4; ++i) {
+            const float y = glyph_min.y + (glyph * (0.18f + (0.22f * static_cast<float>(i))));
+            const float length = glyph * (i == 3 ? 0.55f : 0.95f);
+            draw->AddLine(ImVec2(glyph_min.x, y), ImVec2(glyph_min.x + length, y), ink, line);
         }
     }
+    draw->AddText(ImVec2(glyph_min.x + glyph + px(6.0f), std::floor(min.y + ((height - ImGui::GetFontSize()) * 0.5f))),
+                  ink, label);
+    return pressed;
+}
+
+void Editor::status_bar(app::Engine& engine, ImVec2 size) {
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, color(ThemeColor::Surface));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,
+                        ImVec2(px(6.0f), std::max(0.0f, (size.y - ImGui::GetFrameHeight()) * 0.5f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(4.0f), 0.0f));
+    if (ImGui::BeginChild("##status", size, ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        // The drawers, as Unreal's bottom bar has them: Resources and the output.
+        if (drawer_button("##resources drawer", "Resources", true, drawer_ == Drawer::Resources)) {
+            drawer_ = drawer_ == Drawer::Resources ? Drawer::None : Drawer::Resources;
+        }
+        if (ImGui::IsItemHovered()) {
+            tooltip("The project's files (Ctrl+Space)");
+        }
+        ImGui::SameLine();
+        if (drawer_button("##output drawer", "Output", false, drawer_ == Drawer::Output)) {
+            drawer_ = drawer_ == Drawer::Output ? Drawer::None : Drawer::Output;
+        }
+        if (ImGui::IsItemHovered()) {
+            tooltip("What the engine and the console have said");
+        }
+        // A command line: the console's (` over the Playground opens its window too).
+        ImGui::SameLine(0.0f, px(12.0f));
+        const float label_y = ImGui::GetCursorPosY() + ((ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f);
+        const float label_x = ImGui::GetCursorPosX();
+        ImGui::SetCursorPosY(label_y);
+        const bool typing = engine.console_ui != nullptr && engine.console_ui->command_line_active();
+        ImGui::TextColored(color(typing ? ThemeColor::Accent : ThemeColor::TextSecondary), "Cmd");
+        ImGui::SameLine(label_x + ImGui::CalcTextSize("Cmd").x + px(6.0f));
+        ImGui::SetCursorPosY(label_y - ((ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f));
+        if (engine.console_ui != nullptr) {
+            engine.console_ui->draw_command_line(px(380.0f), "a console command (help lists them)");
+        }
+        // What the focused panel reports, or the editor's last word. (The camera's speed is the toolbar's.)
+        const char* text = hierarchy_.focused()           ? hierarchy_.status()
+                           : cell_map_.focused()          ? cell_map_.status()
+                           : drawer_ == Drawer::Resources ? browser_.status()
+                                                          : message_;
+        ImGui::SameLine(0.0f, px(14.0f));
+        ImGui::SetCursorPosY(label_y);
+        ImGui::TextColored(color(ThemeColor::TextSecondary), "%s", text);
+        if (unsaved() || cooker_.running()) {
+            const char* state = cooker_.running() ? "Cooking..." : "Unsaved edits (Ctrl+S)";
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX() + px(14.0f),
+                                     ImGui::GetWindowWidth() - ImGui::CalcTextSize(state).x - px(12.0f)));
+            ImGui::SetCursorPosY(label_y);
+            ImGui::TextColored(color(cooker_.running() ? ThemeColor::TextSecondary : ThemeColor::Warning), "%s", state);
+        }
+        status_hovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
+    }
     ImGui::EndChild();
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
     ImGui::PopStyleColor();
+}
+
+bool Editor::drawer(app::Engine& engine, ImVec2 min, ImVec2 size) {
+    if (drawer_ == Drawer::None) {
+        return false;
+    }
+    // Up from the bottom bar, over the panels, as tall as was last dragged.
+    const float height = std::clamp(size.y * drawer_share_, std::min(px(140.0f), size.y), size.y);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, color(ThemeColor::Surface));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    constexpr ImGuiWindowFlags kDrawer = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+                                         ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoSavedSettings |
+                                         ImGuiWindowFlags_NoScrollWithMouse;
+    const bool content = drawer_ == Drawer::Resources;
+    bool hovered = false;
+    bool opened = false;
+    if (begin_over_panels(content ? "Resources##drawer" : "Output##drawer", ImVec2(min.x, min.y + size.y - height),
+                          ImVec2(size.x, height), kDrawer)) {
+        hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows |
+                                         ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+        ImDrawList* draw = ImGui::GetWindowDrawList();
+        const ImVec2 top = ImGui::GetWindowPos();
+        // Its top edge: dragged, it's taller or shorter.
+        const float edge = std::max(4.0f, px(5.0f));
+        ImGui::SetCursorScreenPos(top);
+        ImGui::InvisibleButton("##drawer edge", ImVec2(size.x, edge));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+        if (ImGui::IsItemActive()) {
+            drawer_share_ = std::clamp((min.y + size.y - ImGui::GetIO().MousePos.y) / size.y, 0.15f, 0.85f);
+        }
+        draw->AddLine(
+            top, ImVec2(top.x + size.x, top.y),
+            color_u32(ImGui::IsItemHovered() || ImGui::IsItemActive() ? ThemeColor::Accent : ThemeColor::Border),
+            std::max(1.0f, px(1.0f)));
+
+        // Its header: what it is, its own controls, and a close button at the right.
+        const float row = header_row_height();
+        const float inset = px(10.0f);
+        ImGui::SetCursorScreenPos(ImVec2(top.x + inset, top.y + edge));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(6.0f), 0.0f));
+        const float text_y = top.y + edge + ((row - ImGui::GetFontSize()) * 0.5f);
+        draw->AddText(ImVec2(top.x + inset, text_y), color_u32(ThemeColor::TextEmphasis),
+                      content ? "Resources" : "Output");
+        if (!content) {
+            // A filter over the lines, and clearing them.
+            ImGui::SetCursorScreenPos(
+                ImVec2(top.x + inset + px(70.0f), top.y + edge + ((row - ImGui::GetFrameHeight()) * 0.5f)));
+            search_field("##output filter", output_filter_, sizeof(output_filter_), "Filter the lines", px(260.0f));
+            ImGui::SameLine();
+            if (ImGui::Button("Clear") && engine.console_ui != nullptr) {
+                engine.console_ui->clear_log();
+            }
+        }
+        const float close = ImGui::GetFrameHeight();
+        ImGui::SetCursorScreenPos(ImVec2(top.x + size.x - close - inset, top.y + edge + ((row - close) * 0.5f)));
+        if (ImGui::InvisibleButton("##close drawer", ImVec2(close, close))) {
+            drawer_ = Drawer::None;
+        }
+        const ImVec2 cross = ImGui::GetItemRectMin();
+        const float pad = close * 0.3f;
+        const ImU32 cross_ink = color_u32(ImGui::IsItemHovered() ? ThemeColor::TextEmphasis : ThemeColor::Text);
+        draw->AddLine(ImVec2(cross.x + pad, cross.y + pad), ImVec2(cross.x + close - pad, cross.y + close - pad),
+                      cross_ink, std::max(1.0f, px(1.5f)));
+        draw->AddLine(ImVec2(cross.x + close - pad, cross.y + pad), ImVec2(cross.x + pad, cross.y + close - pad),
+                      cross_ink, std::max(1.0f, px(1.5f)));
+        ImGui::PopStyleVar();
+
+        // What it holds, below.
+        ImGui::SetCursorScreenPos(ImVec2(top.x, top.y + edge + row));
+        const ImVec2 room(size.x, std::max(1.0f, height - edge - row));
+        if (content) {
+            if (ImGui::BeginChild("##content", room)) {
+                opened = browser_.draw(engine.vfs, selection_);
+            }
+            ImGui::EndChild();
+        } else if (engine.console_ui != nullptr) {
+            ImGui::SetCursorScreenPos(ImVec2(top.x + inset, top.y + edge + row));
+            engine.console_ui->draw_log_panel(room.x - (2.0f * inset), room.y - px(4.0f), output_filter_);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+
+    // A click anywhere else puts it away, as Unreal's drawers do; not while a menu or popup of its own is open.
+    const bool clicked = ImGui::IsMouseClicked(ImGuiMouseButton_Left) || ImGui::IsMouseClicked(ImGuiMouseButton_Right);
+    if (clicked && !hovered && !status_hovered_ && !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup)) {
+        drawer_ = Drawer::None;
+    }
+    return opened;
 }
 
 View Editor::playground_view(ImVec2 min, ImVec2 size) const {
@@ -764,7 +979,7 @@ void Editor::playground_toolbar(app::Engine& engine) {
             draw->AddText(ImVec2(min.x + extent, std::floor(min.y + ((extent - ImGui::GetFontSize()) * 0.5f))),
                           color_u32(ThemeColor::Text), speed);
             if (hovered) {
-                tooltip("The camera's speed: the wheel over the scene changes it");
+                tooltip("The camera's speed: the wheel changes it while the right button flies the camera");
             }
             push_menu_style();
             if (ImGui::BeginPopup(kPopup)) {
@@ -780,10 +995,10 @@ void Editor::playground_toolbar(app::Engine& engine) {
             pop_menu_style();
         }
         ImGui::SameLine(0.0f, px(6.0f));
-        if (begin_combo("##scene_view", render::scene_view_name(engine.view), view_width)) {
+        if (begin_combo("##scene_view", ViewName(engine.view).text, view_width)) {
             for (uint32_t i = 0; i < static_cast<uint32_t>(render::SceneView::Count); ++i) {
                 const auto view = static_cast<render::SceneView>(i);
-                if (ImGui::Selectable(render::scene_view_name(view), engine.view == view)) {
+                if (ImGui::Selectable(ViewName(view).text, engine.view == view)) {
                     engine.view = view;
                 }
             }
@@ -824,6 +1039,10 @@ void Editor::playground(app::Engine& engine) {
         engine.viewport.want_height = static_cast<uint32_t>(std::lround(size.y * scale.y));
         const ImVec2 corner = ImGui::GetCursorScreenPos();
         const ImVec2 far_corner(corner.x + size.x, corner.y + size.y);
+        engine.viewport.ui_x = corner.x; // the frame stats go over the picture
+        engine.viewport.ui_y = corner.y;
+        engine.viewport.ui_width = size.x;
+        engine.viewport.ui_height = size.y;
         // A button under the picture: clicking the scene takes the keyboard from a text box, and hovering is exact.
         ImGui::InvisibleButton("scene", size,
                                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
@@ -840,6 +1059,15 @@ void Editor::playground(app::Engine& engine) {
         const flecs::entity selected = selection_.kind == Selection::Kind::Entity && ecs.is_alive(selection_.entity)
                                            ? ecs.entity(selection_.entity)
                                            : flecs::entity();
+        // The frame stats over the picture, as a part of this panel: whatever comes over it (a drawer, a menu) covers
+        // them.
+        if (engine.frame_stats && engine.stats_panel != nullptr) {
+            engine.stats_panel->draw_in_window(corner.x, corner.y, size.x, size.y);
+        }
+        if (engine.freeze_cull) {
+            tools::draw_viewport_notice(draw, corner.x, corner.y, size.x, "CULL FROZEN (F4)");
+        }
+        engine.viewport.overlays_drawn = true;
         draw->PushClipRect(corner, far_corner, true);
         // Alt keeps the mouse for the camera: no handle takes it then.
         const bool mouse_free = playground_hovered_ && !looking_ && !io.KeyAlt && !navigation_.dragging();
@@ -893,12 +1121,19 @@ void Editor::playground(app::Engine& engine) {
 
 void Editor::shortcuts(app::Engine& engine) {
     const flecs::world& ecs = engine.world.ecs();
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+        save(engine);
+    }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
         static_cast<void>(commands_.undo(ecs));
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Y, ImGuiInputFlags_RouteGlobal) ||
         ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
         static_cast<void>(commands_.redo(ecs));
+    }
+    // Ctrl+Space: the Resources drawer (Unreal's content drawer).
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Space, ImGuiInputFlags_RouteGlobal)) {
+        drawer_ = drawer_ == Drawer::Resources ? Drawer::None : Drawer::Resources;
     }
     // Ctrl+`: the world's axes or the selection's own, as Unreal's.
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_GraveAccent, ImGuiInputFlags_RouteGlobal)) {
@@ -909,6 +1144,222 @@ void Editor::shortcuts(app::Engine& engine) {
         selection_.kind == Selection::Kind::Entity) {
         selection_.frame_entity = true;
     }
+}
+
+void Editor::save(app::Engine& engine) {
+    if (cooker_.running()) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Still cooking the last save: save again after"));
+        return;
+    }
+    if (!cell_sources_.scan(engine.vfs) && cell_sources_.size() == 0) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Nothing saved: src:/content couldn't be read"));
+        return;
+    }
+    // Whatever the commands and the selection name, keyed now: the cook will spawn them again.
+    keyed_changes_ = UINT64_MAX;
+    cooking_.clear();
+    core::Array<MemberMove> moves(editor_heap());
+    const CellSaveReport report =
+        save_cells(engine.world.ecs(), engine.assets, engine.vfs, cell_sources_, viewer_.world_id(), &cooking_, &moves);
+    members_.apply(moves.span()); // what moved in the files: the cook will spawn it there
+    if (report.cells_failed > 0) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "%u %s couldn't be saved (the Output says why)",
+                                        report.cells_failed, report.cells_failed == 1 ? "file" : "files"));
+        start_cook(engine); // what was written, cooked
+        return;             // the edits stay unsaved
+    }
+    saved_changes_ = commands_.changes();
+    commands_.forget_saved_values(); // what's saved now is the world as it is
+    if (report.files_written == 0) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Nothing to save: the cells are as their files"));
+        return;
+    }
+    if (report.outside_cell > 0) {
+        DE_LOG_WARN("editor",
+                    "%u moved out of their cell's square, but no world lists their cell's file: they stay in it",
+                    report.outside_cell);
+    }
+    start_cook(engine);
+    char moved[96] = "";
+    if (report.refiled > 0) {
+        static_cast<void>(std::snprintf(moved, sizeof(moved), ", %u filed into another cell%s", report.refiled,
+                                        report.cells_made > 0 ? " (a new one)" : ""));
+    }
+    static_cast<void>(std::snprintf(message_, sizeof(message_), "Saved %u %s (%u %s%s)%s", report.files_written,
+                                    report.files_written == 1 ? "file" : "files", report.entities_changed,
+                                    report.entities_changed == 1 ? "entity" : "entities", moved,
+                                    cooker_.running() ? ": cooking" : ": run the cooker to see them in the game"));
+    DE_LOG_INFO("editor", "%s", message_);
+}
+
+void Editor::start_cook(app::Engine& engine) {
+    if (cooking_.empty() || cooker_.running()) {
+        return;
+    }
+    // In the background, into the engine's own cooked folder: cells and worlds (the shaders stay as they are).
+    const core::Result<platform::PathString> cooker = platform::program_beside_engine("cooker");
+    const char* src_root = engine.vfs.mount_root(platform::Mount::Src);
+    const char* game_root = engine.vfs.mount_root(platform::Mount::Game);
+    if (cooker && src_root != nullptr && game_root != nullptr) {
+        const char* args[] = {cooker->c_str(), "--src", src_root, "--out", game_root, "--no-shaders"};
+        if (core::Result<platform::Process> started = platform::Process::start(args)) {
+            cooker_ = std::move(*started);
+        }
+    }
+}
+
+bool Editor::may_close(app::Engine& /*engine*/) {
+    if (!unsaved() || !keep_settings_) {
+        return true; // nothing to lose (or a picture's run)
+    }
+    pending_ = Pending::Quit;
+    return false;
+}
+
+void Editor::unsaved_prompt(app::Engine& engine) {
+    constexpr const char* kPrompt = "Unsaved edits";
+    if (pending_ == Pending::None) {
+        return;
+    }
+    if (!ImGui::IsPopupOpen(kPrompt)) {
+        ImGui::OpenPopup(kPrompt);
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(16.0f), px(14.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(8.0f), px(10.0f)));
+    if (ImGui::BeginPopupModal(kPrompt, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        ImGui::TextUnformatted(pending_ == Pending::Quit ? "Save your edits before closing?"
+                                                         : "Save your edits before opening another world?");
+        ImGui::TextColored(color(ThemeColor::TextSecondary), "What isn't saved is lost.");
+        enum class Choice : uint8_t { None, Save, Discard, Cancel };
+        Choice choice = Choice::None;
+        const ImVec2 button(px(96.0f), 0.0f);
+        if (ImGui::Button("Save", button) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
+            choice = Choice::Save;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Don't Save", button)) {
+            choice = Choice::Discard;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", button) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            choice = Choice::Cancel;
+        }
+        if (choice != Choice::None) {
+            ImGui::CloseCurrentPopup();
+            const Pending pending = pending_;
+            pending_ = Pending::None;
+            if (choice == Choice::Save) {
+                save(engine);
+            }
+            // Saved (or let go): on with what was asked. A save that failed stays here, with the reason shown.
+            if (choice == Choice::Discard || (choice == Choice::Save && !unsaved())) {
+                if (pending == Pending::Quit) {
+                    quit_ = true; // the cooker, if it's running, finishes on its own
+                } else {
+                    open_world(engine, true);
+                }
+            }
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar(2);
+}
+
+void Editor::save_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    editor->save(*editor->engine_);
+    out.info("%s", editor->message_);
+}
+
+void Editor::move_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    app::Engine& engine = *editor->engine_;
+    if (args.size() != 4) {
+        out.error("editor.move takes a name and x y z");
+        return;
+    }
+    double place[3] = {};
+    for (size_t i = 0; i < 3; ++i) {
+        const std::string_view word = args[i + 1];
+        const std::from_chars_result parsed = std::from_chars(word.data(), word.data() + word.size(), place[i]);
+        if (parsed.ec != std::errc() || parsed.ptr != word.data() + word.size()) {
+            out.error("editor.move: '%.*s' isn't a number", static_cast<int>(word.size()), word.data());
+            return;
+        }
+    }
+    const std::string_view name = args[0];
+    flecs::entity found;
+    char label[128];
+    engine.world.ecs().each([&](flecs::entity entity, const world::Transform&) {
+        entity_label(engine.assets, entity, label);
+        if (!found.is_valid() && name == label) {
+            found = entity;
+        }
+    });
+    if (!found.is_valid()) {
+        out.error("editor.move: nothing is called %.*s", static_cast<int>(name.size()), name.data());
+        return;
+    }
+    world::Transform moved = found.get<world::Transform>();
+    moved.position = DVec3(place[0], place[1], place[2]);
+    if (!editor->commands_.set_component(found, engine.world.ecs().component<world::Transform>().id(),
+                                         std::as_bytes(std::span(&moved, 1)))) {
+        out.error("editor.move: %.*s couldn't be moved", static_cast<int>(name.size()), name.data());
+        return;
+    }
+    editor->selection_.select_entity(found.id());
+    out.info("moved %.*s to %g %g %g", static_cast<int>(name.size()), name.data(), place[0], place[1], place[2]);
+}
+
+void Editor::follow_saves(app::Engine& engine) {
+    DE_PROFILE_ZONE("Editor::follow_saves");
+    int code = 0;
+    if (cooker_.running() && cooker_.finished(code)) {
+        // Judged by what was saved: something else failing to cook (a terrain being worked on) isn't this save's.
+        uint32_t failed = 0;
+        const auto report = engine.vfs.read_whole_file("game:/cook_report.json", editor_heap());
+        const std::string_view text =
+            report ? std::string_view(reinterpret_cast<const char*>(report->data()), report->size()) : "";
+        for (const platform::PathString& path : cooking_) {
+            if (!report || cook_report_has_error(text, path.view())) {
+                ++failed;
+                DE_LOG_ERROR("editor", "%s didn't cook: game:/cook_report.json says why", path.c_str());
+            }
+        }
+        if (failed == 0) {
+            static_cast<void>(std::snprintf(message_, sizeof(message_), "Saved and cooked"));
+            DE_LOG_INFO("editor", "the saved cells cooked%s: hot reload brings them in",
+                        code == 0 ? "" : " (something else didn't: the cook report says what)");
+        } else {
+            static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                            "Saved, but %u %s didn't cook: the Output says why", failed,
+                                            failed == 1 ? "cell" : "cells"));
+        }
+        cooker_ = {};
+    }
+    // What the commands and the selection name, where it came from, while it's alive; and after a cell is spawned
+    // again, what took its place.
+    const flecs::world& ecs = engine.world.ecs();
+    if (selection_.kind == Selection::Kind::Entity) {
+        members_.note(ecs, engine.assets, selection_.entity);
+    }
+    if (commands_.changes() != keyed_changes_) {
+        keyed_changes_ = commands_.changes();
+        commands_.entities(scratch_entities_);
+        for (const flecs::entity_t entity : scratch_entities_) {
+            members_.note(ecs, engine.assets, entity);
+        }
+    }
+    members_.follow(ecs, engine.assets, [this](flecs::entity_t from, flecs::entity_t to) {
+        commands_.remap(from, to);
+        if (selection_.kind == Selection::Kind::Entity && selection_.entity == from) {
+            selection_.entity = to;
+        }
+        gathered_for_ = 0; // the selection's meshes again
+    });
 }
 
 tools::CameraPose Editor::camera_pose() const {
@@ -956,7 +1407,7 @@ void Editor::frame_selection(app::Engine& engine) {
                       lens != nullptr ? lens->vertical_fov_rad : 1.0f);
 }
 
-void Editor::open_world(app::Engine& engine) {
+void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     asset::Guid guid;
     asset::AssetId id;
     if (!source_asset_id(engine.vfs, selection_.file.view(), guid, id)) {
@@ -968,8 +1419,13 @@ void Editor::open_world(app::Engine& engine) {
     if (id == viewer_.world_id()) {
         return; // already open
     }
+    if (unsaved() && !unsaved_asked) {
+        pending_ = Pending::OpenWorld; // asked first; it comes back here
+        return;
+    }
     DE_LOG_INFO("editor", "opening %s (%s)", selection_.file.c_str(), asset::format_asset_id(id).c_str());
-    commands_.clear();     // their entities go with the world
+    commands_.clear(); // their entities go with the world
+    saved_changes_ = commands_.changes();
     selection_.entity = 0; // the file stays selected
     hierarchy_.reset();
     if (viewer_.open_world(engine, id)) {

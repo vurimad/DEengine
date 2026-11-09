@@ -7,6 +7,10 @@ add_library(de_editor STATIC
     asset_browser.h
     cell_map_panel.cpp
     cell_map_panel.h
+    cell_saver.cpp
+    cell_saver.h
+    cell_source.cpp
+    cell_source.h
     commands.cpp
     commands.h
     editor.cpp

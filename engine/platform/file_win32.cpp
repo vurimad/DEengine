@@ -371,4 +371,8 @@ core::Result<PathString> system_temp_folder() {
     return folder;
 }
 
+const char* program_suffix() {
+    return ".exe";
+}
+
 } // namespace de::platform

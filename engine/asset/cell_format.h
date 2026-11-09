@@ -48,7 +48,7 @@ struct CellEntity {
     CellEntityFlags flags = CellEntityFlags::None;
     uint32_t fog_volume = kNone; // into CellAsset::fog_volumes
     uint32_t collision = kNone;  // into the header's dependencies (a mesh's collision): a static body in that shape
-    uint32_t reserved = 0;
+    uint32_t source_index = 0;   // its place in the .cell source's entities, for the editor's saving: unique
 };
 static_assert(sizeof(CellEntity) == 80);
 
@@ -60,7 +60,7 @@ static_assert(sizeof(CellEntity) == 80);
 // Entities are in an order where every parent comes before its children.
 struct CellAsset {
     static constexpr AssetType kType = AssetType::Cell;
-    static constexpr uint16_t kFormatVersion = 4; // 4: collision
+    static constexpr uint16_t kFormatVersion = 5; // 4: collision; 5: each entity's place in the source
 
     AssetHeader header;
     int32_t coord_x = 0; // the cell's place in the grid (world::CellCoord)

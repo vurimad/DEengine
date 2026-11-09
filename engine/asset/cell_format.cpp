@@ -32,6 +32,9 @@ core::Result<void> CellAsset::validate(std::span<const std::byte> file) const {
         if (entity.parent != CellEntity::kNone && entity.parent >= i) {
             return core::fail(ErrorCode::CorruptData, "cell entity's parent doesn't come before it");
         }
+        if (entity.source_index >= all.size()) {
+            return core::fail(ErrorCode::CorruptData, "cell entity's place in its source is past the end");
+        }
         if (entity.mesh != CellEntity::kNone &&
             (entity.mesh >= dependencies.size() || dependencies[entity.mesh].type != AssetType::Mesh)) {
             return core::fail(ErrorCode::CorruptData, "cell entity's mesh isn't one of the cell's dependencies");

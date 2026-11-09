@@ -9,6 +9,8 @@
 
 #include <imgui.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <new>
@@ -63,6 +65,19 @@ void destroy_imgui() {
     if (ImGui::GetCurrentContext() != nullptr) {
         ImGui::DestroyContext();
     }
+}
+
+void draw_viewport_notice(ImDrawList* draw, float x, float y, float width, const char* text) {
+    const float font = ImGui::GetFontSize();
+    const ImVec2 size = ImGui::CalcTextSize(text);
+    const ImVec2 pad(std::floor(font * 0.75f), std::floor(font * 0.4f));
+    const float margin = std::floor(font * 0.8f);
+    const ImVec2 max(std::floor(x + width - margin), std::floor(y + margin + size.y + (2.0f * pad.y)));
+    const ImVec2 min(std::floor(max.x - size.x - (2.0f * pad.x)), std::floor(y + margin));
+    const float rounding = 2.0f;
+    draw->AddRectFilled(min, max, IM_COL32(255, 204, 0, 240), rounding);
+    draw->AddRect(min, max, IM_COL32(140, 100, 0, 255), rounding, ImDrawFlags_None, 1.0f);
+    draw->AddText(ImVec2(min.x + pad.x, min.y + pad.y), IM_COL32(24, 20, 8, 255), text);
 }
 
 struct DebugUiState {

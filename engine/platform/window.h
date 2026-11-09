@@ -36,6 +36,8 @@ public:
 
     // The user asked to close the window (or quit the app).
     bool close_requested() const { return close_requested_; }
+    // The close asked for isn't happening (the application asks first): close_requested() is false again.
+    void cancel_close() { close_requested_ = false; }
     bool minimized() const { return minimized_; }
     bool focused() const { return focused_; }
 
@@ -53,6 +55,10 @@ public:
     bool resized() const { return resized_; }
 
     void set_title(const char* title);
+    // Whether the click that brings the window to the front also reaches it, as a click: on for a tool (the editor: a
+    // button clicked while the window was behind another works at once); off by default, so a game doesn't act on the
+    // click that only meant to come back to it. SDL's setting: it holds for every window.
+    static void set_focus_clicks(bool pass);
 
     // The SDL window. Engine code doesn't need it: the RHI backend creates its surface through
     // create_vulkan_surface below.

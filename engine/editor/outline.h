@@ -50,7 +50,7 @@ private:
 };
 
 // The entity's name for people, into out (terminated, cut short if it doesn't fit): its flecs name, its name in its
-// cell's file, "cell [x, z]" for a cell, or what it is and its number ("Mesh 1234").
+// cell's file, "cell [x, z]" for a cell, or what it is and its number ("Mesh 1234"); "(gone)" if it's no longer there.
 void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std::span<char> out);
 
 // What the entity is, for people: "Cell", "Camera", "Fog volume", "Body", "Mesh" or "Entity".

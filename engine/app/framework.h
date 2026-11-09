@@ -19,6 +19,9 @@ namespace de::rhi {
 class Device;
 class Uploader;
 } // namespace de::rhi
+namespace de::console {
+class Console;
+}
 namespace de::render {
 class RenderGraph;
 class GpuAssets;
@@ -32,6 +35,10 @@ class AssetRegistry;
 namespace de::physics {
 class Physics;
 }
+namespace de::tools {
+class ConsoleUi;
+class StatsPanel;
+} // namespace de::tools
 namespace de::world {
 class World;
 }
@@ -75,6 +82,8 @@ struct FrameworkArgs {
     bool show_sticks = false;
 #if DE_BUILD_DEV
     EyesFlags eyes;
+    uint32_t stats_sections =
+        0; // --stats frame,gpu,...: what the frame stats show (tools/stats_panel.h); 0 the default
 #endif
 };
 
@@ -98,6 +107,15 @@ struct SceneViewport {
     uint64_t texture_id = 0;
     uint32_t width = 0;
     uint32_t height = 0;
+    // Asked by the application in ui() with the size: where the picture is in the UI (its coordinates), for what's
+    // drawn over it (the frame stats). 0 wide: the whole window.
+    float ui_x = 0.0f;
+    float ui_y = 0.0f;
+    float ui_width = 0.0f;
+    float ui_height = 0.0f;
+    // Set by the application when it drew the picture's overlays itself, inside its panel: the frame stats
+    // (StatsPanel::draw_in_window) and the notices (tools::draw_viewport_notice).
+    bool overlays_drawn = false;
 };
 #endif
 
@@ -115,6 +133,9 @@ struct Engine {
     world::World& world;
     physics::Physics& physics;
     render::GpuAssets& gpu_assets;
+    // Named commands and variables run from text: the console window (`), --exec, the agents' socket. An application
+    // adds its own, and removes them (Console::remove) when it shuts down.
+    console::Console& console;
     // config/engine.settings, as text (read with setting(engine.settings, "name")).
     std::string_view settings;
     // What each frame draws, as the application sets it.
@@ -132,6 +153,10 @@ struct Engine {
     SceneViewport viewport{}; // the scene in a panel (the editor), or over the window
     bool frame_stats = true;  // the frame stats panel shows (F1); off in pictures, and at first in the editor
     bool scripted = false;    // a picture or a path taken by script (the agent's eyes): no input, and nothing to keep
+    // The console's window and its pieces, for panels of an application's own (the editor's Output and command line).
+    tools::ConsoleUi* console_ui = nullptr;
+    // The frame stats, for an application that draws them in a panel of its own (the editor's Playground).
+    tools::StatsPanel* stats_panel = nullptr;
     // The editor's selection outline and picks (SceneRenderer::set_editor_overlay): off unless it asks. A pick asked
     // for is sent once; its answer comes back frames later in pick_answer, whose count grows by one each time.
     render::EditorOverlay editor_overlay{};
@@ -162,6 +187,9 @@ public:
     // frame_s is what this frame moves things by (FrameClock): over 0, in even steps while the frame rate
     // holds the refresh rate, otherwise the time measured.
     virtual bool update(Engine& engine, float frame_s) = 0;
+    // The window was asked to close (its close button, Alt+F4): true lets the run end, false keeps it going (the
+    // editor asks about unsaved edits first, then ends the run from update()).
+    virtual bool may_close(Engine& /*engine*/) { return true; }
 #if DE_BUILD_DEV
     // Dev builds, every frame that builds a debug UI, after update() and the world's advance: the application's
     // ImGui windows (the editor's panels). Engine::viewport puts the scene in one of them.

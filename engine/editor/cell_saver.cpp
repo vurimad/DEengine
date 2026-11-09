@@ -1,0 +1,787 @@
+#include "editor/cell_saver.h"
+
+#include "asset/cell_format.h"
+#include "asset/registry.h"
+#include "core/array.h"
+#include "core/fixed_string.h"
+#include "core/log.h"
+#include "core/profile.h"
+#include "editor/cell_source.h"
+#include "editor/source_files.h"
+#include "platform/vfs.h"
+#include "world/cell.h"
+#include "world/render_extract.h"
+#include "world/transform.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <span>
+#include <string_view>
+
+namespace de::editor {
+
+namespace {
+
+core::Allocator& saver_heap() {
+    return core::heap_allocator(core::MemoryTag::Editor);
+}
+
+using Name = core::FixedString<128>;
+
+std::string_view folder_of(std::string_view path) {
+    const size_t slash = path.rfind('/');
+    return slash == std::string_view::npos ? path : path.substr(0, slash);
+}
+
+// Every file under a folder of src:/content, into visit (its src:/ path).
+template <typename Visit>
+bool list_sources(const platform::Vfs& vfs, const platform::PathString& folder, int depth, Visit& visit) {
+    if (depth > 32) {
+        return true;
+    }
+    bool ok = true;
+    const core::Result<void> listed = vfs.list(folder.c_str(), [&](const char* name, bool is_directory) {
+        platform::PathString path;
+        if (!path.assign(folder.view()) || !path.append("/") || !path.append(name)) {
+            return;
+        }
+        if (is_directory) {
+            ok = list_sources(vfs, path, depth + 1, visit) && ok;
+        } else {
+            visit(path);
+        }
+    });
+    if (!listed) {
+        DE_LOG_WARN("editor", "can't look through %s: %s", folder.c_str(), listed.error().message);
+        return false;
+    }
+    return ok;
+}
+
+bool read_text(const platform::Vfs& vfs, const char* path, core::Array<char>& out) {
+    const auto bytes = vfs.read_whole_file(path, saver_heap());
+    if (!bytes) {
+        return false;
+    }
+    out.resize(bytes->size());
+    std::memcpy(out.data(), bytes->data(), bytes->size());
+    return true;
+}
+
+// A member of a loaded cell: which of the cooked cell's entities it is.
+struct Member {
+    flecs::entity_t cell = 0;
+    uint32_t index = 0;
+    flecs::entity_t entity = 0;
+};
+
+bool same_position(const DVec3& a, const double (&b)[3]) {
+    constexpr double kTolerance = 1e-5; // well under what a file writes (0.1 mm)
+    return std::abs(a.x - b[0]) <= kTolerance && std::abs(a.y - b[1]) <= kTolerance &&
+           std::abs(a.z - b[2]) <= kTolerance;
+}
+
+bool same_rotation(const Quat& a, const float (&b)[4]) {
+    const float dot = (a.x * b[0]) + (a.y * b[1]) + (a.z * b[2]) + (a.w * b[3]);
+    return std::abs(dot) >= 1.0f - 1e-7f;
+}
+
+bool same_floats(const float* a, const float* b, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        if (std::abs(a[i] - b[i]) > 1e-6f * std::max(1.0f, std::abs(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// A fog volume's key, written as its file writes it.
+struct FogEdit {
+    const char* key = "";
+    char value[96] = {};
+    int decimals = 4; // -1: compared as text
+};
+
+void number_list(const float* values, size_t count, std::span<char> out) {
+    size_t length = 0;
+    out[length++] = '[';
+    for (size_t i = 0; i < count; ++i) {
+        if (i > 0) {
+            out[length++] = ',';
+            out[length++] = ' ';
+        }
+        length += format_number(values[i], 4, out.subspan(length));
+    }
+    out[length++] = ']';
+    out[length] = '\0';
+}
+
+// What differs between a fog volume as cooked and as it is now, key by key.
+size_t fog_edits(const asset::CellFogVolume& cooked, const world::FogVolume& now, std::span<FogEdit> out) {
+    size_t count = 0;
+    const auto number = [&](const char* key, float was, float is) {
+        if (!same_floats(&is, &was, 1) && count < out.size()) {
+            FogEdit& edit = out[count++];
+            edit.key = key;
+            edit.value[format_number(is, 4, edit.value)] = '\0';
+        }
+    };
+    const auto list = [&](const char* key, const float* was, const float* is) {
+        if (!same_floats(is, was, 3) && count < out.size()) {
+            FogEdit& edit = out[count++];
+            edit.key = key;
+            number_list(is, 3, edit.value);
+        }
+    };
+    const bool was_ellipsoid = cooked.shape == asset::CellFogShape::Ellipsoid;
+    if (was_ellipsoid != now.ellipsoid && count < out.size()) {
+        FogEdit& edit = out[count++];
+        edit.key = "shape";
+        static_cast<void>(std::snprintf(edit.value, sizeof(edit.value), "\"%s\"", now.ellipsoid ? "ellipsoid" : "box"));
+        edit.decimals = -1;
+    }
+    number("density_per_m", cooked.density_per_m, now.density_per_m);
+    number("edge_m", cooked.edge_m, now.edge_m);
+    list("tint", cooked.tint, now.tint);
+    number("noise_size_m", cooked.noise_size_m, now.noise_size_m);
+    number("noise_amount", cooked.noise_amount, now.noise_amount);
+    list("drift_mps", cooked.drift_mps, now.drift_mps);
+    number("height_fade_m", cooked.height_fade_m, now.height_fade_m);
+    return count;
+}
+
+// A cell file open while saving, edited in memory and written at the end.
+struct OpenFile {
+    explicit OpenFile(core::Allocator& allocator) : source(allocator), removed(allocator) {}
+    platform::PathString path;
+    CellSource source;
+    int32_t x = 0;
+    int32_t z = 0;
+    uint32_t world = UINT32_MAX; // the world it's filed in (UINT32_MAX: none lists it)
+    bool changed = false;
+    bool made = false;             // a new file, for a cell that had none
+    bool received = false;         // things moved into it from another cell's file
+    core::Array<uint32_t> removed; // places taken out (as they were before any was)
+};
+
+// One entry moving from its file to another cell's.
+struct Moving {
+    uint32_t from_file = 0;
+    uint32_t from_index = 0;
+    uint32_t to_file = 0;
+    Name name;
+    Name parent;
+    bool parent_renamed = false; // its parent took another name where they go
+    core::Array<char> text{saver_heap()};
+};
+
+} // namespace
+
+// ---- CellSources ----
+
+bool CellSources::scan(const platform::Vfs& vfs) {
+    DE_PROFILE_ZONE("CellSources::scan");
+    cells_.clear();
+    worlds_.clear();
+    listed_.clear();
+    by_id_.clear();
+    platform::PathString root;
+    static_cast<void>(root.assign("src:/content"));
+    core::Array<char> text(saver_heap());
+    CellSource reader(saver_heap());
+    core::Array<platform::PathString> world_paths(saver_heap());
+    auto visit = [&](const platform::PathString& path) {
+        if (path.view().ends_with(".world")) {
+            world_paths.push(path);
+            return;
+        }
+        if (!path.view().ends_with(".cell")) {
+            return;
+        }
+        asset::Guid guid;
+        Cell cell;
+        if (!source_asset_id(vfs, path.view(), guid, cell.id)) {
+            return; // not cooked yet: nothing loaded came from it
+        }
+        cell.path = path;
+        if (read_text(vfs, path.c_str(), text) && reader.parse({text.data(), text.size()})) {
+            cell.placed = reader.coord(cell.x, cell.z);
+        }
+        by_id_.set(cell.id.value(), static_cast<uint32_t>(cells_.size()));
+        cells_.push(cell);
+    };
+    const bool listed = list_sources(vfs, root, 0, visit);
+    for (const platform::PathString& path : world_paths) {
+        World world;
+        asset::Guid guid;
+        if (!source_asset_id(vfs, path.view(), guid, world.id) || !read_text(vfs, path.c_str(), text)) {
+            continue;
+        }
+        world.path = path;
+        const auto index = static_cast<uint32_t>(worlds_.size());
+        worlds_.push(world);
+        static_cast<void>(world_cells({text.data(), text.size()}, [&](std::string_view cell) {
+            char joined[platform::kMaxPathLength];
+            size_t length = 0;
+            if (!joined_path(folder_of(path.view()), cell, joined, length)) {
+                return;
+            }
+            const std::string_view full(joined, length);
+            for (size_t i = 0; i < cells_.size(); ++i) {
+                if (cells_[i].path.view() == full) {
+                    listed_.push({.world = index, .cell = static_cast<uint32_t>(i)});
+                }
+            }
+        }));
+    }
+    return listed;
+}
+
+const CellSources::Cell* CellSources::find(asset::AssetId id) const {
+    const uint32_t* index = by_id_.find(id.value());
+    return index != nullptr ? &cells_[*index] : nullptr;
+}
+
+uint32_t CellSources::world_of(std::string_view cell_path, asset::AssetId wanted) const {
+    uint32_t first = UINT32_MAX;
+    for (const Listing& listing : listed_) {
+        if (cells_[listing.cell].path.view() != cell_path) {
+            continue;
+        }
+        if (worlds_[listing.world].id == wanted) {
+            return listing.world;
+        }
+        first = std::min(first, listing.world);
+    }
+    return first;
+}
+
+const CellSources::Cell* CellSources::cell_at(uint32_t world, int32_t x, int32_t z) const {
+    for (const Listing& listing : listed_) {
+        const Cell& cell = cells_[listing.cell];
+        if (listing.world == world && cell.placed && cell.x == x && cell.z == z) {
+            return &cell;
+        }
+    }
+    return nullptr;
+}
+
+// ---- Saving ----
+
+CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& assets, const platform::Vfs& vfs,
+                          const CellSources& sources, asset::AssetId world, core::Array<platform::PathString>* written,
+                          core::Array<MemberMove>* moves) {
+    DE_PROFILE_ZONE("save_cells");
+    CellSaveReport report;
+
+    // Every member of a loaded cell, grouped by cell.
+    core::Array<Member> members(saver_heap());
+    ecs.each([&](flecs::entity entity, const world::CellMember& member) {
+        const flecs::entity cell = entity.target<world::InCell>();
+        if (cell.is_valid()) {
+            members.push({.cell = cell.id(), .index = member.index, .entity = entity.id()});
+        }
+    });
+    std::ranges::sort(members, [](const Member& a, const Member& b) {
+        return a.cell != b.cell ? a.cell < b.cell : a.index < b.index;
+    });
+
+    core::Array<OpenFile> files(saver_heap());
+    core::Array<char> text(saver_heap());
+    const auto open_file = [&](const char* path) -> uint32_t {
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (files[i].path.view() == path) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        if (!read_text(vfs, path, text)) {
+            DE_LOG_ERROR("editor", "can't read %s", path);
+            return UINT32_MAX;
+        }
+        OpenFile& file = files.push(OpenFile(saver_heap()));
+        static_cast<void>(file.path.assign(path));
+        if (const core::Result<void> parsed = file.source.parse({text.data(), text.size()}); !parsed) {
+            DE_LOG_ERROR("editor", "can't save into %s: %s", path, parsed.error().message);
+            files.pop();
+            return UINT32_MAX;
+        }
+        static_cast<void>(file.source.coord(file.x, file.z));
+        file.world = sources.world_of(file.path.view(), world);
+        return static_cast<uint32_t>(files.size() - 1);
+    };
+
+    // 1. Each cell's changes, into its file; and what now stands in another cell's square.
+    struct Refile {
+        uint32_t file = 0;
+        uint32_t source_index = 0;
+        int32_t x = 0;
+        int32_t z = 0;
+    };
+    core::Array<Refile> refiles(saver_heap());
+    core::Array<flecs::entity_t> by_index(saver_heap());
+    for (size_t first = 0; first < members.size();) {
+        size_t last = first;
+        while (last < members.size() && members[last].cell == members[first].cell) {
+            ++last;
+        }
+        const std::span<const Member> group(members.data() + first, last - first);
+        first = last;
+
+        const flecs::entity cell = ecs.entity(group[0].cell);
+        const auto* held = cell.try_get<world::Cell>();
+        const asset::CellAsset* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
+        if (cooked == nullptr) {
+            continue; // not loaded now: nothing of it is shown, so nothing was edited
+        }
+        const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
+        const std::span<const asset::CellFogVolume> fogs = cooked->fog_volumes.get(cooked);
+        by_index.clear();
+        by_index.resize(entities.size(), 0);
+        for (const Member& member : group) {
+            if (member.index < entities.size()) {
+                by_index[member.index] = member.entity;
+            }
+        }
+
+        struct Change {
+            uint32_t source_index = 0;
+            std::string_view name; // as cooked: the file's entry there must have it
+            SourceTransform transform;
+            TransformParts parts;
+            FogEdit fog[8];
+            size_t fog_count = 0;
+        };
+        core::Array<Change> changes(saver_heap());
+        core::Array<Refile> leaving(saver_heap());
+        for (size_t i = 0; i < entities.size(); ++i) {
+            const asset::CellEntity& entry = entities[i];
+            const flecs::entity entity = by_index[i] != 0 ? ecs.entity(by_index[i]) : flecs::entity();
+            const auto* now = entity.is_valid() ? entity.try_get<world::WorldTransform>() : nullptr;
+            if (now == nullptr) {
+                continue;
+            }
+            world::Transform local{.position = now->position, .rotation = now->rotation, .scale = now->scale};
+            if (entry.parent != asset::CellEntity::kNone) {
+                const flecs::entity parent =
+                    by_index[entry.parent] != 0 ? ecs.entity(by_index[entry.parent]) : flecs::entity();
+                const auto* parent_now = parent.is_valid() ? parent.try_get<world::WorldTransform>() : nullptr;
+                if (parent_now == nullptr) {
+                    continue; // its parent's gone: where it stands relative to it isn't known
+                }
+                local = world::local_of(*parent_now, *now);
+            } else {
+                // A root files by where it stands: its origin, divided by the cell's size, rounded down.
+                const auto x = static_cast<int32_t>(std::floor(now->position.x / world::kCellSize));
+                const auto z = static_cast<int32_t>(std::floor(now->position.z / world::kCellSize));
+                if (x != cooked->coord_x || z != cooked->coord_z) {
+                    leaving.push({.source_index = entry.source_index, .x = x, .z = z});
+                }
+            }
+            Change change{.source_index = entry.source_index,
+                          .name = cooked->name(cooked, entry),
+                          .transform = {.position = local.position, .rotation = local.rotation, .scale = local.scale},
+                          .parts = {.position = !same_position(local.position, entry.position),
+                                    .rotation = !same_rotation(local.rotation, entry.rotation),
+                                    .scale = !same_floats(&local.scale.x, entry.scale, 3)},
+                          .fog = {},
+                          .fog_count = 0};
+            const auto* fog_now = entity.try_get<world::FogVolume>();
+            if (fog_now != nullptr && entry.fog_volume < fogs.size()) {
+                change.fog_count = fog_edits(fogs[entry.fog_volume], *fog_now, change.fog);
+            }
+            const bool moved_here = change.parts.position || change.parts.rotation || change.parts.scale;
+            // One leaving its cell is checked against the file too, though it may not have moved within it.
+            const bool leaves = !leaving.empty() && leaving[leaving.size() - 1].source_index == entry.source_index;
+            if (moved_here || change.fog_count > 0 || leaves) {
+                changes.push(change);
+            }
+        }
+        if (changes.empty()) {
+            continue;
+        }
+        const CellSources::Cell* source_cell = sources.find(assets.asset(held->asset).id);
+        const uint32_t file_index = source_cell != nullptr ? open_file(source_cell->path.c_str()) : UINT32_MAX;
+        if (file_index == UINT32_MAX) {
+            if (source_cell == nullptr) {
+                DE_LOG_ERROR("editor", "cell [%d, %d] has edits, but its source wasn't found under src:/content",
+                             cooked->coord_x, cooked->coord_z);
+            }
+            ++report.cells_failed;
+            continue;
+        }
+        OpenFile& file = files[file_index];
+        // The file must be the one the cell was cooked from: each entry where the cook had it.
+        bool all_there = true;
+        for (const Change& change : changes) {
+            all_there = all_there && change.source_index < file.source.entity_count() &&
+                        file.source.name(change.source_index) == change.name;
+        }
+        if (!all_there) {
+            DE_LOG_ERROR("editor", "%s changed since it was cooked: cook it, then save again", file.path.c_str());
+            ++report.cells_failed;
+            continue;
+        }
+        core::Array<char> was(saver_heap());
+        was.resize(file.source.view().size());
+        std::memcpy(was.data(), file.source.view().data(), was.size());
+        for (const Change& change : changes) {
+            static_cast<void>(file.source.set_transform(change.source_index, change.transform, change.parts));
+            for (size_t f = 0; f < change.fog_count; ++f) {
+                static_cast<void>(file.source.set_fog_member(change.source_index, change.fog[f].key,
+                                                             change.fog[f].value, change.fog[f].decimals));
+            }
+        }
+        if (file.source.view() != std::string_view(was.data(), was.size())) {
+            file.changed = true;
+            report.entities_changed += static_cast<uint32_t>(changes.size());
+        }
+        for (Refile& refile : leaving) {
+            refile.file = file_index;
+            refiles.push(refile);
+        }
+    }
+
+    // 2. What stands in another cell's square goes to that cell's file, with everything under it.
+    core::Array<Moving> moving(saver_heap());
+    for (const Refile& refile : refiles) {
+        if (files[refile.file].world == UINT32_MAX) {
+            ++report.outside_cell; // no world lists its file: nowhere to file it by
+            continue;
+        }
+        // Its target: the world's cell there, else a file made for it next to the one it leaves.
+        const uint32_t world_index = files[refile.file].world;
+        uint32_t target = UINT32_MAX;
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (files[i].world == world_index && files[i].x == refile.x && files[i].z == refile.z &&
+                (files[i].made || sources.cell_at(world_index, refile.x, refile.z) != nullptr)) {
+                target = static_cast<uint32_t>(i);
+            }
+        }
+        if (target == UINT32_MAX) {
+            if (const CellSources::Cell* there = sources.cell_at(world_index, refile.x, refile.z)) {
+                target = open_file(there->path.c_str());
+            } else {
+                platform::PathString path;
+                for (int n = 1; n < 100; ++n) {
+                    char name[64];
+                    static_cast<void>(
+                        n == 1 ? std::snprintf(name, sizeof(name), "/cell_%d_%d.cell", refile.x, refile.z)
+                               : std::snprintf(name, sizeof(name), "/cell_%d_%d_%d.cell", refile.x, refile.z, n));
+                    if (!path.assign(folder_of(files[refile.file].path.view())) || !path.append(name)) {
+                        break;
+                    }
+                    bool taken = vfs.exists(path.c_str());
+                    for (const OpenFile& open : files) {
+                        taken = taken || open.path.view() == path.view();
+                    }
+                    if (!taken) {
+                        break;
+                    }
+                }
+                OpenFile& made = files.push(OpenFile(saver_heap()));
+                made.path = path;
+                new_cell_text(refile.x, refile.z, text);
+                static_cast<void>(made.source.parse({text.data(), text.size()}));
+                made.x = refile.x;
+                made.z = refile.z;
+                made.world = world_index;
+                made.made = true;
+                made.changed = true;
+                target = static_cast<uint32_t>(files.size() - 1);
+                ++report.cells_made;
+            }
+        }
+        if (target == UINT32_MAX) {
+            ++report.cells_failed;
+            continue;
+        }
+        // The root, and what names it as a parent, and what names those, in the file's order.
+        const CellSource& from = files[refile.file].source;
+        core::Array<uint8_t> going(saver_heap());
+        going.resize(from.entity_count(), 0);
+        going[refile.source_index] = 1;
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (uint32_t i = 0; i < from.entity_count(); ++i) {
+                if (going[i] != 0 || from.parent(i).empty()) {
+                    continue;
+                }
+                for (uint32_t p = 0; p < from.entity_count(); ++p) {
+                    if (going[p] != 0 && from.name(p) == from.parent(i)) {
+                        going[i] = 1;
+                        grew = true;
+                        break;
+                    }
+                }
+            }
+        }
+        for (uint32_t i = 0; i < from.entity_count(); ++i) {
+            if (going[i] == 0) {
+                continue;
+            }
+            Moving& entry = moving.push(Moving{});
+            entry.from_file = refile.file;
+            entry.from_index = i;
+            entry.to_file = target;
+            static_cast<void>(entry.name.assign(from.name(i)));
+            static_cast<void>(entry.parent.assign(from.parent(i)));
+            const std::string_view object = from.entity_text(i);
+            entry.text.resize(object.size());
+            std::memcpy(entry.text.data(), object.data(), object.size());
+            files[refile.file].removed.push(i);
+        }
+        ++report.refiled;
+    }
+
+    // Out of the files they leave, the last first, so the places of the others hold while they go.
+    for (OpenFile& file : files) {
+        if (file.removed.empty()) {
+            continue;
+        }
+        std::ranges::sort(file.removed, std::greater<>());
+        for (const uint32_t index : file.removed) {
+            static_cast<void>(file.source.remove_entity(index));
+        }
+        file.changed = true;
+        // Those after them moved up.
+        if (moves != nullptr) {
+            const auto total = static_cast<uint32_t>(file.source.entity_count() + file.removed.size());
+            for (uint32_t index = 0; index < total; ++index) {
+                const auto gone_before = static_cast<uint32_t>(
+                    std::ranges::count_if(file.removed, [index](uint32_t removed) { return removed < index; }));
+                const bool gone = std::ranges::find(file.removed, index) != file.removed.end();
+                if (!gone && gone_before > 0) {
+                    moves->push({.from = {.x = file.x, .z = file.z, .source_index = index},
+                                 .to = {.x = file.x, .z = file.z, .source_index = index - gone_before}});
+                }
+            }
+        }
+    }
+    // Into the files they go to, named apart from what's there, their meshes found from the new folder.
+    for (size_t m = 0; m < moving.size(); ++m) {
+        Moving& entry = moving[m];
+        OpenFile& to = files[entry.to_file];
+        const OpenFile& from = files[entry.from_file];
+        const uint32_t placed = to.source.add_entity({entry.text.data(), entry.text.size()});
+        to.changed = true;
+        to.received = true;
+        if (!entry.name.empty()) {
+            Name unique = entry.name;
+            for (int n = 2; n < 1000; ++n) {
+                bool taken = false;
+                for (uint32_t i = 0; i < to.source.entity_count() && !taken; ++i) {
+                    taken = i != placed && to.source.name(i) == unique.view();
+                }
+                if (!taken) {
+                    break;
+                }
+                char suffixed[160];
+                static_cast<void>(std::snprintf(suffixed, sizeof(suffixed), "%s_%d", entry.name.c_str(), n));
+                static_cast<void>(unique.assign(suffixed));
+            }
+            if (unique.view() != entry.name.view()) {
+                char quoted[160];
+                static_cast<void>(std::snprintf(quoted, sizeof(quoted), "\"%s\"", unique.c_str()));
+                static_cast<void>(to.source.set_entity_member(placed, "name", quoted));
+                DE_LOG_INFO("editor", "%s is %s in %s: the name was taken there", entry.name.c_str(), unique.c_str(),
+                            to.path.c_str());
+                // What names it as a parent, coming with it, follows.
+                for (size_t c = m + 1; c < moving.size(); ++c) {
+                    if (moving[c].to_file == entry.to_file && moving[c].parent.view() == entry.name.view()) {
+                        static_cast<void>(moving[c].parent.assign(unique.view()));
+                        moving[c].parent_renamed = true;
+                    }
+                }
+            }
+        }
+        if (entry.parent_renamed) {
+            char quoted[160];
+            static_cast<void>(std::snprintf(quoted, sizeof(quoted), "\"%s\"", entry.parent.c_str()));
+            static_cast<void>(to.source.set_entity_member(placed, "parent", quoted));
+        }
+        // A mesh by a path from the old file's folder, from the new one's.
+        const std::string_view mesh = to.source.mesh(placed);
+        const std::string_view from_folder = folder_of(from.path.view());
+        const std::string_view to_folder = folder_of(to.path.view());
+        if (!mesh.empty() && from_folder != to_folder) {
+            char full[platform::kMaxPathLength];
+            char relative[platform::kMaxPathLength + 2];
+            size_t full_length = 0;
+            size_t relative_length = 0;
+            if (joined_path(from_folder, mesh, full, full_length) &&
+                relative_path(to_folder, {full, full_length}, {relative + 1, sizeof(relative) - 2}, relative_length)) {
+                relative[0] = '"';
+                relative[relative_length + 1] = '"';
+                static_cast<void>(to.source.set_entity_member(placed, "mesh", {relative, relative_length + 2}));
+            }
+        }
+        if (moves != nullptr) {
+            moves->push({.from = {.x = from.x, .z = from.z, .source_index = entry.from_index},
+                         .to = {.x = to.x, .z = to.z, .source_index = placed}});
+        }
+    }
+
+    // 3. Every file that changed: first those things moved into, then the rest. If one of the first can't be written,
+    // the files things left aren't either, so nothing is in neither.
+    bool receiving_failed = false;
+    for (int pass = 0; pass < 2; ++pass) {
+        for (const OpenFile& file : files) {
+            if (!file.changed || file.received != (pass == 0)) {
+                continue;
+            }
+            if (pass == 1 && receiving_failed && !file.removed.empty()) {
+                DE_LOG_ERROR("editor", "%s isn't written: what moves out of it couldn't be written where it goes",
+                             file.path.c_str());
+                ++report.cells_failed;
+                continue;
+            }
+            if (const core::Result<void> stored = vfs.write_file(file.path.c_str(), std::as_bytes(file.source.text()));
+                !stored) {
+                DE_LOG_ERROR("editor", "can't write %s: %s", file.path.c_str(), stored.error().message);
+                ++report.cells_failed;
+                receiving_failed = receiving_failed || pass == 0;
+                continue;
+            }
+            DE_LOG_INFO("editor", "saved %s%s", file.path.c_str(), file.made ? " (a new cell)" : "");
+            ++report.files_written;
+            if (written != nullptr) {
+                written->push(file.path);
+            }
+        }
+    }
+    core::Array<char> world_text(saver_heap());
+    core::Array<char> edited(saver_heap());
+    for (const OpenFile& file : files) {
+        if (!file.made || file.world == UINT32_MAX) {
+            continue;
+        }
+        const CellSources::World& owner = sources.world(file.world);
+        char listed[platform::kMaxPathLength];
+        size_t length = 0;
+        if (!read_text(vfs, owner.path.c_str(), world_text) ||
+            !relative_path(folder_of(owner.path.view()), file.path.view(), listed, length) ||
+            !add_world_cell({world_text.data(), world_text.size()}, {listed, length}, edited) ||
+            !vfs.write_file(owner.path.c_str(), std::as_bytes(edited.span()))) {
+            DE_LOG_ERROR("editor", "can't add %s to %s's cells: add it by hand", file.path.c_str(), owner.path.c_str());
+            ++report.cells_failed;
+            continue;
+        }
+        DE_LOG_INFO("editor", "added %.*s to %s", static_cast<int>(length), listed, owner.path.c_str());
+        ++report.files_written;
+        if (written != nullptr) {
+            written->push(owner.path);
+        }
+    }
+    return report;
+}
+
+bool cook_report_has_error(std::string_view report, std::string_view source) {
+    // The report names sources from src:/ ("content/a.cell"); each diagnostic writes its severity, then its path.
+    constexpr std::string_view kSrc = "src:/";
+    const std::string_view path = source.starts_with(kSrc) ? source.substr(kSrc.size()) : source;
+    constexpr std::string_view kError = R"("severity": "error")";
+    constexpr std::string_view kPath = R"("path": ")";
+    for (size_t at = report.find(kError); at != std::string_view::npos; at = report.find(kError, at + 1)) {
+        const size_t end = report.find('}', at);
+        const size_t key = report.find(kPath, at);
+        if (key == std::string_view::npos || key > end) {
+            continue;
+        }
+        const size_t begin = key + kPath.size();
+        const size_t close = report.find('"', begin);
+        if (close != std::string_view::npos && report.substr(begin, close - begin) == path) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ---- MemberTracker ----
+
+uint64_t MemberTracker::pack(const MemberKey& key) {
+    return (static_cast<uint64_t>(static_cast<uint16_t>(key.x)) << 48U) |
+           (static_cast<uint64_t>(static_cast<uint16_t>(key.z)) << 32U) | key.source_index;
+}
+
+void MemberTracker::note(const flecs::world& ecs, const asset::AssetRegistry& assets, flecs::entity_t id) {
+    if (id == 0 || !ecs.is_alive(id)) {
+        return;
+    }
+    const flecs::entity entity = ecs.entity(id);
+    const auto* member = entity.try_get<world::CellMember>();
+    const flecs::entity cell = member != nullptr ? entity.target<world::InCell>() : flecs::entity();
+    const auto* held = cell.is_valid() ? cell.try_get<world::Cell>() : nullptr;
+    const auto* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
+    if (cooked == nullptr) {
+        return;
+    }
+    const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
+    if (member->index < entities.size()) {
+        keys_.set(id,
+                  {.x = cooked->coord_x, .z = cooked->coord_z, .source_index = entities[member->index].source_index});
+    }
+}
+
+void MemberTracker::apply(std::span<const MemberMove> moves) {
+    for (auto [entity, key] : keys_) {
+        for (const MemberMove& move : moves) {
+            if (move.from == key) {
+                key = move.to;
+                break;
+            }
+        }
+    }
+}
+
+void MemberTracker::follow(const flecs::world& ecs, const asset::AssetRegistry& assets,
+                           core::FunctionRef<void(flecs::entity_t from, flecs::entity_t to)> moved) {
+    bool spawned = false;
+    ecs.each([&](flecs::entity cell, const world::CellContents& contents) {
+        uint32_t* known = revisions_.find(cell.id());
+        if (known == nullptr) {
+            revisions_.set(cell.id(), contents.revision);
+            spawned = spawned || contents.revision != 0; // a cell loaded since: it may hold what moved there
+        } else if (*known != contents.revision) {
+            *known = contents.revision;
+            spawned = true;
+        }
+    });
+    if (!spawned || keys_.empty()) {
+        return;
+    }
+    // Every member by its key, then each noted entity that's gone finds its own.
+    members_.clear();
+    ecs.each([&](flecs::entity entity, const world::CellMember& member) {
+        const flecs::entity cell = entity.target<world::InCell>();
+        const auto* held = cell.is_valid() ? cell.try_get<world::Cell>() : nullptr;
+        const auto* cooked = held != nullptr ? assets.get<asset::CellAsset>(held->asset) : nullptr;
+        if (cooked == nullptr) {
+            return;
+        }
+        const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
+        if (member.index < entities.size()) {
+            members_.set(
+                pack({.x = cooked->coord_x, .z = cooked->coord_z, .source_index = entities[member.index].source_index}),
+                entity.id());
+        }
+    });
+    moved_.clear();
+    for (auto [entity, key] : keys_) {
+        if (ecs.is_alive(entity)) {
+            continue;
+        }
+        if (const flecs::entity_t* now = members_.find(pack(key)); now != nullptr) {
+            moved_.push({.from = entity, .to = *now, .key = key});
+        }
+    }
+    for (const Moved& move : moved_) {
+        static_cast<void>(keys_.remove(move.from));
+        keys_.set(move.to, move.key);
+        moved(move.from, move.to);
+    }
+}
+
+} // namespace de::editor

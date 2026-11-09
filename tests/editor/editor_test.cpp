@@ -6,6 +6,7 @@
 #include "editor/navigation.h"
 #include "editor/outline.h"
 #include "editor/source_files.h"
+#include "editor/widgets.h"
 #include "platform/vfs.h"
 #include "support/sandbox.h"
 #include "tools/debug_ui.h"
@@ -16,6 +17,7 @@
 
 #include <doctest/doctest.h>
 #include <glm/gtc/quaternion.hpp>
+#include <imgui_internal.h> // the dock builder
 
 #include <cmath>
 #include <cstring>
@@ -196,6 +198,13 @@ TEST_CASE("entity labels: a flecs name, a cell's coordinates, or what it is and 
     char small[5];
     de::editor::entity_label(*registry, ecs.entity("a_long_name"), small);
     CHECK((std::string_view(small) == "a_lo"));
+    // Gone (a panel still holding it after its cell spawned again): said so, not asked of.
+    const flecs::entity gone = ecs.entity("gone");
+    const flecs::entity_t id = gone.id();
+    gone.destruct();
+    char gone_label[32];
+    de::editor::entity_label(*registry, ecs.entity(id), gone_label);
+    CHECK((std::string_view(gone_label) == "(gone)"));
 }
 
 TEST_CASE("searching is by part of a name, in either case") {
@@ -427,6 +436,67 @@ TEST_CASE("gizmo: a drag on a ring or a scaling handle snaps with snapping on") 
     de::tools::destroy_imgui();
 }
 
+TEST_CASE("panels are resized from either side of the gap between them, and the mouse says so") {
+    de::tools::create_imgui();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(800.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.Fonts->AddFontDefault();
+    ImGui::GetStyle().WindowBorderHoverPadding = 6.0f;
+    ImGui::GetStyle().DockingSeparatorSize = 2.0f;
+    ImGui::GetStyle().WindowPadding = ImVec2(0.0f, 0.0f); // as the Playground's: its scene reaches its edges
+    // Two panels side by side, each all one button, as the Playground's scene is: their items reach the gap.
+    bool laid_out = false;
+    const auto frame = [&](ImVec2 mouse) {
+        io.AddMousePosEvent(mouse.x, mouse.y);
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(800.0f, 600.0f));
+        ImGui::Begin("host", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking);
+        const ImGuiID dock = ImGui::GetID("dock");
+        if (!laid_out) {
+            laid_out = true;
+            ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
+            ImGui::DockBuilderSetNodeSize(dock, ImVec2(800.0f, 600.0f));
+            ImGuiID right = 0;
+            const ImGuiID left = ImGui::DockBuilderSplitNode(dock, ImGuiDir_Left, 0.5f, nullptr, &right);
+            ImGui::DockBuilderDockWindow("left", left);
+            ImGui::DockBuilderDockWindow("right", right);
+            ImGui::DockBuilderFinish(dock);
+        }
+        de::editor::dock_space_with_splitters(dock, ImVec2(800.0f, 600.0f), ImGuiDockNodeFlags_None);
+        ImGui::End();
+        for (const char* name : {"left", "right"}) {
+            ImGui::Begin(name);
+            ImGui::InvisibleButton("all of it", ImGui::GetContentRegionAvail());
+            ImGui::End();
+        }
+        const ImGuiMouseCursor cursor = ImGui::GetMouseCursor();
+        ImGui::EndFrame();
+        return cursor;
+    };
+    for (int i = 0; i < 3; ++i) {
+        static_cast<void>(frame(ImVec2(600.0f, 300.0f))); // settles the layout
+    }
+    // Where the gap is, from the left panel's own edge.
+    const ImGuiWindow* left_window = ImGui::FindWindowByName("left");
+    REQUIRE(left_window != nullptr);
+    const float gap = left_window->Pos.x + left_window->Size.x;
+    // Four pixels inside the right panel, over its button: a few frames on (the cursor waits for the hover to stay).
+    ImGuiMouseCursor cursor = ImGuiMouseCursor_Arrow;
+    for (int i = 0; i < 6; ++i) {
+        cursor = frame(ImVec2(gap + 2.0f + 4.0f, 300.0f));
+    }
+    CHECK(cursor == ImGuiMouseCursor_ResizeEW);
+    // Well inside it, the panel's own.
+    for (int i = 0; i < 6; ++i) {
+        cursor = frame(ImVec2(gap + 60.0f, 300.0f));
+    }
+    CHECK(cursor == ImGuiMouseCursor_Arrow);
+    de::tools::destroy_imgui();
+}
+
 TEST_CASE("navigation: framing eases the camera back from a sphere, and the wheel zooms toward the pivot") {
     using de::Vec3;
     de::tools::create_imgui();
@@ -454,5 +524,83 @@ TEST_CASE("navigation: framing eases the camera back from a sphere, and the whee
     ImGui::GetIO().MouseWheel = 1.0f;
     CHECK_FALSE(navigation.update(view, true, true, 0.016f, pose));
     ImGui::GetIO().MouseWheel = 0.0f;
+    de::tools::destroy_imgui();
+}
+
+TEST_CASE("a drawer over the docked panels stays in front of them, and behind its own popups") {
+    de::tools::create_imgui();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(800.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.Fonts->AddFontDefault();
+    bool laid_out = false;
+    bool focus_panel = false;
+    bool open_popup = false;
+    bool item_hovered = false;
+    const auto frame = [&](ImVec2 mouse) {
+        io.AddMousePosEvent(mouse.x, mouse.y);
+        ImGui::NewFrame();
+        if (focus_panel) {
+            ImGui::SetWindowFocus("panel");
+            focus_panel = false;
+        }
+        // The editor's host: the panels are docked in it, and it never comes in front of what's over them.
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+        ImGui::SetNextWindowSize(ImVec2(800.0f, 600.0f));
+        ImGui::Begin("host", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoDocking |
+                         ImGuiWindowFlags_NoBringToFrontOnFocus);
+        const ImGuiID dock = ImGui::GetID("dock");
+        if (!laid_out) {
+            laid_out = true;
+            ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
+            ImGui::DockBuilderSetNodeSize(dock, ImVec2(800.0f, 600.0f));
+            ImGui::DockBuilderDockWindow("panel", dock);
+            ImGui::DockBuilderFinish(dock);
+        }
+        de::editor::dock_space_with_splitters(dock, ImVec2(800.0f, 600.0f), ImGuiDockNodeFlags_None);
+        ImGui::End();
+        ImGui::Begin("panel");
+        ImGui::InvisibleButton("all of it", ImGui::GetContentRegionAvail());
+        ImGui::End();
+        // The drawer over the bottom half, and a popup of its own (the favourites' list, say) over it.
+        if (de::editor::begin_over_panels("drawer", ImVec2(0.0f, 300.0f), ImVec2(800.0f, 300.0f),
+                                          ImGuiWindowFlags_NoDecoration)) {
+            if (open_popup) {
+                ImGui::OpenPopup("list");
+                open_popup = false;
+            }
+            ImGui::SetNextWindowPos(ImVec2(100.0f, 350.0f));
+            if (ImGui::BeginPopup("list")) {
+                ImGui::Selectable("a favourite", false, ImGuiSelectableFlags_None, ImVec2(200.0f, 40.0f));
+                item_hovered = ImGui::IsItemHovered();
+                ImGui::EndPopup();
+            }
+        }
+        ImGui::End();
+        const ImGuiWindow* hovered = GImGui->HoveredWindow;
+        ImGui::EndFrame();
+        return hovered;
+    };
+    const ImVec2 over_both(400.0f, 450.0f); // the drawer, with the panel under it
+    for (int i = 0; i < 4; ++i) {
+        static_cast<void>(frame(over_both));
+    }
+    const ImGuiWindow* drawer = ImGui::FindWindowByName("drawer");
+    REQUIRE(drawer != nullptr);
+    CHECK(frame(over_both) == drawer);
+    // The panel under it taking the keyboard doesn't bring it in front.
+    focus_panel = true;
+    for (int i = 0; i < 4; ++i) {
+        static_cast<void>(frame(over_both));
+    }
+    CHECK(frame(over_both) == drawer);
+    // Its popup stays in front of it, frame after frame, and its item takes the mouse.
+    open_popup = true;
+    for (int i = 0; i < 6; ++i) {
+        static_cast<void>(frame(ImVec2(150.0f, 370.0f)));
+    }
+    CHECK(item_hovered);
     de::tools::destroy_imgui();
 }

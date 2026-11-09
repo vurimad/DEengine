@@ -4,6 +4,7 @@
 #include "asset/registry.h"
 #include "asset/terrain_format.h"
 #include "asset/terrain_layers_format.h"
+#include "console/console.h"
 #include "core/array.h"
 #include "core/fixed_string.h"
 #include "core/job_system.h"
@@ -29,11 +30,15 @@
 #include "render/shader/shader_asset.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
+#include "tools/agent_server.h"
+#include "tools/console_ui.h"
 #include "tools/debug_ui.h"
 #include "tools/stats_panel.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
+
+#include <imgui.h>
 
 #include <charconv>
 #include <cstdio>
@@ -95,6 +100,214 @@ bool load_bindings(const platform::Vfs& vfs, platform::Input& input, bool has_sr
     return true;
 }
 
+#if DE_BUILD_DEV
+// A log sink added for as long as it's in scope.
+class LogFeedScope {
+public:
+    explicit LogFeedScope(core::LogSink& sink) : sink_(sink) { core::add_log_sink(sink_); }
+    ~LogFeedScope() { core::remove_log_sink(sink_); }
+    LogFeedScope(const LogFeedScope&) = delete;
+    LogFeedScope& operator=(const LogFeedScope&) = delete;
+    LogFeedScope(LogFeedScope&&) = delete;
+    LogFeedScope& operator=(LogFeedScope&&) = delete;
+
+private:
+    core::LogSink& sink_;
+};
+
+// The framework's own console commands (dev builds): the frame stats, the renderer's switches, the camera, quitting.
+struct DevConsole {
+    Engine& engine;
+    tools::StatsPanel& stats;
+    tools::CameraPose goto_pose{};
+    bool go = false; // goto_pose is next frame's camera
+    bool quit = false;
+};
+
+// A scene view's name as the console takes it: "base color" -> "base_color".
+core::FixedString<31> view_word(render::SceneView view) {
+    const std::string_view name = render::scene_view_name(view);
+    char word[32] = {};
+    const size_t length = std::min(name.size(), sizeof(word) - 1);
+    for (size_t i = 0; i < length; ++i) {
+        word[i] = name[i] == ' ' ? '_' : name[i];
+    }
+    return core::FixedString<31>(std::string_view(word, length));
+}
+
+void stat_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    const uint32_t shown = dev.engine.frame_stats ? dev.stats.sections() : 0;
+    if (args.empty()) {
+        out.info("frame stats %s (F1); a section with stat <section>:", dev.engine.frame_stats ? "shown" : "hidden");
+        for (const tools::StatsSectionName& section : tools::kStatsSectionNames) {
+            out.info("  %-14.*s %s", static_cast<int>(section.name.size()), section.name.data(),
+                     (shown & section.bits) != 0 ? "on" : "off");
+        }
+        return;
+    }
+    const std::string_view word = args[0];
+    if (word == "none") {
+        dev.stats.set_sections(0);
+        dev.engine.frame_stats = false;
+        out.info("frame stats hidden");
+        return;
+    }
+    uint32_t sections = 0;
+    if (!tools::parse_stats_sections(word, sections) || word.find(',') != std::string_view::npos) {
+        out.error("No section '%.*s' (stat alone lists them; stats takes several)", static_cast<int>(word.size()),
+                  word.data());
+        return;
+    }
+    if (word == "default" || word == "all") {
+        dev.stats.set_sections(sections);
+        dev.engine.frame_stats = true;
+        out.info("frame stats: %.*s", static_cast<int>(word.size()), word.data());
+        return;
+    }
+    // As Unreal's: on if it wasn't showing, off if it was; the stats hide with nothing left on.
+    const uint32_t next = (shown & sections) == sections ? shown & ~sections : shown | sections;
+    dev.stats.set_sections(next);
+    dev.engine.frame_stats = next != 0;
+    out.info("stat %.*s: %s", static_cast<int>(word.size()), word.data(), (next & sections) != 0 ? "on" : "off");
+}
+
+void stats_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    uint32_t sections = 0;
+    if (args.size() != 1 || !tools::parse_stats_sections(args[0], sections)) {
+        out.error("stats takes sections, comma separated: frame, graph, allocations, camera, cull, memory, gpu, "
+                  "render_graph, uploads, device, default, all");
+        return;
+    }
+    dev.stats.set_sections(sections);
+    dev.engine.frame_stats = sections != 0;
+    out.info("frame stats: %.*s", static_cast<int>(args[0].size()), args[0].data());
+}
+
+void view_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    const auto count = static_cast<uint32_t>(render::SceneView::Count);
+    if (!args.empty()) {
+        // Any case, with spaces or underscores: "base_color", "Base Color".
+        const auto same = [](std::string_view typed, std::string_view name) {
+            size_t a = 0;
+            size_t b = 0;
+            const auto skip = [](std::string_view text, size_t& at) {
+                while (at < text.size() && (text[at] == '_' || text[at] == ' ')) {
+                    ++at;
+                }
+            };
+            for (;;) {
+                skip(typed, a);
+                skip(name, b);
+                if (a == typed.size() || b == name.size()) {
+                    return a == typed.size() && b == name.size();
+                }
+                const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+                if (lower(typed[a++]) != lower(name[b++])) {
+                    return false;
+                }
+            }
+        };
+        uint32_t found = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            if (same(args[0], render::scene_view_name(static_cast<render::SceneView>(i)))) {
+                found = i;
+            }
+        }
+        if (found == count) {
+            out.error("No view '%.*s'", static_cast<int>(args[0].size()), args[0].data());
+        } else {
+            dev.engine.view = static_cast<render::SceneView>(found);
+        }
+    }
+    char names[console::kLineLength + 1] = {};
+    size_t length = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int written = std::snprintf(names + length, sizeof(names) - length, "%s%s", i == 0 ? "" : ", ",
+                                          view_word(static_cast<render::SceneView>(i)).c_str());
+        length = std::min(length + static_cast<size_t>(std::max(written, 0)), sizeof(names) - 1);
+    }
+    out.info("r.view = %s (%s)", view_word(dev.engine.view).c_str(), names);
+}
+
+void goto_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    double place[3] = {};
+    float turn_deg[2] = {};
+    const bool turned = args.size() == 5;
+    bool ok = args.size() == 3 || turned;
+    for (size_t i = 0; i < 3 && ok; ++i) {
+        ok = console::Args::parse_double(args[i], place[i]);
+    }
+    for (size_t i = 0; i < 2 && ok && turned; ++i) {
+        ok = console::Args::parse_float(args[3 + i], turn_deg[i]);
+    }
+    if (!ok) {
+        out.error("camera.goto takes x y z (meters), and yaw and pitch (degrees) if it's to face elsewhere");
+        return;
+    }
+    // Facing as the camera does now, unless told.
+    float yaw_rad = 0.0f;
+    float pitch_rad = 0.0f;
+    const flecs::world& ecs = dev.engine.world.ecs();
+    const auto* active = ecs.try_get<world::ActiveCamera>();
+    const auto* place_now = active != nullptr && active->entity != 0 && ecs.is_alive(active->entity)
+                                ? ecs.entity(active->entity).try_get<world::WorldTransform>()
+                                : nullptr;
+    if (place_now != nullptr) {
+        const Vec3 forward = place_now->rotation * Vec3(0.0f, 0.0f, -1.0f);
+        yaw_rad = std::atan2(-forward.x, -forward.z);
+        pitch_rad = std::asin(std::clamp(forward.y, -1.0f, 1.0f));
+    }
+    if (turned) {
+        yaw_rad = glm::radians(turn_deg[0]);
+        pitch_rad = glm::radians(turn_deg[1]);
+    }
+    dev.goto_pose = {.position = DVec3(place[0], place[1], place[2]), .yaw_rad = yaw_rad, .pitch_rad = pitch_rad};
+    dev.go = true;
+    out.info("camera to %.2f %.2f %.2f, yaw %.1f, pitch %.1f", place[0], place[1], place[2],
+             static_cast<double>(glm::degrees(yaw_rad)), static_cast<double>(glm::degrees(pitch_rad)));
+}
+
+void quit_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    static_cast<DevConsole*>(user)->quit = true;
+    out.info("closing");
+}
+
+void console_show_command(void* user, const console::Args& args, console::Output& out) {
+    auto& window = *static_cast<tools::ConsoleUi*>(user);
+    bool open = !window.is_open();
+    if (!args.empty() && !console::Args::parse_bool(args[0], open)) {
+        out.error("console.show takes on or off");
+        return;
+    }
+    window.set_open(open);
+    out.info("console window %s", open ? "open" : "closed");
+}
+
+void add_dev_commands(console::Console& console, DevConsole& dev) {
+    console.add_command("stat", "[section | none | default | all]",
+                        "Show or hide one section of the frame stats (F1). With nothing after it, lists the sections.",
+                        &stat_command, &dev);
+    console.add_command("stats", "<section,section,...>", "Show exactly these frame stats sections (as --stats does).",
+                        &stats_command, &dev);
+    console.add_variable("r.taa", "Temporal anti-aliasing on or off (F3).", &dev.engine.taa, &dev);
+    console.add_variable("r.freeze_cull", "Freeze culling where the camera is now, to look around it (F4).",
+                         &dev.engine.freeze_cull, &dev);
+    console.add_variable("r.fog_low_camera", "Thin the height fog when the camera is low (F5).",
+                         &dev.engine.fog_low_camera, &dev);
+    console.add_command("r.view", "[name]",
+                        "Show the scene lit or as one buffer: base_color, normal, roughness... (F2).", &view_command,
+                        &dev);
+    console.add_command("camera.goto", "<x> <y> <z> [yaw pitch]",
+                        "Move the camera to a place in meters; yaw and pitch in degrees turn it too.", &goto_command,
+                        &dev);
+    console.add_command("quit", "", "Close the engine.", &quit_command, &dev);
+}
+#endif
+
 } // namespace
 
 std::string_view setting(std::string_view settings, std::string_view name) {
@@ -129,6 +342,17 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
     out.fullscreen = has_flag(out, "--fullscreen");
+#if DE_BUILD_DEV
+    if (const char* stats = flag_value(out, "--stats")) {
+        if (!tools::parse_stats_sections(stats, out.stats_sections)) {
+            DE_LOG_ERROR("app",
+                         "--stats: '%s' names a section there isn't (frame, graph, allocations, camera, cull, "
+                         "memory, gpu, render_graph, uploads, device, default, all)",
+                         stats);
+            return false;
+        }
+    }
+#endif
     if (has_flag(out, "--window")) {
         const char* const window = flag_value(out, "--window");
         const std::string_view size = window != nullptr ? std::string_view(window) : std::string_view();
@@ -357,6 +581,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         settings = std::move(*read);
     }
 
+    console::Console console(core::heap_allocator(core::MemoryTag::Tools));
     platform::Input input;
     if (args.deadzone >= 0.0f) {
         input.set_stick_deadzone(args.deadzone);
@@ -373,6 +598,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .world = *world,
                   .physics = physics,
                   .gpu_assets = *gpu_assets,
+                  .console = console,
                   .settings = as_text(settings),
                   .lighting = {},
                   .view = render::SceneView::Lit,
@@ -390,8 +616,32 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
     tools::DebugUi debug_ui = tools::DebugUi::create(*window, *device, engine.shaders, *uploader);
     tools::StatsPanel stats_panel;
-    engine.frame_stats = !scripted; // what it shows changes from run to run: not in a picture to compare
+    // What it shows changes from run to run: not in a picture to compare, unless it's asked for (--stats).
+    engine.frame_stats = !scripted || has_flag(args, "--stats");
+    stats_panel.set_sections(args.stats_sections != 0 ? args.stats_sections : tools::kStatsDefault);
     engine.scripted = scripted;
+    tools::ConsoleUi console_ui(console);
+    console_ui.load_history(*vfs);
+    engine.console_ui = &console_ui;
+    engine.stats_panel = &stats_panel;
+    // The engine's log, into the console's (the Output panel, the console window).
+    console::LogFeed log_feed(core::heap_allocator(core::MemoryTag::Tools));
+    const LogFeedScope log_feed_scope(log_feed);
+    DevConsole dev_console{.engine = engine, .stats = stats_panel};
+    add_dev_commands(console, dev_console);
+    console.add_command("console.show", "[on | off]", "Open or close the console window (the ` key).",
+                        &console_show_command, &console_ui);
+    // The agents' door (tools/agent_server.h): not for a picture, which takes no input from anywhere.
+    std::optional<tools::AgentServer> agent_server;
+    if (!scripted && !has_flag(args, "--no-agent-server")) {
+        if (core::Result<tools::AgentServer> started = tools::AgentServer::start(); started) {
+            agent_server.emplace(std::move(*started));
+            DE_LOG_INFO("agents", "commands on 127.0.0.1:%u (JSON-RPC, a request a line; tools/console.py)",
+                        static_cast<unsigned>(agent_server->port()));
+        } else {
+            DE_LOG_WARN("agents", "no socket for agents: %s", started.error().message);
+        }
+    }
     const platform::ActionId toggle_stats = input.add_action("debug.toggle_stats"_sid, platform::ActionKind::Button);
     // The raw stick readout (--show-sticks), for measuring drift: the deadzone is off, so these show
     // the true resting values.
@@ -417,6 +667,18 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
     DE_LOG_INFO("input", "stick deadzone %.2f", static_cast<double>(input.stick_deadzone()));
 #if DE_BUILD_DEV
+    // --exec "stat gpu; r.taa 0": what Unreal's -ExecCmds does, once everything is up.
+    if (const char* exec = flag_value(args, "--exec")) {
+        core::Array<console::Line> said(core::heap_allocator(core::MemoryTag::Tools));
+        static_cast<void>(console.execute(exec, &said));
+        for (const console::Line& line : said) {
+            if (line.severity == console::Severity::Info) {
+                DE_LOG_INFO("console", "%s", line.text.c_str());
+            }
+        }
+    }
+#endif
+#if DE_BUILD_DEV
     if (scripted && !eyes.wait_for_scene(*window, input, *assets, *gpu_assets, *uploader, *device)) {
         application.shutdown(engine);
         static_cast<void>(eyes.finish(*device));
@@ -431,7 +693,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     uint64_t title_start_ns = previous_frame_ns;
     uint32_t title_frames = 0;
     bool was_minimized = false;
-    while (!window->close_requested()) {
+    while (true) {
         const uint64_t frame_start_allocations = core::heap_allocation_count(); // every thread, jobs included
         const uint64_t frame_start_ns = platform::time_ns();
         const double measured_s = static_cast<double>(frame_start_ns - previous_frame_ns) * 1e-9;
@@ -442,6 +704,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
         const double frame_s = eyes.frame_s(clock_s);
         engine.camera_pose = eyes.begin_frame();
+        if (dev_console.go) {
+            engine.camera_pose = &dev_console.goto_pose; // camera.goto
+            dev_console.go = false;
+        }
 #else
         const double frame_s = clock_s;
 #endif
@@ -449,9 +715,30 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         previous_frame_ns = frame_start_ns;
 
         platform::pump_events(*window, input);
+        if (window->close_requested()) {
+            if (application.may_close(engine)) {
+                break;
+            }
+            window->cancel_close();
+        }
+#if DE_BUILD_DEV
+        // Typing in the console (or any text field) mustn't fly the camera or press F1.
+        if (ImGui::GetIO().WantTextInput) {
+            input.release_all(platform::time_ns());
+        }
+#endif
         if (!scripted) { // a stray key or a drifting stick mustn't change a script's pictures
             input.sample();
         }
+#if DE_BUILD_DEV
+        log_feed.take(console);
+        if (agent_server) {
+            agent_server->poll(console);
+        }
+        if (dev_console.quit) {
+            break;
+        }
+#endif
         if (window->minimized() != was_minimized) {
             was_minimized = window->minimized();
             DE_LOG_INFO("platform", was_minimized ? "minimized" : "restored");
@@ -470,6 +757,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 #if DE_BUILD_DEV
         if (input.state(toggle_stats).pressed) {
             engine.frame_stats = !engine.frame_stats;
+            if (stats_panel.sections() == 0) {
+                stats_panel.set_sections(tools::kStatsDefault); // after "stat none"
+            }
         }
         if (args.show_sticks && platform::time_ns() >= next_stick_report_ns) {
             next_stick_report_ns = platform::time_ns() + platform::kNsPerSecond / 2;
@@ -512,12 +802,29 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         engine.viewport.height = viewport_texture.is_valid() ? viewport_desc.height : 0;
         engine.viewport.want_width = 0; // asked again by ui(), every frame it's shown
         engine.viewport.want_height = 0;
+        engine.viewport.ui_width = 0.0f;
+        engine.viewport.ui_height = 0.0f;
+        engine.viewport.overlays_drawn = false;
         // The debug UI's frame; its textures go to the uploader before record().
         if (debug_ui.begin_frame(*window, static_cast<float>(measured_s))) {
             application.ui(engine);
-            if (engine.frame_stats) {
-                stats_panel.draw(&engine.frame_stats);
+            // Over the game's picture: the editor's panel, when it's shown in one, or the window.
+            const SceneViewport& shown = engine.viewport;
+            const ImGuiViewport* window_view = ImGui::GetMainViewport();
+            const bool in_panel = shown.ui_width > 0.0f && shown.ui_height > 0.0f;
+            const ImVec4 picture =
+                in_panel ? ImVec4(shown.ui_x, shown.ui_y, shown.ui_width, shown.ui_height)
+                         : ImVec4(window_view->Pos.x, window_view->Pos.y, window_view->Size.x, window_view->Size.y);
+            if (!shown.overlays_drawn) {
+                if (engine.frame_stats) {
+                    stats_panel.draw_overlay(picture.x, picture.y, picture.z, picture.w);
+                }
+                if (engine.freeze_cull) {
+                    tools::draw_viewport_notice(ImGui::GetBackgroundDrawList(), picture.x, picture.y, picture.z,
+                                                "CULL FROZEN (F4)");
+                }
             }
+            console_ui.draw(picture.x, picture.y, picture.z, picture.w);
             debug_ui.end_frame();
         }
         scene_in_viewport = viewport_texture.is_valid() && engine.viewport.want_width > 0;
@@ -702,6 +1009,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
 
     // --- Down -------------------------------------------------------------------------------------
     application.shutdown(engine);
+#if DE_BUILD_DEV
+    if (!scripted) {
+        console_ui.save_history(*vfs);
+    }
+#endif
 #if DE_BUILD_DEV
     device->destroy(viewport_texture);
 #endif

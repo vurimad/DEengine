@@ -68,6 +68,11 @@ void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std:
     if (out.empty()) {
         return;
     }
+    // Gone (its cell spawned again since a panel last looked): said so, not asked of.
+    if (!entity.is_valid() || !entity.is_alive()) {
+        static_cast<void>(std::snprintf(out.data(), out.size(), "(gone)"));
+        return;
+    }
     // Cut short if it doesn't fit: a label is only for people.
     if (const char* name = entity.name().c_str(); name != nullptr && name[0] != '\0') {
         static_cast<void>(std::snprintf(out.data(), out.size(), "%s", name));

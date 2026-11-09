@@ -1162,10 +1162,6 @@ void AssetBrowser::draw_contents(Selection& selection, float region_min_x, float
 bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
     DE_PROFILE_ZONE("AssetBrowser::draw");
     opened_ = UINT32_MAX;
-    if (!ImGui::Begin(kWindow)) {
-        ImGui::End();
-        return false;
-    }
     if (!scanned_ || refresh_) {
         refresh_ = false;
         scan(vfs);
@@ -1268,7 +1264,6 @@ bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
         pop_menu_style();
     }
     ImGui::EndChild();
-    ImGui::End();
 
     const bool search = search_[0] != '\0';
     static_cast<void>(std::snprintf(status_, sizeof(status_), "%zu %s%s  %zu selected", shown_.size(),

@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace de::tools {
 
@@ -17,6 +18,41 @@ inline constexpr size_t kFrameHistory = 240;
 // loop, even at a good frame rate. The lower quartile, so neither one hitch nor a rhythm of short and long
 // frames can hide it.
 size_t late_frames(std::span<const float> frame_ms);
+
+// What the frame stats show (--stats): sections, as bits.
+inline constexpr uint32_t kStatsFrame = 1U << 0;       // frames a second and their time, the worst, the late ones
+inline constexpr uint32_t kStatsGraph = 1U << 1;       // frame time over the last kFrameHistory frames
+inline constexpr uint32_t kStatsAllocations = 1U << 2; // heap allocations in the frame
+inline constexpr uint32_t kStatsCamera = 1U << 3;      // where the camera is and where it looks
+inline constexpr uint32_t kStatsCull = 1U << 4;        // what the frozen cull kept (F4), while it's frozen
+inline constexpr uint32_t kStatsMemory = 1U << 5;      // GPU memory, by category
+inline constexpr uint32_t kStatsGpu = 1U << 6;         // GPU time, by render graph pass
+inline constexpr uint32_t kStatsRenderGraph = 1U << 7; // passes, barriers, the pool
+inline constexpr uint32_t kStatsUploads = 1U << 8;     // queued, staging, uploaded
+inline constexpr uint32_t kStatsDevice = 1U << 9;      // live objects, bindless entries, validation messages
+inline constexpr uint32_t kStatsDefault = kStatsFrame | kStatsGraph | kStatsAllocations | kStatsCamera | kStatsCull |
+                                          kStatsMemory | kStatsGpu | kStatsRenderGraph;
+inline constexpr uint32_t kStatsAll = (1U << 10U) - 1U;
+
+// The sections' names, as --stats and the console's stat take them.
+struct StatsSectionName {
+    std::string_view name;
+    uint32_t bits = 0;
+};
+inline constexpr StatsSectionName kStatsSectionNames[] = {{.name = "frame", .bits = kStatsFrame},
+                                                          {.name = "graph", .bits = kStatsGraph},
+                                                          {.name = "allocations", .bits = kStatsAllocations},
+                                                          {.name = "camera", .bits = kStatsCamera},
+                                                          {.name = "cull", .bits = kStatsCull},
+                                                          {.name = "memory", .bits = kStatsMemory},
+                                                          {.name = "gpu", .bits = kStatsGpu},
+                                                          {.name = "render_graph", .bits = kStatsRenderGraph},
+                                                          {.name = "uploads", .bits = kStatsUploads},
+                                                          {.name = "device", .bits = kStatsDevice}};
+
+// Sections by name, comma separated: those above, fps (frame, as Unreal's), default and all. False on a name it
+// doesn't know.
+bool parse_stats_sections(std::string_view text, uint32_t& sections);
 
 // One frame's numbers, gathered by whoever runs the frame.
 struct FrameStats {
@@ -36,9 +72,9 @@ struct FrameStats {
     uint32_t visible_shadow_triangles = 0;
 };
 
-// The frame stats panel (M0a): frame time and its history, heap allocations per frame, GPU memory
-// by category, GPU time per render graph pass, the render graph, uploads and the device. Draws with Dear ImGui, between
-// NewFrame() and Render().
+// The frame stats (M0a): frame time and its history, heap allocations per frame, GPU memory by category, GPU time per
+// render graph pass, the render graph, uploads and the device, the sections chosen with set_sections (--stats). Drawn
+// over the game's picture, see-through, taking no clicks. With Dear ImGui, between NewFrame() and Render().
 class StatsPanel {
 public:
     StatsPanel() = default;
@@ -49,8 +85,14 @@ public:
     StatsPanel& operator=(StatsPanel&&) = delete;
 
     void record(const FrameStats& stats);
-    // A window the user can close: open is set to false then.
-    void draw(bool* open);
+    void set_sections(uint32_t sections) { sections_ = sections; }
+    uint32_t sections() const { return sections_; }
+    // Over the game's picture, from its top-left corner (x, y in the UI's coordinates), no bigger than it: a window of
+    // its own, over everything (a game's window, where nothing else is).
+    void draw_overlay(float x, float y, float width, float height);
+    // The same, as a child of the window being drawn (the editor's Playground): under anything over that window (a
+    // drawer, a menu), clipped to it.
+    void draw_in_window(float x, float y, float width, float height);
 
 private:
     float frame_ms_[kFrameHistory] = {};
@@ -59,6 +101,9 @@ private:
     uint64_t frames_with_allocations_ = 0;
     size_t late_ = 0; // of the history, counted now and then while drawn: it's read as a slow number
     uint32_t draws_until_late_ = 0;
+    uint32_t sections_ = kStatsDefault;
+
+    void draw_contents();
     FrameStats last_; // its gpu_passes point at gpu_passes_
     render::PassGpuTime gpu_passes_[render::kMaxTimedPasses] = {};
 };
