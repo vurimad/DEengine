@@ -159,6 +159,19 @@ size_t fog_edits(const asset::CellFogVolume& cooked, const world::FogVolume& now
     return count;
 }
 
+// A folder as an entry writes it: removed when it's empty, else set (quoted).
+void write_folder(CellSource& source, uint32_t index, const char* path) {
+    if (path[0] == 0) {
+        static_cast<void>(source.remove_entity_member(index, "folder"));
+        return;
+    }
+    char quoted[160];
+    const int length = std::snprintf(quoted, sizeof(quoted), "\"%s\"", path);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(quoted)) {
+        static_cast<void>(source.set_entity_member(index, "folder", {quoted, static_cast<size_t>(length)}));
+    }
+}
+
 // A cell file open while saving, edited in memory and written at the end.
 struct OpenFile {
     explicit OpenFile(core::Allocator& allocator) : source(allocator), removed(allocator) {}
@@ -381,6 +394,7 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             TransformParts parts;
             FogEdit fog[8];
             size_t fog_count = 0;
+            const char* folder = nullptr; // its folder, when it isn't the one its file has
         };
         core::Array<Change> changes(saver_heap());
         core::Array<Refile> leaving(saver_heap());
@@ -420,10 +434,14 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             if (fog_now != nullptr && entry.fog_volume < fogs.size()) {
                 change.fog_count = fog_edits(fogs[entry.fog_volume], *fog_now, change.fog);
             }
+            if (const auto* folder = entity.try_get<EditorFolder>();
+                folder != nullptr && std::strcmp(folder->path, folder->filed) != 0) {
+                change.folder = folder->path;
+            }
             const bool moved_here = change.parts.position || change.parts.rotation || change.parts.scale;
             // One leaving its cell is checked against the file too, though it may not have moved within it.
             const bool leaves = !leaving.empty() && leaving[leaving.size() - 1].source_index == entry.source_index;
-            if (moved_here || change.fog_count > 0 || leaves) {
+            if (moved_here || change.fog_count > 0 || change.folder != nullptr || leaves) {
                 changes.push(change);
             }
         }
@@ -460,6 +478,9 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             for (size_t f = 0; f < change.fog_count; ++f) {
                 static_cast<void>(file.source.set_fog_member(change.source_index, change.fog[f].key,
                                                              change.fog[f].value, change.fog[f].decimals));
+            }
+            if (change.folder != nullptr) {
+                write_folder(file.source, change.source_index, change.folder);
             }
         }
         if (file.source.view() != std::string_view(was.data(), was.size())) {
@@ -730,6 +751,9 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
         Name name;
         static_cast<void>(name.assign(made.name));
         static_cast<void>(settle(files[target], placed, name, made.folder));
+        if (const auto* folder = entity.try_get<EditorFolder>()) {
+            write_folder(files[target].source, placed, folder->path);
+        }
         ++report.added;
         ++report.entities_changed;
         if (placed_out != nullptr) {

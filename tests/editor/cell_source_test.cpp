@@ -255,3 +255,12 @@ TEST_CASE("cell sources: a key comes out of an entity with the comma that set it
     CHECK((source.entity_text(1) == R"({})"));
     CHECK_FALSE(source.remove_entity_member(0, "scale"));
 }
+
+TEST_CASE("cell sources: a string key of an entity, as written") {
+    CellSource source(heap());
+    REQUIRE(source.parse(R"({"entities": [{"name": "a", "folder": "camp/props", "scale": 2}, {"name": "b"}]})"));
+    CHECK((source.string_member(0, "folder") == "camp/props"));
+    CHECK((source.string_member(0, "scale").empty())); // not a string
+    CHECK((source.string_member(1, "folder").empty()));
+    CHECK((source.string_member(2, "folder").empty()));
+}

@@ -284,6 +284,9 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     engine.console.add_command("editor.select", "[name ...]",
                                "Choose the entities of those names (the last the primary); none: nothing chosen.",
                                &Editor::select_command, this);
+    engine.console.add_command("editor.folder", "<folder> [name ...]",
+                               "Put the entities of those names (or the selection) in a folder, \"\" for none.",
+                               &Editor::folder_command, this);
     engine.console.add_command("editor.undo", "", "Undo the last edit (as Ctrl+Z does).", &Editor::undo_command, this);
     engine.console.add_command("editor.redo", "", "Do again what was undone (as Ctrl+Y does).", &Editor::redo_command,
                                this);
@@ -442,7 +445,8 @@ void Editor::ui(app::Engine& engine) {
             }
         });
     }
-    hierarchy_.draw(engine, selection_, viewer_.camera_entity().id());
+    read_folders(engine);
+    hierarchy_.draw(engine, selection_, viewer_.camera_entity().id(), commands_);
     DVec3 go_to(0.0);
     if (cell_map_.draw(engine, selection_, go_to)) {
         go_to_place(go_to);
@@ -1351,6 +1355,12 @@ flecs::entity Editor::make(const EntityRecord& record) {
     if (record.has_fog) {
         entity.set(record.fog);
     }
+    // In its folder; one the editor made has nothing filed yet.
+    EditorFolder folder = record.folder;
+    if (!member) {
+        folder.filed[0] = 0;
+    }
+    entity.set(folder);
     world::place(entity, record.transform);
     return entity;
 }
@@ -1375,6 +1385,9 @@ void Editor::record(flecs::entity entity, EntityRecord& out) {
         out.fog = *fog;
     }
     out.is_static = entity.has<world::StaticTransform>();
+    if (const auto* folder = entity.try_get<EditorFolder>()) {
+        out.folder = *folder;
+    }
     if (const auto* made = entity.try_get<EditorEntry>()) {
         out.entry = *made;
         out.has_entry = true;
@@ -2048,6 +2061,95 @@ void Editor::move_command(void* user, const console::Args& args, console::Output
     out.info("moved %.*s to %g %g %g", static_cast<int>(name.size()), name.data(), place[0], place[1], place[2]);
 }
 
+void Editor::read_folders(app::Engine& engine) {
+    DE_PROFILE_ZONE("Editor::read_folders");
+    const flecs::world& ecs = engine.world.ecs();
+    // The cells spawned since: their members get the folders their files give them.
+    scratch_entities_.clear();
+    ecs.each([&](flecs::entity cell, const world::CellContents& contents) {
+        if (contents.revision == 0) {
+            return;
+        }
+        if (const uint32_t* read = folders_read_.find(cell.id()); read != nullptr && *read == contents.revision) {
+            return;
+        }
+        folders_read_.set(cell.id(), contents.revision);
+        scratch_entities_.push(cell.id());
+    });
+    if (scratch_entities_.empty()) {
+        return;
+    }
+    struct Filed {
+        flecs::entity_t entity;
+        EditorFolder folder;
+    };
+    core::Array<Filed> filed(editor_heap());
+    CellSource file(editor_heap());
+    for (const flecs::entity_t cell_id : scratch_entities_) {
+        const flecs::entity cell = ecs.entity(cell_id);
+        const auto* held = cell.try_get<world::Cell>();
+        const auto* cooked = held != nullptr ? engine.assets.get<asset::CellAsset>(held->asset) : nullptr;
+        if (cooked == nullptr) {
+            continue;
+        }
+        const asset::AssetId id = engine.assets.asset(held->asset).id;
+        if (cell_sources_.find(id) == nullptr) {
+            static_cast<void>(cell_sources_.scan(engine.vfs)); // a new file, or not looked for yet
+        }
+        const CellSources::Cell* source = cell_sources_.find(id);
+        bool parsed = false;
+        if (source != nullptr) {
+            if (auto bytes = engine.vfs.read_whole_file(source->path.c_str(), editor_heap())) {
+                parsed = file.parse({reinterpret_cast<const char*>(bytes->data()), bytes->size()}).ok();
+            }
+        }
+        const std::span<const asset::CellEntity> entities = cooked->entities.get(cooked);
+        ecs.each([&](flecs::entity member, const world::CellMember& at) {
+            if (at.index >= entities.size() || member.target<world::InCell>().id() != cell_id) {
+                return;
+            }
+            Filed& entry = filed.push({.entity = member.id(), .folder = {}});
+            const std::string_view path =
+                parsed ? file.string_member(entities[at.index].source_index, "folder") : std::string_view();
+            static_cast<void>(std::snprintf(entry.folder.path, sizeof(entry.folder.path), "%.*s",
+                                            static_cast<int>(path.size()), path.data()));
+            static_cast<void>(std::snprintf(entry.folder.filed, sizeof(entry.folder.filed), "%s", entry.folder.path));
+        });
+    }
+    // Set after the walk: a component added moves the entity to another table.
+    for (const Filed& entry : filed) {
+        ecs.entity(entry.entity).set(entry.folder);
+    }
+}
+
+void Editor::folder_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.empty()) {
+        out.error(R"(editor.folder takes a folder ("camp/props", or "" for none) and names, or uses the selection)");
+        return;
+    }
+    const std::string_view path = args[0];
+    if (args.size() > 1) {
+        Selection chosen;
+        for (size_t i = 1; i < args.size(); ++i) {
+            const flecs::entity found = editor->find_named(*editor->engine_, args[i]);
+            if (!found.is_valid()) {
+                out.error("nothing is called %.*s", static_cast<int>(args[i].size()), args[i].data());
+                return;
+            }
+            chosen.add_entity(found.id());
+        }
+        editor->selection_.select_entity(0);
+        for (const flecs::entity_t id : chosen.entities) {
+            editor->selection_.add_entity(id);
+        }
+    }
+    core::Array<flecs::entity_t> roots(editor_heap());
+    editor->chosen_roots(*editor->engine_, roots);
+    HierarchyPanel::move_to_folder(editor->engine_->world.ecs(), editor->commands_, roots.span(), path);
+    out.info("%zu into %.*s", roots.size(), static_cast<int>(path.size()), path.data());
+}
+
 void Editor::follow_saves(app::Engine& engine) {
     DE_PROFILE_ZONE("Editor::follow_saves");
     int code = 0;
@@ -2161,6 +2263,7 @@ void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     DE_LOG_INFO("editor", "opening %s (%s)", selection_.file.c_str(), asset::format_asset_id(id).c_str());
     commands_.clear(); // their entities go with the world
     release_holds();
+    folders_read_.clear();
     saved_changes_ = commands_.changes();
     selection_.entities.clear(); // the file stays selected
     selection_.entity = 0;

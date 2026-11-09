@@ -657,6 +657,36 @@ std::string_view CellSource::mesh(uint32_t index) const {
     return value.size() >= 2 && value.front() == '"' ? value.substr(1, value.size() - 2) : std::string_view();
 }
 
+std::string_view CellSource::string_member(uint32_t index, std::string_view key) const {
+    if (index >= entities_.size()) {
+        return {};
+    }
+    const Span object = entities_[index].object;
+    const std::string_view source(text_.data(), text_.size());
+    Scanner scan(source.substr(0, object.end));
+    scan.jump(object.begin + 1);
+    while (scan.skip() && !scan.done() && scan.peek() != '}') {
+        uint32_t key_begin = 0;
+        uint32_t key_end = 0;
+        if (!scan.string(key_begin, key_end) || !scan.skip() || scan.peek() != ':') {
+            return {};
+        }
+        scan.step();
+        Span value;
+        if (!scan.skip() || !scan.value(value.begin, value.end) || !scan.skip()) {
+            return {};
+        }
+        if (source.substr(key_begin, key_end - key_begin) == key) {
+            const std::string_view text = slice(value);
+            return text.size() >= 2 && text.front() == '"' ? text.substr(1, text.size() - 2) : std::string_view();
+        }
+        if (scan.peek() == ',') {
+            scan.step();
+        }
+    }
+    return {};
+}
+
 std::string_view CellSource::entity_text(uint32_t index) const {
     return index < entities_.size() ? slice(entities_[index].object) : std::string_view();
 }

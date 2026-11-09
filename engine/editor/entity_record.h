@@ -21,6 +21,15 @@ struct EditorEntry {
     bool saved = false;     // written into a cell's file, waiting for the cell to come back cooked
 };
 
+// On every placed entity in the editor: the designer's folder it's in, for the hierarchy ("camp/props"; empty: none),
+// and the one its cell's file has (what a save compares with). Read from the file when its cell spawns; changed by
+// commands like any component, and written back at a save as the entry's "folder". Only for organising: it moves
+// nothing and streams nothing.
+struct EditorFolder {
+    char path[128] = {};
+    char filed[128] = {};
+};
+
 // What an entity is, to make it again (undo, redo): taken from it before it goes.
 struct EntityRecord {
     world::Transform transform; // in the world: it comes back a root, where it stood
@@ -39,6 +48,7 @@ struct EntityRecord {
     // As an entry of its own: for one the editor made, or a member put back once a save took it out of its file.
     EditorEntry entry;
     bool has_entry = false;
+    EditorFolder folder;
     // Among what a command takes away together (the entity, then what's attached to it, each after what it hangs on):
     // the entity it was, and the one before it in the list it's attached to (UINT32_MAX: none, the first).
     flecs::entity_t was = 0;

@@ -6,6 +6,7 @@
 #include "editor/cell_saver.h"
 #include "editor/commands.h"
 #include "editor/entity_record.h"
+#include "editor/hierarchy_panel.h"
 #include "editor/outline.h"
 #include "editor/source_files.h"
 #include "platform/file.h"
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <string_view>
 
@@ -615,4 +617,84 @@ TEST_CASE("names for what's made: free as they are, else a trailing number count
     CHECK((std::string_view(out) == "rock_02"));
     de::editor::free_name("camp", taken, out);
     CHECK((std::string_view(out) == "camp_2"));
+}
+
+TEST_CASE("folders: into one, renamed with what's under it, out of every one, each a command") {
+    World world = World::create().value();
+    const flecs::world& ecs = world.ecs();
+    de::editor::CommandStack commands(heap());
+    const auto made = [&](const char* folder) {
+        const flecs::entity entity = ecs.entity();
+        de::editor::EditorFolder filed;
+        std::snprintf(filed.path, sizeof(filed.path), "%s", folder);
+        std::snprintf(filed.filed, sizeof(filed.filed), "%s", folder);
+        entity.set(filed);
+        return entity;
+    };
+    const auto path = [](flecs::entity entity) { return std::string(entity.get<de::editor::EditorFolder>().path); };
+    const flecs::entity tent = made("");
+    const flecs::entity fire = made("camp");
+    const flecs::entity log = made("camp/wood");
+    const flecs::entity rock = made("campfire"); // not in camp: only its name starts the same
+
+    const flecs::entity_t into[] = {tent.id()};
+    de::editor::HierarchyPanel::move_to_folder(ecs, commands, into, "camp/\"tents\"/");
+    CHECK(path(tent) == "camp/tents"); // what a file can't hold, and slashes at the end, left out
+    de::editor::HierarchyPanel::rename_folder(ecs, commands, "camp", "north/camp");
+    CHECK(path(tent) == "north/camp/tents");
+    CHECK(path(fire) == "north/camp");
+    CHECK(path(log) == "north/camp/wood");
+    CHECK(path(rock) == "campfire");
+    // Removed (what's in it up a level): "north/camp" into "north".
+    de::editor::HierarchyPanel::rename_folder(ecs, commands, "north/camp", "north");
+    CHECK(path(fire) == "north");
+    CHECK(path(log) == "north/wood");
+    // Into itself: nothing.
+    de::editor::HierarchyPanel::rename_folder(ecs, commands, "north", "north/inner");
+    CHECK(path(fire) == "north");
+    // Each edit one undo; the file's folder is kept throughout.
+    REQUIRE(commands.undo(ecs));
+    REQUIRE(commands.undo(ecs));
+    CHECK(path(fire) == "camp");
+    CHECK(path(log) == "camp/wood");
+    CHECK(std::string(fire.get<de::editor::EditorFolder>().filed) == "camp");
+    const flecs::entity_t out[] = {log.id()};
+    de::editor::HierarchyPanel::move_to_folder(ecs, commands, out, "");
+    CHECK(path(log).empty());
+}
+
+TEST_CASE("saving writes a changed folder into the entity's entry, and takes an emptied one out") {
+    Scene scene;
+    scene.write_source("content/world/camp.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "fire", "folder": "camp", "position": [64, 0, 64]},
+    {"name": "tent", "position": [60, 0, 60]}
+  ]
+}
+)");
+    scene.cook(); // "folder" is the editor's: the cooker takes it and leaves it out
+    de::editor::CellSources sources(heap());
+    REQUIRE(sources.scan(scene.vfs));
+    static_cast<void>(de::world::load_cell(scene.world.ecs(), id_of(scene, "src:/content/world/camp.cell")));
+    scene.settle();
+    const auto set = [](flecs::entity entity, const char* path, const char* filed) {
+        de::editor::EditorFolder folder;
+        std::snprintf(folder.path, sizeof(folder.path), "%s", path);
+        std::snprintf(folder.filed, sizeof(folder.filed), "%s", filed);
+        entity.set(folder);
+    };
+    set(scene.member("fire"), "", "camp");
+    set(scene.member("tent"), "camp/tents", "");
+    const de::editor::CellSaveReport report =
+        de::editor::save_cells(scene.world.ecs(), scene.assets, scene.vfs, sources, {});
+    CHECK(report.files_written == 1);
+    CHECK(scene.read_source("src:/content/world/camp.cell") == R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "fire", "position": [64, 0, 64]},
+    {"name": "tent", "position": [60, 0, 60], "folder": "camp/tents"}
+  ]
+}
+)");
 }

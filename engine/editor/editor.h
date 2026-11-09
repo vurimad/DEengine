@@ -161,6 +161,10 @@ private:
     static void undo_command(void* user, const console::Args& args, console::Output& out);
     // editor.select NAME...: those chosen (none: nothing).
     static void select_command(void* user, const console::Args& args, console::Output& out);
+    // editor.folder PATH [NAME...]: those (or the selection) into a folder.
+    static void folder_command(void* user, const console::Args& args, console::Output& out);
+    // Each frame: the members of cells spawned since get the folders their files give them (EditorFolder).
+    void read_folders(app::Engine& engine);
     // The names given chosen (false, said, if one isn't there); none given: the selection as it is.
     bool choose_named(const console::Args& args, console::Output& out);
     static void redo_command(void* user, const console::Args& args, console::Output& out);
@@ -227,8 +231,9 @@ private:
     View last_view_;                                       // the Playground's, as last drawn
     std::optional<world::TerrainHeights> terrain_heights_; // the ground's heights, for placing on it (from startup)
     core::HashMap<uint64_t, asset::AssetHandle> holds_;    // by asset ID
-    MemberTracker members_;                                // what the commands and the selection name, through respawns
-    uint64_t keyed_changes_ = UINT64_MAX;                  // commands_.changes() when their keys were noted
+    core::HashMap<flecs::entity_t, uint32_t> folders_read_{core::heap_allocator(core::MemoryTag::Editor)};
+    MemberTracker members_;               // what the commands and the selection name, through respawns
+    uint64_t keyed_changes_ = UINT64_MAX; // commands_.changes() when their keys were noted
     core::Array<flecs::entity_t> scratch_entities_;
     bool quit_ = false;
 };

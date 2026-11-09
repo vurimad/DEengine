@@ -91,11 +91,15 @@ private:
             return;
         }
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
-        static constexpr const char* kKeys[] = {"name",  "mesh",   "position", "rotation",   "rotation_deg",
-                                                "scale", "parent", "static",   "fog_volume", "collision"};
+        // "folder" is the editor's, for its hierarchy: read there, not cooked.
+        static constexpr const char* kKeys[] = {"name",   "mesh",   "position",   "rotation",  "rotation_deg", "scale",
+                                                "parent", "static", "fog_volume", "collision", "folder"};
         reader.check_keys(kKeys, "cell entity");
         Parsed& parsed = parsed_.back();
         parsed.name = reader.string("name", "");
+        if (reader.has("folder") && !yyjson_is_str(yyjson_obj_get(object, "folder"))) {
+            diagnostics_.error(path_, "entity %zu: folder should be a string (\"camp/props\")", index);
+        }
         parsed.parent = reader.string("parent", "");
         const Label label = label_of(index);
         const auto bad = [&](const char* what) { diagnostics_.error(path_, "%s: %s", label.c_str(), what); };

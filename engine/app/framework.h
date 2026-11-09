@@ -50,7 +50,7 @@ namespace de::app {
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --no-vsync       present without waiting for vertical blank
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
-//   --game-dir DIR   folder mounted as game:/ (default ./cooked)
+//   --game-dir DIR   folder mounted as game:/ (default ./cooked; a dev build without one there uses its source tree's)
 //   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
 //   --lod-error-pixels X  how far a LOD may lie from LOD 0 (default 1); 0 draws LOD 0 everywhere

@@ -98,6 +98,8 @@ public:
     // The parent's name the entity names ("" without one), and its mesh's path as written ("" without one).
     std::string_view parent(uint32_t index) const;
     std::string_view mesh(uint32_t index) const;
+    // A string key of the entity's object, as written (escapes left as they are): "" if it isn't there or isn't one.
+    std::string_view string_member(uint32_t index, std::string_view key) const;
     // The entity's object, as the file has it ("{...}").
     std::string_view entity_text(uint32_t index) const;
 

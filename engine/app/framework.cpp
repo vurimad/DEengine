@@ -456,12 +456,21 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     // game:/ is the cooked data; src:/ the source tree, in dev builds only (shaders compile from it
     // and hot reload; without it, they load from the cooker's .deshader files).
     const char* src_root = DE_BUILD_DEV != 0 ? (args.src_dir != nullptr ? args.src_dir : DE_SOURCE_DIR) : nullptr;
-    auto vfs = platform::Vfs::create({.game_root = args.game_dir, .src_root = src_root, .jobs = &jobs});
+    // A dev build started away from its tree (from the exe's folder, a shortcut) without --game-dir: the cooked data
+    // beside its sources, not a "cooked" folder where it happens to be.
+    const char* game_root = args.game_dir;
+    platform::PathString beside_sources;
+    if (src_root != nullptr && flag_value(args, "--game-dir") == nullptr && !platform::path_exists(game_root) &&
+        beside_sources.assign(src_root) && beside_sources.append("/cooked") &&
+        platform::path_exists(beside_sources.c_str())) {
+        game_root = beside_sources.c_str();
+    }
+    auto vfs = platform::Vfs::create({.game_root = game_root, .src_root = src_root, .jobs = &jobs});
     if (!vfs && src_root != nullptr) {
         // A dev build away from its source tree: run without src:/ rather than not at all.
         DE_LOG_WARN("engine", "source tree %s not found (pass --src-dir): running without src:/", src_root);
         src_root = nullptr;
-        vfs = platform::Vfs::create({.game_root = args.game_dir, .jobs = &jobs});
+        vfs = platform::Vfs::create({.game_root = game_root, .jobs = &jobs});
     }
     if (!vfs) {
         return EXIT_FAILURE;
