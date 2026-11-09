@@ -10,6 +10,7 @@ The game world (docs/design.md, Core systems; Open world & streaming: world mode
 | `transform.h` | `Transform` (local, double position), `WorldTransform` and `PreviousWorldTransform` (computed), `StaticTransform`, `compose`, `interpolate`, `place`, `attach`, `detach` |
 | `cell.h` | `Cell`, `InCell`, `load_cell` (spawns a cooked cell's members once it's loaded), `create_cell`, `add_to_cell`: cells own their entities and the assets they use. `MeshCollider`: what asks `engine/physics` for a static body in the shape of a cooked mesh |
 | `render_extract.h` | `MeshInstance`, `Camera`, `ActiveCamera`, and `RenderFrame`: instances as `RenderTransform`s, the camera as floats relative to a render origin |
+| `terrain_heights.h` | `TerrainHeights`: the ground's height anywhere on a cooked terrain on the CPU (the finest level's block under a point, bilinear), and where a ray comes down onto it; blocks read when first asked about, blocking, a few kept: for tools and the editor |
 | `flecs_os.h` | flecs on the engine's allocator and log, with its own threads off |
 
 ## Rules and invariants

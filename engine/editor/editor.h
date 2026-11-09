@@ -15,6 +15,9 @@
 #include "editor/properties_panel.h"
 #include "editor/selection.h"
 #include "platform/process.h"
+#include "world/terrain_heights.h"
+
+#include <optional>
 
 #if DE_BUILD_DEV
 namespace de::editor {
@@ -106,6 +109,12 @@ private:
     // Delete: the selected entity away, as a command. Ctrl+D: a copy of it where it stands, made in the editor (saved
     // into its cell at the next save), selected.
     void delete_selection(app::Engine& engine);
+    // End: the selection down onto the ground below it, its lowest point (the box round its mesh, as it's turned and
+    // scaled) on the nearer of the terrain and something solid (not itself or what hangs on it), as a command. False if
+    // there's nothing below it.
+    bool drop_selection_to_ground(app::Engine& engine);
+    // Where the ground is under start, straight down (start's own height and below): false if nothing is.
+    bool ground_below(app::Engine& engine, const DVec3& start, flecs::entity ignore, DVec3& out);
     void duplicate_selection(app::Engine& engine);
     // A model from the resources (src:/ path) dropped on the Playground at screen: made where the ray from the camera
     // meets the ground, as a command, selected.
@@ -133,8 +142,12 @@ private:
     static void move_command(void* user, const console::Args& args, console::Output& out);
     // editor.place PATH X Y Z, editor.duplicate NAME, editor.delete NAME: as dropping, Ctrl+D and Delete do.
     static void place_command(void* user, const console::Args& args, console::Output& out);
+    // editor.drop PATH: a model dropped at the middle of the Playground, as a mouse drop there.
+    static void drop_command(void* user, const console::Args& args, console::Output& out);
     static void duplicate_command(void* user, const console::Args& args, console::Output& out);
     static void delete_command(void* user, const console::Args& args, console::Output& out);
+    // editor.ground NAME: as End does with it selected.
+    static void ground_command(void* user, const console::Args& args, console::Output& out);
     // editor.undo, editor.redo: as Ctrl+Z and Ctrl+Y.
     static void undo_command(void* user, const console::Args& args, console::Output& out);
     static void redo_command(void* user, const console::Args& args, console::Output& out);
@@ -192,12 +205,14 @@ private:
     CellSources cell_sources_;
     platform::Process cooker_;
     Pending pending_ = Pending::None;
-    core::Array<platform::PathString> cooking_;         // what the last save wrote, which the cooker's cooking
-    uint64_t saved_changes_ = 0;                        // commands_.changes() at the last save
-    app::Engine* engine_ = nullptr;                     // for the console's commands and the maker
-    core::HashMap<uint64_t, asset::AssetHandle> holds_; // by asset ID
-    MemberTracker members_;                             // what the commands and the selection name, through respawns
-    uint64_t keyed_changes_ = UINT64_MAX;               // commands_.changes() when their keys were noted
+    core::Array<platform::PathString> cooking_;            // what the last save wrote, which the cooker's cooking
+    uint64_t saved_changes_ = 0;                           // commands_.changes() at the last save
+    app::Engine* engine_ = nullptr;                        // for the console's commands and the maker
+    View last_view_;                                       // the Playground's, as last drawn
+    std::optional<world::TerrainHeights> terrain_heights_; // the ground's heights, for placing on it (from startup)
+    core::HashMap<uint64_t, asset::AssetHandle> holds_;    // by asset ID
+    MemberTracker members_;                                // what the commands and the selection name, through respawns
+    uint64_t keyed_changes_ = UINT64_MAX;                  // commands_.changes() when their keys were noted
     core::Array<flecs::entity_t> scratch_entities_;
     bool quit_ = false;
 };

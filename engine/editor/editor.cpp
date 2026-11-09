@@ -259,6 +259,7 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     viewer_.set_quit_on_escape(false);
     engine_ = &engine;
     commands_.set_maker(this);
+    terrain_heights_.emplace(engine.vfs, editor_heap());
     engine.console.add_command("editor.save", "",
                                "Save the edits into the cells' text sources, then cook them (as Ctrl+S does).",
                                &Editor::save_command, this);
@@ -268,10 +269,17 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     engine.console.add_command("editor.place", "<src:/content/...model> <x> <y> <z>",
                                "Place a model there (meters), as dropping it on the Playground does.",
                                &Editor::place_command, this);
+    engine.console.add_command(
+        "editor.drop", "<src:/content/...model>",
+        "Drop a model at the middle of the Playground, on the ground there (as the mouse would).",
+        &Editor::drop_command, this);
     engine.console.add_command("editor.duplicate", "<name>", "Duplicate the entity of that name (as Ctrl+D does).",
                                &Editor::duplicate_command, this);
     engine.console.add_command("editor.delete", "<name>", "Delete the entity of that name (as the Delete key does).",
                                &Editor::delete_command, this);
+    engine.console.add_command("editor.ground", "<name>",
+                               "Drop the entity of that name onto the ground below it (as End does).",
+                               &Editor::ground_command, this);
     engine.console.add_command("editor.undo", "", "Undo the last edit (as Ctrl+Z does).", &Editor::undo_command, this);
     engine.console.add_command("editor.redo", "", "Do again what was undone (as Ctrl+Y does).", &Editor::redo_command,
                                this);
@@ -633,6 +641,9 @@ void Editor::header_row(app::Engine& engine) {
         }
         if (ImGui::MenuItem("Delete", "Del", false, an_entity)) {
             delete_selection(engine);
+        }
+        if (ImGui::MenuItem("Drop to Ground", "End", false, an_entity)) {
+            static_cast<void>(drop_selection_to_ground(engine));
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Frame Selected", "F", false, selection_.kind == Selection::Kind::Entity)) {
@@ -1089,6 +1100,7 @@ void Editor::playground(app::Engine& engine) {
 
         // The selection's handles; a click elsewhere in the scene selects what's under it.
         const View view = playground_view(corner, size);
+        last_view_ = view;
         const flecs::world& ecs = engine.world.ecs();
         const flecs::entity selected = selection_.kind == Selection::Kind::Entity && ecs.is_alive(selection_.entity)
                                            ? ecs.entity(selection_.entity)
@@ -1162,6 +1174,9 @@ void Editor::shortcuts(app::Engine& engine) {
     }
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_Delete, ImGuiInputFlags_RouteGlobal)) {
         delete_selection(engine);
+    }
+    if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_End, ImGuiInputFlags_RouteGlobal)) {
+        static_cast<void>(drop_selection_to_ground(engine));
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
         undo(engine);
@@ -1458,6 +1473,107 @@ void Editor::delete_selection(app::Engine& engine) {
     }
 }
 
+bool Editor::ground_below(app::Engine& engine, const DVec3& start, flecs::entity ignore, DVec3& out) {
+    constexpr double kReach = 10000.0;
+    const Vec3 down(0.0f, -1.0f, 0.0f);
+    bool found = false;
+    // Something solid: not what's being dropped, nor what hangs on it (cast again past those).
+    DVec3 from = start;
+    for (int tries = 0; tries < 16; ++tries) {
+        physics::QueryHit hit;
+        if (!engine.physics.ray_cast(from, down, static_cast<float>(kReach), hit, {.ignore = ignore.id()})) {
+            break;
+        }
+        bool its_own = false;
+        for (flecs::entity at = engine.world.ecs().entity(hit.entity); at.is_valid() && at.is_alive() && !its_own;) {
+            const auto* parent = at.try_get<flecs::Parent>();
+            if (parent == nullptr) {
+                break;
+            }
+            its_own = parent->value == ignore.id();
+            at = engine.world.ecs().entity(parent->value);
+        }
+        if (!its_own) {
+            out = hit.position;
+            found = true;
+            break;
+        }
+        from = DVec3(hit.position.x, hit.position.y - 0.01, hit.position.z);
+    }
+    // The terrain, if it's higher.
+    if (terrain_heights_.has_value()) {
+        world::TerrainHeights& heights = *terrain_heights_;
+        heights.set_terrain(engine.assets.get<asset::TerrainAsset>(engine.terrain));
+        double ground = 0.0;
+        if (heights.height_at(start.x, start.z, ground) && ground <= start.y && (!found || ground > out.y)) {
+            out = DVec3(start.x, ground, start.z);
+            found = true;
+        }
+    }
+    return found;
+}
+
+bool Editor::drop_selection_to_ground(app::Engine& engine) {
+    const flecs::world& ecs = engine.world.ecs();
+    if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
+        return false;
+    }
+    const flecs::entity entity = ecs.entity(selection_.entity);
+    const auto* where = entity.try_get<world::WorldTransform>();
+    if (where == nullptr || entity.has<world::Cell>() || entity.id() == viewer_.camera_entity().id()) {
+        return false;
+    }
+    // Its lowest and highest points, as it's turned and scaled now: the box round its mesh (its pivot without one).
+    const world::WorldTransform now = *where;
+    double lowest = 0.0;
+    double highest = 0.0;
+    const auto* instance = entity.try_get<world::MeshInstance>();
+    if (const auto* mesh = instance != nullptr ? engine.assets.get<asset::MeshAsset>(instance->mesh) : nullptr) {
+        lowest = std::numeric_limits<double>::max();
+        highest = std::numeric_limits<double>::lowest();
+        for (uint32_t c = 0; c < 8; ++c) {
+            const Vec3 corner((c & 1U) != 0 ? mesh->bounds.max[0] : mesh->bounds.min[0],
+                              (c & 2U) != 0 ? mesh->bounds.max[1] : mesh->bounds.min[1],
+                              (c & 4U) != 0 ? mesh->bounds.max[2] : mesh->bounds.min[2]);
+            const double height = (now.rotation * (now.scale * corner)).y;
+            lowest = std::min(lowest, height);
+            highest = std::max(highest, height);
+        }
+    }
+    // Looked for from just over its top, so one half sunk into the ground comes up onto it; its lowest point lands.
+    DVec3 ground;
+    bool below = ground_below(engine, now.position + DVec3(0.0, highest + 0.5, 0.0), entity, ground);
+    // Under the terrain altogether: up onto it.
+    if (double terrain = 0.0; !below && terrain_heights_.has_value() &&
+                              terrain_heights_->height_at(now.position.x, now.position.z, terrain)) {
+        ground = DVec3(now.position.x, terrain, now.position.z);
+        below = true;
+    }
+    if (!below) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Nothing below it to drop onto"));
+        return false;
+    }
+    world::WorldTransform dropped = now;
+    dropped.position.y = ground.y - lowest;
+    // As its Transform has it: in the world, or relative to what it's attached to.
+    world::Transform placed{.position = dropped.position, .rotation = dropped.rotation, .scale = dropped.scale};
+    if (const auto* parent = entity.try_get<flecs::Parent>()) {
+        const auto* parent_world = ecs.entity(parent->value).try_get<world::WorldTransform>();
+        if (parent_world == nullptr) {
+            return false;
+        }
+        placed = world::local_of(*parent_world, dropped);
+    }
+    const bool moved =
+        commands_.set_component(entity, ecs.component<world::Transform>().id(), std::as_bytes(std::span(&placed, 1)));
+    if (moved) {
+        const double moved_by = now.position.y - dropped.position.y;
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Dropped to the ground, %.2f m %s",
+                                        std::abs(moved_by), moved_by >= 0.0 ? "down" : "up"));
+    }
+    return moved;
+}
+
 void Editor::duplicate_selection(app::Engine& engine) {
     const flecs::world& ecs = engine.world.ecs();
     if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
@@ -1486,12 +1602,29 @@ void Editor::duplicate_selection(app::Engine& engine) {
 }
 
 void Editor::place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen) {
-    // Where the ray under the mouse meets the ground: something solid, else the level of the world's zero.
+    // Where the ray under the mouse meets the ground: the nearer of something solid and the terrain, else the level of
+    // the world's zero.
     const Vec3 direction = view.ray(screen);
     DVec3 point = view.position + (DVec3(direction) * 20.0);
+    constexpr double kReach = 5000.0;
+    double nearest = kReach;
+    bool found = false;
     physics::QueryHit hit;
-    if (engine.physics.ray_cast(view.position, direction, 5000.0f, hit)) {
+    if (engine.physics.ray_cast(view.position, direction, static_cast<float>(kReach), hit)) {
         point = hit.position;
+        nearest = hit.distance_m;
+        found = true;
+    }
+    if (terrain_heights_.has_value()) {
+        world::TerrainHeights& heights = *terrain_heights_;
+        heights.set_terrain(engine.assets.get<asset::TerrainAsset>(engine.terrain));
+        if (DVec3 ground; heights.ray_cast(view.position, direction, nearest, ground)) {
+            point = ground;
+            found = true;
+        }
+    }
+    if (found) {
+        // On what it met.
     } else if (direction.y < -1e-4f) {
         const double along = -view.position.y / static_cast<double>(direction.y);
         if (along > 0.0 && along < 5000.0) {
@@ -1616,6 +1749,25 @@ void Editor::place_command(void* user, const console::Args& args, console::Outpu
     out.info("%s", editor->message_);
 }
 
+void Editor::drop_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1 || editor->last_view_.size.x <= 0.0f) {
+        out.error("editor.drop takes a model's src:/ path, with the Playground shown");
+        return;
+    }
+    const View& view = editor->last_view_;
+    const ImVec2 middle(view.min.x + (view.size.x * 0.5f), view.min.y + (view.size.y * 0.5f));
+    const flecs::entity_t before = editor->selection_.entity;
+    editor->place_model(*editor->engine_, args[0], view, middle);
+    const flecs::world& ecs = editor->engine_->world.ecs();
+    if (editor->selection_.entity == before || !ecs.is_alive(editor->selection_.entity)) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    const DVec3 at = ecs.entity(editor->selection_.entity).get<world::Transform>().position;
+    out.info("%s, at %.3f %.3f %.3f", editor->message_, at.x, at.y, at.z);
+}
+
 void Editor::duplicate_command(void* user, const console::Args& args, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
     const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
@@ -1648,6 +1800,22 @@ void Editor::redo_command(void* user, const console::Args& /*args*/, console::Ou
     }
     out.info("redo %s", what);
     editor->redo(*editor->engine_);
+}
+
+void Editor::ground_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const flecs::entity found = args.size() == 1 ? editor->find_named(*editor->engine_, args[0]) : flecs::entity();
+    if (!found.is_valid()) {
+        out.error("editor.ground: name an entity that's there");
+        return;
+    }
+    editor->selection_.select_entity(found.id());
+    if (!editor->drop_selection_to_ground(*editor->engine_)) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    const DVec3 at = found.get<world::WorldTransform>().position;
+    out.info("%s: at %.3f %.3f %.3f", editor->message_, at.x, at.y, at.z);
 }
 
 void Editor::delete_command(void* user, const console::Args& args, console::Output& out) {

@@ -8,6 +8,8 @@ add_library(de_world STATIC
     flecs_os.h
     render_extract.cpp
     render_extract.h
+    terrain_heights.cpp
+    terrain_heights.h
     transform.cpp
     transform.h
     world.cpp
@@ -15,4 +17,4 @@ add_library(de_world STATIC
 add_library(de::world ALIAS de_world)
 
 target_link_libraries(de_world
-    PUBLIC de::asset de::core de::compile_options $<IF:$<TARGET_EXISTS:flecs::flecs>,flecs::flecs,flecs::flecs_static>)
+    PUBLIC de::asset de::core de::platform de::compile_options $<IF:$<TARGET_EXISTS:flecs::flecs>,flecs::flecs,flecs::flecs_static>)

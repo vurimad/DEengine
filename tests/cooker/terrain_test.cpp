@@ -14,6 +14,7 @@
 #include "platform/vfs.h"
 #include "support/cook_kit.h"
 #include "support/sandbox.h"
+#include "world/terrain_heights.h"
 
 #include <doctest/doctest.h>
 
@@ -26,6 +27,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace de::asset;
@@ -1657,4 +1659,59 @@ TEST_CASE("terrain: it loads with its world, and its heights never load whole") 
     registry.release(world_handle);
     registry.update();
     CHECK(registry.stats().assets == 0);
+}
+
+TEST_CASE("terrain heights on the CPU: the ground at any point, and where a ray comes down onto it") {
+    using de::DVec3;
+    using de::Vec3;
+    const Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 1});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    // A map larger than a node at its spacing, so a point can lie in any of several blocks.
+    Map map = bumpy_map(300, 200);
+    map.origin_m[0] = 1000.5;
+    map.origin_m[1] = -2000.25;
+    const CookedMap cooked(map);
+    REQUIRE(vfs.write_file(cooked_path(kId, AssetType::TerrainHeights).c_str(), cooked.heights_file()).ok());
+    de::world::TerrainHeights heights(vfs, de::core::heap_allocator(de::core::MemoryTag::World));
+    heights.set_terrain(&cooked.terrain());
+
+    // On a sample: the source's height, as the finest level rounds it.
+    const double step = map.spacing_m / static_cast<double>(kTerrainStepsPerSpacing);
+    for (const auto [x, z] : {std::pair{0U, 0U}, {17U, 33U}, {150U, 120U}, {299U, 199U}, {128U, 64U}}) {
+        double ground = 0.0;
+        REQUIRE(
+            heights.height_at(map.origin_m[0] + (x * map.spacing_m), map.origin_m[1] + (z * map.spacing_m), ground));
+        CHECK(std::abs(ground - map.height_m(map.at(x, z))) <= step);
+    }
+    // Between samples: between their heights.
+    double ground = 0.0;
+    REQUIRE(
+        heights.height_at(map.origin_m[0] + (40.5 * map.spacing_m), map.origin_m[1] + (60 * map.spacing_m), ground));
+    const double left = map.height_m(map.at(40, 60));
+    const double right = map.height_m(map.at(41, 60));
+    CHECK(std::abs(ground - ((left + right) * 0.5)) <= step * 2.0);
+    // Off the map: nothing.
+    CHECK_FALSE(heights.height_at(map.origin_m[0] - 1.0, map.origin_m[1] + 10.0, ground));
+    CHECK_FALSE(heights.height_at(map.origin_m[0] + 10.0, map.origin_m[1] + 1000.0, ground));
+
+    // Straight down from above: onto the ground there.
+    const DVec3 above(map.origin_m[0] + 211.3, 2000.0, map.origin_m[1] + 157.9);
+    REQUIRE(heights.height_at(above.x, above.z, ground));
+    DVec3 hit;
+    REQUIRE(heights.ray_cast(above, Vec3(0.0f, -1.0f, 0.0f), 5000.0, hit));
+    CHECK(std::abs(hit.y - ground) <= 0.01);
+    // At a slant, from far off: where it comes down, it's on the ground.
+    const DVec3 far(map.origin_m[0] - 100.0, 600.0, map.origin_m[1] + 100.0);
+    const Vec3 slant = glm::normalize(Vec3(1.0f, -1.0f, 0.2f));
+    REQUIRE(heights.ray_cast(far, slant, 5000.0, hit));
+    REQUIRE(heights.height_at(hit.x, hit.z, ground));
+    CHECK(std::abs(hit.y - ground) <= 0.01);
+    // From under the ground, or not reaching it: no.
+    CHECK_FALSE(heights.ray_cast(DVec3(above.x, ground - 600.0, above.z), Vec3(0.0f, -1.0f, 0.0f), 5000.0, hit));
+    CHECK_FALSE(heights.ray_cast(above, Vec3(0.0f, -1.0f, 0.0f), 10.0, hit));
+    CHECK_FALSE(heights.ray_cast(above, Vec3(0.0f, 1.0f, 0.0f), 5000.0, hit));
+    // Without a terrain: nothing.
+    heights.set_terrain(nullptr);
+    CHECK_FALSE(heights.height_at(above.x, above.z, ground));
 }
