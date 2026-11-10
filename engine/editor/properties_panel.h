@@ -54,6 +54,8 @@ private:
 
     void draw_entity(const app::Engine& engine, Selection& selection, CommandStack& commands);
     bool draw_file(const app::Engine& engine, const Selection& selection);
+    // The terrain: what it is, read only (it isn't moved, turned or scaled).
+    void draw_terrain(const app::Engine& engine);
     // The rows of a struct's members; offset is where the struct starts in value's bytes.
     void draw_members(const flecs::world& ecs, flecs::entity_t type, const Value& value, size_t offset, uint32_t depth,
                       Edit& edit);

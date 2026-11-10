@@ -1,0 +1,3 @@
+# A DEengine project (docs/design.md, Projects): its sources are content/, meta/ and config/ beside this file,
+# its cooked data cooked/. Open it with --project projects/sandbox.
+name sandbox

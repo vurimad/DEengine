@@ -123,6 +123,14 @@ struct GBufferPush {
 };
 
 #if DE_BUILD_DEV
+// Matches TerrainSelectionPush in shaders/scene/terrain_selection.slang.
+struct TerrainSelectionPush {
+    uint32_t ids = 0;
+    uint32_t mask = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+};
+
 // Matches OutlinePush in shaders/scene/outline.slang.
 struct OutlinePush {
     uint32_t mask = 0;
@@ -546,6 +554,7 @@ struct SceneRendererState {
     shader::ProgramHandle id_programs[6];
     bool id_programs_made = false;
     shader::ProgramHandle selection_program;
+    shader::ProgramHandle terrain_selection_program;
     shader::ProgramHandle outline_program;
     rhi::Format outline_format = rhi::Format::Unknown;
     EditorOverlay editor;
@@ -671,6 +680,7 @@ struct SceneRendererState {
             shaders->destroy(program);
         }
         shaders->destroy(selection_program);
+        shaders->destroy(terrain_selection_program);
         shaders->destroy(outline_program);
         for (const rhi::BufferHandle buffer : selection_draws) {
             device->destroy(buffer);
@@ -904,6 +914,9 @@ struct SceneRendererState {
                                            .debug_name = "editor selection"};
             mask.color_formats[0] = kSelectionMaskFormat;
             selection_program = make("scene.gbuffer", mask, "fragment_selection");
+            const core::Result<shader::ProgramHandle> terrain_mask = shaders->create_compute(
+                {.module = "scene.terrain_selection", .debug_name = "editor terrain selection"});
+            terrain_selection_program = terrain_mask ? *terrain_mask : shader::ProgramHandle{};
         }
         if (target_format != outline_format) {
             shaders->destroy(outline_program);
@@ -926,7 +939,7 @@ struct SceneRendererState {
         device->invalidate_mapped(pick_readback[slot]);
         uint32_t id = 0;
         std::memcpy(&id, device->mapped(pick_readback[slot]).data(), sizeof(id));
-        pick.slot = id == 0 ? kNothingPicked : id - 1;
+        pick.slot = id == 0 || id == kEditorTerrainId ? kNothingPicked : id - 1;
         ++pick.count;
     }
 #endif
@@ -2957,6 +2970,42 @@ GraphTexture SceneRenderer::add_editor_passes(RenderGraph& graph, GraphTexture i
         }
     }
     state.editor.pick = false;
+
+    // The terrain chosen: its mask from the IDs the G-buffer wrote.
+    if (state.editor.enabled && state.editor.terrain_selected) {
+        const rhi::PipelineHandle terrain = state.shaders->pipeline(state.terrain_selection_program);
+        if (!terrain.is_valid() || !ids.is_valid()) {
+            return {};
+        }
+        struct TerrainSelectionPass {
+            GraphTexture mask;
+        };
+        const auto& pass = graph.add_pass<TerrainSelectionPass>(
+            "editor terrain selection",
+            [&](PassBuilder& builder, TerrainSelectionPass& data) {
+                data.mask =
+                    builder.create_texture({.desc = {.format = rhi::Format::RGBA8Unorm}, .reference_scale = 1.0f});
+                builder.use(data.mask, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                builder.use(ids, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+            },
+            [ids, terrain](const TerrainSelectionPass& data, PassContext& context) {
+                DE_PROFILE_ZONE("editor terrain selection pass");
+                const rhi::TextureHandle mask = context.texture(data.mask);
+                const rhi::TextureDesc* desc = context.device.texture_desc(mask);
+                if (desc == nullptr) {
+                    return;
+                }
+                context.list.bind_pipeline(terrain);
+                context.list.push_constants(TerrainSelectionPush{
+                    .ids = context.device.storage_texture_index(context.texture(ids)),
+                    .mask = context.device.storage_texture_index(mask),
+                    .width = desc->width,
+                    .height = desc->height,
+                });
+                context.list.dispatch((desc->width + 7) / 8, (desc->height + 7) / 8, 1);
+            });
+        return pass.mask;
+    }
 
     // The selection's mask: its meshes alone (their finest LOD), each pixel covered and whether it's seen.
     const rhi::PipelineHandle selection = state.shaders->pipeline(state.selection_program);

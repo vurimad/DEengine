@@ -12,18 +12,18 @@
 
 namespace de::editor {
 
-// What the editor has chosen: entities in the world (the Playground, the hierarchy) or a source file (the resource
-// browser). The properties panel shows whichever was chosen last. Several entities can be chosen (Ctrl toggles one,
-// Shift adds); the one chosen last is the primary: what the properties show and where the handles sit, and what an
-// edit of all of them goes by.
+// What the editor has chosen: entities in the world (the Playground, the hierarchy), the world's terrain (the
+// hierarchy: it's outlined, and can't be moved), or a source file (the resource browser). The properties panel shows
+// whichever was chosen last. Several entities can be chosen (Ctrl toggles one, Shift adds); the one chosen last is the
+// primary: what the properties show and where the handles sit, and what an edit of all of them goes by.
 struct Selection {
-    enum class Kind : uint8_t { None, Entity, File };
+    enum class Kind : uint8_t { None, Entity, Terrain, File };
 
     Kind kind = Kind::None;
     flecs::entity_t entity = 0; // the primary: the one chosen last
     core::Array<flecs::entity_t> entities{core::heap_allocator(core::MemoryTag::Editor)}; // every one, it among them
     core::FixedString<255> file; // "src:/content/terrain/wc.world"
-    bool frame_entity = false;   // asked this frame: the camera goes to look at the entity
+    bool frame_entity = false;   // asked this frame: the camera goes to look at the entity (or the terrain)
 
     // Only this one (none for 0).
     void select_entity(flecs::entity_t chosen) {
@@ -83,6 +83,12 @@ struct Selection {
     // Whether an entity is chosen now (not just in the list behind a chosen file).
     bool has_entity(flecs::entity_t chosen) const { return kind == Kind::Entity && contains(chosen); }
 
+    // The terrain, alone.
+    void select_terrain() {
+        entities.clear();
+        entity = 0;
+        kind = Kind::Terrain;
+    }
     void select_file(std::string_view path) {
         kind = Kind::File;
         file.assign(path);

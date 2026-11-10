@@ -299,7 +299,7 @@ ShaderDependency module_file(const LibraryState& state, const Program& program) 
     }
     // Always fits: module names are at most 63 characters.
     platform::PathString relative;
-    ShaderDependency file{.path = platform::PathString("src:/")};
+    ShaderDependency file{.path = platform::PathString("engine:/")};
     const bool fits_path = shader_module_path(program.module.view(), relative) && file.path.append(relative.view());
     DE_ASSERT(fits_path);
     static_cast<void>(fits_path);

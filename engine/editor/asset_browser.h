@@ -4,7 +4,9 @@
 #include "core/array.h"
 #include "core/fixed_string.h"
 #include "core/hash_map.h"
+#include "editor/file_ops.h"
 #include "editor/selection.h"
+#include "editor/thumbnails.h"
 
 #include <imgui.h>
 
@@ -22,8 +24,9 @@ namespace de::editor {
 // navigation surface beside the folder's contents, as a list or a grid of cards (Ctrl+wheel sizes them), with a search
 // over every file and folder above them. One-column layout: a single tree with the files in it. A click selects (Ctrl
 // adds, Shift takes a range); a double-click or Enter opens a folder, or asks the editor to open a file (a world).
-// Items drag out (payload kSourceFilePayload: the path, terminated). Read once, and again on Refresh. Favourites, the
-// view and the layout are kept in user:/editor/resources.settings.
+// Items drag out (payload kSourceFilePayload: the path, terminated). Read once, and again on Refresh. Kept between
+// sessions in user:/editor/resources.settings: the view, the layout, the card size, the favourites, the folder shown,
+// the folders open in the tree, what's selected, the search and the folder tree's width.
 class AssetBrowser {
 public:
     static constexpr const char* kWindow = "Resources";
@@ -37,6 +40,19 @@ public:
     // What the status bar shows while the panel has focus: "12 items  1 selected".
     const char* status() const { return status_; }
     bool focused() const { return focused_; }
+
+    // Opens the folder a file is in, the tree open down to it ("src:/content/props/rock.gltf"), once it's read.
+    void show_file(std::string_view path) { show_file_ = Path(path); }
+    // Read the folders again next time it's drawn (files changed under it: a console command, a cook).
+    void refresh() { refresh_ = true; }
+    // Whether files were moved, renamed or deleted since last asked (the editor reads its cells' sources again).
+    bool take_files_changed() {
+        const bool changed = files_changed_;
+        files_changed_ = false;
+        return changed;
+    }
+    // Models' pictures on their cards and rows; null: their glyphs.
+    void set_thumbnails(Thumbnails* thumbnails) { thumbnails_ = thumbnails; }
 
     void load_settings(const platform::Vfs& vfs);
     void save_settings(const platform::Vfs& vfs) const;
@@ -88,6 +104,16 @@ private:
     void item_context_menu(uint32_t entry, Selection& selection);
     void keyboard(Selection& selection, uint32_t columns);
     void rebuild_shown();
+    // File operations (file_ops.h): rename (F2), delete to the recycle bin (Delete, after saying who still names
+    // it), a new folder, and moving by dropping onto a folder.
+    void folder_drop_target(uint32_t folder, Selection& selection);
+    void apply_moves(std::span<const SourceMove> moves, Selection& selection);
+    void start_rename(uint32_t entry);
+    void ask_delete(uint32_t entry);
+    void new_folder(uint32_t parent);
+    void draw_file_dialogs(Selection& selection);
+    // A model's picture, if it's made (and asked for if not).
+    bool model_picture(uint32_t entry, Thumbnails::Picture& out);
 
     core::Array<char> names_;
     core::Array<Entry> entries_;     // [0]: content/ itself; each folder's entries together, folder by folder
@@ -107,6 +133,22 @@ private:
     float grid_extent_ = 96.0f; // card thumbnails, screen pixels at 100%
     char search_[96] = {};
     char status_[96] = {};
+    Thumbnails* thumbnails_ = nullptr;
+    const platform::Vfs* vfs_ = nullptr; // while drawn
+    bool files_changed_ = false;
+    // The rename dialog: what's renamed, its new name; the delete dialog: what goes, who still names it.
+    Path renaming_;
+    char rename_text_[128] = {};
+    bool open_rename_ = false;
+    Path rename_after_scan_; // a folder just made: renamed once the folders are read again
+    core::Array<SourcePath> deleting_;
+    core::Array<SourcePath> users_;
+    bool open_delete_ = false;
+    Path show_file_; // to open when next drawn
+    // Kept from the last session, applied once the folders are read: the folder shown and what was selected there.
+    Path start_folder_;
+    core::Array<Path> start_selected_;
+    float folders_width_ = 260.0f; // the tree's column, screen pixels at 100%
     bool scanned_ = false;
     bool refresh_ = false; // asked from the toolbar: read the folders again
     bool scroll_to_top_ = false;

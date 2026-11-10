@@ -244,6 +244,9 @@ public float2 octahedral_encode(float3 n)
 }
 
 // A triangle covering the screen, for full-screen passes: draw(3). ndc in [-1, 1], +Y up.
+// The editor's instance ID for the terrain and its grass (EDITOR_IDS): never a pick, the terrain's outline.
+public static const uint kEditorTerrainId = 0xFFFFFFFFu;
+
 public float4 fullscreen_triangle(uint vertex_id, out float2 ndc)
 {
     const float2 corner = float2(float((vertex_id << 1) & 2), float(vertex_id & 2));

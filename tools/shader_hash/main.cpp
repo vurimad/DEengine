@@ -23,7 +23,7 @@ int main(int argc, char** argv) {
     const auto vfs = de::platform::Vfs::create({.game_root = argv[2],
                                                 .user_root = argv[2],
                                                 .temp_root = argv[2],
-                                                .src_root = argv[1],
+                                                .engine_root = argv[1],
                                                 .reader_threads = 1,
                                                 .game_writable = true});
     if (!vfs) {

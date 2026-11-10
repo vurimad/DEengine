@@ -61,7 +61,7 @@ class IconSet {
 public:
     explicit IconSet(core::Allocator& allocator) : points_(allocator), shapes_(allocator) {}
 
-    // Reads every icon from src:/engine/editor/icons/ ("snap_grid.svg"). False (logged) if any is missing or doesn't
+    // Reads every icon from engine:/engine/editor/icons/ ("snap_grid.svg"). False (logged) if any is missing or doesn't
     // parse: those draw nothing.
     bool load(const platform::Vfs& vfs);
     // Reads one icon from an SVG's text. False if it doesn't parse.

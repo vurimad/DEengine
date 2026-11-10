@@ -18,6 +18,7 @@
 #include "platform/events.h"
 #include "platform/input.h"
 #include "platform/platform.h"
+#include "platform/project.h"
 #include "platform/thread.h"
 #include "platform/time.h"
 #include "platform/vfs.h"
@@ -334,7 +335,7 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     if (const char* game_dir = flag_value(out, "--game-dir")) {
         out.game_dir = game_dir;
     }
-    out.src_dir = flag_value(out, "--src-dir");
+    out.project = flag_value(out, "--project");
     out.vsync = !has_flag(out, "--no-vsync");
     if (const char* cap = flag_value(out, "--fps-cap")) {
         out.fps_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 10));
@@ -453,34 +454,47 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         .on_worker_start = [](uint32_t /*index*/, const char* name) { platform::set_current_thread_name(name); }});
     DE_LOG_INFO("engine", "job system: %u workers", jobs.worker_count());
 
-    // game:/ is the cooked data; src:/ the source tree, in dev builds only (shaders compile from it
-    // and hot reload; without it, they load from the cooker's .deshader files).
-    const char* src_root = DE_BUILD_DEV != 0 ? (args.src_dir != nullptr ? args.src_dir : DE_SOURCE_DIR) : nullptr;
-    // A dev build started away from its tree (from the exe's folder, a shortcut) without --game-dir: the cooked data
-    // beside its sources, not a "cooked" folder where it happens to be.
-    const char* game_root = args.game_dir;
-    platform::PathString beside_sources;
-    if (src_root != nullptr && flag_value(args, "--game-dir") == nullptr && !platform::path_exists(game_root) &&
-        beside_sources.assign(src_root) && beside_sources.append("/cooked") &&
-        platform::path_exists(beside_sources.c_str())) {
-        game_root = beside_sources.c_str();
+    // game:/ is the cooked data. Dev builds also mount the open project's sources as src:/ and the engine's own
+    // (shaders/) as engine:/: shaders compile from engine:/ and hot reload; without them, they load from the
+    // cooker's .deshader files. The project's cooked/ is game:/ unless --game-dir says otherwise.
+    const char* engine_root = DE_BUILD_DEV != 0 ? DE_SOURCE_DIR : nullptr;
+    const char* src_root = nullptr;
+    platform::Project project;
+    if (DE_BUILD_DEV != 0) {
+        const char* given = args.project != nullptr ? args.project : DE_DEFAULT_PROJECT;
+        if (const core::Result<platform::Project> found = platform::find_project(given, engine_root)) {
+            project = *found;
+            src_root = project.root.c_str();
+            DE_LOG_INFO("engine", "project %s: %s", project.name.c_str(), project.root.c_str());
+        } else {
+            DE_LOG_WARN("engine", "project %s: %s: running without src:/", given, found.error().message);
+        }
     }
-    auto vfs = platform::Vfs::create({.game_root = game_root, .src_root = src_root, .jobs = &jobs});
-    if (!vfs && src_root != nullptr) {
-        // A dev build away from its source tree: run without src:/ rather than not at all.
-        DE_LOG_WARN("engine", "source tree %s not found (pass --src-dir): running without src:/", src_root);
+    const char* game_root = args.game_dir;
+    platform::PathString project_cooked;
+    if (src_root != nullptr && flag_value(args, "--game-dir") == nullptr && project_cooked.assign(src_root) &&
+        project_cooked.append("/cooked")) {
+        game_root = project_cooked.c_str();
+    }
+    auto vfs = platform::Vfs::create(
+        {.game_root = game_root, .src_root = src_root, .engine_root = engine_root, .jobs = &jobs});
+    if (!vfs && engine_root != nullptr) {
+        // A dev build away from its repository: run without src:/ and engine:/ rather than not at all.
+        DE_LOG_WARN("engine", "the engine's sources %s or the project's aren't there: running without them",
+                    engine_root);
         src_root = nullptr;
+        engine_root = nullptr;
         vfs = platform::Vfs::create({.game_root = game_root, .jobs = &jobs});
     }
     if (!vfs) {
         return EXIT_FAILURE;
     }
     core::Result<shader::ShaderCompiler> compiler =
-        core::fail(core::ErrorCode::Unsupported, "no src:/ to compile shaders from");
-    if (src_root != nullptr) {
+        core::fail(core::ErrorCode::Unsupported, "no engine:/ to compile shaders from");
+    if (engine_root != nullptr) {
         compiler = shader::ShaderCompiler::create(*vfs);
     }
-    if (!compiler && src_root != nullptr) {
+    if (!compiler && engine_root != nullptr) {
         // Sources are there but can't be compiled: no hot reload.
         DE_LOG_WARN("engine", "the shader compiler didn't start (%s): using cooked shaders from game:/",
                     compiler.error().message);

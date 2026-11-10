@@ -457,7 +457,7 @@ bool IconSet::load(const platform::Vfs& vfs) {
     bool all = true;
     for (uint32_t i = 0; i < static_cast<uint32_t>(Icon::Count); ++i) {
         core::FixedString<96> path;
-        static_cast<void>(path.assign("src:/engine/editor/icons/"));
+        static_cast<void>(path.assign("engine:/engine/editor/icons/"));
         static_cast<void>(path.append(kNames[i]));
         static_cast<void>(path.append(".svg"));
         auto file = vfs.read_whole_file(path.c_str(), core::heap_allocator(core::MemoryTag::Editor));

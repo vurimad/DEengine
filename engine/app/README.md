@@ -29,10 +29,10 @@ The framework that runs an application, and the applications (docs/design.md, Hi
 What lets an agent see the real engine with no human and no re-cook: place the camera, take a repeatable picture, compare it with another (`tools/image_diff`). Dev builds only: `parse_args` doesn't read these flags in ship, and nothing in ship's `deengine` reaches this code, so none of it is linked. They stand in until the command API's `camera.goto` and `screenshot.capture` (docs/design.md, AI-friendly by design). The window still opens: there's no headless mode yet.
 
 ```
-deengine --view camp_south --still src:/build/eyes/camp.png              # a settled, repeatable picture, and exit
-deengine --camera 64,2,74,0,-7 --still src:/build/eyes/camp.png          # the same from the command line
+deengine --view camp_south --still engine:/build/eyes/camp.png              # a settled, repeatable picture, and exit
+deengine --camera 64,2,74,0,-7 --still engine:/build/eyes/camp.png          # the same from the command line
 deengine --camera 16000.25,40,-16000.5,135,-5                            # just place the free camera, and fly from there
-deengine --camera-path src:/config/camp_ride.path --path-shots src:/build/eyes/ride/shot --path-every 30
+deengine --camera-path src:/config/camp_ride.path --path-shots engine:/build/eyes/ride/shot --path-every 30
 image_diff build/eyes/before.png build/eyes/camp.png --out build/eyes/diff.png
 ```
 
@@ -51,7 +51,7 @@ image_diff build/eyes/before.png build/eyes/camp.png --out build/eyes/diff.png
 | `--camera-path PATH`, `--path-speed M/S` | Flies a path file: holds at its start for the settle frames, flies its waypoints (straight lines, at 13 m/s, or its `speed` line, or this flag), exits at its end. No vsync |
 | `--path-shots PREFIX`, `--path-every N` | A picture every N frames (default 30) from where the flight starts, as `PREFIX_0000.png`, `_0001` and so on |
 
-Paths are VFS paths, so lowercase. `src:/build/eyes/...` lands in `build/`, which git ignores: pictures aren't committed, and baselines stay outside the repository, one set per GPU. The log says where each picture went. A flag that makes no sense, or a file or path that can't work, is refused before a window opens. The exit code is failure if a picture wasn't taken or written, if a frame wasn't drawn, or if validation reported errors.
+Paths are VFS paths, so lowercase. `engine:/build/eyes/...` lands in the repository's `build/`, which git ignores (`src:/` is the open project's folder now, so pictures don't go there): pictures aren't committed, and baselines stay outside the repository, one set per GPU. The log says where each picture went. A flag that makes no sense, or a file or path that can't work, is refused before a window opens. The exit code is failure if a picture wasn't taken or written, if a frame wasn't drawn, or if validation reported errors.
 
 A still, a screenshot or a path makes the run **scripted**:
 

@@ -130,8 +130,9 @@ const Fonts& fonts() {
 }
 
 bool load_fonts(const platform::Vfs& vfs) {
-    ImFont* regular = load_font(vfs, "src:/engine/editor/fonts/source_sans_3_regular.ttf", "Source Sans 3 Regular");
-    ImFont* semibold = load_font(vfs, "src:/engine/editor/fonts/source_sans_3_semibold.ttf", "Source Sans 3 Semibold");
+    ImFont* regular = load_font(vfs, "engine:/engine/editor/fonts/source_sans_3_regular.ttf", "Source Sans 3 Regular");
+    ImFont* semibold =
+        load_font(vfs, "engine:/engine/editor/fonts/source_sans_3_semibold.ttf", "Source Sans 3 Semibold");
     if (regular == nullptr || semibold == nullptr) {
         return false;
     }

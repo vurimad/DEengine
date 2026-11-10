@@ -1,6 +1,6 @@
-"""Fetches ground texture sets and packs each into a layer under content/terrain/layers: color, normal, and one texture of
+"""Fetches ground texture sets and packs each into a layer under projects/dreadworld/content/terrain/layers: color, normal, and one texture of
 occlusion, roughness and height. Poly Haven's are CC0, through its API; Megascans ones are read from build/fab_raw, where
-their zips are unpacked by hand. Nothing here is committed: content/terrain is ignored.
+their zips are unpacked by hand. Nothing here is committed: projects/dreadworld is ignored.
 
     python tools/worldgen/ground_layers.py slug slug ...     fetch and pack these Poly Haven sets
     python tools/worldgen/ground_layers.py --grey name       a copy of a layer with most of its color out, to tint per region
@@ -17,7 +17,7 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 Image.MAX_IMAGE_PIXELS = None
-LAYERS = 'D:/DE/content/terrain/layers'
+LAYERS = 'D:/DE/projects/dreadworld/content/terrain/layers'
 RAW = 'D:/DE/build/terrain_raw'
 UA = {'User-Agent': 'DEengine-asset-pilot/1.0'}
 RES = '2k'

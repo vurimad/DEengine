@@ -74,8 +74,24 @@ world::WorldTransform scaled_about(const world::WorldTransform& start, const DVe
 // the moving handles' layout with a cube for each cone, a triangle across each corner to scale two axes, a cube in the
 // middle to scale it whole (always along its own axes). Each drag is one command; snapping rounds what it does. An
 // attached entity keeps its parent: what changes is its place relative to it.
+// What puts a dragged entity on the ground under where it's dragged to (the editor's surface snapping): where's
+// position comes down, or up, so its lowest point is on it. False if there's no ground there (it stays as dragged).
+class GroundSnap {
+public:
+    GroundSnap() = default;
+    virtual ~GroundSnap() = default;
+    GroundSnap(const GroundSnap&) = delete;
+    GroundSnap& operator=(const GroundSnap&) = delete;
+    GroundSnap(GroundSnap&&) = delete;
+    GroundSnap& operator=(GroundSnap&&) = delete;
+    virtual bool settle(flecs::entity entity, world::WorldTransform& where) = 0;
+};
+
 class Gizmo {
 public:
+    // Surface snapping: moves across the ground (along X or Z, in the ground's plane, or free) keep what's moved on
+    // it; null: off. Moves up and down are left as they are.
+    void set_ground(GroundSnap* ground) { ground_ = ground; }
     // Draws the tool's handles at origin (the entity's pivot or its geometry's centre: HandlesAt) and runs a drag.
     // mouse_free: the mouse is over the scene and nothing else has it. True while the mouse is on a handle or dragging
     // one: a click there selects nothing else.
@@ -99,6 +115,7 @@ public:
     static constexpr int kMiddle = 6;
 
 private:
+    GroundSnap* ground_ = nullptr;
     int handle_ = -1; // being dragged
     flecs::entity_t entity_ = 0;
     world::WorldTransform start_;

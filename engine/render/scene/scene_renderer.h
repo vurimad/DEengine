@@ -205,13 +205,16 @@ struct SelectedMesh {
 struct EditorOverlay {
     bool enabled = false; // the G-buffer keeps each pixel's instance: the selection and the picks need it
     std::span<const SelectedMesh> selected;
-    bool pick = false; // read the instance under this pixel (the target's), for pick_answer()
+    bool terrain_selected = false; // the terrain chosen: outlined round its edges and skyline (selected is ignored)
+    bool pick = false;             // read the instance under this pixel (the target's), for pick_answer()
     uint32_t pick_x = 0;
     uint32_t pick_y = 0;
     float outline_px = 2.0f; // how wide the outline is, in the target's pixels
 };
 
 inline constexpr uint32_t kNothingPicked = UINT32_MAX;
+// The ID the terrain and its grass write (shaders/scene/scene_common.slang, kEditorTerrainId): never picked.
+inline constexpr uint32_t kEditorTerrainId = UINT32_MAX;
 
 // What the last pick found: the instance slot in that pixel (kNothingPicked: none, the ground, the sky), and how many
 // picks have come back, so a new answer can be told from the last.

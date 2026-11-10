@@ -11,7 +11,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | `events.h` | `pump_events(window, input)`: once per rendered frame |
 | `input.h` | `Input`: named actions bound by text, sampled once per tick |
 | `process.h` | `Process`: a program run beside the engine (the editor's cooker), in the background with no console window, asked each frame whether it's ended; `program_beside_engine` |
-| `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` `src:/` mounts, path rules, blocking and async reads by priority, atomic writes, file info for hot reload |
+| `vfs.h` | `Vfs`: `game:/` `user:/` `temp:/` `src:/` `engine:/` mounts, path rules, blocking and async reads by priority, atomic writes, file info for hot reload |
 | `file.h` | Native files: positional reads, atomic writes, size and write time, folders, the OS user and temp folders |
 | `time.h` | `time_ns()`, `sleep_ns()`: the same clock as input timestamps |
 | `thread.h` | `Thread` (named, joined on destruction), thread names and ids, core count |
@@ -32,6 +32,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 - `push` and `sample` never allocate.
 - The platform tests never initialize SDL video, so they run on headless CI.
 - Engine code reads and writes files only through the `Vfs`; `file.h` is for the VFS and tools. Paths are `mount:/lowercase/forward/slashes`.
-- `src:/` is the source tree (the repository root: `shaders/`, `content/`, `meta/`), mounted only in dev builds and tools (`VfsDesc::src_root`). Shaders compile from it and the editor writes sources through it.
-- `game:/` is read only. Writes to `user:/`, `temp:/` and `src:/` are atomic (temp file, then rename). `temp:/` is emptied at every start; the VFS only ever clears folders it named itself (`DEengine`, `deengine_temp`).
+- `src:/` is the open project's sources (`projects/<name>/`: `content/`, `meta/`, `config/`), `engine:/` the engine's (the repository root: `shaders/`), both mounted only in dev builds and tools (`VfsDesc::src_root`, `engine_root`). Shaders compile from `engine:/`; the editor writes sources through `src:/`.
+- `project.h`: `find_project`, the project `--project` names (docs/design.md, Projects): its folder or `.deproject` file, relative to the working folder or the engine's repository.
+- `game:/` is read only. Writes to `user:/`, `temp:/`, `src:/` and `engine:/` are atomic (temp file, then rename). `temp:/` is emptied at every start; the VFS only ever clears folders it named itself (`DEengine`, `deengine_temp`).
 - Async reads go straight into caller memory; queueing, polling and finishing never allocate. Phase 1: blocking positional reads on a small reader pool behind one lock; phase 2 (IoRing / io_uring) keeps the API.

@@ -1,6 +1,6 @@
 """A test world from real height data, to compare against the generated map: Utah's canyon country on the west half,
 the valley under Aoraki on the east, 8 x 4 km at 2 m, with the light map baked, snow worked out on the alpine half and
-our ground rules. The data stays local (build/terrain_raw/), and so does what this writes (content/terrain/realtest.*).
+our ground rules. The data stays local (build/terrain_raw/), and so does what this writes (projects/dreadworld/content/terrain/realtest.*).
 
     python tools/worldgen/realtest.py
 """

@@ -294,7 +294,7 @@ void with_pool(const PoolOptions& options, Body body) {
     auto vfs = de::platform::Vfs::create({.game_root = game_root.c_str(),
                                           .user_root = user_root.c_str(),
                                           .temp_root = temp_root.c_str(),
-                                          .src_root = DE_SOURCE_DIR,
+                                          .engine_root = DE_SOURCE_DIR,
                                           .jobs = &jobs,
                                           .game_writable = true});
     REQUIRE(vfs.ok());

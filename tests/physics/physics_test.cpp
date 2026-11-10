@@ -1333,7 +1333,7 @@ std::vector<std::byte> benchmark_mesh(bool big, de::platform::Vfs& vfs, de::core
         return guid;
     }());
     if (big) {
-        const auto cooked = de::platform::Vfs::create({.game_root = DE_SOURCE_DIR "/cooked"});
+        const auto cooked = de::platform::Vfs::create({.game_root = DE_SOURCE_DIR "/projects/sandbox/cooked"});
         if (cooked && cooked->exists(de::asset::cooked_path(boulder, AssetType::Mesh).c_str())) {
             name = "boulder_01";
             return read(*cooked, boulder);

@@ -71,13 +71,13 @@ private:
 };
 
 // "shaders/x.slang", "./shaders/x.slang", "shaders\x.slang" or "shaders/tests/../x.slang" ->
-// "src:/shaders/x.slang". Absolute paths and paths that climb out of src:/ are refused.
+// "engine:/shaders/x.slang". Absolute paths and paths that climb out of engine:/ are refused.
 bool to_vfs_path(const char* path, platform::PathString& out) {
     const std::string_view text(path != nullptr ? path : "");
     if (text.empty() || text.find(':') != std::string_view::npos || text.front() == '/' || text.front() == '\\') {
         return false;
     }
-    constexpr std::string_view kPrefix = "src:/";
+    constexpr std::string_view kPrefix = "engine:/";
     out.assign(kPrefix);
     size_t start = 0;
     while (start <= text.size()) {
@@ -92,7 +92,7 @@ bool to_vfs_path(const char* path, platform::PathString& out) {
         }
         if (segment == "..") {
             if (out.size() == kPrefix.size()) {
-                return false; // above src:/
+                return false; // above engine:/
             }
             const size_t parent = out.view().find_last_of('/');
             out.truncate(parent + 1 > kPrefix.size() ? parent : kPrefix.size());
@@ -105,7 +105,7 @@ bool to_vfs_path(const char* path, platform::PathString& out) {
     return out.size() > kPrefix.size();
 }
 
-// Slang's view of src:/: it asks for "shaders/common/color.slang", we read src:/shaders/common/color.slang
+// Slang's view of engine:/: it asks for "shaders/common/color.slang", we read engine:/shaders/common/color.slang
 // through the VFS and note the file as a dependency of the compile in progress.
 // Owned by the compiler and outliving every session, so its reference count never frees it.
 class VfsFileSystem final : public ISlangFileSystem {
@@ -460,7 +460,7 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
     messages.add(diagnostic, module == nullptr);
     if (module == nullptr) {
         if (diagnostic == nullptr) {
-            messages.add_text("shader module not found under src:/shaders/", true);
+            messages.add_text("shader module not found under engine:/shaders/", true);
         }
         return core::fail(core::ErrorCode::NotFound, "the shader module failed to load or compile");
     }

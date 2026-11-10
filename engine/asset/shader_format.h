@@ -93,9 +93,9 @@ uint64_t shader_defines_hash(std::span<const ShaderDefineText> defines);
 
 // C++ and shaders share data layouts by hand, and a mismatch reaches the GPU as wild pointers. So
 // cooked shaders and the engine both name the sources they came from, by this hash: every .slang
-// under src:/shaders/ except shaders/tests/ (which games never load), by path and content, the same
+// under engine:/shaders/ except shaders/tests/ (which games never load), by path and content, the same
 // on a Windows and a Linux checkout (CRLF reads as LF). Any edit counts, even to a comment. Fails
-// with NotFound if src:/shaders/ isn't there. Blocking, for tools.
+// with NotFound if engine:/shaders/ isn't there. Blocking, for tools.
 core::Result<uint64_t> shader_sources_hash(const platform::Vfs& vfs);
 
 // Written by the cooker once every module in game:/ is cooked from those sources, removed while it

@@ -14,6 +14,7 @@
 #include "editor/navigation.h"
 #include "editor/properties_panel.h"
 #include "editor/selection.h"
+#include "editor/thumbnails.h"
 #include "platform/process.h"
 #include "world/terrain_heights.h"
 
@@ -46,10 +47,11 @@ namespace de::editor {
 //   --handles AT    pivot or center
 //   --drawer NAME   resources or output: that drawer open
 //   --cmd TEXT      that text in the command line, the keyboard on it
+//   --cell-grid     the cells' borders shown (View > Cell Grid)
 //   --drag H,AMOUNT show a drag under way on handle H (0-2 an axis, 3-5 a plane, 6 the middle), gone AMOUNT (meters,
 //                   or radians turning), changing nothing
 // A scripted run (a picture) keeps nothing: not the layout, not the settings.
-class Editor final : public app::Application, public EntityMaker {
+class Editor final : public app::Application, public EntityMaker, public GroundSnap {
 public:
     static constexpr const char* kPlayground = "Playground";
 
@@ -62,6 +64,8 @@ public:
     bool may_close(app::Engine& engine) override;
 
     // The commands' maker (undo and redo make and take away entities): entity_record.h.
+    // Surface snapping (the gizmo's GroundSnap): as End, at where it's dragged to.
+    bool settle(flecs::entity entity, world::WorldTransform& where) override;
     flecs::entity make(const EntityRecord& record) override;
     void record(flecs::entity entity, EntityRecord& out) override;
     void unmake(flecs::entity entity) override;
@@ -103,6 +107,21 @@ private:
     // File > Save, Ctrl+S: the edits into the cells' text sources (cell_saver.h), then the cooker in the background,
     // so hot reload swaps the cooked cells in.
     void save(app::Engine& engine);
+    // View > Cell Grid: the cells' borders on the ground around the camera, each cell's coordinates in its middle.
+    void draw_cell_grid(app::Engine& engine, const View& view, ImDrawList* draw);
+    // Camera bookmarks: Ctrl+1 to 9 keeps where the camera is, 1 to 9 goes back there; kept per world in
+    // user:/editor/bookmarks.settings.
+    struct Bookmark {
+        uint64_t world = 0;
+        uint32_t slot = 0; // 1 to 9
+        tools::CameraPose pose;
+    };
+    void keep_bookmark(uint32_t slot);
+    bool go_to_bookmark(uint32_t slot);
+    void load_bookmarks(const platform::Vfs& vfs);
+    void save_bookmarks(const platform::Vfs& vfs) const;
+    // editor.bookmark N [set]: as 1 to 9, or Ctrl with them.
+    static void bookmark_command(void* user, const console::Args& args, console::Output& out);
     // Undo and redo, the selection following what they make and take away.
     void undo(app::Engine& engine);
     void redo(app::Engine& engine);
@@ -130,6 +149,16 @@ private:
     void place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen);
     // The same at a place in the world: true if it was placed.
     bool place_model_at(app::Engine& engine, std::string_view path, const DVec3& point);
+    // What placing a model makes there (named apart from everything in the world); false (message_ says why) if it
+    // isn't a model, or isn't cooked.
+    bool model_record(app::Engine& engine, std::string_view path, const DVec3& point, EntityRecord& out);
+    // Where a model let go at screen goes: where the ray meets the nearer of something solid and the terrain, else
+    // the level of the world's zero.
+    DVec3 drop_point(app::Engine& engine, const View& view, ImVec2 screen);
+    // While a model is dragged from the resources over the Playground (hovering: the mouse is over its picture), the
+    // model itself under the mouse, where it would go; out of the Playground, or the drag over, it goes again.
+    void preview_model(app::Engine& engine, const View& view, bool hovering, ImVec2 screen);
+    void end_preview(app::Engine& engine);
     // A name no entity in the world has, from base: a trailing number counts up, keeping its width ("boulder_1" to
     // "boulder_5" if 2 to 4 are taken, "rock_01" to "rock_02"), and a name without one gets "_2", "_3"...
     void unique_name(const app::Engine& engine, std::string_view base, std::span<char> out) const;
@@ -161,6 +190,15 @@ private:
     static void undo_command(void* user, const console::Args& args, console::Output& out);
     // editor.select NAME...: those chosen (none: nothing).
     static void select_command(void* user, const console::Args& args, console::Output& out);
+    // editor.move_file FROM TO, editor.new_folder PATH, editor.delete_file PATH...: Resources' file operations
+    // (file_ops.h), for agents and scripts.
+    static void move_file_command(void* user, const console::Args& args, console::Output& out);
+    static void new_folder_command(void* user, const console::Args& args, console::Output& out);
+    static void delete_file_command(void* user, const console::Args& args, console::Output& out);
+    // After files moved or went: Resources and the cells' sources read again.
+    void files_changed(app::Engine& engine);
+    // editor.frame: as F.
+    static void frame_command(void* user, const console::Args& args, console::Output& out);
     // editor.folder PATH [NAME...]: those (or the selection) into a folder.
     static void folder_command(void* user, const console::Args& args, console::Output& out);
     // Each frame: the members of cells spawned since get the folders their files give them (EditorFolder).
@@ -203,7 +241,10 @@ private:
     uint64_t gathered_for_ = 0;                      // which were chosen when gathered
     float gathered_s_ = 0.0f;
     PropertiesPanel properties_;
+    Thumbnails thumbnails_; // before the browser, which draws them
     AssetBrowser browser_;
+    bool show_cells_ = false;           // View > Cell Grid
+    bool snap_ground_ = false;          // the toolbar's surface snapping
     float ui_scale_ = 1.0f;             // the user's, on top of the display's
     float applied_ui_scale_ = 0.0f;     // what the style was last made with
     float applied_display_ = 0.0f;      //
@@ -211,7 +252,10 @@ private:
     const char* select_name_ = nullptr; // --select, until it's found
     const char* show_panel_ = nullptr;  // --show, until it's done
     bool playground_hovered_ = false;   // in the last frame's UI
-    bool looking_ = false;              // a mouse look that started over the Playground
+    flecs::entity_t preview_ = 0;       // the model being dragged in, shown where it would go (not a command yet)
+    core::FixedString<255> preview_path_;
+    const char* preview_flag_ = nullptr; // --preview PATH: as that model held over the Playground's middle (pictures)
+    bool looking_ = false;               // a mouse look that started over the Playground
     bool reset_layout_ = false;
     // The drawers, as Unreal's: Resources (Ctrl+Space) and the Output log, up from the bottom bar
     // over the panels while they're wanted, away again at a click elsewhere.
@@ -231,6 +275,7 @@ private:
     View last_view_;                                       // the Playground's, as last drawn
     std::optional<world::TerrainHeights> terrain_heights_; // the ground's heights, for placing on it (from startup)
     core::HashMap<uint64_t, asset::AssetHandle> holds_;    // by asset ID
+    core::Array<Bookmark> bookmarks_{core::heap_allocator(core::MemoryTag::Editor)}; // every world's
     core::HashMap<flecs::entity_t, uint32_t> folders_read_{core::heap_allocator(core::MemoryTag::Editor)};
     MemberTracker members_;               // what the commands and the selection name, through respawns
     uint64_t keyed_changes_ = UINT64_MAX; // commands_.changes() when their keys were noted

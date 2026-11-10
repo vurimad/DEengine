@@ -199,7 +199,7 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
     auto vfs = de::platform::Vfs::create({.game_root = game_root.c_str(),
                                           .user_root = user_root.c_str(),
                                           .temp_root = temp_root.c_str(),
-                                          .src_root = DE_SOURCE_DIR,
+                                          .engine_root = DE_SOURCE_DIR,
                                           .jobs = &jobs,
                                           .game_writable = true});
     REQUIRE(vfs.ok());
@@ -614,7 +614,7 @@ TEST_CASE("the sun casts a shadow where an occluder blocks it, and lights the re
     auto vfs = de::platform::Vfs::create({.game_root = game_root.c_str(),
                                           .user_root = user_root.c_str(),
                                           .temp_root = temp_root.c_str(),
-                                          .src_root = DE_SOURCE_DIR,
+                                          .engine_root = DE_SOURCE_DIR,
                                           .jobs = &jobs,
                                           .game_writable = true});
     REQUIRE(vfs.ok());
@@ -706,7 +706,7 @@ TEST_CASE("a material whose texture was missing picks it up when it appears") {
     auto vfs = de::platform::Vfs::create({.game_root = game_root.c_str(),
                                           .user_root = user_root.c_str(),
                                           .temp_root = temp_root.c_str(),
-                                          .src_root = DE_SOURCE_DIR,
+                                          .engine_root = DE_SOURCE_DIR,
                                           .jobs = &jobs,
                                           .game_writable = true});
     REQUIRE(vfs.ok());
@@ -844,7 +844,7 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
     de::core::JobSystem jobs({.worker_count = 2});
     const de::platform::PathString game_root = sandbox.game();
     auto vfs = de::platform::Vfs::create(
-        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
     REQUIRE(vfs.ok());
     // A red square per material variant: its alpha mode, flags and base color alpha.
     using de::asset::AlphaMode;
@@ -1008,7 +1008,7 @@ TEST_CASE("the froxel grid agrees with the closed form, and adds the sun's shado
     de::core::JobSystem jobs({.worker_count = 2});
     const de::platform::PathString game_root = sandbox.game();
     auto vfs = de::platform::Vfs::create(
-        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
     REQUIRE(vfs.ok());
     put_assets(*vfs);
     auto compiler = de::shader::ShaderCompiler::create(*vfs);
@@ -2085,7 +2085,7 @@ TEST_CASE("motion vectors follow the camera and the instances, across render ori
     de::core::JobSystem jobs({.worker_count = 2});
     const de::platform::PathString game_root = sandbox.game();
     auto vfs = de::platform::Vfs::create(
-        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
     REQUIRE(vfs.ok());
     put_assets(*vfs);
     auto compiler = de::shader::ShaderCompiler::create(*vfs);
@@ -2206,7 +2206,7 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
     de::core::JobSystem jobs({.worker_count = 2});
     const de::platform::PathString game_root = sandbox.game();
     auto vfs = de::platform::Vfs::create(
-        {.game_root = game_root.c_str(), .src_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
     REQUIRE(vfs.ok());
     put_assets(*vfs);
     auto compiler = de::shader::ShaderCompiler::create(*vfs);

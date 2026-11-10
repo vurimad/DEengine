@@ -1,6 +1,7 @@
 #include "editor/hierarchy_panel.h"
 
 #include "app/framework.h"
+#include "asset/terrain_format.h"
 #include "core/hash.h"
 #include "core/profile.h"
 #include "editor/entity_record.h"
@@ -497,6 +498,34 @@ void HierarchyPanel::draw(const app::Engine& engine, Selection& selection, flecs
         }
         char label[128];
         bool menu_asked = false;
+        // The world's terrain, first: chosen, it's outlined; it isn't an entity, and stays where it is.
+        const bool has_terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain) != nullptr;
+        if (has_terrain && contains_ignoring_case("Terrain", filter_)) {
+            const bool chosen = selection.kind == Selection::Kind::Terrain;
+            const ImVec2 min = ImGui::GetCursorScreenPos();
+            const ImVec2 max(min.x + width, min.y + row);
+            if (ImGui::InvisibleButton("##terrain", ImVec2(width, row))) {
+                selection.select_terrain();
+                chosen_folder_ = 0;
+            }
+            const bool hovered = ImGui::IsItemHovered();
+            if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                selection.frame_entity = true; // all of it in view
+            }
+            if (hovered && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                tooltip("The world's terrain: outlined when chosen, not moved; F or a double-click frames it");
+            }
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            if (chosen) {
+                draw->AddRectFilled(min, max, color_u32(ThemeColor::Selection));
+            } else if (hovered) {
+                draw->AddRectFilled(min, max, color_u32(ThemeColor::Header));
+            }
+            const float text_y = std::floor(min.y + ((row - ImGui::GetFontSize()) * 0.5f));
+            draw->AddText(ImVec2(min.x + px(20.0f), text_y),
+                          color_u32(chosen ? ThemeColor::TextEmphasis : ThemeColor::Text), "Terrain");
+            ImGui::SetCursorScreenPos(ImVec2(min.x, max.y));
+        }
         ImGuiListClipper clipper;
         clipper.Begin(static_cast<int>(rows_.size()), row);
         while (clipper.Step()) {

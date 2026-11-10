@@ -38,7 +38,7 @@ inline constexpr uint32_t kSettleFrames = 96;
 inline constexpr double kEyesFrameS = 1.0 / 60.0;
 
 // What the command line asks of the agent's eyes (dev builds; see engine/app/README.md). Paths are VFS paths
-// ("src:/build/eyes/camp.png").
+// ("engine:/build/eyes/camp.png").
 //   --camera X,Y,Z,YAW_DEG,PITCH_DEG  place the free camera (meters, degrees), and fly from there unless scripted
 //   --view NAME               the same, from a named view
 //   --views-file PATH         where the views are (default: camera.views in src:/config, or game:/config)

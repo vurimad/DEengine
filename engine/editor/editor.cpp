@@ -2,6 +2,7 @@
 
 #include "asset/cell_format.h"
 #include "asset/mesh_format.h"
+#include "asset/terrain_format.h"
 #include "core/log.h"
 #include "core/profile.h"
 #include "core/text.h"
@@ -35,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <span>
 #include <string_view>
 #include <system_error>
@@ -46,6 +48,7 @@ namespace {
 
 constexpr const char* kLayoutPath = "user:/editor/layout.ini";
 constexpr const char* kSettingsPath = "user:/editor/editor.settings";
+constexpr const char* kBookmarksPath = "user:/editor/bookmarks.settings";
 constexpr float kUiScales[] = {0.8f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f};
 
 // "X,Y": two whole numbers (--pick).
@@ -94,6 +97,8 @@ struct Settings {
     HandlesAt handles_at = HandlesAt::Pivot;
     Snap snap;
     float drawer_share = 0.4f;
+    bool cell_grid = false;
+    bool snap_ground = false;
 };
 
 float to_number(std::string_view text, float fallback) {
@@ -135,6 +140,10 @@ Settings load_settings(const platform::Vfs& vfs) {
                                                 : Tool::Move;
         } else if (key == "space") {
             settings.space = value == "local" ? Space::Local : Space::World;
+        } else if (key == "cell_grid") {
+            settings.cell_grid = on;
+        } else if (key == "snap_ground") {
+            settings.snap_ground = on;
         } else if (key == "drawer") {
             settings.drawer_share = std::clamp(to_number(value, settings.drawer_share), 0.15f, 0.85f);
         } else if (key == "handles") {
@@ -161,13 +170,14 @@ void save_settings(const platform::Vfs& vfs, const Settings& settings) {
                       "# The editor's interface scale (on top of the display's), its tool, its axes, where its handles "
                       "sit and its snapping.\n"
                       "ui_scale %.2f\ntool %s\nspace %s\nhandles %s\nsnap_move %s %g\nsnap_rotate %s %g\n"
-                      "snap_scale %s %g\ndrawer %.2f\n",
+                      "snap_scale %s %g\ndrawer %.2f\ncell_grid %s\nsnap_ground %s\n",
                       static_cast<double>(settings.ui_scale), kTools[static_cast<int>(settings.tool)],
                       settings.space == Space::Local ? "local" : "world",
                       settings.handles_at == HandlesAt::Center ? "center" : "pivot", settings.snap.move ? "on" : "off",
                       static_cast<double>(settings.snap.move_m), settings.snap.rotate ? "on" : "off",
                       static_cast<double>(settings.snap.rotate_deg), settings.snap.scale ? "on" : "off",
-                      static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share));
+                      static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share),
+                      settings.cell_grid ? "on" : "off", settings.snap_ground ? "on" : "off");
     if (length > 0) {
         static_cast<void>(vfs.write_file(kSettingsPath, std::as_bytes(std::span(text, static_cast<size_t>(length)))));
     }
@@ -248,9 +258,9 @@ void snap_step(const char* id, float& step, const float (&steps)[N], const char*
 
 Editor::Editor()
     : commands_(editor_heap()), hierarchy_(editor_heap()), icons_(editor_heap()), selected_meshes_(editor_heap()),
-      selected_entities_(editor_heap()), properties_(editor_heap()), browser_(editor_heap()),
-      cell_sources_(editor_heap()), cooking_(editor_heap()), holds_(editor_heap()), members_(editor_heap()),
-      scratch_entities_(editor_heap()) {}
+      selected_entities_(editor_heap()), properties_(editor_heap()), thumbnails_(editor_heap()),
+      browser_(editor_heap()), cell_sources_(editor_heap()), cooking_(editor_heap()), holds_(editor_heap()),
+      members_(editor_heap()), scratch_entities_(editor_heap()) {}
 
 bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     if (!viewer_.startup(engine, args)) {
@@ -281,12 +291,30 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     engine.console.add_command("editor.ground", "[name ...]",
                                "Drop the entity of that name onto the ground below it (as End does).",
                                &Editor::ground_command, this);
-    engine.console.add_command("editor.select", "[name ...]",
-                               "Choose the entities of those names (the last the primary); none: nothing chosen.",
-                               &Editor::select_command, this);
+    engine.console.add_command("editor.move_file", "<from> <to>",
+                               "Move or rename a file or folder in content/ (src:/content/... paths), with its meta, "
+                               "rewriting what names it.",
+                               &Editor::move_file_command, this);
+    engine.console.add_command("editor.new_folder", "<path>", "Make a folder in content/ (a src:/content/... path).",
+                               &Editor::new_folder_command, this);
+    engine.console.add_command("editor.delete_file", "<path ...>",
+                               "Send files or folders in content/ to the recycle bin with their metas, saying what "
+                               "still names them.",
+                               &Editor::delete_file_command, this);
+    engine.console.add_command("editor.frame", "",
+                               "Frame the selection, as F: the camera eases back until it's in view.",
+                               &Editor::frame_command, this);
+    engine.console.add_command(
+        "editor.select", "[name ...]",
+        "Choose the entities of those names (the last the primary), or Terrain; none: nothing chosen.",
+        &Editor::select_command, this);
     engine.console.add_command("editor.folder", "<folder> [name ...]",
                                "Put the entities of those names (or the selection) in a folder, \"\" for none.",
                                &Editor::folder_command, this);
+    engine.console.add_command("editor.bookmark", "<1-9> [set]",
+                               "Go to a camera bookmark (as 1 to 9), or keep where the camera is in it (as Ctrl with "
+                               "them).",
+                               &Editor::bookmark_command, this);
     engine.console.add_command("editor.undo", "", "Undo the last edit (as Ctrl+Z does).", &Editor::undo_command, this);
     engine.console.add_command("editor.redo", "", "Do again what was undone (as Ctrl+Y does).", &Editor::redo_command,
                                this);
@@ -306,6 +334,9 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     handles_at_ = settings.handles_at;
     snap_ = settings.snap;
     drawer_share_ = settings.drawer_share;
+    show_cells_ = settings.cell_grid;
+    snap_ground_ = settings.snap_ground;
+    show_cells_ = show_cells_ || app::has_flag(args, "--cell-grid");
     if (const char* typed = app::flag_value(args, "--cmd"); typed != nullptr && engine.console_ui != nullptr) {
         engine.console_ui->set_command_line(typed);
     }
@@ -313,9 +344,11 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
         drawer_ = std::string_view(drawer) == "output" ? Drawer::Output : Drawer::Resources;
     }
     select_name_ = app::flag_value(args, "--select");
+    preview_flag_ = app::flag_value(args, "--preview");
     show_panel_ = app::flag_value(args, "--show");
     if (const char* file = app::flag_value(args, "--select-file")) {
         selection_.select_file(file);
+        browser_.show_file(file);
     }
     if (const char* tool = app::flag_value(args, "--tool")) {
         const std::string_view name(tool);
@@ -349,7 +382,9 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
         pick_flag_ = true;
     }
     browser_.load_settings(engine.vfs);
+    browser_.set_thumbnails(&thumbnails_);
     load_layout(engine.vfs);
+    load_bookmarks(engine.vfs);
     DE_LOG_INFO("editor", "editing world %s", asset::format_asset_id(viewer_.world_id()).c_str());
     return true;
 }
@@ -363,7 +398,9 @@ void Editor::shutdown(app::Engine& engine) {
                                    .space = space_,
                                    .handles_at = handles_at_,
                                    .snap = snap_,
-                                   .drawer_share = drawer_share_});
+                                   .drawer_share = drawer_share_,
+                                   .cell_grid = show_cells_,
+                                   .snap_ground = snap_ground_});
     }
     commands_.clear();
     release_holds();
@@ -432,6 +469,11 @@ void Editor::ui(app::Engine& engine) {
 
     take_pick(engine);
     follow_saves(engine);
+    if (select_name_ != nullptr && std::string_view(select_name_) == "Terrain" &&
+        engine.assets.get<asset::TerrainAsset>(engine.terrain) != nullptr) {
+        selection_.select_terrain(); // --select Terrain
+        select_name_ = nullptr;
+    }
     if (select_name_ != nullptr) {
         // --select: the first entity of that name, once its cell has spawned it.
         char label[128];
@@ -596,6 +638,7 @@ DVec3 Editor::handles_origin(const app::Engine& engine, flecs::entity selected) 
 void Editor::send_selection(app::Engine& engine) {
     engine.editor_overlay.enabled = true;
     engine.editor_overlay.selected = selected_meshes_.span();
+    engine.editor_overlay.terrain_selected = selection_.kind == Selection::Kind::Terrain;
     engine.editor_overlay.outline_px = std::max(2.0f, 2.0f * engine.window.content_scale());
 }
 
@@ -668,7 +711,9 @@ void Editor::header_row(app::Engine& engine) {
             static_cast<void>(drop_selection_to_ground(engine));
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Frame Selected", "F", false, selection_.kind == Selection::Kind::Entity)) {
+        if (ImGui::MenuItem("Frame Selected", "F", false,
+                            selection_.kind == Selection::Kind::Entity ||
+                                selection_.kind == Selection::Kind::Terrain)) {
             selection_.frame_entity = true;
         }
         ImGui::EndMenu();
@@ -677,6 +722,7 @@ void Editor::header_row(app::Engine& engine) {
     if (ImGui::BeginMenu("View")) {
         // The scene's views are the Playground toolbar's.
         ImGui::MenuItem("Frame Stats", "F1", &engine.frame_stats);
+        ImGui::MenuItem("Cell Grid", nullptr, &show_cells_);
         ImGui::EndMenu();
     }
     prepare_menu_popup();
@@ -900,7 +946,11 @@ bool Editor::drawer(app::Engine& engine, ImVec2 min, ImVec2 size) {
         const ImVec2 room(size.x, std::max(1.0f, height - edge - row));
         if (content) {
             if (ImGui::BeginChild("##content", room)) {
+                thumbnails_.update(engine.vfs);
                 opened = browser_.draw(engine.vfs, selection_);
+                if (browser_.take_files_changed()) {
+                    static_cast<void>(cell_sources_.scan(engine.vfs)); // cells moved or renamed: their sources anew
+                }
             }
             ImGui::EndChild();
         } else if (engine.console_ui != nullptr) {
@@ -1007,6 +1057,11 @@ void Editor::playground_toolbar(app::Engine& engine) {
         }
         ImGui::SameLine();
         snap_step("##snap_scale_step", snap_.scale_step, kScaleSteps, "");
+        ImGui::SameLine(0.0f, px(8.0f));
+        if (icon_button(icons_, "##snap_ground", Icon::SnapTerrain,
+                        "Keep what's moved on the ground (the terrain, or what's below it)", snap_ground_)) {
+            snap_ground_ = !snap_ground_;
+        }
 
         // The right: the camera's speed, the view, framing the selection.
         char speed[32];
@@ -1064,7 +1119,7 @@ void Editor::playground_toolbar(app::Engine& engine) {
         }
         ImGui::SameLine(0.0f, px(6.0f));
         if (icon_button(icons_, "##frame", Icon::FocusSelection, "Frame the selection (F)", false,
-                        selection_.kind == Selection::Kind::Entity)) {
+                        selection_.kind == Selection::Kind::Entity || selection_.kind == Selection::Kind::Terrain)) {
             selection_.frame_entity = true;
         }
     }
@@ -1106,7 +1161,13 @@ void Editor::playground(app::Engine& engine) {
                                ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
                                    ImGuiButtonFlags_MouseButtonMiddle);
         playground_hovered_ = ImGui::IsItemHovered();
-        // A model dragged from the resources and let go over the scene: placed there.
+        // A model dragged from the resources: shown under the mouse while it's over the scene, placed where it's let
+        // go.
+        preview_model(engine, playground_view(corner, size),
+                      ImGui::IsMouseHoveringRect(corner, far_corner) &&
+                          ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem),
+                      preview_flag_ != nullptr ? ImVec2(corner.x + (size.x * 0.5f), corner.y + (size.y * 0.5f))
+                                               : io.MousePos);
         if (ImGui::BeginDragDropTarget()) {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(AssetBrowser::kSourceFilePayload)) {
                 const std::string_view dropped(static_cast<const char*>(payload->Data),
@@ -1137,8 +1198,12 @@ void Editor::playground(app::Engine& engine) {
         }
         engine.viewport.overlays_drawn = true;
         draw->PushClipRect(corner, far_corner, true);
+        if (show_cells_) {
+            draw_cell_grid(engine, view, draw);
+        }
         // Alt keeps the mouse for the camera: no handle takes it then.
         const bool mouse_free = playground_hovered_ && !looking_ && !io.KeyAlt && !navigation_.dragging();
+        gizmo_.set_ground(snap_ground_ ? this : nullptr);
         const bool on_gizmo = gizmo_.update(view, draw, tool_, space_, snap_, selected, selection_.entities.span(),
                                             handles_origin(engine, selected), mouse_free, commands_);
         draw->PopClipRect();
@@ -1189,13 +1254,28 @@ void Editor::playground(app::Engine& engine) {
 }
 
 void Editor::shortcuts(app::Engine& engine) {
+    // Camera bookmarks: Ctrl+1 to 9 keeps one, 1 to 9 goes there (not while typing).
+    if (!ImGui::GetIO().WantTextInput) {
+        for (uint32_t slot = 1; slot <= 9; ++slot) {
+            const auto key = static_cast<ImGuiKey>(ImGuiKey_0 + static_cast<int>(slot));
+            if (ImGui::Shortcut(static_cast<ImGuiKeyChord>(ImGuiMod_Ctrl) | static_cast<ImGuiKeyChord>(key),
+                                ImGuiInputFlags_RouteGlobal)) {
+                keep_bookmark(slot);
+                save_bookmarks(engine.vfs);
+            } else if (ImGui::Shortcut(key, ImGuiInputFlags_RouteGlobal)) {
+                static_cast<void>(go_to_bookmark(slot));
+            }
+        }
+    }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
         save(engine);
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_D, ImGuiInputFlags_RouteGlobal)) {
         duplicate_selection(engine);
     }
-    if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_Delete, ImGuiInputFlags_RouteGlobal)) {
+    // Delete in Resources is the files' (it asks first).
+    if (!ImGui::GetIO().WantTextInput && !browser_.focused() &&
+        ImGui::Shortcut(ImGuiKey_Delete, ImGuiInputFlags_RouteGlobal)) {
         delete_selection(engine);
     }
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_End, ImGuiInputFlags_RouteGlobal)) {
@@ -1218,7 +1298,7 @@ void Editor::shortcuts(app::Engine& engine) {
     }
     // F, unless it's being typed.
     if (!ImGui::GetIO().WantTextInput && ImGui::Shortcut(ImGuiKey_F, ImGuiInputFlags_RouteGlobal) &&
-        selection_.kind == Selection::Kind::Entity) {
+        (selection_.kind == Selection::Kind::Entity || selection_.kind == Selection::Kind::Terrain)) {
         selection_.frame_entity = true;
     }
 }
@@ -1294,12 +1374,13 @@ void Editor::start_cook(app::Engine& engine) {
     if (cooking_.empty() || cooker_.running()) {
         return;
     }
-    // In the background, into the engine's own cooked folder: cells and worlds (the shaders stay as they are).
+    // In the background, the open project into the cooked folder the engine reads: cells and worlds (the shaders stay
+    // as they are).
     const core::Result<platform::PathString> cooker = platform::program_beside_engine("cooker");
     const char* src_root = engine.vfs.mount_root(platform::Mount::Src);
     const char* game_root = engine.vfs.mount_root(platform::Mount::Game);
     if (cooker && src_root != nullptr && game_root != nullptr) {
-        const char* args[] = {cooker->c_str(), "--src", src_root, "--out", game_root, "--no-shaders"};
+        const char* args[] = {cooker->c_str(), "--project", src_root, "--out", game_root, "--no-shaders"};
         if (core::Result<platform::Process> started = platform::Process::start(args)) {
             cooker_ = std::move(*started);
         }
@@ -1601,14 +1682,9 @@ bool Editor::drop_selection_to_ground(app::Engine& engine) {
     return dropped > 0;
 }
 
-bool Editor::drop_to_ground(app::Engine& engine, flecs::entity entity) {
-    const flecs::world& ecs = engine.world.ecs();
-    const auto* where = editable(entity) ? entity.try_get<world::WorldTransform>() : nullptr;
-    if (where == nullptr) {
-        return false;
-    }
-    // Its lowest and highest points, as it's turned and scaled now: the box round its mesh (its pivot without one).
-    const world::WorldTransform now = *where;
+bool Editor::settle(flecs::entity entity, world::WorldTransform& where) {
+    app::Engine& engine = *engine_;
+    // Its lowest and highest points, as it's turned and scaled: the box round its mesh (its pivot without one).
     double lowest = 0.0;
     double highest = 0.0;
     const auto* instance = entity.try_get<world::MeshInstance>();
@@ -1619,26 +1695,39 @@ bool Editor::drop_to_ground(app::Engine& engine, flecs::entity entity) {
             const Vec3 corner((c & 1U) != 0 ? mesh->bounds.max[0] : mesh->bounds.min[0],
                               (c & 2U) != 0 ? mesh->bounds.max[1] : mesh->bounds.min[1],
                               (c & 4U) != 0 ? mesh->bounds.max[2] : mesh->bounds.min[2]);
-            const double height = (now.rotation * (now.scale * corner)).y;
+            const double height = (where.rotation * (where.scale * corner)).y;
             lowest = std::min(lowest, height);
             highest = std::max(highest, height);
         }
     }
     // Looked for from just over its top, so one half sunk into the ground comes up onto it; its lowest point lands.
     DVec3 ground;
-    bool below = ground_below(engine, now.position + DVec3(0.0, highest + 0.5, 0.0), entity, ground);
+    bool below = ground_below(engine, where.position + DVec3(0.0, highest + 0.5, 0.0), entity, ground);
     // Under the terrain altogether: up onto it.
     if (double terrain = 0.0; !below && terrain_heights_.has_value() &&
-                              terrain_heights_->height_at(now.position.x, now.position.z, terrain)) {
-        ground = DVec3(now.position.x, terrain, now.position.z);
+                              terrain_heights_->height_at(where.position.x, where.position.z, terrain)) {
+        ground = DVec3(where.position.x, terrain, where.position.z);
         below = true;
     }
     if (!below) {
+        return false;
+    }
+    where.position.y = ground.y - lowest;
+    return true;
+}
+
+bool Editor::drop_to_ground(app::Engine& engine, flecs::entity entity) {
+    const flecs::world& ecs = engine.world.ecs();
+    const auto* where = editable(entity) ? entity.try_get<world::WorldTransform>() : nullptr;
+    if (where == nullptr) {
+        return false;
+    }
+    const world::WorldTransform now = *where;
+    world::WorldTransform dropped = now;
+    if (!settle(entity, dropped)) {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "Nothing below it to drop onto"));
         return false;
     }
-    world::WorldTransform dropped = now;
-    dropped.position.y = ground.y - lowest;
     // As its Transform has it: in the world, or relative to what it's attached to.
     world::Transform placed{.position = dropped.position, .rotation = dropped.rotation, .scale = dropped.scale};
     if (const auto* parent = entity.try_get<flecs::Parent>()) {
@@ -1707,9 +1796,9 @@ flecs::entity Editor::duplicate_entity(app::Engine& engine, flecs::entity source
     return made;
 }
 
-void Editor::place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen) {
+DVec3 Editor::drop_point(app::Engine& engine, const View& view, ImVec2 screen) {
     // Where the ray under the mouse meets the ground: the nearer of something solid and the terrain, else the level of
-    // the world's zero.
+    // the world's zero. (A model being previewed has no collision yet: the ray goes through it.)
     const Vec3 direction = view.ray(screen);
     DVec3 point = view.position + (DVec3(direction) * 20.0);
     constexpr double kReach = 5000.0;
@@ -1729,18 +1818,75 @@ void Editor::place_model(app::Engine& engine, std::string_view path, const View&
             found = true;
         }
     }
-    if (found) {
-        // On what it met.
-    } else if (direction.y < -1e-4f) {
+    if (!found && direction.y < -1e-4f) {
         const double along = -view.position.y / static_cast<double>(direction.y);
-        if (along > 0.0 && along < 5000.0) {
+        if (along > 0.0 && along < kReach) {
             point = view.position + (DVec3(direction) * along);
         }
     }
+    return point;
+}
+
+void Editor::place_model(app::Engine& engine, std::string_view path, const View& view, ImVec2 screen) {
+    const DVec3 point = drop_point(engine, view, screen);
+    // The preview, where it is: it's the one placed.
+    const flecs::world& ecs = engine.world.ecs();
+    if (preview_ != 0 && ecs.is_alive(preview_) && preview_path_.view() == path) {
+        const flecs::entity placed = ecs.entity(preview_);
+        world::place(placed, {.position = point});
+        preview_ = 0;
+        commands_.created(placed);
+        selection_.select_entity(placed.id());
+        const auto* entry = placed.try_get<EditorEntry>();
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Placed %s (saved into its cell with Ctrl+S)",
+                                        entry != nullptr ? entry->name : "it"));
+        return;
+    }
+    end_preview(engine);
     static_cast<void>(place_model_at(engine, path, point));
 }
 
-bool Editor::place_model_at(app::Engine& engine, std::string_view path, const DVec3& point) {
+void Editor::preview_model(app::Engine& engine, const View& view, bool hovering, ImVec2 screen) {
+    const ImGuiPayload* drag = ImGui::GetDragDropPayload();
+    const bool dragging = drag != nullptr && drag->IsDataType(AssetBrowser::kSourceFilePayload);
+    if ((!dragging || !hovering) && preview_flag_ == nullptr) {
+        end_preview(engine);
+        return;
+    }
+    const std::string_view path = dragging ? std::string_view(static_cast<const char*>(drag->Data),
+                                                              static_cast<size_t>(std::max(drag->DataSize - 1, 0)))
+                                           : std::string_view(preview_flag_);
+    if (file_kind(path) != "Model") {
+        end_preview(engine);
+        return;
+    }
+    const DVec3 point = drop_point(engine, view, screen);
+    const flecs::world& ecs = engine.world.ecs();
+    if (preview_ != 0 && ecs.is_alive(preview_) && preview_path_.view() == path) {
+        world::place(ecs.entity(preview_), {.position = point});
+        return;
+    }
+    end_preview(engine);
+    EntityRecord record;
+    if (!model_record(engine, path, point, record)) {
+        return; // not cooked: the drop says so
+    }
+    preview_ = make(record).id();
+    preview_path_.assign(path);
+}
+
+void Editor::end_preview(app::Engine& engine) {
+    if (preview_ == 0) {
+        return;
+    }
+    const flecs::world& ecs = engine.world.ecs();
+    if (ecs.is_alive(preview_)) {
+        ecs.entity(preview_).destruct();
+    }
+    preview_ = 0;
+}
+
+bool Editor::model_record(app::Engine& engine, std::string_view path, const DVec3& point, EntityRecord& out) {
     if (file_kind(path) != "Model") {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "Only models (.gltf, .glb, .fbx) can be placed"));
         return false;
@@ -1756,23 +1902,31 @@ bool Editor::place_model_at(app::Engine& engine, std::string_view path, const DV
     const size_t slash = path.rfind('/');
     const std::string_view file = path.substr(slash + 1);
     const std::string_view stem = file.substr(0, file.rfind('.'));
-    EntityRecord placed;
-    placed.transform = {.position = point};
-    placed.mesh = mesh;
-    placed.is_static = true;
-    placed.has_entry = true;
+    out = EntityRecord{};
+    out.transform = {.position = point};
+    out.mesh = mesh;
+    out.is_static = true;
+    out.has_entry = true;
     static_cast<void>(std::snprintf(
-        placed.entry.object, sizeof(placed.entry.object), R"({"name": "%.*s", "mesh": "%.*s", "collision": "mesh"})",
+        out.entry.object, sizeof(out.entry.object), R"({"name": "%.*s", "mesh": "%.*s", "collision": "mesh"})",
         static_cast<int>(stem.size()), stem.data(), static_cast<int>(file.size()), file.data()));
     const std::string_view folder = path.substr(0, slash);
-    const size_t folder_length = std::min(folder.size(), sizeof(placed.entry.folder) - 1);
-    std::memcpy(placed.entry.folder, folder.data(), folder_length);
-    placed.entry.folder[folder_length] = 0;
-    static_cast<void>(std::snprintf(placed.entry.name, sizeof(placed.entry.name), "%.*s", static_cast<int>(stem.size()),
-                                    stem.data()));
+    const size_t folder_length = std::min(folder.size(), sizeof(out.entry.folder) - 1);
+    std::memcpy(out.entry.folder, folder.data(), folder_length);
+    out.entry.folder[folder_length] = 0;
+    static_cast<void>(
+        std::snprintf(out.entry.name, sizeof(out.entry.name), "%.*s", static_cast<int>(stem.size()), stem.data()));
     char name[128];
-    unique_name(engine, placed.entry.name, name);
-    static_cast<void>(rename_entry(placed.entry, name));
+    unique_name(engine, out.entry.name, name);
+    static_cast<void>(rename_entry(out.entry, name));
+    return true;
+}
+
+bool Editor::place_model_at(app::Engine& engine, std::string_view path, const DVec3& point) {
+    EntityRecord placed;
+    if (!model_record(engine, path, point, placed)) {
+        return false;
+    }
     const flecs::entity made = make(placed);
     commands_.created(made);
     selection_.select_entity(made.id());
@@ -1883,6 +2037,182 @@ void Editor::duplicate_command(void* user, const console::Args& args, console::O
     out.info("%s", editor->message_);
 }
 
+void Editor::draw_cell_grid(app::Engine& engine, const View& view, ImDrawList* draw) {
+    DE_PROFILE_ZONE("Editor::draw_cell_grid");
+    // The cells round the camera, their borders a little above the ground (the terrain's, else the world's zero), in
+    // steps short enough to follow it.
+    constexpr int kReach = 3;        // cells each way
+    constexpr double kStepM = 8.0;   // along a border
+    constexpr double kAboveM = 0.15; // over the ground, so it isn't lost in it
+    const double cell = world::kCellSize;
+    if (terrain_heights_.has_value()) {
+        terrain_heights_->set_terrain(engine.assets.get<asset::TerrainAsset>(engine.terrain));
+    }
+    const auto ground = [&](double x, double z) {
+        double y = 0.0;
+        if (!terrain_heights_.has_value() || !terrain_heights_->height_at(x, z, y)) {
+            y = 0.0;
+        }
+        return DVec3(x, y + kAboveM, z);
+    };
+    const auto at_x = static_cast<int>(std::floor(view.position.x / cell));
+    const auto at_z = static_cast<int>(std::floor(view.position.z / cell));
+    const ImU32 ink = IM_COL32(255, 255, 255, 70);
+    const float width = std::max(1.0f, px(1.0f));
+    const auto line = [&](DVec3 from, DVec3 to) {
+        ImVec2 a;
+        ImVec2 b;
+        if (view.project(from, a) && view.project(to, b)) {
+            draw->AddLine(a, b, ink, width);
+        }
+    };
+    const double low_x = (at_x - kReach) * cell;
+    const double high_x = (at_x + kReach + 1) * cell;
+    const double low_z = (at_z - kReach) * cell;
+    const double high_z = (at_z + kReach + 1) * cell;
+    for (int k = at_x - kReach; k <= at_x + kReach + 1; ++k) {
+        const double x = k * cell;
+        for (int step = 0; low_z + (step * kStepM) < high_z; ++step) {
+            const double z = low_z + (step * kStepM);
+            line(ground(x, z), ground(x, std::min(z + kStepM, high_z)));
+        }
+    }
+    for (int k = at_z - kReach; k <= at_z + kReach + 1; ++k) {
+        const double z = k * cell;
+        for (int step = 0; low_x + (step * kStepM) < high_x; ++step) {
+            const double x = low_x + (step * kStepM);
+            line(ground(x, z), ground(std::min(x + kStepM, high_x), z));
+        }
+    }
+    // Each cell's coordinates in its middle.
+    char label[32];
+    for (int cz = at_z - kReach; cz <= at_z + kReach; ++cz) {
+        for (int cx = at_x - kReach; cx <= at_x + kReach; ++cx) {
+            ImVec2 middle;
+            if (!view.project(ground((cx + 0.5) * cell, (cz + 0.5) * cell), middle)) {
+                continue;
+            }
+            const int length = std::snprintf(label, sizeof(label), "[%d, %d]", cx, cz);
+            const ImVec2 size = ImGui::CalcTextSize(label, label + std::max(length, 0));
+            draw->AddText(ImVec2(std::floor(middle.x - (size.x * 0.5f)), std::floor(middle.y - (size.y * 0.5f))),
+                          IM_COL32(255, 255, 255, 120), label);
+        }
+    }
+}
+
+void Editor::keep_bookmark(uint32_t slot) {
+    const uint64_t world = viewer_.world_id().value();
+    Bookmark* kept = nullptr;
+    for (Bookmark& bookmark : bookmarks_) {
+        if (bookmark.world == world && bookmark.slot == slot) {
+            kept = &bookmark;
+        }
+    }
+    if (kept == nullptr) {
+        kept = &bookmarks_.push({.world = world, .slot = slot, .pose = {}});
+    }
+    kept->pose = camera_pose();
+    static_cast<void>(std::snprintf(message_, sizeof(message_), "Bookmark %u kept (%u goes back there)", slot, slot));
+}
+
+bool Editor::go_to_bookmark(uint32_t slot) {
+    const uint64_t world = viewer_.world_id().value();
+    for (const Bookmark& bookmark : bookmarks_) {
+        if (bookmark.world == world && bookmark.slot == slot) {
+            viewer_.set_camera_pose(bookmark.pose);
+            static_cast<void>(std::snprintf(message_, sizeof(message_), "Bookmark %u", slot));
+            return true;
+        }
+    }
+    static_cast<void>(
+        std::snprintf(message_, sizeof(message_), "No bookmark %u in this world: Ctrl+%u keeps one", slot, slot));
+    return false;
+}
+
+void Editor::load_bookmarks(const platform::Vfs& vfs) {
+    bookmarks_.clear();
+    if (!vfs.exists(kBookmarksPath)) {
+        return;
+    }
+    auto file = vfs.read_whole_file(kBookmarksPath, editor_heap());
+    if (!file) {
+        return;
+    }
+    // "world slot x y z yaw_deg pitch_deg", a line each.
+    std::string_view text = core::skip_bom(std::string_view(reinterpret_cast<const char*>(file->data()), file->size()));
+    while (!text.empty()) {
+        const std::string_view line = core::trim(core::strip_comment(core::next_line(text)));
+        if (line.empty()) {
+            continue;
+        }
+        // Its words, each a number.
+        double values[7] = {};
+        size_t count = 0;
+        uint64_t world = 0;
+        std::string_view rest = line;
+        bool good = true;
+        while (good && !rest.empty() && count < 7) {
+            const size_t space = rest.find(' ');
+            const std::string_view word = rest.substr(0, space);
+            rest = space == std::string_view::npos ? std::string_view() : core::trim(rest.substr(space));
+            const char* begin = word.data();
+            const char* end = begin + word.size();
+            good = count == 0 ? std::from_chars(begin, end, world, 16).ptr == end
+                              : std::from_chars(begin, end, values[count]).ptr == end;
+            ++count;
+        }
+        const auto slot = static_cast<uint32_t>(values[1]);
+        if (good && count == 7 && slot >= 1 && slot <= 9) {
+            constexpr double kRad = std::numbers::pi / 180.0;
+            bookmarks_.push({.world = world,
+                             .slot = slot,
+                             .pose = {.position = DVec3(values[2], values[3], values[4]),
+                                      .yaw_rad = static_cast<float>(values[5] * kRad),
+                                      .pitch_rad = static_cast<float>(values[6] * kRad)}});
+        }
+    }
+}
+
+void Editor::save_bookmarks(const platform::Vfs& vfs) const {
+    core::Array<char> text(editor_heap());
+    const auto add = [&text](const char* line, int length) {
+        if (length > 0) {
+            const size_t at = text.size();
+            text.resize(at + static_cast<size_t>(length));
+            std::memcpy(text.data() + at, line, static_cast<size_t>(length));
+        }
+    };
+    char line[256];
+    add(line, std::snprintf(line, sizeof(line), "# Camera bookmarks: world, slot, x y z (m), yaw and pitch (deg).\n"));
+    constexpr double kDeg = 180.0 / std::numbers::pi;
+    for (const Bookmark& bookmark : bookmarks_) {
+        add(line, std::snprintf(line, sizeof(line), "%016llx %u %.4f %.4f %.4f %.3f %.3f\n",
+                                static_cast<unsigned long long>(bookmark.world), bookmark.slot,
+                                bookmark.pose.position.x, bookmark.pose.position.y, bookmark.pose.position.z,
+                                bookmark.pose.yaw_rad * kDeg, bookmark.pose.pitch_rad * kDeg));
+    }
+    if (const core::Result<void> written = vfs.write_file(kBookmarksPath, std::as_bytes(text.span())); !written) {
+        DE_LOG_WARN("editor", "can't keep the bookmarks in %s: %s", kBookmarksPath, written.error().message);
+    }
+}
+
+void Editor::bookmark_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const uint32_t slot = args.empty() || args[0].size() != 1 ? 0 : static_cast<uint32_t>(args[0][0] - '0');
+    if (slot < 1 || slot > 9 || args.size() > 2 || (args.size() == 2 && args[1] != "set")) {
+        out.error("editor.bookmark takes a slot, 1 to 9, and set to keep the camera in it");
+        return;
+    }
+    if (args.size() == 2) {
+        editor->keep_bookmark(slot);
+        editor->save_bookmarks(editor->engine_->vfs);
+    } else if (!editor->go_to_bookmark(slot)) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("%s", editor->message_);
+}
+
 void Editor::undo_command(void* user, const console::Args& /*args*/, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
     const char* what = editor->commands_.undo_name(editor->engine_->world.ecs());
@@ -1948,9 +2278,91 @@ void Editor::select_command(void* user, const console::Args& args, console::Outp
         out.info("nothing chosen");
         return;
     }
+    if (args.size() == 1 && args[0] == "Terrain") {
+        if (editor->engine_->assets.get<asset::TerrainAsset>(editor->engine_->terrain) == nullptr) {
+            out.error("this world has no terrain");
+            return;
+        }
+        editor->selection_.select_terrain();
+        out.info("the terrain chosen");
+        return;
+    }
     if (editor->choose_named(args, out)) {
         out.info("%zu chosen", editor->selection_.entities.size());
     }
+}
+
+void Editor::files_changed(app::Engine& engine) {
+    browser_.refresh();
+    static_cast<void>(cell_sources_.scan(engine.vfs));
+}
+
+void Editor::move_file_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 2) {
+        out.error(
+            "editor.move_file takes where it is and where it goes: src:/content/a/rock.gltf src:/content/b/rock.gltf");
+        return;
+    }
+    const SourceMove move{.from = SourcePath(args[0]), .to = SourcePath(args[1])};
+    const core::Result<FileOpReport> report = move_sources(editor->engine_->vfs, std::span(&move, 1));
+    if (!report) {
+        out.error("not moved: %s", report.error().message);
+        return;
+    }
+    editor->files_changed(*editor->engine_);
+    out.info("moved; %u file%s naming it rewritten", report->rewritten, report->rewritten == 1 ? "" : "s");
+}
+
+void Editor::new_folder_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1) {
+        out.error("editor.new_folder takes a path: src:/content/props/rocks");
+        return;
+    }
+    if (const core::Result<void> made = make_source_folder(editor->engine_->vfs, args[0]); !made) {
+        out.error("not made: %s", made.error().message);
+        return;
+    }
+    editor->files_changed(*editor->engine_);
+    out.info("made");
+}
+
+void Editor::delete_file_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.empty()) {
+        out.error("editor.delete_file takes paths: src:/content/props/rock");
+        return;
+    }
+    core::Array<SourcePath> paths(editor_heap());
+    core::Array<SourcePath> users(editor_heap());
+    for (size_t i = 0; i < args.size(); ++i) {
+        const std::string_view path = args[i];
+        paths.push(SourcePath(path));
+        users.clear();
+        find_users(editor->engine_->vfs, path, users);
+        for (const SourcePath& named_by : users) {
+            out.info("careful: %.*s is still named by %s", static_cast<int>(path.size()), path.data(),
+                     named_by.c_str());
+        }
+    }
+    const core::Result<uint32_t> trashed = trash_sources(editor->engine_->vfs, paths.span());
+    if (!trashed) {
+        out.error("not deleted: %s", trashed.error().message);
+        return;
+    }
+    editor->files_changed(*editor->engine_);
+    out.info("%u sent to the recycle bin", *trashed);
+}
+
+void Editor::frame_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (editor->selection_.kind != Selection::Kind::Entity && editor->selection_.kind != Selection::Kind::Terrain) {
+        out.error("nothing chosen to frame");
+        return;
+    }
+    editor->selection_.frame_entity = true;
+    out.info("framing the selection");
 }
 
 void Editor::delete_command(void* user, const console::Args& args, console::Output& out) {
@@ -2154,6 +2566,7 @@ void Editor::follow_saves(app::Engine& engine) {
     DE_PROFILE_ZONE("Editor::follow_saves");
     int code = 0;
     if (cooker_.running() && cooker_.finished(code)) {
+        thumbnails_.forget_all(); // the models cooked come with new pictures
         // Judged by what was saved: something else failing to cook (a terrain being worked on) isn't this save's.
         uint32_t failed = 0;
         const auto report = engine.vfs.read_whole_file("game:/cook_report.json", editor_heap());
@@ -2213,8 +2626,47 @@ void Editor::go_to_place(const DVec3& place) {
     viewer_.set_camera_pose(pose);
 }
 
+namespace {
+constexpr float kFrameTerrainPitchRad = 0.6f; // about 35 degrees down
+} // namespace
+
 void Editor::frame_selection(app::Engine& engine) {
     const flecs::world& ecs = engine.world.ecs();
+    const auto* lens = viewer_.camera_entity().try_get<world::Camera>();
+    const float fov_rad = lens != nullptr ? lens->vertical_fov_rad : 1.0f;
+    // The terrain: all of it, about its middle (its patches' bounds give how high that is).
+    if (selection_.kind == Selection::Kind::Terrain) {
+        const auto* terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain);
+        if (terrain == nullptr) {
+            return;
+        }
+        float lowest = 0.0f;
+        float highest = 0.0f;
+        bool any = false;
+        for (const asset::TerrainPatch& patch : terrain->patches.get(terrain)) {
+            lowest = any ? std::min(lowest, patch.min_m) : patch.min_m;
+            highest = any ? std::max(highest, patch.max_m) : patch.max_m;
+            any = true;
+        }
+        DVec3 middle(terrain->origin_m[0] + (static_cast<double>(terrain->width_m) * 0.5),
+                     (static_cast<double>(lowest) + static_cast<double>(highest)) * 0.5,
+                     terrain->origin_m[1] + (static_cast<double>(terrain->depth_m) * 0.5));
+        if (terrain_heights_.has_value()) {
+            terrain_heights_->set_terrain(terrain);
+        }
+        if (double ground = 0.0;
+            terrain_heights_.has_value() && terrain_heights_->height_at(middle.x, middle.z, ground)) {
+            middle.y = ground; // the ground there, nearer than the bounds' middle
+        }
+        const float radius_m =
+            0.5f * std::sqrt((terrain->width_m * terrain->width_m) + (terrain->depth_m * terrain->depth_m));
+        // Looked down on, from the way the camera faces: easing back along a level or upward view would go under it.
+        tools::CameraPose pose = camera_pose();
+        pose.pitch_rad = -kFrameTerrainPitchRad;
+        viewer_.set_camera_pose(pose);
+        navigation_.frame(pose, middle, std::max(radius_m, 1.0f), fov_rad);
+        return;
+    }
     if (selection_.kind != Selection::Kind::Entity || !ecs.is_alive(selection_.entity)) {
         return;
     }
@@ -2239,9 +2691,7 @@ void Editor::frame_selection(app::Engine& engine) {
         }
     }
     // The camera eases back along where it looks until the sphere around it fills about half the view.
-    const auto* lens = viewer_.camera_entity().try_get<world::Camera>();
-    navigation_.frame(camera_pose(), center, std::max(radius_m, 0.25f),
-                      lens != nullptr ? lens->vertical_fov_rad : 1.0f);
+    navigation_.frame(camera_pose(), center, std::max(radius_m, 0.25f), fov_rad);
 }
 
 void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
@@ -2261,6 +2711,7 @@ void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
         return;
     }
     DE_LOG_INFO("editor", "opening %s (%s)", selection_.file.c_str(), asset::format_asset_id(id).c_str());
+    end_preview(engine);
     commands_.clear(); // their entities go with the world
     release_holds();
     folders_read_.clear();

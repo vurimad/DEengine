@@ -89,7 +89,7 @@ struct Fonts {
 };
 const Fonts& fonts();
 
-// Loads Source Sans 3 (regular and semibold) from src:/engine/editor/fonts and makes it ImGui's default. False
+// Loads Source Sans 3 (regular and semibold) from engine:/engine/editor/fonts and makes it ImGui's default. False
 // (logged) if they're missing: ImGui's own font stays.
 bool load_fonts(const platform::Vfs& vfs);
 

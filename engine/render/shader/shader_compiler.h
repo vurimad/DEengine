@@ -40,7 +40,7 @@ struct ShaderEntry {
 // One program: several entry points of one module, compiled together (the module and its
 // imports are parsed and checked once).
 struct CompileRequest {
-    // A module under src:/shaders/, by Slang module name: "triangle" is shaders/triangle.slang,
+    // A module under engine:/shaders/, by Slang module name: "triangle" is shaders/triangle.slang,
     // "common.color" is shaders/common/color.slang.
     const char* module = nullptr;
     // Empty: every entry point the module marks with [shader("...")], in the order it defines them.
@@ -84,7 +84,7 @@ struct CompiledProgram {
 // A source file a compile read, with its size and write time when it was read: if either
 // changes, the shader is stale. A file that couldn't be read has a zero info.
 struct ShaderDependency {
-    platform::PathString path{}; // "src:/shaders/common/color.slang"
+    platform::PathString path{}; // "engine:/shaders/common/color.slang"
     platform::FileInfo info{};
 };
 
@@ -104,7 +104,7 @@ struct ShaderCompilerDesc {
 };
 
 // Compiles Slang shaders to the RHI backend's bytecode, with reflection (docs/design.md, Shaders,
-// materials & VFX). Sources are read through the VFS from src:/shaders/.
+// materials & VFX). Sources are read through the VFS from engine:/shaders/.
 //
 // Conventions for shaders: column-major matrices (mul(matrix, vector), like GLM), push constants
 // in one [[vk::push_constant]] ConstantBuffer, resources reached bindlessly (by index or pointer).

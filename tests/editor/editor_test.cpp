@@ -1,14 +1,19 @@
 #include "asset/registry.h"
+#include "core/array.h"
 #include "core/job_system.h"
 #include "editor/commands.h"
+#include "editor/file_ops.h"
 #include "editor/gizmo.h"
 #include "editor/icons.h"
 #include "editor/navigation.h"
 #include "editor/outline.h"
 #include "editor/selection.h"
 #include "editor/source_files.h"
+#include "editor/thumbnails.h"
 #include "editor/widgets.h"
 #include "platform/vfs.h"
+#include "support/cook_kit.h"
+#include "support/gltf_source.h"
 #include "support/sandbox.h"
 #include "tools/debug_ui.h"
 #include "world/cell.h"
@@ -21,10 +26,13 @@
 #include <imgui_internal.h> // the dock builder
 
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <numbers>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 using de::DVec3;
 using de::editor::CommandStack;
@@ -723,4 +731,238 @@ TEST_CASE("editor commands: a group undoes and redoes as one") {
     CHECK(a.get<Transform>().position.y == doctest::Approx(1.0));
     CHECK(b.get<Transform>().position.y == doctest::Approx(1.0));
     CHECK_FALSE(commands.can_redo());
+}
+
+TEST_CASE("gizmo: with surface snapping, a move across the ground stays on it, and one up or down doesn't") {
+    using de::Vec3;
+    de::tools::create_imgui();
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(800.0f, 600.0f);
+    io.DeltaTime = 1.0f / 60.0f;
+    io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures;
+    io.Fonts->AddFontDefault();
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    const flecs::entity rock = ecs.entity();
+    de::world::place(rock, Transform{.position = {0.0, 0.0, 0.0}});
+    CommandStack commands(editor_heap());
+    // Ground 2 m up everywhere.
+    struct Shelf final : de::editor::GroundSnap {
+        bool settle(flecs::entity, WorldTransform& where) override {
+            where.position.y = 2.0;
+            return true;
+        }
+    } shelf;
+    constexpr float kDeg = std::numbers::pi_v<float> / 180.0f;
+    const de::editor::View view{.position = {0.0, 7.0, 7.0},
+                                .rotation = glm::angleAxis(-45.0f * kDeg, Vec3(1.0f, 0.0f, 0.0f)),
+                                .vertical_fov_rad = 1.0f,
+                                .min = ImVec2(0.0f, 0.0f),
+                                .size = ImVec2(800.0f, 600.0f)};
+    de::editor::Gizmo gizmo;
+    gizmo.set_ground(&shelf);
+    const auto frame = [&](ImVec2 mouse, bool down) {
+        io.AddMousePosEvent(mouse.x, mouse.y);
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, down);
+        ImGui::NewFrame();
+        static_cast<void>(gizmo.update(view, ImGui::GetForegroundDrawList(), de::editor::Tool::Move,
+                                       de::editor::Space::World, de::editor::Snap{}, rock, {},
+                                       rock.get<WorldTransform>().position, true, commands));
+        ImGui::EndFrame();
+    };
+    // Along the arrow to the handle, then dragged on: X, then up the Y arrow.
+    const auto drag = [&](DVec3 tip_at, int handle, ImVec2 by) {
+        ImVec2 center;
+        ImVec2 tip;
+        REQUIRE(view.project(rock.get<WorldTransform>().position, center));
+        REQUIRE(view.project(rock.get<WorldTransform>().position + tip_at, tip));
+        const float length = std::hypot(tip.x - center.x, tip.y - center.y);
+        ImVec2 at = center;
+        for (int step = 10; step < 400 && gizmo.hovered_handle() != handle; ++step) {
+            const auto along = static_cast<float>(step);
+            at = ImVec2(center.x + ((tip.x - center.x) * along / length),
+                        center.y + ((tip.y - center.y) * along / length));
+            frame(at, false);
+        }
+        REQUIRE(gizmo.hovered_handle() == handle);
+        frame(at, true);
+        frame(ImVec2(at.x + by.x, at.y + by.y), true);
+        frame(ImVec2(at.x + by.x, at.y + by.y), false);
+    };
+    drag(DVec3(1.0, 0.0, 0.0), 0, ImVec2(60.0f, 0.0f));
+    CHECK(rock.get<WorldTransform>().position.x > 0.3);
+    CHECK(rock.get<WorldTransform>().position.y == doctest::Approx(2.0));
+    drag(DVec3(0.0, 1.0, 0.0), 1, ImVec2(0.0f, -40.0f));
+    CHECK(rock.get<WorldTransform>().position.y > 2.3);
+    de::tools::destroy_imgui();
+}
+
+TEST_CASE("thumbnails: read from the cooked pictures into capped pages, the one seen longest ago making room") {
+    using de::editor::Thumbnails;
+    using de::test::gltf;
+    using de::test::grid;
+    using de::test::Vertex;
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(4, vertices, indices);
+    const std::string model = gltf(vertices, indices, 0.0f, R"([{"name": "paint"}])", "[]", "[]");
+    for (const char* name : {"content/props/a.gltf", "content/props/b.gltf", "content/props/c.gltf"}) {
+        de::test::write_src(sandbox, name, model);
+    }
+    de::platform::Vfs vfs = de::test::cooker_vfs(sandbox);
+    REQUIRE(de::test::run_cook(vfs).ok());
+    de::tools::create_imgui();
+    {
+        // Two pages of one picture each.
+        Thumbnails thumbnails(de::core::heap_allocator(de::core::MemoryTag::Editor), 2, 1);
+        Thumbnails::Picture picture;
+        const auto shown = [&](const char* path) { return thumbnails.find(path, picture); };
+        // Asked for, then read: a and b fill the pages; c waits, both on screen.
+        CHECK_FALSE(shown("src:/content/props/a.gltf"));
+        CHECK_FALSE(shown("src:/content/props/b.gltf"));
+        CHECK_FALSE(shown("src:/content/props/c.gltf"));
+        CHECK_FALSE(shown("src:/content/props/none.gltf")); // never cooked
+        thumbnails.update(vfs);
+        CHECK(thumbnails.pages() == 2);
+        CHECK(shown("src:/content/props/a.gltf"));
+        CHECK((picture.uv_min.x > 0.0f && picture.uv_max.x < 1.0f));
+        CHECK(shown("src:/content/props/b.gltf"));
+        CHECK_FALSE(shown("src:/content/props/c.gltf"));
+        thumbnails.update(vfs);
+        CHECK_FALSE(shown("src:/content/props/c.gltf"));
+        // b goes out of sight: c takes its place, and b is asked for again.
+        CHECK(shown("src:/content/props/a.gltf"));
+        thumbnails.update(vfs);
+        CHECK(shown("src:/content/props/c.gltf"));
+        CHECK(shown("src:/content/props/a.gltf"));
+        CHECK_FALSE(shown("src:/content/props/b.gltf"));
+        CHECK(thumbnails.pages() == 2);
+        thumbnails.update(vfs);
+        CHECK_FALSE(shown("src:/content/props/none.gltf"));
+        // Forgotten: read again.
+        thumbnails.forget_all();
+        CHECK_FALSE(shown("src:/content/props/a.gltf"));
+        thumbnails.update(vfs);
+        CHECK(shown("src:/content/props/a.gltf"));
+    }
+    de::tools::destroy_imgui();
+}
+
+TEST_CASE("selection: the terrain, alone, and an entity after it") {
+    de::editor::Selection selection;
+    selection.select_entity(42);
+    selection.add_entity(43);
+    selection.select_terrain();
+    CHECK(selection.kind == de::editor::Selection::Kind::Terrain);
+    CHECK(selection.entities.empty());
+    CHECK(selection.entity == 0);
+    CHECK_FALSE(selection.has_entity(42));
+    // Ctrl with an entity: that one, the terrain no longer.
+    selection.toggle_entity(7);
+    CHECK(selection.kind == de::editor::Selection::Kind::Entity);
+    CHECK(selection.entities.size() == 1);
+    CHECK(selection.entity == 7);
+}
+
+TEST_CASE("file operations: references are relative paths with an extension, read from strings outside comments") {
+    using de::editor::looks_like_reference;
+    CHECK(looks_like_reference("rock.gltf"));
+    CHECK(looks_like_reference("../water/sea_foam.material"));
+    CHECK_FALSE(looks_like_reference("fir_sapling_medium")); // a name, even with a folder of that name beside it
+    CHECK_FALSE(looks_like_reference("mesh"));
+    CHECK_FALSE(looks_like_reference("src:/content/a.cell"));
+    CHECK_FALSE(looks_like_reference("textures/rock%20a.png")); // escaped URIs aren't ours to rewrite
+    CHECK_FALSE(looks_like_reference(".."));
+    std::vector<std::string> found;
+    de::editor::for_each_string(R"({"a": "x.cell", // "commented.cell"
+        /* "block.cell" */ "b": "say \"hi\".cell"})",
+                                [&](size_t begin, size_t end) {
+                                    found.emplace_back("?");
+                                    static_cast<void>(begin + end);
+                                });
+    CHECK(found.size() == 4); // a, x.cell, b and the escaped one; the comments' aren't strings
+    // Whether a text names a file, or anything in a folder.
+    const std::string_view cell = R"({"entities": [{"mesh": "../props/rock/rock.gltf"}]})";
+    CHECK(de::editor::names_target(cell, "src:/content/world/a.cell", "src:/content/props/rock/rock.gltf"));
+    CHECK(de::editor::names_target(cell, "src:/content/world/a.cell", "src:/content/props"));
+    CHECK_FALSE(de::editor::names_target(cell, "src:/content/world/a.cell", "src:/content/prop"));
+    CHECK_FALSE(de::editor::names_target(cell, "src:/content/world/a.cell", "src:/content/world"));
+    // Names as path parts.
+    char cleaned[64];
+    size_t length = 0;
+    REQUIRE(de::editor::clean_file_name("Rock 01  (Big).GLTF", cleaned, length));
+    CHECK((std::string_view(cleaned, length) == "rock_01_big.gltf"));
+    REQUIRE(de::editor::clean_file_name("_folder.json", cleaned, length));
+    CHECK((std::string_view(cleaned, length) == "_folder.json"));
+    CHECK_FALSE(de::editor::clean_file_name("  ", cleaned, length));
+    CHECK_FALSE(de::editor::clean_file_name("..", cleaned, length));
+}
+
+TEST_CASE("file operations: a move takes the meta along, and every file naming it follows") {
+    using de::editor::SourceMove;
+    using de::editor::SourcePath;
+    using de::test::write_src;
+    const Sandbox sandbox;
+    write_src(sandbox, "content/props/rock/rock.gltf", R"({"buffers": [{"uri": "rock.bin"}]})");
+    write_src(sandbox, "content/props/rock/rock.bin", "bytes");
+    write_src(sandbox, "meta/props/rock/rock.gltf.json", R"({"guid": "6681c1d7-0c12-4528-9523-2642e902ae2d"})");
+    write_src(sandbox, "content/world/a.cell",
+              "{\n  // the rock\n  \"entities\": [{\"name\": \"rock\", \"mesh\": \"../props/rock/rock.gltf\"}]\n}\n");
+    write_src(sandbox, "meta/world/a.cell.json", R"({"guid": "11111111-2222-4333-8444-555555555555"})");
+    write_src(sandbox, "content/world/w.world", R"({"cells": ["a.cell"]})");
+    const de::platform::Vfs vfs = sandbox.make_vfs();
+    const auto text = [&](const char* path) {
+        const auto bytes = vfs.read_whole_file(path, de::core::heap_allocator(de::core::MemoryTag::Editor));
+        REQUIRE(bytes.ok());
+        return std::string(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    };
+    // A folder: its meta folder goes too; the cell names its new place; the glTF's own buffer stays beside it.
+    const SourceMove folder{.from = SourcePath("src:/content/props/rock"),
+                            .to = SourcePath("src:/content/props/stones/rock")};
+    auto report = de::editor::move_sources(vfs, std::span(&folder, 1));
+    REQUIRE(report.ok());
+    CHECK(report->moved == 1);
+    CHECK(report->rewritten == 1);
+    CHECK(vfs.exists("src:/content/props/stones/rock/rock.bin"));
+    CHECK(vfs.exists("src:/meta/props/stones/rock/rock.gltf.json"));
+    CHECK_FALSE(vfs.exists("src:/meta/props/rock"));
+    CHECK((
+        text("src:/content/world/a.cell") ==
+        "{\n  // the rock\n  \"entities\": [{\"name\": \"rock\", \"mesh\": \"../props/stones/rock/rock.gltf\"}]\n}\n"));
+    CHECK((text("src:/content/props/stones/rock/rock.gltf") == R"({"buffers": [{"uri": "rock.bin"}]})"));
+    // A cell renamed: the world lists it by its new name, and its meta follows.
+    const SourceMove rename{.from = SourcePath("src:/content/world/a.cell"),
+                            .to = SourcePath("src:/content/world/b.cell")};
+    REQUIRE(de::editor::move_sources(vfs, std::span(&rename, 1)).ok());
+    CHECK((text("src:/content/world/w.world") == R"({"cells": ["b.cell"]})"));
+    CHECK(vfs.exists("src:/meta/world/b.cell.json"));
+    // A model moved alone: its own references follow from where it is now, and the cell's to it.
+    const SourceMove alone{.from = SourcePath("src:/content/props/stones/rock/rock.gltf"),
+                           .to = SourcePath("src:/content/models/rock.gltf")};
+    REQUIRE(de::editor::move_sources(vfs, std::span(&alone, 1)).ok());
+    CHECK((text("src:/content/models/rock.gltf") == R"({"buffers": [{"uri": "../props/stones/rock/rock.bin"}]})"));
+    CHECK(text("src:/content/world/b.cell").find("\"../models/rock.gltf\"") != std::string::npos);
+    // Who names what.
+    de::core::Array<SourcePath> users(de::core::heap_allocator(de::core::MemoryTag::Editor));
+    de::editor::find_users(vfs, "src:/content/models/rock.gltf", users);
+    REQUIRE(users.size() == 1);
+    CHECK((users[0].view() == "src:/content/world/b.cell"));
+    // Refused before anything moves: a taken name, a folder into itself, outside content/, capitals.
+    const SourceMove taken{.from = SourcePath("src:/content/world/b.cell"),
+                           .to = SourcePath("src:/content/world/w.world")};
+    CHECK(de::editor::move_sources(vfs, std::span(&taken, 1)).error().code == de::core::ErrorCode::AlreadyExists);
+    const SourceMove into{.from = SourcePath("src:/content/props"), .to = SourcePath("src:/content/props/inner")};
+    CHECK_FALSE(de::editor::move_sources(vfs, std::span(&into, 1)).ok());
+    const SourceMove outside{.from = SourcePath("src:/content/world/b.cell"), .to = SourcePath("src:/meta/b.cell")};
+    CHECK_FALSE(de::editor::move_sources(vfs, std::span(&outside, 1)).ok());
+    const SourceMove capitals{.from = SourcePath("src:/content/world/b.cell"),
+                              .to = SourcePath("src:/content/world/B.cell")};
+    CHECK_FALSE(de::editor::move_sources(vfs, std::span(&capitals, 1)).ok());
+    CHECK(vfs.exists("src:/content/world/b.cell"));
+    // A new folder.
+    REQUIRE(de::editor::make_source_folder(vfs, "src:/content/props/new_folder").ok());
+    CHECK(vfs.file_info("src:/content/props/new_folder")->is_directory);
+    CHECK_FALSE(de::editor::make_source_folder(vfs, "src:/content/props/new_folder").ok());
 }

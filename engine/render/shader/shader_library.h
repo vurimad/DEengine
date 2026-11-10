@@ -28,7 +28,7 @@ struct Program;
 using ProgramHandle = core::SlotHandle<Program>;
 
 struct GraphicsProgramDesc {
-    const char* module = nullptr; // Slang module under src:/shaders/: "triangle", "common.color"
+    const char* module = nullptr; // Slang module under engine:/shaders/: "triangle", "common.color"
     const char* vertex_entry = "vertex_main";
     const char* fragment_entry = "fragment_main";
     std::span<const ShaderDefine> defines{};
@@ -59,7 +59,7 @@ struct ShaderLibraryStats {
 // and its programs rebuild in the background while the game keeps rendering with the last good
 // version; errors are logged with file and line, and the old pipeline stays until a fix compiles.
 //
-// Builds without src:/ (ship) use create_cooked() instead: programs come from the cooker's
+// Builds without engine:/ (ship) use create_cooked() instead: programs come from the cooker's
 // .deshader files in game:/, compiled ahead of time with the same compiler. With hot reload on,
 // a re-cooked file is picked up the same way an edited source is, as long as it's cooked from the
 // sources this build was compiled from: otherwise the running pipelines stay.

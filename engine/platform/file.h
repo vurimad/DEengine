@@ -72,6 +72,14 @@ core::Result<void> create_directories(const char* path);
 // Deletes path and everything under it, never following links. Succeeds if it doesn't exist.
 core::Result<void> delete_tree(const char* path);
 
+// Moves (renames) a file or a folder with everything in it, creating to's missing parent folders. Fails if to is
+// there already, or if they're on different drives.
+core::Result<void> move_path(const char* from, const char* to);
+
+// Sends a file or folder to the OS's recycle bin (Windows) or trash (Linux, the freedesktop.org one), where it can be
+// brought back. NotFound if nothing is there.
+core::Result<void> move_to_trash(const char* path);
+
 // Calls visit(name, is_directory) for each entry of a folder, except "." and "..".
 core::Result<void> list_directory(const char* path, core::FunctionRef<void(const char* name, bool is_directory)> visit);
 

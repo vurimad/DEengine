@@ -21,6 +21,7 @@
 #include "cooker/terrain_cooker.h"
 #include "cooker/texture_cooker.h"
 #include "cooker/third_party.h"
+#include "cooker/thumbnail_cooker.h"
 #include "cooker/world_cooker.h"
 #include "core/hash.h"
 #include "core/log.h"
@@ -41,6 +42,8 @@ namespace {
 
 // Bumped when the cooker writes different files for the same inputs (a better encoder, a fixed
 // bug): every source cooks again. Format versions are hashed in too, per kind.
+// Models' pictures (thumbnail_cooker.h): a change to how they're drawn cooks the models again, nothing else.
+constexpr uint64_t kThumbnailVersion = 1;
 constexpr uint64_t kCookerVersion = 6; // 2: cell children are as static as their parent; 6: longer LOD chains
 
 constexpr std::string_view kShaderTests = "shaders/tests/";
@@ -391,7 +394,7 @@ private:
             return;
         }
         const core::Result<uint64_t> sources = asset::shader_sources_hash(vfs_);
-        if (!sources && vfs_.exists("src:/shaders")) {
+        if (!sources && vfs_.exists("engine:/shaders")) {
             diagnostics_.error("shaders", "could not be hashed: %s", sources.error().message);
         }
         core::Array<SourcePath> files(tools_heap());
@@ -494,7 +497,7 @@ private:
     void check_cooked_shaders() {
         const core::Result<uint64_t> sources = asset::shader_sources_hash(vfs_);
         if (!sources) {
-            if (vfs_.exists("src:/shaders")) {
+            if (vfs_.exists("engine:/shaders")) {
                 diagnostics_.error("shaders", "could not be hashed: %s", sources.error().message);
             }
             return;
@@ -541,6 +544,7 @@ private:
         hasher.add(asset::MaterialAsset::kFormatVersion);
         hasher.add(asset::TextureAsset::kFormatVersion);
         hasher.add(asset::CollisionAsset::kFormatVersion);
+        hasher.add(kThumbnailVersion);
         hasher.add(physics::mesh_shape_format()); // another Jolt can't read this one's
         hasher.add(source_hash);
         hasher.add(std::as_bytes(settings.mesh.write(false).span()));
@@ -680,12 +684,77 @@ private:
             failed(path, &record);
             return;
         }
+        cook_model_thumbnail(record, model, *mesh, material_ids.span(), source.id);
         record.input_hash = input_hash(record.dependencies.span(), record.texture_uses.span());
         for (const TextureUse& use : record.texture_uses) {
             note_use(use, path);
         }
         next_.put(std::move(record));
         ++stats_.cooked;
+    }
+
+    // The model's picture for the editor: its cooked mesh drawn with its materials' base colours and textures. One
+    // that can't be drawn (nothing to see) is left out; it's never an error.
+    void cook_model_thumbnail(CookRecord& record, const ModelData& model, const core::Array<std::byte>& mesh_bytes,
+                              std::span<const asset::AssetId> material_ids, asset::AssetId mesh_id) {
+        DE_PROFILE_ZONE("cook thumbnail");
+        const std::string_view path = record.path.view();
+        const core::Result<const asset::MeshAsset*> mesh = asset::load_in_place<asset::MeshAsset>(mesh_bytes.span());
+        if (!mesh) {
+            return;
+        }
+        // Each base colour texture once, small; read again from its source (an embedded one too), quietly: what's
+        // wrong with one was reported when it was cooked.
+        Diagnostics quiet(false);
+        core::Array<uint32_t> loaded_from(tools_heap()); // model texture index of each in images
+        core::Array<Image> images(tools_heap());
+        const auto image_of = [&](uint32_t texture) -> const Image* {
+            if (texture >= model.textures.size()) {
+                return nullptr;
+            }
+            for (size_t i = 0; i < loaded_from.size(); ++i) {
+                if (loaded_from[i] == texture) {
+                    return images[i].width != 0 ? &images[i] : nullptr;
+                }
+            }
+            const ModelTexture& source = model.textures[texture];
+            core::Result<Image> decoded = core::fail(core::ErrorCode::NotFound, "");
+            if (source.file.empty()) {
+                decoded = decode_image(model.images[source.embedded].encoded.span(), path, quiet);
+            } else if (const core::Result<core::Array<std::byte>> bytes = read_source(source.file.view())) {
+                decoded = decode_image(bytes->span(), source.file.view(), quiet);
+            }
+            loaded_from.push(texture);
+            Image& kept = images.emplace();
+            if (decoded) {
+                kept = thumbnail_texture(*decoded);
+            }
+            return kept.width != 0 ? &kept : nullptr;
+        };
+        images.reserve(model.textures.size()); // pointers into it stay good
+        core::Array<ThumbnailLook> looks(tools_heap());
+        const void* file = *mesh;
+        for (const asset::MeshMaterialSlot& slot : (*mesh)->materials.get(file)) {
+            ThumbnailLook& look = looks.emplace();
+            const auto found = std::ranges::find(material_ids, slot.material);
+            if (!slot.material.is_valid() || found == material_ids.end()) {
+                continue;
+            }
+            const ModelMaterial& material = model.materials[static_cast<size_t>(found - material_ids.begin())];
+            std::memcpy(look.base_color, material.base_color, sizeof(look.base_color));
+            look.masked = material.alpha_mode != asset::AlphaMode::Opaque;
+            look.alpha_cutoff = material.alpha_cutoff;
+            look.texture = image_of(material.base_color_texture);
+        }
+        Image picture;
+        if (!draw_thumbnail(**mesh, looks.span(), picture)) {
+            return;
+        }
+        const asset::AssetId id = asset::thumbnail_asset_id(mesh_id);
+        const core::Result<core::Array<std::byte>> cooked = cook_thumbnail(picture, id, &jobs_, path, quiet);
+        if (cooked) {
+            static_cast<void>(write(record, id, asset::AssetType::Texture, *cooked));
+        }
     }
 
     bool cook_embedded_image(CookRecord& record, const ModelImage& image, TextureUsage usage,
@@ -722,8 +791,15 @@ private:
             Hasher hasher("material");
             hasher.add(source.id.value());
             hasher.add(asset::MaterialAsset::kFormatVersion);
+            hasher.add(kThumbnailVersion);
             hasher.add(source_hash);
             hash_texture_ids(hasher, uses);
+            // Its picture shows its textures: an edit to one draws it again.
+            core::Array<SourcePath> files(tools_heap());
+            for (const TextureUse& use : uses) {
+                files.push(use.path);
+            }
+            hash_files(hasher, files.span());
             return hasher.value();
         };
         if (const CookRecord* last = previous_.find(path); last != nullptr) {
@@ -739,6 +815,7 @@ private:
             failed(path, &record);
             return;
         }
+        add_material_picture(record, *build, asset::thumbnail_asset_id(source.id));
         record.input_hash = input_hash(record.texture_uses.span());
         for (const TextureUse& use : record.texture_uses) {
             note_use(use, path);
@@ -1061,8 +1138,22 @@ private:
         hasher.add(asset::TextureAsset::kFormatVersion);
         hasher.add(source_hash);
         hasher.add(std::as_bytes(settings_json.write(false).span()));
+        const asset::AssetId picture_id = asset::thumbnail_asset_id(source.id);
         if (const CookRecord* same = unchanged(path, hasher.value()); same != nullptr) {
-            keep(*same);
+            // Up to date: kept, with its picture added if it was cooked before textures had one (no new encode).
+            const bool has_picture = std::ranges::any_of(same->outputs, [&](const CookedOutput& output) {
+                return output.id == picture_id && output.type == asset::AssetType::Texture;
+            });
+            if (has_picture || options_.check_only) {
+                keep(*same);
+                return;
+            }
+            CookRecord kept = clone(*same);
+            Diagnostics quiet(false);
+            if (const core::Result<Image> image = decode_image(bytes->span(), path, quiet)) {
+                add_texture_picture(kept, *image, picture_id);
+            }
+            keep(kept);
             return;
         }
         CookRecord record{
@@ -1075,8 +1166,76 @@ private:
             failed(path);
             return;
         }
+        add_texture_picture(record, *image, picture_id);
         next_.put(std::move(record));
         ++stats_.cooked;
+    }
+
+    // A texture's picture for the editor (thumbnail_cooker.h): never an error if it can't be made.
+    void add_texture_picture(CookRecord& record, const Image& image, asset::AssetId id) {
+        DE_PROFILE_ZONE("cook texture thumbnail");
+        Image picture;
+        Diagnostics quiet(false);
+        if (!draw_texture_thumbnail(image, picture)) {
+            return;
+        }
+        if (const core::Result<core::Array<std::byte>> cooked =
+                cook_thumbnail(picture, id, &jobs_, record.path.view(), quiet)) {
+            static_cast<void>(write(record, id, asset::AssetType::Texture, *cooked));
+        }
+    }
+
+    // A text material's picture: a sphere in its base colour, base colour and normal textures (read again, small,
+    // from their sources), roughness and metalness.
+    void add_material_picture(CookRecord& record, const MaterialBuild& build, asset::AssetId id) {
+        DE_PROFILE_ZONE("cook material thumbnail");
+        MaterialLook look;
+        for (const asset::MaterialParam& param : build.params) {
+            if (param.name == asset::material::kBaseColor) {
+                std::memcpy(look.base_color, param.value, sizeof(look.base_color));
+            } else if (param.name == asset::material::kRoughness) {
+                look.roughness = param.value[0];
+            } else if (param.name == asset::material::kMetallic) {
+                look.metallic = param.value[0];
+            } else if (param.name == asset::material::kAlphaCutoff) {
+                look.alpha_cutoff = param.value[0];
+            }
+        }
+        look.masked = build.alpha_mode != asset::AlphaMode::Opaque;
+        Diagnostics quiet(false);
+        const auto small_image = [&](asset::AssetId texture, Image& out) {
+            for (const Source& source : tree_.sources()) {
+                if (source.id != texture) {
+                    continue;
+                }
+                const core::Result<core::Array<std::byte>> bytes = read_source(source.path.view());
+                if (bytes) {
+                    if (const core::Result<Image> decoded = decode_image(bytes->span(), source.path.view(), quiet)) {
+                        out = thumbnail_texture(*decoded);
+                    }
+                }
+                return;
+            }
+        };
+        Image color;
+        Image normal;
+        for (const asset::MaterialTexture& texture : build.textures) {
+            if (texture.slot == asset::material::kBaseColorTexture) {
+                small_image(texture.texture, color);
+                look.base_color_texture = color.width != 0 ? &color : nullptr;
+            } else if (texture.slot == asset::material::kNormalTexture) {
+                small_image(texture.texture, normal);
+                look.normal_texture = normal.width != 0 ? &normal : nullptr;
+            }
+        }
+        Image picture;
+        if (!draw_material_thumbnail(look, picture)) {
+            return;
+        }
+        if (const core::Result<core::Array<std::byte>> cooked =
+                cook_thumbnail(picture, id, &jobs_, record.path.view(), quiet)) {
+            static_cast<void>(write(record, id, asset::AssetType::Texture, *cooked));
+        }
     }
 
     // Cooked files no source makes any more: their source was deleted, or no longer has them.

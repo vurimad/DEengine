@@ -1,7 +1,7 @@
 """A map from a layout: regions at set heights, walls and layers between them, ways up, and room for water and towns.
 
 The layout below is by hand, so geography stays a decision: where each region is, how high it stands, which way rivers and
-roads run. Noise only wanders its edges and fills in the ground. Output goes under content/terrain/, which isn't committed.
+roads run. Noise only wanders its edges and fills in the ground. Output goes under projects/dreadworld/content/terrain/, which isn't committed.
 
     python tools/worldgen/worldgen.py sketch    a top-down picture of the layout, in seconds
     python tools/worldgen/worldgen.py build     the height image, masks, ground rules, world and views
@@ -26,7 +26,7 @@ import lightbake  # noqa: E402
 
 Image.MAX_IMAGE_PIXELS = None
 NAME = 'realm'
-OUT = 'D:/DE/content/terrain'
+OUT = 'D:/DE/projects/dreadworld/content/terrain'
 EYES = 'D:/DE/build/eyes/realm'
 SAMPLES = 8192
 SPACING_M = 2.0
@@ -722,7 +722,7 @@ def write_lighting(fine):
 
 
 def write_ground():
-    """The ground's rules. Layers are in content/terrain/layers (tools/worldgen/ground_layers.py)."""
+    """The ground's rules. Layers are in projects/dreadworld/content/terrain/layers (tools/worldgen/ground_layers.py)."""
 
     SCREE_TINT = [0.5, 0.78, 1.3]
     ROCK_TINT = [1.5, 1.72, 1.72]

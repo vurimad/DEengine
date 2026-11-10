@@ -89,7 +89,7 @@ if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
     target_compile_definitions(de_tests PRIVATE _CRT_SECURE_NO_WARNINGS)
 endif()
 
-# The repository root, so tests compile the real shaders from src:/shaders/.
+# The repository root, so tests compile the real shaders from engine:/shaders/.
 target_compile_definitions(de_tests PRIVATE "DE_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
 de_deploy_slang_runtime(de_tests)
 

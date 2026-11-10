@@ -2,14 +2,14 @@
 /build/
 /out/
 
-# Cooked data and ship layout: rebuilt by the cooker, never committed
-/cooked/
+# Cooked data and ship layout: rebuilt by the cooker, never committed (each project's cooked/)
+/projects/*/cooked/
 /Archives/
 *.arc
 
-# Real maps stay local until their data can be credited and hosted (the repository is public)
-/content/terrain/
-/meta/terrain/
+# The game's project is private (real maps, store assets) and versioned apart, not in the engine's public repository;
+# only the sandbox project (the test scene) is committed here.
+/projects/dreadworld/
 
 # vcpkg
 /vcpkg_installed/

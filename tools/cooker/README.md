@@ -3,13 +3,13 @@
 The asset cooker (docs/design.md, Asset formats): turns the source tree into the cooked files the engine loads. A library (`de::cooker`, so the editor can run it on file changes and tests can drive it) and the `cooker` command line.
 
 ```
-cooker [--src DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debug] [--shader-checks]
+cooker [--project DIR] [--out DIR] [--check] [--force] [--no-shaders] [--shader-debug] [--shader-checks]
 ```
 
 | Flag | Meaning |
 | --- | --- |
-| `--src DIR` | the repository root, mounted as `src:/` (default: this repository) |
-| `--out DIR` | where cooked files go, mounted as `game:/` (default: `<src>/cooked`, which the engine mounts by default) |
+| `--project DIR` | the project to cook, its folder or `.deproject` file, relative to the working folder or the repository (default: the build's, `projects/sandbox`); its sources are `src:/`, the engine's shaders `engine:/` |
+| `--out DIR` | where cooked files go, mounted as `game:/` (default: the project's `cooked/`, which the engine mounts when it opens the project) |
 | `--check` | check the source and meta trees, report stale cooked shaders and collision, read every terrain source and check what's cooked from it, and write nothing; exit code 1 on errors (CI). With nothing cooked there's nothing stale |
 | `--force` | cook every source again |
 | `--no-shaders` | skip shaders (no Slang compiler needed), in `--check` too |
@@ -27,6 +27,7 @@ It exits with 0 when there are no errors, and writes a JSON report (counts and e
 | `gltf_import.cpp`, `fbx_import.cpp`, `model.h` | glTF (cgltf) and FBX (ufbx) to one in-memory model |
 | `mesh_cooker.h` | `.demesh`: merged, optimized and LOD-chained with meshoptimizer |
 | `collision_cooker.h` | `.dephys`: a cooked mesh's collision, through `physics/jolt_shapes.h` |
+| `thumbnail_cooker.h` | the pictures the editor's resources show (`asset::thumbnail_asset_id`, 128 x 128 BC7): a model from its cooked mesh and its materials, a texture fitted to the square, a text material as a lit sphere; drawn on the CPU |
 | `texture_cooker.h` | `.detex`: mips filtered with stb_image_resize2, then BC1/BC4/BC5 (rgbcx) or BC7 (bc7enc) |
 | `material_cooker.h` | `.demat`: from model materials and `.material` text sources |
 | `cell_cooker.h` | `.decell`: from `.cell` text sources (the format is described there) |
@@ -79,9 +80,9 @@ Cooked files are named by asset ID: `game:/3f/3f8a0c1e5b2d4e61.demesh`. A source
 
 | Source | Cooked |
 | --- | --- |
-| Texture | a `.detex` |
-| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.dephys` (`collision`: see below), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it) |
-| `.material` | a `.demat` |
+| Texture | a `.detex`, and its picture for the editor (fitted to the square, its texels as they are; a texture cooked before pictures existed gets one at the next cook without being encoded again) |
+| glTF, FBX | a `.demesh` (the default scene flattened into one mesh, a part per material), a `.dephys` (`collision`: see below), a `.demat` per material (`material/<name>`, or `material/#<index>` for unnamed or repeated names, and names starting with `#`), a `.detex` per embedded image (`image/<n>`, by the image's index in the file, so material order doesn't change it), and its picture for the editor (`thumbnail`, `asset::thumbnail_asset_id`: a 128 x 128 BC7 sRGB `.detex`, one mip, clear round the model; none if there's nothing to see) |
+| `.material` | a `.demat`, and its picture (a sphere wearing it; its textures' files are among its inputs, so an edit to one draws it again) |
 | `.cell` | a `.decell`: its entities, parents first, and their fog volumes (shape, density, edge, tint, noise, drift, height fade), with the meshes of the models they name (relative paths) as its dependencies, and the `.dephys` of those that ask with `"collision": "mesh"` after them |
 | `.world` | a `.deworld`: its cells' IDs and coordinates (read from the cells, sorted), its start, its environment and optionally its terrain as its dependencies; cooked again when a cell it lists changes (its coordinate may have), not when the environment or the terrain does |
 | `.environment` | a `.deenv`: colors times intensities, the sun's direction from elevation and azimuth, the shadow and fog settings within their limits |
@@ -103,7 +104,7 @@ A `.dephys` is the binary state of a Jolt `MeshShape` (`Shape::SaveBinaryState`)
 ## Rules and invariants
 
 - The same inputs give the same bytes: no timestamps or paths in cooked files, padding zeroed.
-- A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references, or (for cells) the IDs of the models it places: a model cooked again doesn't cook its cells again. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
+- A source cooks again when anything its outputs depend on changes: its GUID, its bytes, its resolved settings, files it reads (glTF buffers, shader imports, a material's textures for its picture), the cooker's and the formats' versions, or (for models and materials) the IDs of the textures it references, or (for cells) the IDs of the models it places: a model cooked again doesn't cook its cells again. Otherwise it's skipped, as long as its cooked files exist. Cooked files no source makes any more are removed.
 - `game:/shader_sources.hash` names the shader sources of everything in `game:/` by `asset::shader_sources_hash()`: every `.slang` under `shaders/` but `shaders/tests/`, by path and content, with CRLF read as LF. It's removed when a cook of the shaders starts and written when every module made it (test modules aside) and the sources hash as they did at the start, so a cook that fails, stops halfway or sees a file saved meanwhile leaves none, and the next one cooks every module. If it can't be removed, no shaders are cooked and the cook fails. It comes from the sources this run read, not from this cooker's own build. The engine refuses cooked shaders whose stamp doesn't match its build (`engine/render/shader/README.md`), and `--check` compares it with the sources as they are now; `.deshader` files without one are stale too.
 - A failed source keeps its last cooked files and texture uses, and is tried again next time. `--no-shaders` leaves cooked shaders as they are; `CookOptions::content = false` (shaders only, for tests) leaves what was cooked from `content/` as it is.
 - A glTF buffer shorter than the glTF says (a Git LFS pointer that was never pulled) is reported, never read past.

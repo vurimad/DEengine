@@ -56,8 +56,8 @@ struct CookReport {
 //   the stamp of the sources they came from (asset::kShaderStampPath), which the engine compares
 //   at startup; a module that fails, or sources that change during the cook, leave no stamp, and
 //   then every module cooks again next time. Needs a compiler; without one shaders are skipped.
-// - Models (glTF, FBX): one .demesh, its collision as a .dephys, a .demat per material and a .detex
-//   per embedded image.
+// - Models (glTF, FBX): one .demesh, its collision as a .dephys, a .demat per material, a .detex
+//   per embedded image, and its picture for the editor as a .detex (thumbnail_cooker.h).
 // - Materials (.material text): a .demat.
 // - Textures: a .detex, with defaults picked by how models and materials use them, then the folder
 //   rules, then the meta.

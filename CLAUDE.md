@@ -14,7 +14,8 @@ ctest --preset msvc-debug
 clang-format --dry-run --Werror <files>   # must be clean
 clang-tidy -p build/clang-cl <cpp files>  # every finding is an error; skip *_linux.cpp on Windows
 build/msvc/bin/Debug/deengine --frames 120  # smoke run: opens the window, exits after 120 frames
-build/msvc/bin/Debug/cooker                 # cook content/ (+ meta/) and shaders into cooked/; --check for CI
+build/msvc/bin/Debug/cooker                 # cook a project (default projects/sandbox; --project projects/dreadworld)
+                                            # and the shaders into its cooked/; --check for CI
 tools/profile.ps1 -Seconds 10               # headless Tracy capture of the dev build: zone and plot tables in text (median,
                                             # p95, p99, past the first 2 s), the GPU's clocks, CSVs + trace.tracy in
                                             # build/profiles/<timestamp>/ (build msvc-dev first). For GPU numbers pass
@@ -38,12 +39,13 @@ Before calling work done: it builds warning-free (warnings are errors), tests pa
 - Profiling: put `DE_PROFILE_ZONE("name")` at the top of every system's per-frame entry point. Tracy viewer 0.14.1 must match the client in vcpkg.
 - Threads: parallel work goes through `JobSystem` (`submit` + `JobCounter`, or `parallel_for`); don't create threads for work.
 - Shaders: Slang in `shaders/` (module `common.color` is `shaders/common/color.slang`). One `[[vk::push_constant]]` block of at most 128 bytes, no descriptor slots (buffers by pointer, textures by bindless index through the `common.bindless` accessors, never the raw tables), clip space +Y up with reverse Z. See `shaders/README.md`.
-- Files: only through `platform::Vfs` with `game:/`, `user:/`, `temp:/`, `src:/` paths (lowercase, forward slashes). No `fopen`, `std::filesystem` or OS file calls outside `engine/platform/`.
+- Files: only through `platform::Vfs` with `game:/`, `user:/`, `temp:/`, `src:/` (the open project), `engine:/` (the engine's shaders) paths (lowercase, forward slashes). No `fopen`, `std::filesystem` or OS file calls outside `engine/platform/`.
+- Projects: a game lives in `projects/<name>/` (`content/`, `meta/`, `config/`, `cooked/`), opened with `--project`. Engine code never names a project or reaches into one; only `projects/sandbox/` (the test scene) is committed, `projects/dreadworld/` is private.
 
 ## Git
 
 - Commit messages: imperative, prefixed by system: `render: add Hi-Z build pass`, `core: add SlotMap`.
-- Never commit build output, cooked data, `Archives/`, captures (`.rdc`) or profiles.
+- Never commit build output, cooked data (`projects/*/cooked/`), `projects/dreadworld/`, `Archives/`, captures (`.rdc`) or profiles.
 
 ## Clean IP
 

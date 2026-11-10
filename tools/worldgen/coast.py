@@ -1,7 +1,7 @@
 """A simple map to build other things on: a long strip of golden field ending in a high cliff over the sea, with snow
 mountains behind it. 16.4 x 8.2 km at 2 m. The mountains are the real ones around Aoraki (build/terrain_raw/aoraki, CC BY
 4.0, local only), at 80% of their relief so a terrain node holds them; their vertices and the 1 m normal map come from
-the 1 m data where it's fetched (build/terrain_raw/aoraki_1m). What this writes stays local (content/terrain/coast.*).
+the 1 m data where it's fetched (build/terrain_raw/aoraki_1m). What this writes stays local (projects/dreadworld/content/terrain/coast.*).
 
     python tools/worldgen/coast.py
 """

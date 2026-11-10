@@ -735,6 +735,11 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
             moved.position = start_.position + DVec3(delta);
             moved_ = delta;
             shift = DVec3(delta);
+            // On the ground, unless it's being moved up or down.
+            const bool over_ground = handle_ == 0 || handle_ == 2 || handle_ == kPlane + 1 || handle_ == kMiddle;
+            if (ground_ != nullptr && over_ground) {
+                static_cast<void>(ground_->settle(entity, moved));
+            }
         } else if (tool == Tool::Rotate) {
             const float step = snap.rotate_deg * std::numbers::pi_v<float> / 180.0f;
             if (handle_ == kMiddle) {
@@ -808,6 +813,11 @@ bool Gizmo::update(const View& view, ImDrawList* draw, Tool tool, Space space, c
                 world::WorldTransform then = other.start;
                 if (tool == Tool::Move) {
                     then.position = other.start.position + shift;
+                    const bool over_ground =
+                        handle_ == 0 || handle_ == 2 || handle_ == kPlane + 1 || handle_ == kMiddle;
+                    if (ground_ != nullptr && over_ground) {
+                        static_cast<void>(ground_->settle(follower, then));
+                    }
                 } else if (tool == Tool::Rotate) {
                     then = turned_about(other.start, start_origin_, turn);
                 } else {

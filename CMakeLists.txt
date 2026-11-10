@@ -22,6 +22,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin")
 
 option(DE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
 option(DE_BUILD_TESTS "Build the unit test suite" ON)
+# The project dev builds and the cooker open without --project (docs/design.md, Projects): a folder or .deproject
+# file, relative to this repository. Only a default: the engine names no project of its own.
+set(DE_DEFAULT_PROJECT "projects/sandbox" CACHE STRING "Project dev builds open without --project")
 
 include(cmake/compile_options.cmake)
 

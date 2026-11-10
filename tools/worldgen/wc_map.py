@@ -6,7 +6,7 @@ close the engine gets to World Creator's own view before bringing its terrain in
 
 HEIGHT.tif: World Creator's float height map, in its export units; --scale says how many meters a unit is (World
 Creator's ruler over the export's own range: 106.45 for the user's first export). SPLAT.tif: its splat map, a channel
-per layer, summing to 255: layer 0 (snow) and layer 1 (debris) here. What this writes stays local (content/terrain/).
+per layer, summing to 255: layer 0 (snow) and layer 1 (debris) here. What this writes stays local (projects/dreadworld/content/terrain/).
 """
 import argparse
 import json
@@ -26,7 +26,7 @@ import fine  # noqa: E402
 import lightbake  # noqa: E402
 
 Image.MAX_IMAGE_PIXELS = None
-OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'content', 'terrain')
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'projects', 'dreadworld', 'content', 'terrain')
 # The light, as World Creator's view has it: a low warm sun from about the south, behind and left of a camera looking
 # north-west, blue in the shade.
 SUN_AZIMUTH_DEG, SUN_ELEVATION_DEG = 190.0, 20.0

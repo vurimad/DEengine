@@ -2,6 +2,8 @@
 
 #include <SDL3/SDL_filesystem.h>
 #include <windows.h>
+// After windows.h, which it needs.
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -297,6 +299,59 @@ core::Result<void> delete_tree(const char* path) {
     }
     if (!delete_tree_wide(wide)) {
         return fail(ErrorCode::IoError, "directory tree could not be deleted");
+    }
+    return {};
+}
+
+core::Result<void> move_path(const char* from, const char* to) {
+    WidePath wide_from;
+    WidePath wide_to;
+    if (!to_wide(from, wide_from) || !to_wide(to, wide_to)) {
+        return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
+    }
+    if (GetFileAttributesW(wide_from.text) == INVALID_FILE_ATTRIBUTES) {
+        return fail(ErrorCode::NotFound, "nothing to move there");
+    }
+    if (GetFileAttributesW(wide_to.text) != INVALID_FILE_ATTRIBUTES) {
+        return fail(ErrorCode::AlreadyExists, "something is there already");
+    }
+    // Its new parent folder, made if missing.
+    PathString parent(to);
+    const size_t slash = parent.view().find_last_of("/\\");
+    if (slash != std::string_view::npos && slash > 0) {
+        parent.truncate(slash);
+        if (const core::Result<void> made = create_directories(parent.c_str()); !made) {
+            return made;
+        }
+    }
+    if (MoveFileExW(wide_from.text, wide_to.text, MOVEFILE_WRITE_THROUGH) == 0) {
+        return fail(error_from_last(), "could not be moved");
+    }
+    return {};
+}
+
+core::Result<void> move_to_trash(const char* path) {
+    // The shell wants a plain absolute path (no \\?\ prefix), ended by two nulls.
+    wchar_t relative[kWideCapacity];
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, relative, static_cast<int>(kWideCapacity)) <= 0) {
+        return fail(ErrorCode::InvalidArgument, "path is not valid UTF-8 or too long");
+    }
+    wchar_t absolute[kWideCapacity + 1] = {};
+    const DWORD length = GetFullPathNameW(relative, kWideCapacity - 1, absolute, nullptr);
+    if (length == 0 || length >= kWideCapacity - 1 || length >= MAX_PATH) {
+        return fail(ErrorCode::InvalidArgument, "path is too long for the recycle bin");
+    }
+    absolute[length] = L'\0';
+    absolute[length + 1] = L'\0';
+    if (GetFileAttributesW(absolute) == INVALID_FILE_ATTRIBUTES) {
+        return fail(ErrorCode::NotFound, "nothing to delete there");
+    }
+    SHFILEOPSTRUCTW operation = {};
+    operation.wFunc = FO_DELETE;
+    operation.pFrom = absolute;
+    operation.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    if (SHFileOperationW(&operation) != 0 || operation.fAnyOperationsAborted != 0) {
+        return fail(ErrorCode::IoError, "could not be sent to the recycle bin");
     }
     return {};
 }

@@ -21,12 +21,15 @@ enum class Mount : uint8_t {
     Game, // game:/  cooked game data. Read only. Dev: loose files; ship: archives (later)
     User, // user:/  saves, settings, logs, caches. Read and write
     Temp, // temp:/  scratch, one folder per process, emptied at start. Read and write
-    // src:/  the source tree: shaders/, content/, meta/. Editor, cooker and dev builds only:
+    // src:/  the open project's sources: content/, meta/, config/. Editor, cooker and dev builds only:
     // mounted when VfsDesc::src_root is set. Read and write (the editor and AI tools edit sources)
     Src,
+    // engine:/  the engine's own sources, whatever project is open: shaders/. Editor, cooker and dev builds
+    // only: mounted when VfsDesc::engine_root is set. Read and write, as src:/
+    Engine,
 };
 
-inline constexpr size_t kMountCount = 4;
+inline constexpr size_t kMountCount = 5;
 
 enum class IoPriority : uint8_t {
     Critical, // the player and the boss, now
@@ -86,7 +89,8 @@ struct VfsDesc {
     const char* game_root = nullptr;      // folder with the cooked game data (required)
     const char* user_root = nullptr;      // null: the OS user data folder; the Vfs uses <root>/DEengine
     const char* temp_root = nullptr;      // null: the OS temp folder; the Vfs uses <root>/deengine_temp/<process>
-    const char* src_root = nullptr;       // the repository root; null: no src:/ mount (ship builds)
+    const char* src_root = nullptr;       // the project's folder; null: no src:/ mount (ship builds)
+    const char* engine_root = nullptr;    // the engine repository's root; null: no engine:/ mount (ship builds)
     uint32_t reader_threads = 2;          // phase 1: blocking positional reads on a small pool
     uint32_t max_reads = 1024;            // reads in flight at once
     core::JobSystem* jobs = nullptr;      // where ReadRequest::on_complete callbacks run
@@ -140,6 +144,15 @@ public:
 
     // Blocking: deletes a file (never a folder) where write_file() may write. Succeeds if it isn't there.
     core::Result<void> remove_file(const char* path) const;
+
+    // Blocking, where write_file() may write, within one mount: moves a file or a folder (and all in it) to another
+    // path, making its new parent folders; fails if something is there already. For the editor's file operations.
+    core::Result<void> move(const char* from, const char* to) const;
+    // Blocking: makes a folder and any missing parents, where write_file() may write. Succeeds if it's there.
+    core::Result<void> create_folder(const char* path) const;
+    // Blocking: sends a file or folder to the OS's recycle bin or trash, where write_file() may write; it can be
+    // brought back from there. NotFound if it isn't there.
+    core::Result<void> move_to_trash(const char* path) const;
 
     // Calls visit(name, is_directory) for each entry of a folder ("src:/content/rocks"; "src:/" is
     // the mount's root). Names are as the OS spells them, so they may break the path rules

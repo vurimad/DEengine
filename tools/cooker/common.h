@@ -34,7 +34,8 @@ inline uint64_t path_key(std::string_view path) {
     return core::fnv1a_64(path.data(), path.size());
 }
 
-// "src:/" + path; fails (empty) if it doesn't fit, which a SourcePath always does.
+// Where a source path is: shaders (shaders/...) are the engine's, in engine:/; the rest is the project's, in src:/
+// (docs/design.md, Projects). Fails (empty) if it doesn't fit, which a SourcePath always does.
 core::FixedString<kMaxSourcePath + 8> src_path(std::string_view relative);
 
 enum class Severity : uint8_t {

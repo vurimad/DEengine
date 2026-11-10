@@ -45,7 +45,7 @@ private:
         auto created = platform::Vfs::create({.game_root = game.c_str(),
                                               .user_root = user.c_str(),
                                               .temp_root = temp.c_str(),
-                                              .src_root = DE_SOURCE_DIR});
+                                              .engine_root = DE_SOURCE_DIR});
         REQUIRE(created.ok());
         return std::move(created).value();
     }

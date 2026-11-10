@@ -51,7 +51,9 @@ namespace de::app {
 //   --no-vsync       present without waiting for vertical blank
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked; a dev build without one there uses its source tree's)
-//   --src-dir DIR    folder mounted as src:/ in dev builds (default: this repository)
+//   --project DIR    dev builds: the project to open, its folder or .deproject file, relative to the working
+//                    directory or the engine's repository (default: the build's, projects/sandbox); its sources
+//                    are src:/, its cooked/ game:/
 //   --deadzone X     stick deadzone, 0..0.9 (default 0.3)
 //   --lod-error-pixels X  how far a LOD may lie from LOD 0 (default 1); 0 draws LOD 0 everywhere
 //   --lod-fade X     how long LODs take to fade into each other, as a share of a LOD's error (default 0.2); 0 cuts
@@ -66,7 +68,7 @@ struct FrameworkArgs {
     char** argv = nullptr;
     uint64_t frames = 0; // 0: until the window closes
     const char* game_dir = "cooked";
-    const char* src_dir = nullptr;       // null: this repository, in dev builds
+    const char* project = nullptr;       // --project: dev builds; null: the build's default (DE_DEFAULT_PROJECT)
     float deadzone = -1.0f;              // below 0: the default
     float lod_error_pixels = 1.0f;       // --lod-error-pixels: 0 draws LOD 0 everywhere, to compare with
     float lod_fade = 0.2f;               // --lod-fade: 0 cuts between LODs, to compare with

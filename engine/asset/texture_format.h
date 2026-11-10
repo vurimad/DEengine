@@ -70,4 +70,12 @@ struct TextureAsset {
 };
 static_assert(sizeof(TextureAsset) == 88);
 
+// A picture for the editor's resources, of a model, a texture or a material: a kThumbnailSize square, BC7 sRGB
+// with alpha (clear around what it shows), one mip. The cooker draws it as it cooks the source
+// (tools/cooker/thumbnail_cooker.h), as a sub-asset of the source's main asset, so what names that asset finds it.
+inline constexpr uint32_t kThumbnailSize = 128;
+constexpr AssetId thumbnail_asset_id(AssetId main) {
+    return sub_asset_id(main, "thumbnail");
+}
+
 } // namespace de::asset

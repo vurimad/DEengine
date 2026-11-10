@@ -7,6 +7,7 @@
 #include "editor/outline.h"
 #include "editor/source_files.h"
 #include "editor/theme.h"
+#include "editor/thumbnails.h"
 #include "editor/widgets.h"
 #include "platform/vfs.h"
 
@@ -83,7 +84,8 @@ void display_path(std::string_view path, char* out, size_t capacity) {
 
 AssetBrowser::AssetBrowser(core::Allocator& allocator)
     : names_(allocator), entries_(allocator), shown_(allocator), selected_(allocator), back_(allocator),
-      forward_(allocator), favorites_(allocator), tree_open_(allocator) {}
+      forward_(allocator), favorites_(allocator), tree_open_(allocator), deleting_(allocator), users_(allocator),
+      start_selected_(allocator) {}
 
 std::string_view AssetBrowser::name_of(uint32_t entry) const {
     if (entry == 0) {
@@ -145,6 +147,10 @@ void AssetBrowser::scan(const platform::Vfs& vfs) {
                 return; // hidden
             }
             const size_t length = std::strlen(name);
+            // A glTF's buffers (.bin) are part of the model beside them: nothing to choose on their own.
+            if (!is_directory && std::string_view(name, length).ends_with(".bin")) {
+                return;
+            }
             Path child = path;
             const bool fits = child.append('/') && child.append(std::string_view(name, length));
             entries_.push({.name = static_cast<uint32_t>(names_.size()),
@@ -168,9 +174,20 @@ void AssetBrowser::scan(const platform::Vfs& vfs) {
         entries_[folder].child_count = static_cast<uint32_t>(entries_.size()) - first;
     }
     tree_open_.set(entries_[0].key, 1); // the root starts open
-    const uint32_t found = had ? find(shown_path.view()) : UINT32_MAX;
+    // The folder shown: as before a Refresh, or as the last session left it.
+    const bool first = !scanned_ && !start_folder_.empty();
+    const uint32_t found = had ? find(shown_path.view()) : first ? find(start_folder_.view()) : UINT32_MAX;
     current_ = found != UINT32_MAX && entries_[found].directory ? found : 0;
     reveal(current_);
+    if (first) {
+        for (const Path& kept : start_selected_) {
+            if (const uint32_t entry = find(kept.view()); entry != UINT32_MAX && entries_[entry].parent == current_) {
+                selected_.push(entry);
+            }
+        }
+    }
+    start_folder_ = {};
+    start_selected_.clear();
     scanned_ = true;
 }
 
@@ -257,6 +274,284 @@ void AssetBrowser::open_item(uint32_t entry, Selection& selection) {
         selection.select_file(path.view());
         opened_ = entry;
     }
+}
+
+namespace {
+
+// A selected item under the mouse keeps its selection's colour, a shade lighter, instead of the plain hover grey.
+// Pushed while it's drawn, if it's selected.
+class SelectedHover {
+public:
+    explicit SelectedHover(bool selected) : pushed_(selected) {
+        if (pushed_) {
+            ImGui::PushStyleColor(ImGuiCol_HeaderHovered, color(ThemeColor::SelectionHovered));
+            ImGui::PushStyleColor(ImGuiCol_HeaderActive, color(ThemeColor::SelectionHovered));
+        }
+    }
+    ~SelectedHover() {
+        if (pushed_) {
+            ImGui::PopStyleColor(2);
+        }
+    }
+    SelectedHover(const SelectedHover&) = delete;
+    SelectedHover& operator=(const SelectedHover&) = delete;
+    SelectedHover(SelectedHover&&) = delete;
+    SelectedHover& operator=(SelectedHover&&) = delete;
+
+private:
+    bool pushed_;
+};
+
+// A model's picture on a square a shade lighter than the panel, so its outline reads against it.
+void draw_picture(const Thumbnails::Picture& picture, ImVec2 at, float extent) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 far(at.x + extent, at.y + extent);
+    draw->AddRectFilled(at, far, color_u32(ThemeColor::Header), screen_px(theme().metrics.control_rounding * 2.0f));
+    draw->AddImage(picture.texture, at, far, picture.uv_min, picture.uv_max);
+}
+
+} // namespace
+
+void AssetBrowser::folder_drop_target(uint32_t folder, Selection& selection) {
+    if (!ImGui::BeginDragDropTarget()) {
+        return;
+    }
+    const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kSourceFilePayload);
+    Path into;
+    if (payload != nullptr && path_of(folder, into)) {
+        // What's dragged: the selection, if the dragged item is in it; else that item.
+        const std::string_view dragged(static_cast<const char*>(payload->Data),
+                                       static_cast<size_t>(std::max(payload->DataSize - 1, 0)));
+        const uint32_t dragged_entry = find(dragged);
+        core::Array<uint32_t> items(core::heap_allocator(core::MemoryTag::Editor));
+        if (dragged_entry != UINT32_MAX && is_selected(dragged_entry)) {
+            items.assign(selected_.span());
+        } else if (dragged_entry != UINT32_MAX) {
+            items.push(dragged_entry);
+        }
+        core::Array<SourceMove> moves(core::heap_allocator(core::MemoryTag::Editor));
+        for (const uint32_t item : items) {
+            Path from;
+            if (item == folder || item == 0 || entries_[item].parent == folder || !path_of(item, from)) {
+                continue; // onto itself, or already there
+            }
+            SourceMove& move = moves.emplace();
+            move.from = SourcePath(from.view());
+            move.to = SourcePath(into.view());
+            const std::string_view leaf = name_of(item);
+            if (!move.to.append('/') || !move.to.append(leaf)) {
+                moves.pop();
+            }
+        }
+        if (!moves.empty()) {
+            apply_moves(moves.span(), selection);
+        }
+    }
+    ImGui::EndDragDropTarget();
+}
+
+void AssetBrowser::apply_moves(std::span<const SourceMove> moves, Selection& selection) {
+    if (vfs_ == nullptr) {
+        return;
+    }
+    const core::Result<FileOpReport> report = move_sources(*vfs_, moves);
+    if (!report) {
+        DE_LOG_ERROR("editor", "%s didn't move: %s", moves[0].from.c_str(), report.error().message);
+        return;
+    }
+    DE_LOG_INFO("editor", "moved %u (%s to %s%s), %u file%s naming %s rewritten", report->moved, moves[0].from.c_str(),
+                moves[0].to.c_str(), moves.size() > 1 ? ", and more" : "", report->rewritten,
+                report->rewritten == 1 ? "" : "s", report->moved == 1 ? "it" : "them");
+    // The chosen file follows, and the folder shown.
+    SourcePath now;
+    if (selection.kind == Selection::Kind::File && moved_path(selection.file.view(), moves, now)) {
+        selection.file.assign(now.view());
+    }
+    Path shown;
+    if (path_of(current_, shown) && moved_path(shown.view(), moves, now)) {
+        start_folder_.assign(now.view());
+    }
+    refresh_ = true;
+    files_changed_ = true;
+}
+
+void AssetBrowser::start_rename(uint32_t entry) {
+    if (entry == 0 || entry >= entries_.size() || !path_of(entry, renaming_)) {
+        return;
+    }
+    const std::string_view name = name_of(entry);
+    static_cast<void>(
+        std::snprintf(rename_text_, sizeof(rename_text_), "%.*s", static_cast<int>(name.size()), name.data()));
+    open_rename_ = true;
+}
+
+void AssetBrowser::ask_delete(uint32_t entry) {
+    if (vfs_ == nullptr || entry == 0 || entry >= entries_.size()) {
+        return;
+    }
+    // The selection, if this is in it; else this.
+    deleting_.clear();
+    users_.clear();
+    const auto add = [this](uint32_t item) {
+        Path path;
+        if (item != 0 && path_of(item, path)) {
+            deleting_.push(SourcePath(path.view()));
+        }
+    };
+    if (is_selected(entry)) {
+        for (const uint32_t item : selected_) {
+            add(item);
+        }
+    } else {
+        add(entry);
+    }
+    // Who still names them, other than what goes with them.
+    core::Array<SourcePath> found(core::heap_allocator(core::MemoryTag::Editor));
+    for (const SourcePath& path : deleting_) {
+        found.clear();
+        find_users(*vfs_, path.view(), found);
+        for (const SourcePath& user : found) {
+            bool going = false;
+            for (const SourcePath& gone : deleting_) {
+                going = going || user.view() == gone.view() ||
+                        (user.view().starts_with(gone.view()) && user.view()[gone.size()] == '/');
+            }
+            bool listed = false;
+            for (const SourcePath& already : users_) {
+                listed = listed || already.view() == user.view();
+            }
+            if (!going && !listed) {
+                users_.push(user);
+            }
+        }
+    }
+    open_delete_ = !deleting_.empty();
+}
+
+void AssetBrowser::new_folder(uint32_t parent) {
+    Path folder;
+    if (vfs_ == nullptr || parent >= entries_.size() || !entries_[parent].directory || !path_of(parent, folder)) {
+        return;
+    }
+    // "new_folder", or "new_folder_2"... where none is.
+    for (uint32_t n = 1; n < 100; ++n) {
+        char name[32];
+        static_cast<void>(n == 1 ? std::snprintf(name, sizeof(name), "new_folder")
+                                 : std::snprintf(name, sizeof(name), "new_folder_%u", n));
+        Path made = folder;
+        if (!made.append('/') || !made.append(name) || vfs_->exists(made.c_str())) {
+            continue;
+        }
+        if (const core::Result<void> created = make_source_folder(*vfs_, made.view()); !created) {
+            DE_LOG_ERROR("editor", "%s wasn't made: %s", made.c_str(), created.error().message);
+            return;
+        }
+        rename_after_scan_ = made;
+        refresh_ = true;
+        return;
+    }
+}
+
+void AssetBrowser::draw_file_dialogs(Selection& selection) {
+    if (open_rename_) {
+        ImGui::OpenPopup("Rename##file");
+        open_rename_ = false;
+    }
+    if (open_delete_) {
+        ImGui::OpenPopup("Delete##file");
+        open_delete_ = false;
+    }
+    const ImVec2 middle = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(middle, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Rename##file", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::string_view old_name = renaming_.view().substr(renaming_.view().rfind('/') + 1);
+        ImGui::Text("Rename %.*s", static_cast<int>(old_name.size()), old_name.data());
+        ImGui::SetNextItemWidth(screen_px(320.0f));
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        const bool entered = ImGui::InputText("##name", rename_text_, sizeof(rename_text_),
+                                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        char cleaned[128];
+        size_t length = 0;
+        const bool valid = clean_file_name(rename_text_, cleaned, length);
+        ImGui::TextColored(color(ThemeColor::TextSecondary), "%s",
+                           valid ? cleaned : "Lowercase letters, digits, _ - and . only");
+        const bool rename = (entered || ImGui::Button("Rename")) && valid;
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        } else if (rename) {
+            SourceMove move{.from = SourcePath(renaming_.view()), .to = SourcePath(renaming_.view())};
+            move.to.truncate(move.to.view().rfind('/') + 1);
+            if (move.to.append(std::string_view(cleaned, length)) && move.to.view() != move.from.view()) {
+                apply_moves(std::span(&move, 1), selection);
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::SetNextWindowPos(middle, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Delete##file", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (deleting_.size() == 1) {
+            const std::string_view name = deleting_[0].view().substr(deleting_[0].view().rfind('/') + 1);
+            ImGui::Text("Delete %.*s?", static_cast<int>(name.size()), name.data());
+        } else {
+            ImGui::Text("Delete these %zu?", deleting_.size());
+        }
+        ImGui::TextColored(color(ThemeColor::TextSecondary), "It goes to the recycle bin, with its meta.");
+        if (!users_.empty()) {
+            ImGui::Spacing();
+            ImGui::TextColored(color(ThemeColor::Warning),
+                               "Still named by %zu file%s, which will break:", users_.size(),
+                               users_.size() == 1 ? "" : "s");
+            for (size_t i = 0; i < users_.size() && i < 8; ++i) {
+                ImGui::BulletText("%s", users_[i].c_str() + std::string_view("src:/content/").size());
+            }
+            if (users_.size() > 8) {
+                ImGui::BulletText("and %zu more", users_.size() - 8);
+            }
+        }
+        ImGui::Spacing();
+        if (ImGui::Button(users_.empty() ? "Delete" : "Delete Anyway")) {
+            if (const core::Result<uint32_t> trashed = trash_sources(*vfs_, deleting_.span()); !trashed) {
+                DE_LOG_ERROR("editor", "not deleted: %s", trashed.error().message);
+            } else {
+                DE_LOG_INFO("editor", "%u sent to the recycle bin", *trashed);
+                if (selection.kind == Selection::Kind::File) {
+                    for (const SourcePath& gone : deleting_) {
+                        SourcePath ignored;
+                        const SourceMove away{.from = gone, .to = SourcePath("src:/content/.gone")};
+                        if (moved_path(selection.file.view(), std::span(&away, 1), ignored)) {
+                            selection.select_entity(0);
+                        }
+                    }
+                }
+                selected_.clear();
+                refresh_ = true;
+                files_changed_ = true;
+            }
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+bool AssetBrowser::model_picture(uint32_t entry, Thumbnails::Picture& out) {
+    if (thumbnails_ == nullptr || entries_[entry].directory) {
+        return false;
+    }
+    // What the cooker draws a picture of (asset::thumbnail_asset_id).
+    const std::string_view kind = file_kind(name_of(entry));
+    if (kind != "Model" && kind != "Texture" && kind != "Material") {
+        return false;
+    }
+    Path path;
+    return path_of(entry, path) && thumbnails_->find(path.view(), out);
 }
 
 void AssetBrowser::rebuild_shown() {
@@ -694,7 +989,11 @@ void AssetBrowser::draw_tree(uint32_t folder, bool include_files, Selection& sel
     ImGui::PushID(static_cast<int>(folder));
     // Rows span the full width to select, so glyphs go from the indented cursor, not the row.
     const float content_x = ImGui::GetCursorScreenPos().x;
-    const bool open = ImGui::TreeNodeEx("##folder", flags, "%s", label);
+    bool open = false;
+    {
+        const SelectedHover keep_selected(selected);
+        open = ImGui::TreeNodeEx("##folder", flags, "%s", label);
+    }
     if (root_font != nullptr) {
         ImGui::PopFont();
     }
@@ -727,6 +1026,7 @@ void AssetBrowser::draw_tree(uint32_t folder, bool include_files, Selection& sel
     if (!root) {
         item_drag_source(folder);
     }
+    folder_drop_target(folder, selection);
     if (open) {
         for (uint32_t i = 0; i < entry.child_count; ++i) {
             if (entries_[entry.first_child + i].directory) {
@@ -749,7 +1049,10 @@ void AssetBrowser::draw_tree(uint32_t folder, bool include_files, Selection& sel
                 if (is_selected(file)) {
                     file_flags |= ImGuiTreeNodeFlags_Selected;
                 }
-                static_cast<void>(ImGui::TreeNodeEx("##file", file_flags, "%s", file_label));
+                {
+                    const SelectedHover keep_selected(is_selected(file));
+                    static_cast<void>(ImGui::TreeNodeEx("##file", file_flags, "%s", file_label));
+                }
                 const ImVec2 file_min = ImGui::GetItemRectMin();
                 const ImVec2 file_max = ImGui::GetItemRectMax();
                 const ImVec2 file_glyph(file_min.x + ImGui::GetTreeNodeToLabelSpacing(), file_min.y);
@@ -757,7 +1060,13 @@ void AssetBrowser::draw_tree(uint32_t folder, bool include_files, Selection& sel
                 char glyph_name[128];
                 static_cast<void>(std::snprintf(glyph_name, sizeof(glyph_name), "%.*s",
                                                 static_cast<int>(file_name.size()), file_name.data()));
-                inline_document_glyph(file_glyph, file_max.y - file_min.y, glyph_name);
+                if (Thumbnails::Picture picture; model_picture(file, picture)) {
+                    const float row = file_max.y - file_min.y;
+                    const float extent = std::max(1.0f, row - screen_px(2.0f));
+                    draw_picture(picture, ImVec2(file_glyph.x, file_min.y + ((row - extent) * 0.5f)), extent);
+                } else {
+                    inline_document_glyph(file_glyph, file_max.y - file_min.y, glyph_name);
+                }
                 const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
                 if (clicked) {
                     if (entries_[file].parent != current_) {
@@ -900,11 +1209,22 @@ void AssetBrowser::item_context_menu(uint32_t entry, Selection& selection) {
     const bool have_path = path_of(entry, path);
     const bool directory = entries_[entry].directory;
     const bool world = !directory && file_kind(name_of(entry)) == "World";
-    if (ImGui::MenuItem(directory ? "Open Folder" : "Open World", nullptr, false, directory || world)) {
+    // Open: a folder, or a world; other files have nothing to open here.
+    if ((directory || world) && ImGui::MenuItem(directory ? "Open Folder" : "Open World")) {
         open_item(entry, selection);
     }
     if (ImGui::MenuItem("Copy Path", nullptr, false, have_path)) {
         ImGui::SetClipboardText(path.c_str());
+    }
+    ImGui::Separator();
+    if (ImGui::MenuItem("New Folder", nullptr, false, true)) {
+        new_folder(directory ? entry : entries_[entry].parent);
+    }
+    if (ImGui::MenuItem("Rename", "F2", false, entry != 0 && have_path)) {
+        start_rename(entry);
+    }
+    if (ImGui::MenuItem("Delete", "Del", false, entry != 0 && have_path)) {
+        ask_delete(entry);
     }
     if (directory && have_path) {
         bool favorite = false;
@@ -928,6 +1248,15 @@ void AssetBrowser::item_context_menu(uint32_t entry, Selection& selection) {
 
 void AssetBrowser::keyboard(Selection& selection, uint32_t columns) {
     if (!ImGui::IsWindowFocused() || ImGui::IsAnyItemActive() || shown_.empty()) {
+        return;
+    }
+    // F2 renames what's chosen (one thing); Delete asks to delete it.
+    if (!selected_.empty() && ImGui::IsKeyPressed(ImGuiKey_F2) && selected_.size() == 1) {
+        start_rename(selected_[0]);
+        return;
+    }
+    if (!selected_.empty() && ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+        ask_delete(selected_.back());
         return;
     }
     const auto* at = anchor_ != UINT32_MAX ? std::ranges::find(shown_, anchor_) : shown_.end();
@@ -972,6 +1301,7 @@ void AssetBrowser::draw_list(Selection& selection) {
             const uint32_t entry = shown_[static_cast<size_t>(i)];
             const bool directory = entries_[entry].directory;
             ImGui::PushID(static_cast<int>(entry));
+            const SelectedHover keep_selected(is_selected(entry));
             const bool clicked = ImGui::Selectable("##row", is_selected(entry), ImGuiSelectableFlags_AllowDoubleClick,
                                                    ImVec2(0.0f, row));
             const bool hovered = ImGui::IsItemHovered();
@@ -979,12 +1309,18 @@ void AssetBrowser::draw_list(Selection& selection) {
             const ImVec2 max = ImGui::GetItemRectMax();
             item_interaction(entry, clicked, clicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left), selection);
             item_drag_source(entry);
+            if (directory) {
+                folder_drop_target(entry, selection);
+            }
             char name[128];
             const std::string_view entry_name = name_of(entry);
             static_cast<void>(
                 std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(entry_name.size()), entry_name.data()));
             const float center_y = (min.y + max.y) * 0.5f;
-            if (directory) {
+            if (Thumbnails::Picture picture; model_picture(entry, picture)) {
+                const float extent = screen_px(22.0f);
+                draw_picture(picture, ImVec2(min.x + padding - screen_px(1.5f), center_y - (extent * 0.5f)), extent);
+            } else if (directory) {
                 const float width = screen_px(20.0f);
                 draw_folder_glyph(ImVec2(min.x + padding, center_y - (width * 0.32f)), width, width * 0.64f);
             } else {
@@ -1058,6 +1394,7 @@ void AssetBrowser::draw_grid(Selection& selection) {
                 const bool directory = entries_[entry].directory;
                 ImGui::PushID(static_cast<int>(entry));
                 const float width = ImGui::GetContentRegionAvail().x;
+                const SelectedHover keep_selected(is_selected(entry));
                 const bool clicked = ImGui::Selectable(
                     "##card", is_selected(entry), ImGuiSelectableFlags_AllowDoubleClick, ImVec2(width, card_height));
                 const bool hovered = ImGui::IsItemHovered();
@@ -1066,11 +1403,17 @@ void AssetBrowser::draw_grid(Selection& selection) {
                 item_interaction(entry, clicked, clicked && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left),
                                  selection);
                 item_drag_source(entry);
+                if (directory) {
+                    folder_drop_target(entry, selection);
+                }
                 char name[128];
                 const std::string_view entry_name = name_of(entry);
                 static_cast<void>(
                     std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(entry_name.size()), entry_name.data()));
-                if (directory) {
+                if (Thumbnails::Picture picture; model_picture(entry, picture)) {
+                    draw_picture(picture, ImVec2(min.x + ((max.x - min.x - thumbnail) * 0.5f), min.y + padding),
+                                 thumbnail);
+                } else if (directory) {
                     const float room = std::max(0.0f, max.x - min.x - (padding * 2.0f));
                     const float folder_width = std::min(room, thumbnail * 1.18f);
                     const float folder_height = folder_width * 0.64f;
@@ -1162,9 +1505,26 @@ void AssetBrowser::draw_contents(Selection& selection, float region_min_x, float
 bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
     DE_PROFILE_ZONE("AssetBrowser::draw");
     opened_ = UINT32_MAX;
+    vfs_ = &vfs;
     if (!scanned_ || refresh_) {
+        if (scanned_ && thumbnails_ != nullptr) {
+            thumbnails_->forget_all(); // models cooked since are drawn again
+        }
         refresh_ = false;
         scan(vfs);
+    }
+    if (!rename_after_scan_.empty()) {
+        if (const uint32_t made = find(rename_after_scan_.view()); made != UINT32_MAX) {
+            start_rename(made);
+        }
+        rename_after_scan_ = {};
+    }
+    if (!show_file_.empty()) {
+        if (const uint32_t entry = find(show_file_.view()); entry != UINT32_MAX) {
+            reveal(entry);
+            navigate(entries_[entry].parent, false);
+        }
+        show_file_ = {};
     }
     // Content starts inside the shared inset, but structural lines reach the panel's edges.
     const float frame_min_x = ImGui::GetWindowPos().x;
@@ -1205,8 +1565,8 @@ bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(cell_padding_x, 0.0f));
             if (ImGui::BeginTable("##layout", 2,
                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchProp |
-                                      ImGuiTableFlags_NoPadInnerX)) {
-                ImGui::TableSetupColumn("Folders", ImGuiTableColumnFlags_WidthFixed, px(260.0f));
+                                      ImGuiTableFlags_NoPadInnerX | ImGuiTableFlags_NoSavedSettings)) {
+                ImGui::TableSetupColumn("Folders", ImGuiTableColumnFlags_WidthFixed, screen_px(folders_width_));
                 ImGui::TableSetupColumn("Contents", ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableNextColumn();
                 // The folder tree is navigation: a surface step darker than the contents beside it.
@@ -1250,6 +1610,13 @@ bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
                     draw_contents(selection, divider_x, frame_max_x);
                 }
                 ImGui::EndChild();
+                // Its width as dragged, kept at 100%.
+                if (const ImGuiTable* layout = ImGui::GetCurrentTable(); layout != nullptr && screen_px(1.0f) > 0.0f) {
+                    const float width = layout->Columns[0].WidthRequest;
+                    if (width > 0.0f) {
+                        folders_width_ = width / screen_px(1.0f);
+                    }
+                }
                 ImGui::EndTable();
             }
             ImGui::PopStyleVar();
@@ -1262,6 +1629,7 @@ bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
             ImGui::EndPopup();
         }
         pop_menu_style();
+        draw_file_dialogs(selection);
     }
     ImGui::EndChild();
 
@@ -1302,6 +1670,25 @@ void AssetBrowser::load_settings(const platform::Vfs& vfs) {
             if (path.assign(value)) {
                 favorites_.push(path);
             }
+        } else if (key == "folder" && !value.empty()) {
+            static_cast<void>(start_folder_.assign(value));
+        } else if (key == "open" && !value.empty()) {
+            // Open folders are kept by their path's hash, as scan() names them.
+            tree_open_.set(core::fnv1a_64(value.data(), value.size()), 1);
+        } else if (key == "selected" && !value.empty()) {
+            Path path;
+            if (path.assign(value)) {
+                start_selected_.push(path);
+            }
+        } else if (key == "search") {
+            const size_t length = std::min(value.size(), sizeof(search_) - 1);
+            std::memcpy(search_, value.data(), length);
+            search_[length] = 0;
+        } else if (key == "folders_width") {
+            char number[32] = {};
+            std::memcpy(number, value.data(), std::min(value.size(), sizeof(number) - 1));
+            const float width = std::strtof(number, nullptr);
+            folders_width_ = std::clamp(width > 0.0f ? width : 260.0f, 80.0f, 2000.0f);
         }
     }
 }
@@ -1315,12 +1702,33 @@ void AssetBrowser::save_settings(const platform::Vfs& vfs) const {
             length = written > 0 ? std::min(sizeof(text) - 1, length + static_cast<size_t>(written)) : length;
         }
     };
-    add("%s", "# The editor's resource browser: its view, its layout and its favourite folders.\n");
+    add("%s",
+        "# The editor's resource browser, as it was left: its view, layout, favourites, folders and selection.\n");
     add("view %s\n", mode_ == ViewMode::List ? "list" : "grid");
     add("layout %s\n", layout_ == Layout::OneColumn ? "one" : "two");
     add("thumbnails %.0f\n", static_cast<double>(grid_extent_));
+    add("folders_width %.0f\n", static_cast<double>(folders_width_));
     for (const Path& favorite : favorites_) {
         add("favorite %s\n", favorite.c_str());
+    }
+    Path path;
+    if (scanned_ && current_ < entries_.size() && path_of(current_, path)) {
+        add("folder %s\n", path.c_str());
+    } else if (!start_folder_.empty()) {
+        add("folder %s\n", start_folder_.c_str()); // never drawn this session: as it was
+    }
+    if (search_[0] != '\0') {
+        add("search %s\n", search_);
+    }
+    for (uint32_t i = 0; scanned_ && i < entries_.size(); ++i) {
+        if (entries_[i].directory && tree_open_.find(entries_[i].key) != nullptr && path_of(i, path)) {
+            add("open %s\n", path.c_str());
+        }
+    }
+    for (const uint32_t entry : selected_) {
+        if (scanned_ && entry < entries_.size() && path_of(entry, path)) {
+            add("selected %s\n", path.c_str());
+        }
     }
     if (const auto written = vfs.write_file(kSettingsPath, std::as_bytes(std::span(text, length))); !written) {
         DE_LOG_WARN("editor", "can't keep %s: %s", kSettingsPath, written.error().message);

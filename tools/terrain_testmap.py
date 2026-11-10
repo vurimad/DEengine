@@ -5,7 +5,7 @@
 its .terrain beside it, to the folder real maps use, which isn't committed. Cook it with the cooker. The same seed gives
 the same file. Needs numpy.
 
-    python tools/terrain_testmap.py [--out content/terrain] [--name capacity] [--size 8192] [--seed 1]
+    python tools/terrain_testmap.py [--out projects/dreadworld/content/terrain] [--name capacity] [--size 8192] [--seed 1]
 """
 
 import argparse
@@ -101,7 +101,7 @@ def write_png(path, samples):
 def main():
     root = pathlib.Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--out", type=pathlib.Path, default=root / "content" / "terrain")
+    parser.add_argument("--out", type=pathlib.Path, default=root / "projects" / "dreadworld" / "content" / "terrain")
     parser.add_argument("--name", default="capacity")
     parser.add_argument("--size", type=int, default=8192, help="samples on a side")
     parser.add_argument("--seed", type=int, default=1)

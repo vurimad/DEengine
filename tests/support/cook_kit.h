@@ -20,8 +20,13 @@ namespace de::test {
 
 // What cooker tests share: sources written to a sandbox, a cook over them, and reading the results.
 
+// Where a source goes: shaders are the engine's (engine:/), the rest the project's (src:/), as the cooker has it.
+inline platform::PathString source_folder(const Sandbox& sandbox, std::string_view relative) {
+    return sandbox.folder(relative == "shaders" || relative.starts_with("shaders/") ? "engine" : "src");
+}
+
 inline void write_src(const Sandbox& sandbox, std::string_view relative, std::span<const std::byte> bytes) {
-    platform::PathString path = sandbox.folder("src");
+    platform::PathString path = source_folder(sandbox, relative);
     REQUIRE(path.append('/'));
     REQUIRE(path.append(relative));
     const platform::PathString parent(path.view().substr(0, path.view().find_last_of('/')));
@@ -34,7 +39,7 @@ inline void write_src(const Sandbox& sandbox, std::string_view relative, std::st
 }
 
 inline void remove_src(const Sandbox& sandbox, std::string_view relative) {
-    platform::PathString path = sandbox.folder("src");
+    platform::PathString path = source_folder(sandbox, relative);
     REQUIRE(path.append('/'));
     REQUIRE(path.append(relative));
     REQUIRE(platform::delete_tree(path.c_str()).ok());

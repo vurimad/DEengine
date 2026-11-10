@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -203,6 +204,86 @@ core::Result<void> delete_tree(const char* path) {
         return fail(ErrorCode::IoError, "directory tree could not be deleted");
     }
     return {};
+}
+
+core::Result<void> move_path(const char* from, const char* to) {
+    struct stat info = {};
+    if (::lstat(from, &info) != 0) {
+        return fail(ErrorCode::NotFound, "nothing to move there");
+    }
+    if (::lstat(to, &info) == 0) {
+        return fail(ErrorCode::AlreadyExists, "something is there already");
+    }
+    PathString parent(to);
+    const size_t slash = parent.view().find_last_of('/');
+    if (slash != std::string_view::npos && slash > 0) {
+        parent.truncate(slash);
+        if (const core::Result<void> made = create_directories(parent.c_str()); !made) {
+            return made;
+        }
+    }
+    if (::rename(from, to) != 0) {
+        return fail(error_from_errno(), "could not be moved");
+    }
+    return {};
+}
+
+core::Result<void> move_to_trash(const char* path) {
+    // The freedesktop.org trash: the file under files/, a note of where it was under info/.
+    char absolute[PATH_MAX];
+    if (::realpath(path, absolute) == nullptr) {
+        return fail(error_from_errno(), "nothing to delete there");
+    }
+    const char* data = std::getenv("XDG_DATA_HOME");
+    const char* home = std::getenv("HOME");
+    PathString trash;
+    if (data != nullptr && data[0] != '\0') {
+        trash.assign(data);
+    } else if (home == nullptr || !trash.assign(home) || !trash.append("/.local/share")) {
+        return fail(ErrorCode::NotFound, "no trash folder (HOME isn't set)");
+    }
+    if (!trash.append("/Trash")) {
+        return fail(ErrorCode::InvalidArgument, "path is too long");
+    }
+    PathString files = trash;
+    PathString info = trash;
+    if (!files.append("/files") || !info.append("/info") || !create_directories(files.c_str()).ok() ||
+        !create_directories(info.c_str()).ok()) {
+        return fail(ErrorCode::IoError, "the trash folder could not be made");
+    }
+    const std::string_view full(absolute);
+    const std::string_view leaf = full.substr(full.find_last_of('/') + 1);
+    // A name not taken there yet.
+    for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+        char name[kMaxPathLength];
+        const int length =
+            attempt == 0
+                ? std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(leaf.size()), leaf.data())
+                : std::snprintf(name, sizeof(name), "%.*s.%u", static_cast<int>(leaf.size()), leaf.data(), attempt);
+        PathString target = files;
+        PathString note = info;
+        if (length <= 0 || !target.append('/') || !target.append(name) || !note.append('/') || !note.append(name) ||
+            !note.append(".trashinfo")) {
+            return fail(ErrorCode::InvalidArgument, "path is too long");
+        }
+        struct stat existing = {};
+        if (::lstat(target.c_str(), &existing) == 0 || ::lstat(note.c_str(), &existing) == 0) {
+            continue;
+        }
+        char text[kMaxPathLength + 128];
+        const int text_length =
+            std::snprintf(text, sizeof(text), "[Trash Info]\nPath=%s\nDeletionDate=1970-01-01T00:00:00\n", absolute);
+        if (text_length <= 0 ||
+            !write_file_atomic(note.c_str(), std::as_bytes(std::span(text, static_cast<size_t>(text_length)))).ok()) {
+            return fail(ErrorCode::IoError, "the trash note could not be written");
+        }
+        if (::rename(absolute, target.c_str()) != 0) {
+            static_cast<void>(::remove(note.c_str()));
+            return fail(error_from_errno(), "could not be moved to the trash");
+        }
+        return {};
+    }
+    return fail(ErrorCode::IoError, "the trash has too many of that name");
 }
 
 core::Result<void> list_directory(const char* path,

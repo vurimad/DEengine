@@ -10,7 +10,8 @@ M0a is done and M0b is under way (task lists in docs/design.md, Roadmap & milest
 
 - Platform layer: SDL3 window and input, files, time, threads; a VFS with `game:/`, `user:/`, `temp:/` and `src:/` mounts and async reads.
 - Core library: containers, strings, `Result`, tagged allocators, logging, a work-stealing job system, Tracy zones.
-- Cooker: textures, glTF and FBX models, materials, cells, worlds, environments, shaders and `config/`, from `content/` and its `meta/` tree into `cooked/`.
+- Projects: each game is its own folder under `projects/` (`projects/sandbox/` is the committed test scene), opened with `--project`; the engine names none (docs/design.md, Projects).
+- Cooker: textures, glTF and FBX models, materials, cells, worlds, environments, shaders and `config/`, from a project's `content/` and its `meta/` tree into its `cooked/`.
 - Asset registry: loads cooked files by ID with their dependencies, reference counted, hot reloaded when they are cooked again.
 - World: one flecs world with its phases and a fixed 60 Hz tick, double-precision transforms, cells as assets and entities, render extraction.
 - Rendering: a Vulkan 1.3 RHI (bindless, buffers by address, a staging uploader) and a render graph. The deferred renderer draws a G-buffer, the sun and a hemisphere ambient, cascaded sun shadows through a screen-space mask, and a filmic tonemap, with debug views of each channel.
@@ -58,7 +59,7 @@ Profile it without the GUI (Windows; needs the Tracy 0.14.1 tools from `winget i
 tools/profile.ps1 -Seconds 10      # prints top zones and plots; CSVs and trace.tracy in build/profiles/
 ```
 
-Cook assets (`content/` with its `meta/` tree, the shaders and `config/`) into `cooked/`, which the engine mounts as `game:/`. Ship builds have no source tree and draw with these cooked shaders. See `tools/cooker/README.md`.
+Cook a project (`cooker --project projects/sandbox`: its `content/` with its `meta/` tree, the engine's shaders and its `config/`) into its `cooked/`, which the engine mounts as `game:/` when it opens that project (`deengine --project projects/sandbox`; that one is the default). Ship builds have no source tree and draw with these cooked shaders. See `tools/cooker/README.md`.
 
 ```sh
 build/<preset>/bin/<config>/cooker              # --check validates and writes nothing; --force cooks everything

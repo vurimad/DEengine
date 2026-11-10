@@ -208,7 +208,7 @@ GBufferOutput fragment_main(VertexOutput input)
     output.emissive = float4(0.0, 0.0, 0.0, 1.0);
     output.motion = motion_between(input.clip, input.previous_clip);
 #ifdef EDITOR_IDS
-    output.id = 0u; // the ground and its grass aren't picked
+    output.id = kEditorTerrainId; // the ground's: as the terrain
 #endif
     return output;
 }

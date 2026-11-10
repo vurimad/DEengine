@@ -17,7 +17,8 @@ inline std::span<const std::byte> bytes_of(std::string_view text) {
     return std::as_bytes(std::span<const char>(text.data(), text.size()));
 }
 
-// A scratch folder per test: game/, src/, user/ and temp/ roots under the OS temp folder, deleted
+// A scratch folder per test: game/, src/ (a project's sources), engine/ (the engine's: shaders/), user/ and temp/
+// roots under the OS temp folder, deleted
 // at the end.
 class Sandbox {
 public:
@@ -38,6 +39,7 @@ public:
         }
         REQUIRE(platform::create_directories(game().c_str()).ok());
         REQUIRE(platform::create_directories(folder("src").c_str()).ok());
+        REQUIRE(platform::create_directories(folder("engine").c_str()).ok());
     }
     ~Sandbox() { static_cast<void>(platform::delete_tree(root_.c_str())); }
     Sandbox(const Sandbox&) = delete;
@@ -63,16 +65,20 @@ public:
         REQUIRE(platform::write_file_atomic(path.c_str(), bytes_of(contents)).ok());
     }
 
-    // A Vfs over the sandbox folders, src:/ included.
+    // A Vfs over the sandbox folders, src:/ and engine:/ included.
     platform::Vfs make_vfs(platform::VfsDesc desc = {}) const {
         const platform::PathString game_root = game();
         const platform::PathString user_root = folder("user");
         const platform::PathString temp_root = folder("temp");
         const platform::PathString src_root = folder("src");
+        const platform::PathString engine_root = folder("engine");
         desc.game_root = game_root.c_str();
         desc.user_root = user_root.c_str();
         desc.temp_root = temp_root.c_str();
         desc.src_root = src_root.c_str();
+        if (desc.engine_root == nullptr) {
+            desc.engine_root = engine_root.c_str();
+        }
         auto vfs = platform::Vfs::create(desc);
         REQUIRE(vfs.ok());
         return std::move(vfs).value();

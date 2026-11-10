@@ -11,7 +11,8 @@
 namespace de::cooker {
 
 core::FixedString<kMaxSourcePath + 8> src_path(std::string_view relative) {
-    core::FixedString<kMaxSourcePath + 8> path("src:/");
+    const bool engine = relative == "shaders" || relative.starts_with("shaders/");
+    core::FixedString<kMaxSourcePath + 8> path(engine ? "engine:/" : "src:/");
     if (!path.append(relative)) {
         path.clear();
     }

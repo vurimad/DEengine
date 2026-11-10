@@ -2,6 +2,7 @@
 #include "core/log.h"
 #include "core/memory_stats.h"
 #include "platform/file.h"
+#include "platform/project.h"
 #include "platform/time.h"
 #include "platform/vfs.h"
 #include "support/sandbox.h"
@@ -143,6 +144,50 @@ TEST_CASE("src:/ is the source tree: mounted on request, readable and writable")
                              .temp_root = temp_root.c_str(),
                              .src_root = missing_root.c_str()})
                     .ok());
+}
+
+TEST_CASE("engine:/ is the engine's sources, apart from the project's src:/") {
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    const Vfs vfs = sandbox.make_vfs();
+    REQUIRE(vfs.write_file("engine:/shaders/test.slang", bytes_of("float4 x;")).ok());
+    CHECK(vfs.exists("engine:/shaders/test.slang"));
+    CHECK_FALSE(vfs.exists("src:/shaders/test.slang")); // another folder
+    CHECK(std::string_view(vfs.mount_root(de::platform::Mount::Engine)).ends_with("/engine"));
+    // Without an engine_root there is no engine:/.
+    const PathString game_root = sandbox.game();
+    const PathString user_root = sandbox.folder("user");
+    const PathString temp_root = sandbox.folder("temp");
+    auto bare =
+        Vfs::create({.game_root = game_root.c_str(), .user_root = user_root.c_str(), .temp_root = temp_root.c_str()});
+    REQUIRE(bare.ok());
+    CHECK(bare->resolve("engine:/shaders/test.slang").error().code == de::core::ErrorCode::NotFound);
+}
+
+TEST_CASE("a project is a folder named by its .deproject file, found from the working folder or the engine's") {
+    using de::platform::find_project;
+    const QuietLog quiet;
+    const Sandbox sandbox;
+    // engine/projects/demo/demo.deproject
+    PathString demo = sandbox.folder("engine");
+    REQUIRE(demo.append("/projects/demo"));
+    REQUIRE(de::platform::create_directories(demo.c_str()).ok());
+    PathString marker = demo;
+    REQUIRE(marker.append("/demo.deproject"));
+    REQUIRE(de::platform::write_file_atomic(marker.c_str(), bytes_of("name demo\n")).ok());
+    const PathString engine = sandbox.folder("engine");
+    // Its folder, its file, or relative to the engine.
+    for (const char* given : {demo.c_str(), marker.c_str(), "projects/demo", "projects/demo/demo.deproject"}) {
+        CAPTURE(given);
+        const auto found = find_project(given, engine.c_str());
+        REQUIRE(found.ok());
+        CHECK(found->name.view() == "demo");
+        CHECK(found->root.view().ends_with("/projects/demo"));
+    }
+    // A folder without its .deproject isn't one; nor is nothing.
+    CHECK(find_project("projects", engine.c_str()).error().code == de::core::ErrorCode::NotFound);
+    CHECK(find_project("projects/missing", engine.c_str()).error().code == de::core::ErrorCode::NotFound);
+    CHECK_FALSE(find_project(nullptr, engine.c_str()).ok());
 }
 
 TEST_CASE("write then read back on user:/ and temp:/, creating folders") {

@@ -28,7 +28,7 @@ namespace {
 
 constexpr uint32_t kSpirvMagic = 0x07230203;
 
-// A Vfs whose src:/ is the repository, for the engine's real shaders.
+// A Vfs whose engine:/ is the repository, for the engine's real shaders.
 Vfs make_repo_vfs(const Sandbox& sandbox) {
     const de::platform::PathString game_root = sandbox.game();
     const de::platform::PathString user_root = sandbox.folder("user");
@@ -36,7 +36,7 @@ Vfs make_repo_vfs(const Sandbox& sandbox) {
     auto vfs = Vfs::create({.game_root = game_root.c_str(),
                             .user_root = user_root.c_str(),
                             .temp_root = temp_root.c_str(),
-                            .src_root = DE_SOURCE_DIR});
+                            .engine_root = DE_SOURCE_DIR});
     REQUIRE(vfs.ok());
     return std::move(vfs).value();
 }
@@ -113,9 +113,9 @@ TEST_CASE("the compiler turns Slang into SPIR-V with reflection and dependencies
     CHECK(field(vertex.reflection, "draws")->offset == 32);
     CHECK(basic_lit->stages[1].code[0] == kSpirvMagic);
     CHECK(basic_lit->stages[1].reflection.stage == ShaderStage::Fragment);
-    CHECK(has_dependency(report, "src:/shaders/scene/gbuffer.slang"));
-    CHECK(has_dependency(report, "src:/shaders/scene/scene_common.slang"));
-    CHECK(has_dependency(report, "src:/shaders/common/bindless.slang"));
+    CHECK(has_dependency(report, "engine:/shaders/scene/gbuffer.slang"));
+    CHECK(has_dependency(report, "engine:/shaders/scene/scene_common.slang"));
+    CHECK(has_dependency(report, "engine:/shaders/common/bindless.slang"));
 
     const ShaderEntry compute_entry[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
     auto compute = compiler.compile({.module = "tests.fill_buffer", .entries = compute_entry});
@@ -135,17 +135,17 @@ TEST_CASE("compile errors name the file and line, and missing pieces fail cleanl
     const Sandbox sandbox;
     Vfs vfs = sandbox.make_vfs();
     ShaderCompiler compiler = make_compiler(vfs);
-    write_source(vfs, "src:/shaders/broken.slang",
+    write_source(vfs, "engine:/shaders/broken.slang",
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() { int x = ; }\n");
-    write_source(vfs, "src:/shaders/permutation.slang",
+    write_source(vfs, "engine:/shaders/permutation.slang",
                  "#if !defined(FAST_PATH) || FAST_PATH != 2\n#error FAST_PATH must be 2\n#endif\n"
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() {}\n");
-    write_source(vfs, "src:/shaders/slots.slang",
+    write_source(vfs, "engine:/shaders/slots.slang",
                  "RWStructuredBuffer<uint> output;\n"
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() { output[0] = 1; }\n");
     // An include that climbs out of its folder: shaders/nested/../shared.slang.
-    write_source(vfs, "src:/shaders/shared.slang", "static const uint kShared = 7;\n");
-    write_source(vfs, "src:/shaders/nested/climb.slang",
+    write_source(vfs, "engine:/shaders/shared.slang", "static const uint kShared = 7;\n");
+    write_source(vfs, "engine:/shaders/nested/climb.slang",
                  "#include \"../shared.slang\"\n"
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\nvoid compute_main() { uint x = kShared; }\n");
     const ShaderEntry compute_main[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
@@ -155,7 +155,7 @@ TEST_CASE("compile errors name the file and line, and missing pieces fail cleanl
     CHECK_FALSE(broken.ok());
     CHECK(text_of(report.diagnostics).find("broken.slang:3:") != std::string_view::npos); // file:line:column
     CHECK(text_of(report.diagnostics).find("error") != std::string_view::npos);
-    CHECK(has_dependency(report, "src:/shaders/broken.slang")); // reported even though it failed
+    CHECK(has_dependency(report, "engine:/shaders/broken.slang")); // reported even though it failed
 
     const auto missing_module = compiler.compile({.module = "nowhere", .entries = compute_main});
     CHECK(missing_module.error().code == de::core::ErrorCode::NotFound);
@@ -170,7 +170,7 @@ TEST_CASE("compile errors name the file and line, and missing pieces fail cleanl
 
     CompileReport climb_report;
     CHECK(compiler.compile({.module = "nested.climb", .entries = compute_main}, &climb_report).ok());
-    CHECK(has_dependency(climb_report, "src:/shaders/shared.slang"));
+    CHECK(has_dependency(climb_report, "engine:/shaders/shared.slang"));
 
     // Names that don't fit are refused, not cut short into a different module.
     const std::string_view long_name = "a_module_name_that_goes_on_and_on_well_past_the_sixty_three_character_limit";
@@ -315,8 +315,8 @@ TEST_CASE("editing a shader rebuilds it live, and a broken edit keeps the last g
                                       "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
                                       "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\n"
                                       "void compute_main() { push.output[0] = kValue; }\n";
-    write_source(vfs, "src:/shaders/value.slang", "public static const uint kValue = 1;\n");
-    write_source(vfs, "src:/shaders/hot.slang", kHot);
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = 1;\n");
+    write_source(vfs, "engine:/shaders/hot.slang", kHot);
     const auto program = library->create_compute({.module = "hot"});
     REQUIRE(program.ok());
     const auto buffer = device->create_buffer(
@@ -330,7 +330,7 @@ TEST_CASE("editing a shader rebuilds it live, and a broken edit keeps the last g
     CHECK(library->stats().reloads == 0);
 
     // Edit the imported file (a different size, so the change shows even on coarse file clocks).
-    write_source(vfs, "src:/shaders/value.slang", "public static const uint kValue = 22;\n");
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = 22;\n");
     library->reload_now();
     CHECK(library->stats().reloads == 1);
     run_fill(*device, library->pipeline(*program), *buffer, 0, 1);
@@ -338,7 +338,7 @@ TEST_CASE("editing a shader rebuilds it live, and a broken edit keeps the last g
 
     // A broken edit: the rebuild fails and the last good pipeline stays in use.
     const de::rhi::PipelineHandle good = library->pipeline(*program);
-    write_source(vfs, "src:/shaders/hot.slang", "this is not slang\n");
+    write_source(vfs, "engine:/shaders/hot.slang", "this is not slang\n");
     library->reload_now();
     CHECK(library->stats().failed_reloads == 1);
     CHECK(library->pipeline(*program) == good);
@@ -348,7 +348,7 @@ TEST_CASE("editing a shader rebuilds it live, and a broken edit keeps the last g
     CHECK(read_u32(*device, *buffer, 0) == 22);
 
     // The fix goes live through update(), as in the frame loop.
-    write_source(vfs, "src:/shaders/hot.slang",
+    write_source(vfs, "engine:/shaders/hot.slang",
                  std::string_view("import value;\n"
                                   "struct Push { uint* output; uint value; uint count; };\n"
                                   "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
@@ -396,7 +396,7 @@ TEST_CASE("a program whose first build fails is kept, and comes to life when fix
     library->reload_now(); // nothing changed: still nothing
     CHECK_FALSE(library->pipeline(*program).is_valid());
 
-    write_source(vfs, "src:/shaders/later.slang",
+    write_source(vfs, "engine:/shaders/later.slang",
                  "struct Push { uint* output; uint value; uint count; };\n"
                  "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
                  "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\n"

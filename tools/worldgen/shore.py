@@ -1,6 +1,6 @@
 """The shore map: what the water needs to know of the land under it and around it (shaders/scene/water.slang reads it),
 over the whole terrain at a few meters a texel, as a material's metallic-roughness texture the world's sea names. It's
-read texel by texel and filtered by the shader, so it isn't compressed (meta/.../_folder.json: "*_shore.*"):
+read texel by texel and filtered by the shader, so it isn't compressed (a project's meta/.../_folder.json: "*_shore.*"):
 
     r, g: distance to the nearest land at the sea's level, in centimeters, high byte then low (0 on land, up to 655 m)
     b: the water's depth, over DEPTH_M (0 on land)

@@ -93,7 +93,7 @@ core::Result<uint64_t> shader_sources_hash(const platform::Vfs& vfs) {
     constexpr std::string_view kExtension = ".slang";
     core::Allocator& heap = core::heap_allocator(core::MemoryTag::Tools);
     const auto src_path = [](std::string_view relative) {
-        platform::PathString path("src:/");
+        platform::PathString path("engine:/");
         return path.append(relative) ? path : platform::PathString();
     };
 

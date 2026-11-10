@@ -32,6 +32,7 @@
 #include <doctest/doctest.h>
 #include <stb_image_write.h>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -306,8 +307,9 @@ TEST_CASE("metas follow files moved outside the tools; orphans, copies and bad n
     CHECK(has_message(report, "meta/a/moss.png.json", "has no source file"));
     CHECK(has_message(report, "content/a/fern.png", "no GUID minted"));
     CHECK_FALSE(vfs.exists("src:/meta/a/fern.png.json"));
-    CHECK(report.stats.removed == 1);
+    CHECK(report.stats.removed == 2); // the texture and its picture
     CHECK_FALSE(vfs.exists(cooked_path(asset_id(moss), AssetType::Texture).c_str()));
+    CHECK_FALSE(vfs.exists(cooked_path(thumbnail_asset_id(asset_id(moss)), AssetType::Texture).c_str()));
     remove_src(sandbox, "meta/a/moss.png.json");
     report = run_cook(vfs);
     CHECK(report.ok());
@@ -350,7 +352,7 @@ TEST_CASE("metas follow files moved outside the tools; orphans, copies and bad n
     const Guid new_fern = guid_of(vfs, "src:/meta/a/fern.png.json");
     REQUIRE(new_fern != fern);
     CHECK(report.stats.cooked == 1);
-    CHECK(report.stats.removed == 1);
+    CHECK(report.stats.removed == 2); // the old ID's texture and picture
     CHECK(vfs.exists(cooked_path(asset_id(new_fern), AssetType::Texture).c_str()));
     CHECK_FALSE(vfs.exists(cooked_path(asset_id(fern), AssetType::Texture).c_str()));
 
@@ -1100,14 +1102,16 @@ TEST_CASE("text materials name their textures by path and set how they are used"
 
 TEST_CASE("shader modules cook to .deshader, and the library builds pipelines from them") {
     const Sandbox sandbox;
-    // src:/ is the repository: its real shaders.
+    // engine:/ is the repository: its real shaders; src:/ an empty project.
     const de::platform::PathString game_root = sandbox.game();
     const de::platform::PathString user_root = sandbox.folder("user");
     const de::platform::PathString temp_root = sandbox.folder("temp");
+    const de::platform::PathString src_root = sandbox.folder("src");
     auto vfs = Vfs::create({.game_root = game_root.c_str(),
                             .user_root = user_root.c_str(),
                             .temp_root = temp_root.c_str(),
-                            .src_root = DE_SOURCE_DIR,
+                            .src_root = src_root.c_str(),
+                            .engine_root = DE_SOURCE_DIR,
                             .game_writable = true});
     REQUIRE(vfs.ok());
     auto compiler = de::shader::ShaderCompiler::create(*vfs, {.debug_info = false, .checks = false});
@@ -1301,7 +1305,7 @@ TEST_CASE("this build's shader hash is the hash of the shaders it was built from
     const auto vfs = Vfs::create({.game_root = game_root.c_str(),
                                   .user_root = user_root.c_str(),
                                   .temp_root = temp_root.c_str(),
-                                  .src_root = DE_SOURCE_DIR});
+                                  .engine_root = DE_SOURCE_DIR});
     REQUIRE(vfs.ok());
     const de::core::Result<uint64_t> sources = shader_sources_hash(*vfs);
     REQUIRE(sources.ok());
@@ -1711,6 +1715,95 @@ std::vector<std::byte> file_bytes(const Vfs& vfs, AssetId id, AssetType type) {
 }
 
 } // namespace
+
+TEST_CASE("a model cooks with its picture: drawn in its colours, clear round it") {
+    const Sandbox sandbox;
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    grid(16, vertices, indices);
+    const std::string model =
+        gltf(vertices, indices, 0.0f,
+             R"([{"name": "paint", "pbrMetallicRoughness": {"baseColorFactor": [0.8, 0.1, 0.1, 1]}}])", "[]", "[]");
+    write_src(sandbox, "content/props/rug.gltf", model);
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const AssetId mesh_id = asset_id(guid_of(vfs, "src:/meta/props/rug.gltf.json"));
+    Cooked file(vfs, thumbnail_asset_id(mesh_id), AssetType::Texture);
+    const auto& picture = file.load<TextureAsset>();
+    CHECK(picture.format == TextureFormat::BC7Srgb);
+    CHECK(picture.width == kThumbnailSize);
+    CHECK(picture.height == kThumbnailSize);
+    REQUIRE(picture.mips.count == 1);
+    const TextureMip& level = picture.mips.get(file.data())[0];
+    const std::span<const std::byte> blocks = picture.mip_data(file.data(), 0);
+    const auto texel = [&](uint32_t x, uint32_t y) {
+        uint8_t decoded[16 * 4];
+        const std::byte* block =
+            blocks.data() + (static_cast<size_t>(y / 4) * level.row_bytes) + (static_cast<size_t>(x / 4) * 16);
+        REQUIRE(bc7decomp::unpack_bc7(block, reinterpret_cast<bc7decomp::color_rgba*>(decoded)));
+        std::array<uint8_t, 4> out{};
+        std::memcpy(out.data(), &decoded[((static_cast<size_t>(y % 4) * 4) + (x % 4)) * 4], 4);
+        return out;
+    };
+    // Its middle: the rug, red and solid; a corner: clear.
+    const std::array<uint8_t, 4> middle = texel(kThumbnailSize / 2, kThumbnailSize / 2);
+    CHECK(middle[3] == 255);
+    CHECK(middle[0] > middle[1] + 60);
+    CHECK(texel(0, 0)[3] == 0);
+
+    // It goes with the model.
+    remove_src(sandbox, "content/props/rug.gltf");
+    remove_src(sandbox, "meta/props/rug.gltf.json");
+    REQUIRE(run_cook(vfs).ok());
+    CHECK_FALSE(vfs.exists(cooked_path(thumbnail_asset_id(mesh_id), AssetType::Texture).c_str()));
+}
+
+TEST_CASE("textures and materials cook with their pictures: the image fitted, the material on a sphere") {
+    const Sandbox sandbox;
+    // A red image twice as wide as tall, and a blue material on it.
+    std::vector<uint8_t> red(static_cast<size_t>(16) * 8 * 4);
+    for (size_t i = 0; i < red.size(); i += 4) {
+        red[i] = 220;
+        red[i + 1] = 20;
+        red[i + 2] = 20;
+        red[i + 3] = 255;
+    }
+    write_src(sandbox, "content/paint/red.png", png(16, 8, red));
+    write_src(sandbox, "content/paint/blue.material",
+              R"({"params": {"base_color": [0.1, 0.2, 0.9], "roughness": 0.4}, "textures": {}})");
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const auto texel = [&](AssetId source, uint32_t x, uint32_t y) {
+        Cooked file(vfs, thumbnail_asset_id(source), AssetType::Texture);
+        const auto& picture = file.load<TextureAsset>();
+        REQUIRE(picture.width == kThumbnailSize);
+        const TextureMip& level = picture.mips.get(file.data())[0];
+        const std::byte* block = picture.mip_data(file.data(), 0).data() +
+                                 (static_cast<size_t>(y / 4) * level.row_bytes) + (static_cast<size_t>(x / 4) * 16);
+        uint8_t decoded[16 * 4];
+        REQUIRE(bc7decomp::unpack_bc7(block, reinterpret_cast<bc7decomp::color_rgba*>(decoded)));
+        std::array<uint8_t, 4> out{};
+        std::memcpy(out.data(), &decoded[((static_cast<size_t>(y % 4) * 4) + (x % 4)) * 4], 4);
+        return out;
+    };
+    // The texture: red in the middle, clear above and below it (it's wider than tall).
+    const AssetId red_id = asset_id(guid_of(vfs, "src:/meta/paint/red.png.json"));
+    const std::array<uint8_t, 4> middle = texel(red_id, kThumbnailSize / 2, kThumbnailSize / 2);
+    CHECK(middle[3] >= 250); // BC7
+    CHECK(middle[0] > 180);
+    CHECK(middle[1] < 60);
+    CHECK(texel(red_id, kThumbnailSize / 2, 2)[3] == 0);
+    // The material: a blue sphere, clear in the corners.
+    const AssetId blue_id = asset_id(guid_of(vfs, "src:/meta/paint/blue.material.json"));
+    const std::array<uint8_t, 4> centre = texel(blue_id, kThumbnailSize / 2, kThumbnailSize / 2);
+    CHECK(centre[3] >= 250);
+    CHECK(centre[2] > centre[0] + 40);
+    CHECK(texel(blue_id, 1, 1)[3] == 0);
+    // A picture gone is made again.
+    REQUIRE(vfs.remove_file(cooked_path(thumbnail_asset_id(red_id), AssetType::Texture).c_str()).ok());
+    REQUIRE(run_cook(vfs).ok());
+    CHECK(vfs.exists(cooked_path(thumbnail_asset_id(red_id), AssetType::Texture).c_str()));
+}
 
 TEST_CASE("a model cooks to collision from the finest LOD under its limit") {
     const Sandbox sandbox;

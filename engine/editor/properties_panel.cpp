@@ -1,6 +1,7 @@
 #include "editor/properties_panel.h"
 
 #include "app/framework.h"
+#include "asset/terrain_format.h"
 #include "core/hash.h"
 #include "core/profile.h"
 #include "editor/commands.h"
@@ -960,6 +961,59 @@ bool PropertiesPanel::draw_file(const app::Engine& engine, const Selection& sele
     return open;
 }
 
+void PropertiesPanel::draw_terrain(const app::Engine& engine) {
+    const auto* terrain = engine.assets.get<asset::TerrainAsset>(engine.terrain);
+    if (terrain == nullptr) {
+        empty_message("This world has no terrain.");
+        return;
+    }
+    ImGui::SetCursorPos(ImVec2(px(10.0f), ImGui::GetCursorStartPos().y + px(6.0f)));
+    if (fonts().semibold != nullptr) {
+        ImGui::PushFont(fonts().semibold, 0.0f);
+    }
+    ImGui::TextColored(color(ThemeColor::TextEmphasis), "Terrain");
+    if (fonts().semibold != nullptr) {
+        ImGui::PopFont();
+    }
+    ImGui::SetCursorPosX(px(10.0f));
+    ImGui::TextColored(color(ThemeColor::TextSecondary), "The world's ground: it stays where it is");
+    ImGui::Dummy(ImVec2(0.0f, px(2.0f)));
+    // How high it reaches: its patches' bounds.
+    float lowest = 0.0f;
+    float highest = 0.0f;
+    bool any = false;
+    for (const asset::TerrainPatch& patch : terrain->patches.get(terrain)) {
+        lowest = any ? std::min(lowest, patch.min_m) : patch.min_m;
+        highest = any ? std::max(highest, patch.max_m) : patch.max_m;
+        any = true;
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 0.0f));
+    const auto text_row = [&](const char* label, const char* text) {
+        const PropertyRow row = begin_property_row(label, 0, nullptr, ThemeColor::Text, label_fraction_);
+        value_label(row, text, ThemeColor::Text);
+        end_property_row(row);
+    };
+    char text[64];
+    if (begin_category("Terrain")) {
+        text_row("Asset ID", asset::format_asset_id(engine.assets.asset(engine.terrain).id).c_str());
+        static_cast<void>(std::snprintf(text, sizeof(text), "%.2f x %.2f km",
+                                        static_cast<double>(terrain->width_m) / 1000.0,
+                                        static_cast<double>(terrain->depth_m) / 1000.0));
+        text_row("Size", text);
+        static_cast<void>(
+            std::snprintf(text, sizeof(text), "%.1f, %.1f m", terrain->origin_m[0], terrain->origin_m[1]));
+        text_row("Origin (X, Z)", text);
+        if (any) {
+            static_cast<void>(std::snprintf(text, sizeof(text), "%.1f to %.1f m", static_cast<double>(lowest),
+                                            static_cast<double>(highest)));
+            text_row("Height bounds", text);
+        }
+        static_cast<void>(std::snprintf(text, sizeof(text), "%u", terrain->levels.count));
+        text_row("Levels", text);
+    }
+    ImGui::PopStyleVar();
+}
+
 bool PropertiesPanel::draw(const app::Engine& engine, Selection& selection, CommandStack& commands) {
     DE_PROFILE_ZONE("PropertiesPanel::draw");
     bool open = false;
@@ -967,6 +1021,9 @@ bool PropertiesPanel::draw(const app::Engine& engine, Selection& selection, Comm
         switch (selection.kind) {
         case Selection::Kind::Entity:
             draw_entity(engine, selection, commands);
+            break;
+        case Selection::Kind::Terrain:
+            draw_terrain(engine);
             break;
         case Selection::Kind::File:
             open = draw_file(engine, selection);

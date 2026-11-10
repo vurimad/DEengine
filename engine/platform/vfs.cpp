@@ -62,10 +62,9 @@ core::Result<ParsedPath> parse_path(const char* path, bool allow_root = false) {
         Mount mount;
     };
     static constexpr Prefix kPrefixes[] = {
-        {.text = "game:/", .mount = Mount::Game},
-        {.text = "user:/", .mount = Mount::User},
-        {.text = "temp:/", .mount = Mount::Temp},
-        {.text = "src:/", .mount = Mount::Src},
+        {.text = "game:/", .mount = Mount::Game},     {.text = "user:/", .mount = Mount::User},
+        {.text = "temp:/", .mount = Mount::Temp},     {.text = "src:/", .mount = Mount::Src},
+        {.text = "engine:/", .mount = Mount::Engine},
     };
     for (const Prefix& prefix : kPrefixes) {
         if (!text.starts_with(prefix.text)) {
@@ -100,7 +99,7 @@ core::Result<ParsedPath> parse_path(const char* path, bool allow_root = false) {
         }
         return ParsedPath{.mount = prefix.mount, .relative = relative};
     }
-    return fail(ErrorCode::InvalidArgument, "path must start with game:/, user:/, temp:/ or src:/");
+    return fail(ErrorCode::InvalidArgument, "path must start with game:/, user:/, temp:/, src:/ or engine:/");
 }
 
 core::Result<PathString> join(const PathString& root, std::string_view relative) {
@@ -437,6 +436,12 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
         DE_LOG_ERROR("vfs", "src:/ folder %s doesn't exist", src_root.c_str());
         return fail(ErrorCode::NotFound, "the src:/ folder doesn't exist");
     }
+    const PathString engine_root =
+        desc.engine_root != nullptr ? normalized(PathString(desc.engine_root)) : PathString();
+    if (desc.engine_root != nullptr && (engine_root.empty() || !path_exists(engine_root.c_str()))) {
+        DE_LOG_ERROR("vfs", "engine:/ folder %s doesn't exist", engine_root.c_str());
+        return fail(ErrorCode::NotFound, "the engine:/ folder doesn't exist");
+    }
 
     core::Allocator& allocator =
         desc.allocator != nullptr ? *desc.allocator : core::heap_allocator(core::MemoryTag::Platform);
@@ -446,6 +451,7 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     state->roots[static_cast<size_t>(Mount::User)] = *user_root;
     state->roots[static_cast<size_t>(Mount::Temp)] = *temp_root;
     state->roots[static_cast<size_t>(Mount::Src)] = src_root;
+    state->roots[static_cast<size_t>(Mount::Engine)] = engine_root;
     state->game_writable = desc.game_writable;
     state->jobs = desc.jobs;
 
@@ -469,6 +475,9 @@ core::Result<Vfs> Vfs::create(const VfsDesc& desc) {
     DE_LOG_INFO("vfs", "temp:/ = %s", temp_root->c_str());
     if (!src_root.empty()) {
         DE_LOG_INFO("vfs", "src:/ = %s", src_root.c_str());
+    }
+    if (!engine_root.empty()) {
+        DE_LOG_INFO("vfs", "engine:/ = %s", engine_root.c_str());
     }
 
     Vfs vfs;
@@ -516,7 +525,7 @@ core::Result<PathString> Vfs::resolve(const char* path) const {
     }
     const PathString& root = state_->roots[static_cast<size_t>(parsed->mount)];
     if (root.empty()) {
-        return fail(ErrorCode::NotFound, "src:/ isn't mounted");
+        return fail(ErrorCode::NotFound, "src:/ or engine:/ isn't mounted");
     }
     return join(root, parsed->relative);
 }
@@ -612,6 +621,55 @@ core::Result<void> Vfs::write_file(const char* path, std::span<const std::byte> 
     return write_file_atomic(native->c_str(), data);
 }
 
+namespace {
+
+// A path write_file() could write to, as an OS path; fails on read-only mounts.
+core::Result<PathString> writable_native(const Vfs& vfs, const char* path, bool game_writable, Mount* mount = nullptr) {
+    const core::Result<ParsedPath> parsed = parse_path(path);
+    if (!parsed) {
+        return fail(parsed.error());
+    }
+    if (parsed->mount == Mount::Game && !game_writable) {
+        return fail(ErrorCode::Unsupported, "game:/ is read only");
+    }
+    if (mount != nullptr) {
+        *mount = parsed->mount;
+    }
+    return vfs.resolve(path);
+}
+
+} // namespace
+
+core::Result<void> Vfs::move(const char* from, const char* to) const {
+    Mount from_mount = Mount::Game;
+    Mount to_mount = Mount::Game;
+    const core::Result<PathString> source = writable_native(*this, from, state_->game_writable, &from_mount);
+    const core::Result<PathString> target = writable_native(*this, to, state_->game_writable, &to_mount);
+    if (!source || !target) {
+        return fail(!source ? source.error() : target.error());
+    }
+    if (from_mount != to_mount) {
+        return fail(ErrorCode::InvalidArgument, "a move stays within its mount");
+    }
+    return move_path(source->c_str(), target->c_str());
+}
+
+core::Result<void> Vfs::create_folder(const char* path) const {
+    const core::Result<PathString> native = writable_native(*this, path, state_->game_writable);
+    if (!native) {
+        return fail(native.error());
+    }
+    return create_directories(native->c_str());
+}
+
+core::Result<void> Vfs::move_to_trash(const char* path) const {
+    const core::Result<PathString> native = writable_native(*this, path, state_->game_writable);
+    if (!native) {
+        return fail(native.error());
+    }
+    return platform::move_to_trash(native->c_str());
+}
+
 core::Result<void> Vfs::remove_file(const char* path) const {
     const core::Result<ParsedPath> parsed = parse_path(path);
     if (!parsed) {
@@ -642,7 +700,7 @@ core::Result<void> Vfs::list(const char* folder,
     }
     const PathString& root = state_->roots[static_cast<size_t>(parsed->mount)];
     if (root.empty()) {
-        return fail(ErrorCode::NotFound, "src:/ isn't mounted");
+        return fail(ErrorCode::NotFound, "src:/ or engine:/ isn't mounted");
     }
     if (parsed->relative.empty()) {
         return list_directory(root.c_str(), visit);

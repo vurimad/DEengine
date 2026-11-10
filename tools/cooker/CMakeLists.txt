@@ -43,7 +43,9 @@ add_library(de_cooker STATIC
     world_cooker.cpp
     world_cooker.h
     third_party.cpp
-    third_party.h)
+    third_party.h
+    thumbnail_cooker.cpp
+    thumbnail_cooker.h)
 add_library(de::cooker ALIAS de_cooker)
 
 # Cooker headers are included relative to tools/: #include "cooker/cooker.h"
@@ -55,5 +57,6 @@ target_link_libraries(de_cooker
 
 add_executable(cooker main.cpp)
 target_link_libraries(cooker PRIVATE de::cooker)
-target_compile_definitions(cooker PRIVATE "DE_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
+target_compile_definitions(cooker PRIVATE "DE_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\""
+    "DE_DEFAULT_PROJECT=\"${DE_DEFAULT_PROJECT}\"")
 de_deploy_slang_runtime(cooker)
