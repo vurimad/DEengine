@@ -4,6 +4,8 @@
 #include "asset/registry.h"
 #include "render/scene/scene_renderer.h"
 
+#include <flecs.h>
+
 #include <cstdint>
 #include <string_view>
 
@@ -150,6 +152,15 @@ struct Engine {
     bool fog_low_camera = true;        // SceneRenderer::set_fog_low_camera
 #if DE_BUILD_DEV
     bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
+    // Physics' colliders drawn over the scene within kColliderReachM of the camera (the editor's toolbar,
+    // physics.show_colliders in the console), as lines along their triangles, colored by kind.
+    bool show_colliders = false;
+    static constexpr float kColliderReachM = 60.0f;
+    // Only some: these entities' colliders (each one's own, or its nearest parent's), and the ground's near the camera
+    // if collider_ground; the application sets them each frame (the editor's selection). show_colliders shows all.
+    bool show_selected_colliders = false;
+    std::span<const flecs::entity_t> collider_entities{};
+    bool collider_ground = false;
     // Where the application's camera goes this frame (the agent's eyes), or null to leave it alone.
     const tools::CameraPose* camera_pose = nullptr;
     SceneViewport viewport{}; // the scene in a panel (the editor), or over the window

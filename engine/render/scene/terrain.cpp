@@ -108,6 +108,8 @@ struct TerrainDrawPush {
     uint32_t has_normals = 0;
     uint32_t colors_material = 0;
     uint32_t has_colors = 0;
+    uint32_t color_map = 0; // the color map's material slot plus one; 0: none (or not in yet)
+    float color_map_strength = 0.0f;
 };
 static_assert(sizeof(TerrainDrawPush) <= 128);
 
@@ -343,6 +345,10 @@ struct TerrainState {
     asset::AssetId colors_material;
     uint32_t colors_slot = 0;
     bool colors_ready = false; // the same: until then the layers' colors, not the default white
+    asset::AssetId color_map_material;
+    uint32_t color_map_slot = 0;
+    bool color_map_ready = false; // the same
+    float color_map_strength = 1.0f;
     float blend = 0.0f;
     asset::TerrainGrass grass;
     rhi::BufferHandle grass_blades;
@@ -984,6 +990,8 @@ void Terrain::set_layers(const asset::TerrainLayersAsset* layers, std::span<cons
     state.normals_ready = false;
     state.colors_material = {};
     state.colors_ready = false;
+    state.color_map_material = {};
+    state.color_map_ready = false;
     state.grass = {};
     ++state.layer_table_version;
     if (layers == nullptr) {
@@ -1005,6 +1013,10 @@ void Terrain::set_layers(const asset::TerrainLayersAsset* layers, std::span<cons
     if (layers->colors != asset::TerrainLayersAsset::kNone) {
         state.colors_material = dependencies[layers->colors].id;
     }
+    if (layers->color_map != asset::TerrainLayersAsset::kNone) {
+        state.color_map_material = dependencies[layers->color_map].id;
+    }
+    state.color_map_strength = layers->color_map_strength;
     state.blend = layers->blend;
     state.grass = layers->grass;
     for (const asset::TerrainLayer& layer : layers->layers.get(file.data())) {
@@ -1074,15 +1086,20 @@ void Terrain::update(const DVec3& camera) {
         const uint32_t normals_slot =
             state.normals_material.is_valid() ? state.gpu_assets->material_slot(state.normals_material) : 0;
         // Once in, it stays in for as long as it keeps its place, even while the table writes it again.
-        state.normals_ready = normals_slot != 0 &&
-                              ((state.normals_ready && normals_slot == state.normals_slot) ||
-                               state.gpu_assets->material_complete(state.normals_material));
+        state.normals_ready = normals_slot != 0 && ((state.normals_ready && normals_slot == state.normals_slot) ||
+                                                    state.gpu_assets->material_complete(state.normals_material));
         state.normals_slot = normals_slot;
         const uint32_t colors_slot =
             state.colors_material.is_valid() ? state.gpu_assets->material_slot(state.colors_material) : 0;
         state.colors_ready = colors_slot != 0 && ((state.colors_ready && colors_slot == state.colors_slot) ||
                                                   state.gpu_assets->material_complete(state.colors_material));
         state.colors_slot = colors_slot;
+        const uint32_t color_map_slot =
+            state.color_map_material.is_valid() ? state.gpu_assets->material_slot(state.color_map_material) : 0;
+        state.color_map_ready =
+            color_map_slot != 0 && ((state.color_map_ready && color_map_slot == state.color_map_slot) ||
+                                    state.gpu_assets->material_complete(state.color_map_material));
+        state.color_map_slot = color_map_slot;
     }
     ++state.update_number;
     state.read_drawn();
@@ -1287,7 +1304,7 @@ void Terrain::draw_grass(PassContext& context, const TerrainFrame& frame, rhi::P
     context.list.bind_index_buffer(state.grass_indices, 0, rhi::IndexType::Uint16);
     for (uint32_t lod = 0; lod < kGrassLods; ++lod) {
         context.list.draw_indexed_indirect(context.buffer(frame.grass_args),
-                                           uint64_t{lod * kGrassArgsWords} * sizeof(uint32_t), 1);
+                                           uint64_t{lod} * kGrassArgsWords * sizeof(uint32_t), 1);
     }
 }
 
@@ -1329,7 +1346,9 @@ void Terrain::draw_gbuffer(PassContext& context, const TerrainFrame& frame, rhi:
                                .normals_material = state.normals_slot,
                                .has_normals = looks && state.normals_ready ? 1U : 0U,
                                .colors_material = state.colors_slot,
-                               .has_colors = looks && state.colors_ready ? 1U : 0U};
+                               .has_colors = looks && state.colors_ready ? 1U : 0U,
+                               .color_map = looks && state.color_map_ready ? state.color_map_slot + 1 : 0U,
+                               .color_map_strength = state.color_map_strength};
     context.list.bind_pipeline(pipeline);
     context.list.push_constants(push);
     context.list.bind_index_buffer(state.indices, 0, rhi::IndexType::Uint16);

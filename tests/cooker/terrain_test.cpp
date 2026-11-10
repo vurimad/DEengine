@@ -11,10 +11,15 @@
 #include "cooker/terrain_cooker.h"
 #include "cooker/world_cooker.h"
 #include "core/job_system.h"
+#include "physics/physics.h"
+#include "platform/time.h"
 #include "platform/vfs.h"
 #include "support/cook_kit.h"
 #include "support/sandbox.h"
+#include "world/render_extract.h"
 #include "world/terrain_heights.h"
+#include "world/transform.h"
+#include "world/world.h"
 
 #include <doctest/doctest.h>
 
@@ -1714,4 +1719,145 @@ TEST_CASE("terrain heights on the CPU: the ground at any point, and where a ray 
     // Without a terrain: nothing.
     heights.set_terrain(nullptr);
     CHECK_FALSE(heights.height_at(above.x, above.z, ground));
+}
+
+namespace {
+
+// A world with physics over a cooked map: what the terrain collision tests stand on.
+struct GroundScene {
+    GroundScene(const Sandbox& sandbox, const CookedMap& cooked, de::core::JobSystem* jobs)
+        : vfs(sandbox.make_vfs({.jobs = jobs, .game_writable = true})), physics({.jobs = jobs}),
+          world(de::world::World::create({.jobs = jobs}).value()) {
+        REQUIRE(vfs.write_file(cooked_path(kId, AssetType::TerrainHeights).c_str(), cooked.heights_file()).ok());
+        physics.add_to_world(world);
+        physics.set_terrain(&cooked.terrain(), &vfs);
+    }
+
+    // Ticks until this many tiles of the ground have come (their reads are in the background), at most a few seconds.
+    void ticks_until_ground(uint32_t tiles) {
+        for (int i = 0; i < 4000 && physics.stats().terrain_tiles < tiles; ++i) {
+            world.tick();
+            de::platform::sleep_ns(1'000'000);
+        }
+    }
+
+    flecs::entity camera(const de::DVec3& at) {
+        const flecs::entity entity = world.ecs().entity().set(de::world::Camera{});
+        de::world::place(entity, de::world::Transform{.position = at});
+        return entity;
+    }
+
+    Vfs vfs;
+    de::physics::Physics physics;
+    de::world::World world;
+};
+
+} // namespace
+
+TEST_CASE("terrain collision: the ground comes around what needs it, things rest on it, and it goes when unneeded") {
+    for (const uint32_t workers : {0U, 2U}) {
+        CAPTURE(workers);
+        const Sandbox sandbox;
+        std::unique_ptr<de::core::JobSystem> jobs;
+        if (workers != 0) {
+            jobs = std::make_unique<de::core::JobSystem>(de::core::JobSystemDesc{.worker_count = workers});
+        }
+        // Flat ground at a known height, larger than a node, off the world's origin.
+        Map map = flat_map(300, 200, 30000);
+        map.origin_m[0] = 1000.5;
+        map.origin_m[1] = -2000.25;
+        const double ground = map.height_m(30000);
+        const CookedMap cooked(map, jobs.get());
+        GroundScene scene(sandbox, cooked, jobs.get());
+
+        // A ball dropped just over it at once: the ground under it is waited for, so it can't fall through.
+        const de::DVec3 at(map.origin_m[0] + 300.0, ground + 0.6, map.origin_m[1] + 200.0);
+        const flecs::entity ball = scene.world.ecs().entity();
+        ball.set(de::physics::Collider{.shape = de::physics::ShapeKind::Sphere, .radius_m = 0.5f});
+        ball.set(de::physics::RigidBody{.kind = de::physics::BodyKind::Dynamic});
+        de::world::place(ball, de::world::Transform{.position = at});
+        scene.world.tick();
+        CHECK(scene.physics.stats().terrain_tiles > 0);
+        for (int i = 0; i < 240; ++i) {
+            scene.world.tick();
+        }
+        const de::DVec3 rest = ball.get<de::world::WorldTransform>().position;
+        CHECK(rest.y == doctest::Approx(ground + 0.48).epsilon(0.0005)); // Jolt's 2 cm of slop
+        // Only tiles within reach of what wanted them: a node and its neighbours at most.
+        CHECK(scene.physics.stats().terrain_tiles <= 9);
+
+        // A ray down meets it where the heights say, hitting no entity.
+        de::physics::QueryHit hit;
+        REQUIRE(scene.physics.ray_cast({at.x + 37.0, ground + 50.0, at.z - 21.0}, {0.0f, -1.0f, 0.0f}, 100.0f, hit));
+        CHECK(std::abs(hit.position.y - ground) < 0.011); // Jolt's compression of the samples: 1 cm
+        CHECK(hit.entity == 0);
+        CHECK(hit.normal.y > 0.999f);
+
+        // Nothing needs it any more: it goes.
+        ball.destruct();
+        for (int i = 0; i < static_cast<int>(de::physics::kTerrainForgetTicks) + 5; ++i) {
+            scene.world.tick();
+        }
+        CHECK(scene.physics.stats().terrain_tiles == 0);
+    }
+}
+
+TEST_CASE("terrain collision: a camera brings the ground around it, the same as the heights on the CPU") {
+    const Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    Map map = bumpy_map(300, 200);
+    map.origin_m[0] = -700.0;
+    map.origin_m[1] = 300.0;
+    const CookedMap cooked(map, &jobs);
+    GroundScene scene(sandbox, cooked, &jobs);
+    scene.camera({map.origin_m[0] + 250.0, 400.0, map.origin_m[1] + 180.0});
+    // The map is smaller than the camera's reach: every node of its finest level comes.
+    const TerrainLevel& finest = cooked.terrain().levels.get(&cooked.terrain()).back();
+    scene.ticks_until_ground(finest.nodes_x * finest.nodes_z);
+    REQUIRE(scene.physics.stats().terrain_tiles == finest.nodes_x * finest.nodes_z);
+    // On the samples, where both are exact: Jolt's height field and the heights file agree within its compression.
+    de::world::TerrainHeights heights(scene.vfs, de::core::heap_allocator(de::core::MemoryTag::World));
+    heights.set_terrain(&cooked.terrain());
+    for (const auto [x, z] : {std::pair{100U, 80U}, {125U, 90U}, {140U, 60U}, {111U, 101U}}) {
+        CAPTURE(x);
+        CAPTURE(z);
+        const double px = map.origin_m[0] + (x * map.spacing_m);
+        const double pz = map.origin_m[1] + (z * map.spacing_m);
+        double expected = 0.0;
+        REQUIRE(heights.height_at(px, pz, expected));
+        de::physics::QueryHit hit;
+        REQUIRE(scene.physics.ray_cast({px, 2000.0, pz}, {0.0f, -1.0f, 0.0f}, 4000.0f, hit));
+        CHECK(std::abs(hit.position.y - expected) < 0.02);
+    }
+}
+
+TEST_CASE("terrain collision: the ground's collider lines fade out with distance, so their reach has no hard edge") {
+    const Sandbox sandbox;
+    const Map map = flat_map(300, 200, 30000);
+    const CookedMap cooked(map);
+    GroundScene scene(sandbox, cooked, nullptr);
+    const de::DVec3 camera(300.0, map.height_m(30000) + 2.0, 200.0);
+    scene.camera(camera);
+    scene.world.tick();
+    REQUIRE(scene.physics.stats().terrain_tiles > 0);
+    de::core::Array<de::world::DebugLine> lines(de::core::heap_allocator(de::core::MemoryTag::Physics));
+    constexpr float kReachM = 60.0f;
+    scene.physics.collect_collider_lines(camera, kReachM, lines, 1'000'000);
+    REQUIRE(lines.size() > 0);
+    uint32_t near_alpha = 0;
+    uint32_t mid_alpha = 255;
+    for (const de::world::DebugLine& line : lines) {
+        const de::DVec3 middle = (line.from + line.to) * 0.5;
+        const double distance = glm::length(middle - camera);
+        const uint32_t alpha = line.color >> 24U;
+        CHECK((line.color & 0x00ffffffU) == (de::physics::ColliderColors::kGround & 0x00ffffffU));
+        if (distance < 5.0) {
+            near_alpha = std::max(near_alpha, alpha);
+        } else if (distance > 25.0 && distance < 35.0) {
+            mid_alpha = std::min(mid_alpha, alpha);
+        }
+        CHECK(distance < kReachM * 0.9 + 2.0); // none past the fade
+    }
+    CHECK(near_alpha == 255);
+    CHECK(mid_alpha < 128);
 }

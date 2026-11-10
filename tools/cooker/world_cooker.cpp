@@ -460,9 +460,9 @@ void read_terrain_layer(const SourceTree& tree, std::string_view path, yyjson_va
         diagnostics.error(path, "a layer should be an object");
         return;
     }
-    static constexpr const char* kKeys[] = {"material",    "tile_m",          "height_m", "slope_deg", "mask",
-                                            "mask_range",  "detail",          "detail_range", "detail_coverage",
-                                            "noise",       "noise_large",     "variation", "tint",      "projection"};
+    static constexpr const char* kKeys[] = {"material",    "tile_m",    "height_m",     "slope_deg",       "mask",
+                                            "mask_range",  "detail",    "detail_range", "detail_coverage", "noise",
+                                            "noise_large", "variation", "tint",         "projection"};
     reader.check_keys(kKeys, "terrain layer");
     asset::TerrainLayer layer;
 
@@ -567,8 +567,9 @@ core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, c
         diagnostics.error(path, "should be a JSON object");
         return core::fail(core::ErrorCode::InvalidArgument, "the terrain layers have errors");
     }
-    static constexpr const char* kKeys[] = {"masks",  "details", "lighting", "normals",
-                                            "colors", "blend",   "layers",   "grass"};
+    static constexpr const char* kKeys[] = {"masks",  "details",   "lighting",           "normals",
+                                            "colors", "color_map", "color_map_strength", "blend",
+                                            "layers", "grass"};
     reader.check_keys(kKeys, "terrain layers");
     const auto map = [&](const char* key, uint32_t& out) {
         if (reader.has(key)) {
@@ -584,6 +585,11 @@ core::Result<TerrainLayersBuild> import_terrain_layers(const SourceTree& tree, c
     map("lighting", build.lighting);
     map("normals", build.normals);
     map("colors", build.colors);
+    map("color_map", build.color_map);
+    double strength = build.color_map_strength;
+    if (reader.has("color_map_strength") && required(reader, "color_map_strength", 0.0, 1.0, strength)) {
+        build.color_map_strength = static_cast<float>(strength);
+    }
     double blend = build.blend;
     if (reader.has("blend") && required(reader, "blend", 0.0, 1.0, blend)) {
         build.blend = static_cast<float>(blend);
@@ -615,6 +621,8 @@ core::Array<std::byte> cook_terrain_layers(const TerrainLayersBuild& build, asse
     asset.lighting = build.lighting;
     asset.normals = build.normals;
     asset.colors = build.colors;
+    asset.color_map = build.color_map;
+    asset.color_map_strength = build.color_map_strength;
     asset.blend = build.blend;
     asset.grass = build.grass;
     BlobWriter writer(sizeof(asset::TerrainLayersAsset));
@@ -635,8 +643,8 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }
     const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
-    static constexpr const char* kKeys[] = {"sun",         "sky",     "ground", "shadow_color",
-                                            "exposure_ev", "shadows", "fog",    "wind", "sea"};
+    static constexpr const char* kKeys[] = {"sun",     "sky", "ground", "shadow_color", "exposure_ev",
+                                            "shadows", "fog", "wind",   "sea"};
     reader.check_keys(kKeys, "environment");
     asset::EnvironmentAsset environment;
 

@@ -2,11 +2,12 @@
 map's layers as the ground's weights, and nothing of ours on top (no snow bake, no fades, no other land). To see how
 close the engine gets to World Creator's own view before bringing its terrain into a bigger map.
 
-    python tools/worldgen/wc_map.py HEIGHT.tif SPLAT.tif [--name wc] [--scale 106.45] [--spacing 1]
+    python tools/worldgen/wc_map.py HEIGHT.tif SPLAT.tif [--color COLOR.png] [--name wc] [--scale 106.45] [--spacing 1]
 
 HEIGHT.tif: World Creator's float height map, in its export units; --scale says how many meters a unit is (World
 Creator's ruler over the export's own range: 106.45 for the user's first export). SPLAT.tif: its splat map, a channel
-per layer, summing to 255: layer 0 (snow) and layer 1 (debris) here. What this writes stays local (projects/dreadworld/content/terrain/).
+per layer, summing to 255: layer 0 (snow) and layer 1 (debris) here. COLOR.png: its color map, the ground's color as
+World Creator shows it: far off the ground's color, and up close our textures tinted to it (the layers' color_map). What this writes stays local (projects/dreadworld/content/terrain/).
 """
 import argparse
 import json
@@ -39,6 +40,7 @@ def main():
     parser.add_argument('--name', default='wc')
     parser.add_argument('--scale', type=float, default=106.45)
     parser.add_argument('--spacing', type=float, default=1.0)
+    parser.add_argument('--color', default=None)
     args = parser.parse_args()
     started = time.time()
     out = os.path.normpath(OUT)
@@ -67,6 +69,13 @@ def main():
     Image.merge('RGBA', [Image.fromarray(c.astype(np.uint8)) for c in channels]).save(f'{folder}/{name}_masks.png')
     with open(f'{folder}/{name}_masks.material', 'w', encoding='utf-8') as f:
         json.dump({'textures': {'metallic_roughness': f'{name}_masks.png'}}, f, indent=1)
+    # Its color map, as it is (on the heights' grid too).
+    if args.color:
+        color = Image.open(args.color).convert('RGB')
+        assert color.size == (cols, rows), 'the color map lies on the heights\' grid'
+        color.save(f'{folder}/{name}_color.png')
+        with open(f'{folder}/{name}_color.material', 'w', encoding='utf-8') as f:
+            json.dump({'textures': {'base_color': f'{name}_color.png'}}, f, indent=1)
 
     # The ground's normal at half the spacing, and the sun's long shadows and the sky seen, from the heights alone.
     fine.write_normal_map(f'{folder}/{name}_normals_tmp.png', heights, args.spacing)
@@ -77,17 +86,21 @@ def main():
     lightbake.write_light_map(folder, name, half, args.spacing * 2.0, SUN_AZIMUTH_DEG, SUN_ELEVATION_DEG)
     print('maps', f'{time.time() - started:.0f}s')
 
-    # The look: debris everywhere, snow over it as much as its layer says, blended by the textures' heights.
+    # The look: debris everywhere, snow over it as much as its layer says, blended by the textures' heights. Both read
+    # from the sides on steep ground, so a face isn't a texture stretched down it.
     def layer(material, tile, **rules):
-        out_layer = {'material': f'layers/{material}/{material}.material', 'tile_m': tile}
+        out_layer = {'material': f'layers/{material}/{material}.material', 'tile_m': tile, 'projection': 'sides'}
         out_layer.update(rules)
         return out_layer
     with open(f'{out}/{name}.terrainlayers', 'w', encoding='utf-8') as f:
-        json.dump({'masks': f'layers/masks/{name}_masks.material', 'lighting': f'layers/masks/{name}_light.material',
-                   'normals': f'layers/masks/{name}_normals.material', 'blend': 0.25,
-                   'layers': [layer('rocks_ground_05', 2.5, tint=[0.62, 0.44, 0.3], variation=0.12),
-                              layer('snow_02', 2.0, mask='r', mask_range=[0.0, 1.0], tint=[2.25, 2.27, 2.32],
-                                    variation=0.04)]}, f, indent=1)
+        look = {'masks': f'layers/masks/{name}_masks.material', 'lighting': f'layers/masks/{name}_light.material',
+                'normals': f'layers/masks/{name}_normals.material', 'blend': 0.25,
+                'layers': [layer('rocks_ground_05', 2.5, tint=[0.62, 0.44, 0.3], variation=0.12),
+                           layer('snow_02', 2.0, mask='r', mask_range=[0.0, 1.0], tint=[2.25, 2.27, 2.32],
+                                 variation=0.04)]}
+        if args.color:
+            look['color_map'] = f'layers/masks/{name}_color.material'
+        json.dump(look, f, indent=1)
 
     with open(f'{out}/coast.environment', encoding='utf-8') as f:
         environment = json.load(f)

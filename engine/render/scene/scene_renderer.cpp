@@ -123,6 +123,19 @@ struct GBufferPush {
 };
 
 #if DE_BUILD_DEV
+// Matches DebugVertex and DebugLinesPush in shaders/scene/debug_lines.slang.
+struct GpuDebugVertex {
+    float position[3] = {};
+    uint32_t color = 0;
+};
+static_assert(sizeof(GpuDebugVertex) == 16);
+struct DebugLinesPush {
+    uint64_t frame = 0;
+    uint64_t vertices = 0;
+    float alpha = 1.0f;
+    uint32_t srgb_target = 0;
+};
+
 // Matches TerrainSelectionPush in shaders/scene/terrain_selection.slang.
 struct TerrainSelectionPush {
     uint32_t ids = 0;
@@ -557,6 +570,12 @@ struct SceneRendererState {
     shader::ProgramHandle terrain_selection_program;
     shader::ProgramHandle outline_program;
     rhi::Format outline_format = rhi::Format::Unknown;
+    // The debug views' lines: where in view, and where hidden; made for the target's format when there are lines.
+    std::span<const world::DebugLine> debug_lines;
+    shader::ProgramHandle debug_seen_program;
+    shader::ProgramHandle debug_hidden_program;
+    rhi::Format debug_format = rhi::Format::Unknown;
+    rhi::BufferHandle debug_buffers[rhi::kFramesInFlight];
     EditorOverlay editor;
     core::Array<SelectedMesh> selected{core::heap_allocator(core::MemoryTag::Render)};
     rhi::BufferHandle selection_draws[rhi::kFramesInFlight];
@@ -682,6 +701,11 @@ struct SceneRendererState {
         shaders->destroy(selection_program);
         shaders->destroy(terrain_selection_program);
         shaders->destroy(outline_program);
+        shaders->destroy(debug_seen_program);
+        shaders->destroy(debug_hidden_program);
+        for (const rhi::BufferHandle buffer : debug_buffers) {
+            device->destroy(buffer);
+        }
         for (const rhi::BufferHandle buffer : selection_draws) {
             device->destroy(buffer);
         }
@@ -2918,10 +2942,123 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         });
 #if DE_BUILD_DEV
     add_editor_outline(graph, selection_mask, target, srgb_target);
+    add_debug_lines(graph, targets.depth, target, target_format, frame_address, frame.origin, cull_slot, srgb_target);
 #endif
 }
 
 #if DE_BUILD_DEV
+void SceneRenderer::set_debug_lines(std::span<const world::DebugLine> lines) {
+    state_->debug_lines = lines;
+}
+
+void SceneRenderer::add_debug_lines(RenderGraph& graph, GraphTexture depth, GraphTexture target,
+                                    rhi::Format target_format, uint64_t frame_address, const DVec3& origin,
+                                    uint32_t slot, uint32_t srgb_target) {
+    SceneRendererState& state = *state_;
+    if (state.debug_lines.empty() || !depth.is_valid()) {
+        return;
+    }
+    DE_PROFILE_ZONE("debug lines");
+    // Its pipelines, for the target's format: one where the scene's depth says in view, one where it's hidden.
+    if (target_format != state.debug_format) {
+        state.shaders->destroy(state.debug_seen_program);
+        state.shaders->destroy(state.debug_hidden_program);
+        rhi::GraphicsPipelineDesc lines{.color_count = 1,
+                                        .depth_format = kDepthFormat,
+                                        .depth_test = true,
+                                        .depth_write = false,
+                                        .depth_compare = rhi::CompareOp::GreaterEqual,
+                                        .topology = rhi::Topology::LineList,
+                                        .cull = rhi::CullMode::None,
+                                        .debug_name = "debug lines"};
+        lines.color_formats[0] = target_format;
+        lines.blend[0] = rhi::BlendMode::Alpha;
+        const auto make = [&](const rhi::GraphicsPipelineDesc& desc) {
+            const core::Result<shader::ProgramHandle> program =
+                state.shaders->create_graphics({.module = "scene.debug_lines", .state = desc});
+            return program ? *program : shader::ProgramHandle{};
+        };
+        state.debug_seen_program = make(lines);
+        lines.depth_compare = rhi::CompareOp::Less;
+        state.debug_hidden_program = make(lines);
+        state.debug_format = target_format;
+    }
+    const rhi::PipelineHandle seen = state.shaders->pipeline(state.debug_seen_program);
+    const rhi::PipelineHandle hidden = state.shaders->pipeline(state.debug_hidden_program);
+    if (!seen.is_valid() || !hidden.is_valid()) {
+        return;
+    }
+    // This slot's vertices, relative to the render origin (its last frame is done).
+    if (!state.debug_buffers[slot].is_valid()) {
+        const core::Result<rhi::BufferHandle> buffer =
+            state.device->create_buffer({.size = uint64_t{kMaxDebugLines} * 2 * sizeof(GpuDebugVertex),
+                                         .usage = rhi::BufferUsage::Storage,
+                                         .memory = rhi::MemoryLocation::Upload,
+                                         .debug_name = "debug lines"});
+        state.debug_buffers[slot] = buffer ? *buffer : rhi::BufferHandle{};
+    }
+    if (!state.debug_buffers[slot].is_valid()) {
+        return;
+    }
+    const std::span<std::byte> mapped = state.device->mapped(state.debug_buffers[slot]);
+    auto* vertices = reinterpret_cast<GpuDebugVertex*>(mapped.data());
+    const auto count = static_cast<uint32_t>(std::min<size_t>(state.debug_lines.size(), kMaxDebugLines));
+    // Those drawn through what hides them first, so the hidden pass draws only them; then the rest.
+    uint32_t written = 0;
+    const auto write = [&](const world::DebugLine& line) {
+        const DVec3 from = line.from - origin;
+        const DVec3 to = line.to - origin;
+        vertices[static_cast<size_t>(written) * 2] = {
+            .position = {static_cast<float>(from.x), static_cast<float>(from.y), static_cast<float>(from.z)},
+            .color = line.color};
+        vertices[(static_cast<size_t>(written) * 2) + 1] = {
+            .position = {static_cast<float>(to.x), static_cast<float>(to.y), static_cast<float>(to.z)},
+            .color = line.color};
+        ++written;
+    };
+    for (size_t i = 0; i < count; ++i) {
+        if (state.debug_lines[i].through) {
+            write(state.debug_lines[i]);
+        }
+    }
+    const uint32_t through = written;
+    for (size_t i = 0; i < count; ++i) {
+        if (!state.debug_lines[i].through) {
+            write(state.debug_lines[i]);
+        }
+    }
+    state.device->flush_mapped(state.debug_buffers[slot], 0, uint64_t{count} * 2 * sizeof(GpuDebugVertex));
+    const DebugLinesPush push{.frame = frame_address,
+                              .vertices = state.device->buffer_address(state.debug_buffers[slot]),
+                              .alpha = 1.0f,
+                              .srgb_target = srgb_target};
+    graph.add_pass(
+        "debug lines",
+        [&](PassBuilder& pass) {
+            pass.use(target, rhi::ResourceState::RenderTarget);
+            pass.use(depth, rhi::ResourceState::DepthRead);
+        },
+        [target, depth, seen, hidden, push, count, through](PassContext& context) {
+            DE_PROFILE_ZONE("debug lines pass");
+            const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::Load};
+            const rhi::DepthAttachment scene_depth{
+                .texture = context.texture(depth), .load = rhi::LoadOp::Load, .read_only = true};
+            context.list.begin_rendering({.colors = std::span(&color, 1), .depth = &scene_depth});
+            // Hidden first, faint; then what's in view over it.
+            DebugLinesPush faint = push;
+            faint.alpha = 0.25f;
+            if (through > 0) {
+                context.list.bind_pipeline(hidden);
+                context.list.push_constants(faint);
+                context.list.draw(through * 2);
+            }
+            context.list.bind_pipeline(seen);
+            context.list.push_constants(push);
+            context.list.draw(count * 2);
+            context.list.end_rendering();
+        });
+}
+
 void SceneRenderer::set_editor_overlay(const EditorOverlay& overlay) {
     SceneRendererState& state = *state_;
     state.editor = overlay;

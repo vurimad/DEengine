@@ -61,6 +61,8 @@ struct TerrainPush
     uint has_normals;
     uint colors_material;
     uint has_colors;
+    uint color_map; // the color map's material plus one; 0: none
+    float color_map_strength;
 };
 
 [[vk::push_constant]]
@@ -72,6 +74,11 @@ static const float kLeastWeight = 0.01;
 // is a few pixels across by then. Over half as far again they're gone.
 static const float kDetailTiles = 30.0;
 static const float kDetailLeastM = 120.0;
+// The color map (the look's color_map): up close the layers' textures, tinted to it; from kColorMapFromM to kColorMapToM
+// the map itself takes over, as it's all a pixel can show of the textures there anyway.
+static const float kColorMapFromM = 80.0;
+static const float kColorMapToM = 400.0;
+
 // From here the same texture at kFarScale times the size takes over, which keeps rows of the tile from showing.
 static const uint kFarScale = 5;
 static const float kFarFadeFromM = 15.0;
@@ -248,6 +255,7 @@ struct Surface
     float occlusion;
     float roughness;
     float height; // of its bumps, 0 to 1
+    float3 mean;  // its textures' color averaged over the whole texture: what the color map tints from
 };
 
 // The fields of a material that terrain reads.
@@ -321,6 +329,7 @@ Surface read_plane(LayerTextures textures, Plane plane, float2 offset, float3 no
     const float3 tangent = normalize(plane.tangent - normal * dot(normal, plane.tangent));
     const float3 bitangent = normalize(plane.bitangent - normal * dot(normal, plane.bitangent));
     surface.normal = tangent * xy.x + bitangent * xy.y + normal * z;
+    surface.mean = surface.color; // read_layer sets the average
     return surface;
 }
 
@@ -332,6 +341,7 @@ Surface mix_surfaces(Surface a, Surface b, float t)
     mixed.occlusion = lerp(a.occlusion, b.occlusion, t);
     mixed.roughness = lerp(a.roughness, b.roughness, t);
     mixed.height = lerp(a.height, b.height, t);
+    mixed.mean = lerp(a.mean, b.mean, t);
     return mixed;
 }
 
@@ -360,6 +370,7 @@ Surface read_untiled(LayerTextures textures, Plane plane, float tile_m, float3 n
         surface.occlusion = 1.0;
         surface.roughness = 0.9;
         surface.height = 0.5;
+        surface.mean = surface.color;
         return surface;
     }
     const TilePick offsets = pick_offsets(plane.place_m, tile_m);
@@ -493,7 +504,12 @@ Surface read_layer(uint index, Pixel pixel)
             surface = mix_surfaces(read_untiled(textures, first, tile_m, pixel.normal, detail, far_share), read_untiled(textures, second, tile_m, pixel.normal, detail, far_share), t);
         }
     }
-    surface.color *= push.layers[index].tint * (1.0 + push.layers[index].variation * (pixel.wander * 2.0 - 1.0));
+    const float3 tint = push.layers[index].tint * (1.0 + push.layers[index].variation * (pixel.wander * 2.0 - 1.0));
+    surface.color *= tint;
+    // Its texture's own average: the smallest mip, one texel.
+    surface.mean = push.color_map != 0u
+                       ? texture_2d(textures.color).SampleLevel(sampler_state(kSamplerLinearWrap), float2(0.5), 16.0).rgb * tint
+                       : surface.color;
     return surface;
 }
 
@@ -623,6 +639,7 @@ Surface layered_surface(VertexOutput input, float3 normal, float3 broad, float3 
     result.occlusion = 0.0;
     result.roughness = 0.0;
     result.height = 0.0;
+    result.mean = float3(0.0);
     float total = 0.0;
     const float soft = lerp(max(push.blend, 0.02), 1.0, smoothstep(kSoftFromM, kSoftToM, pixel.distance_m));
     const float floor_at = highest - soft;
@@ -633,6 +650,7 @@ Surface layered_surface(VertexOutput input, float3 normal, float3 broad, float3 
         result.normal += surfaces[i].normal * share;
         result.occlusion += surfaces[i].occlusion * share;
         result.roughness += surfaces[i].roughness * share;
+        result.mean += surfaces[i].mean * share;
         total += share;
     }
     if (total <= 0.0)
@@ -641,12 +659,24 @@ Surface layered_surface(VertexOutput input, float3 normal, float3 broad, float3 
         result.normal = normal;
         result.occlusion = 1.0;
         result.roughness = 0.92;
+        result.mean = result.color;
         return result;
     }
     result.color /= total;
+    result.mean /= total;
     result.normal = normalize(result.normal);
     result.occlusion /= total;
     result.roughness /= total;
+
+    // The color map: the layers tinted to it up close (their detail kept, their average its color), then it alone.
+    if (push.color_map != 0u)
+    {
+        const Texture2D map = texture_2d(push.materials[push.color_map - 1u].base_color_texture);
+        const float3 painted = map.SampleGrad(sampler_state(kSamplerLinearClamp), map_uv, ddx(map_uv), ddy(map_uv)).rgb;
+        const float3 tinted = result.color * clamp(painted / max(result.mean, float3(0.004)), 0.1, 8.0);
+        const float3 near = lerp(result.color, tinted, push.color_map_strength);
+        result.color = lerp(near, painted, smoothstep(kColorMapFromM, kColorMapToM, pixel.distance_m));
+    }
 
     // Where grass grows the ground takes its color: dark between the blades up close, so bare soil doesn't show through,
     // and as a blade's own color further off, so nothing marks where the last blades stop.

@@ -9,7 +9,9 @@
 #include "core/log.h"
 #include "core/profile.h"
 #include "physics/jolt_shapes.h"
+#include "physics/terrain_collision.h"
 #include "world/cell.h"
+#include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
 
@@ -25,6 +27,7 @@
 #include <Jolt/Physics/Body/BodyActivationListener.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
+#include <Jolt/Physics/Collision/BroadPhase/BroadPhaseQuery.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/CollisionCollectorImpl.h>
 #include <Jolt/Physics/Collision/RayCast.h>
@@ -34,6 +37,7 @@
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
 #include <Jolt/Physics/Collision/Shape/SphereShape.h>
 #include <Jolt/Physics/Collision/ShapeCast.h>
+#include <Jolt/Physics/Collision/TransformedShape.h>
 #include <Jolt/Physics/PhysicsSystem.h>
 // clang-format on
 
@@ -475,7 +479,8 @@ struct PoseColumns {
 
 struct Physics::State {
     explicit State(const PhysicsDesc& desc)
-        : temp(desc.temp_memory_bytes), gravity(desc.gravity_mps2), core_jobs(desc.jobs), assets(desc.assets) {
+        : temp(desc.temp_memory_bytes), gravity(desc.gravity_mps2), core_jobs(desc.jobs),
+          terrain(desc.jobs, core::heap_allocator(MemoryTag::Physics)), assets(desc.assets) {
         system.Init(desc.max_bodies, 0, desc.max_body_pairs, desc.max_contact_constraints, broad_phase_layers,
                     object_vs_broad_phase, object_vs_object);
         system.SetGravity(to_jolt(desc.gravity_mps2));
@@ -489,6 +494,7 @@ struct Physics::State {
         }
     }
     ~State() {
+        terrain.remove_all(system);
         if (single_threaded) {
             static_cast<JPH::JobSystemSingleThreaded*>(jobs)->~JobSystemSingleThreaded();
         } else {
@@ -518,6 +524,7 @@ struct Physics::State {
     void update_characters(float tick_s);
     PoseColumns columns_of(const ecs_world_t* c_world, const ecs_table_t* table) const;
     void write_transforms(const flecs::world& world);
+    void want_ground(const flecs::world& world);
     void step(flecs::iter& it);
 
     BroadPhaseLayers broad_phase_layers;
@@ -529,6 +536,9 @@ struct Physics::State {
     bool single_threaded = false;
     Vec3 gravity;
     core::JobSystem* core_jobs = nullptr;
+    // The ground's collision, around what needs it.
+    TerrainColliders terrain;
+    JPH::BodyIDVector awake_bodies; // kept, so a tick doesn't allocate
     uint32_t characters = 0;
     bool warned_out_of_bodies = false;
     JPH::EPhysicsUpdateError warned_errors = JPH::EPhysicsUpdateError::None;
@@ -1084,6 +1094,23 @@ void Physics::State::write_transforms(const flecs::world& world) {
     render_moved_rows->report({moved_rows.data(), reported});
 }
 
+// The ground is wanted around every camera, and needed under every character and moving body.
+void Physics::State::want_ground(const flecs::world& world) {
+    if (!terrain.has_terrain()) {
+        return;
+    }
+    world.each([this](const world::Camera&, const WorldTransform& place) { terrain.want(place.position, false); });
+    queries().characters.each([this](const CharacterController&, const Transform& place, const CharacterHandle&) {
+        terrain.want(place.position, true);
+    });
+    system.GetActiveBodies(JPH::EBodyType::RigidBody, awake_bodies);
+    const JPH::BodyInterface& bodies = system.GetBodyInterfaceNoLock();
+    for (const JPH::BodyID id : awake_bodies) {
+        terrain.want(to_dvec3(bodies.GetCenterOfMassPosition(id)), true);
+    }
+    terrain.update(system, object_layer::kStatic);
+}
+
 void Physics::State::step(flecs::iter& it) {
     DE_PROFILE_ZONE("physics step");
     const float tick_s = it.delta_time();
@@ -1095,6 +1122,7 @@ void Physics::State::step(flecs::iter& it) {
     create_characters(world);
     follow_transforms(tick_s);
     wake_what_lost_its_support();
+    want_ground(world); // what stands or falls on the ground has it before the step
     update_characters(tick_s);
     fell_asleep.reset(system.GetMaxBodies());
     system.SetBodyActivationListener(&fell_asleep);
@@ -1335,6 +1363,175 @@ bool Physics::sphere_cast(const DVec3& origin, float radius_m, const Vec3& direc
     return true;
 }
 
+namespace {
+
+// A leaf shape's triangles near center (box, relative to center) as lines, at its pose relative to center.
+// fade_m: above 0, lines fade out with their distance from center, from a tenth of it to nothing at 0.85 of it: far
+// lines bunch up on screen, so they have to be faint well before the end to not add up to a band there.
+void leaf_lines(const JPH::Shape& shape, const JPH::AABox& box, JPH::Vec3 position, JPH::Quat rotation, JPH::Vec3 scale,
+                const DVec3& center, uint32_t color, core::Array<world::DebugLine>& out, uint32_t max_lines,
+                float fade_m) {
+    constexpr int kBatch = 256;
+    JPH::Shape::GetTrianglesContext context;
+    shape.GetTrianglesStart(context, box, position, rotation, scale);
+    JPH::Float3 corners[kBatch * 3];
+    for (;;) {
+        const int count = shape.GetTrianglesNext(context, kBatch, corners);
+        if (count <= 0) {
+            return;
+        }
+        for (int t = 0; t < count; ++t) {
+            if (out.size() + 3 > max_lines) {
+                return;
+            }
+            const auto at = [&](int k) {
+                const JPH::Float3& c = corners[(t * 3) + k];
+                return center + DVec3(c.x, c.y, c.z);
+            };
+            uint32_t faded = color;
+            if (fade_m > 0.0f) {
+                // By the triangle's middle, so its three edges fade together.
+                const size_t first = static_cast<size_t>(t) * 3;
+                const JPH::Float3& a = corners[first];
+                const JPH::Float3& b = corners[first + 1];
+                const JPH::Float3& c = corners[first + 2];
+                const float x = (a.x + b.x + c.x) / 3.0f;
+                const float y = (a.y + b.y + c.y) / 3.0f;
+                const float z = (a.z + b.z + c.z) / 3.0f;
+                const float distance = std::sqrt((x * x) + (y * y) + (z * z));
+                const float from = fade_m * 0.1f;
+                const float to = fade_m * 0.85f;
+                const float kept = 1.0f - std::clamp((distance - from) / (to - from), 0.0f, 1.0f);
+                if (kept <= 0.0f) {
+                    continue;
+                }
+                const auto alpha = static_cast<uint32_t>(static_cast<float>(color >> 24U) * kept * kept * kept);
+                faded = (color & 0x00ffffffU) | (alpha << 24U);
+            }
+            // What fades (the ground) shows only where it's seen: through a ridge, its lines pile into a band.
+            const bool through = fade_m <= 0.0f;
+            out.push({.from = at(0), .to = at(1), .color = faded, .through = through});
+            out.push({.from = at(1), .to = at(2), .color = faded, .through = through});
+            out.push({.from = at(2), .to = at(0), .color = faded, .through = through});
+        }
+    }
+}
+
+// The same for any shape: only leaves list their triangles, so a scaled or moved one (and a compound) is broken into
+// its leaves first, each with its own pose and scale.
+void shape_lines(const JPH::Shape& shape, const JPH::AABox& box, JPH::Vec3 position, JPH::Quat rotation,
+                 const DVec3& center, uint32_t color, core::Array<world::DebugLine>& out, uint32_t max_lines,
+                 float fade_m = 0.0f) {
+    JPH::AllHitCollisionCollector<JPH::TransformedShapeCollector> leaves;
+    shape.CollectTransformedShapes(box, position, rotation, JPH::Vec3::sOne(), JPH::SubShapeIDCreator(), leaves,
+                                   JPH::ShapeFilter());
+    for (const JPH::TransformedShape& leaf : leaves.mHits) {
+        if (out.size() + 3 > max_lines) {
+            return;
+        }
+        leaf_lines(*leaf.mShape, box, JPH::Vec3(leaf.mShapePositionCOM), leaf.mShapeRotation, leaf.GetShapeScale(),
+                   center, color, out, max_lines, fade_m);
+    }
+}
+
+// A body's color by kind.
+uint32_t body_color(const JPH::Body& body) {
+    if (body.IsStatic()) {
+        return body.GetUserData() == 0 ? ColliderColors::kGround : ColliderColors::kStatic;
+    }
+    if (body.IsKinematic()) {
+        return ColliderColors::kKinematic;
+    }
+    return body.IsActive() ? ColliderColors::kAwake : ColliderColors::kAsleep;
+}
+
+} // namespace
+
+void Physics::collect_entity_collider_lines(const flecs::world& world, std::span<const flecs::entity_t> entities,
+                                            core::Array<world::DebugLine>& out, uint32_t max_lines) const {
+    DE_PROFILE_ZONE("collect entity collider lines");
+    constexpr float kEverywhereM = 1.0e6f;
+    const JPH::AABox everywhere(JPH::Vec3::sReplicate(-kEverywhereM), JPH::Vec3::sReplicate(kEverywhereM));
+    const JPH::BodyLockInterfaceNoLock& locks = state_->system.GetBodyLockInterfaceNoLock();
+    core::Array<flecs::entity_t> drawn(core::heap_allocator(MemoryTag::Physics)); // each body once
+    for (const flecs::entity_t id : entities) {
+        flecs::entity at = world.is_alive(id) ? world.entity(id) : flecs::entity();
+        // Its own body or character, or its nearest parent's.
+        for (uint32_t depth = 0; depth < 8 && at.is_valid(); ++depth) {
+            if (at.has<BodyHandle>() || at.has<CharacterHandle>()) {
+                break;
+            }
+            const auto* attached = at.try_get<flecs::Parent>();
+            at = attached != nullptr ? world.entity(attached->value) : at.parent();
+        }
+        if (!at.is_valid() || std::ranges::find(drawn, at.id()) != drawn.end()) {
+            continue;
+        }
+        drawn.push(at.id());
+        const DVec3 center = at.has<world::WorldTransform>() ? at.get<world::WorldTransform>().position : DVec3(0.0);
+        if (const auto* body = at.try_get<BodyHandle>(); body != nullptr && body->id != JPH::BodyID::cInvalidBodyID) {
+            const JPH::BodyLockRead lock(locks, JPH::BodyID(body->id));
+            if (lock.Succeeded()) {
+                const JPH::Body& locked = lock.GetBody();
+                shape_lines(*locked.GetShape(), everywhere,
+                            JPH::Vec3(locked.GetCenterOfMassPosition() - to_jolt(center)), locked.GetRotation(), center,
+                            body_color(locked), out, max_lines);
+            }
+        } else if (const auto* character = at.try_get<CharacterHandle>();
+                   character != nullptr && character->character != nullptr) {
+            shape_lines(*character->character->GetShape(), everywhere,
+                        JPH::Vec3(character->character->GetCenterOfMassPosition() - to_jolt(center)),
+                        character->character->GetRotation(), center, ColliderColors::kCharacter, out, max_lines);
+        }
+    }
+}
+
+void Physics::collect_collider_lines(const DVec3& center, float radius_m, core::Array<world::DebugLine>& out,
+                                     uint32_t max_lines, bool ground_only) const {
+    DE_PROFILE_ZONE("collect collider lines");
+    const JPH::AABox box(JPH::Vec3::sReplicate(-radius_m), JPH::Vec3::sReplicate(radius_m));
+    const JPH::AABox world_box(JPH::Vec3(to_jolt(center) - JPH::RVec3::sReplicate(radius_m)),
+                               JPH::Vec3(to_jolt(center) + JPH::RVec3::sReplicate(radius_m)));
+    // Every body there, whatever its layer.
+    JPH::AllHitCollisionCollector<JPH::CollideShapeBodyCollector> found;
+    state_->system.GetBroadPhaseQuery().CollideAABox(world_box, found);
+    const JPH::BodyLockInterfaceNoLock& locks = state_->system.GetBodyLockInterfaceNoLock();
+    for (const JPH::BodyID id : found.mHits) {
+        const JPH::BodyLockRead lock(locks, id);
+        if (!lock.Succeeded()) {
+            continue;
+        }
+        const JPH::Body& body = lock.GetBody();
+        const uint32_t color = body_color(body);
+        if (ground_only && color != ColliderColors::kGround) {
+            continue;
+        }
+        const JPH::Vec3 position(body.GetCenterOfMassPosition() - to_jolt(center));
+        // The ground fades out toward the edge of the reach, so it doesn't end in a hard edge.
+        shape_lines(*body.GetShape(), box, position, body.GetRotation(), center, color, out, max_lines,
+                    color == ColliderColors::kGround ? radius_m : 0.0f);
+    }
+    // Characters aren't bodies.
+    if (ground_only) {
+        return;
+    }
+    state_->queries().characters.each([&](CharacterController&, Transform&, CharacterHandle& handle) {
+        if (handle.character == nullptr) {
+            return;
+        }
+        const JPH::Vec3 position(handle.character->GetCenterOfMassPosition() - to_jolt(center));
+        if (position.Length() > radius_m * 2.0f) {
+            return;
+        }
+        shape_lines(*handle.character->GetShape(), box, position, handle.character->GetRotation(), center,
+                    ColliderColors::kCharacter, out, max_lines);
+    });
+}
+
+void Physics::set_terrain(const asset::TerrainAsset* terrain, platform::Vfs* vfs) {
+    state_->terrain.set_terrain(terrain, vfs, state_->system);
+}
+
 PhysicsStats Physics::stats() const {
     return {.bodies = state_->system.GetNumBodies(),
             .active_bodies = state_->system.GetNumActiveBodies(JPH::EBodyType::RigidBody),
@@ -1342,7 +1539,8 @@ PhysicsStats Physics::stats() const {
             .shapes = static_cast<uint32_t>(state_->shapes.size()) + state_->mesh_shapes,
             .transforms_written = state_->transforms_written,
             .transforms_compared = state_->transforms_compared,
-            .broad_phase_rebuilds = state_->broad_phase_rebuilds};
+            .broad_phase_rebuilds = state_->broad_phase_rebuilds,
+            .terrain_tiles = state_->terrain.tiles()};
 }
 
 } // namespace de::physics

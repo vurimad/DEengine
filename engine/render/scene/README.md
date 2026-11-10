@@ -91,3 +91,5 @@ Not yet: materials, baked normals (derived from the heights in the vertex shader
 - A static shadow cache (static casters drawn once, moving ones over them), local-light and cloud shadows, sun visibility for fog, temporal filtering of the mask; image-based lighting from probes, lighting groups with their key and fill lights, the diffuse/specular split (for subsurface), fog and haze, the tonemap curve as a table and grading LUTs, temporal anti-aliasing: the look study's list.
 - Occlusion culling, impostors for the far field (GPU-driven v1).
 - Streaming mips.
+
+Debug lines (dev builds, `set_debug_lines`): lines in world space, such as physics' colliders, drawn after the tonemap through the camera without TAA's jitter, nudged toward it so lines lying on a surface stay visible, twice against the scene's depth: faint where something stands in front (`shaders/scene/debug_lines.slang`), then solid where in view. Up to `kMaxDebugLines` a frame, from a buffer per frame in flight.

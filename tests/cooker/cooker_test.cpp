@@ -4,6 +4,7 @@
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/shader_format.h"
+#include "asset/terrain_layers_format.h"
 #include "asset/texture_format.h"
 #include "asset/world_format.h"
 #include "cooker/cook_state.h"
@@ -1756,6 +1757,49 @@ TEST_CASE("a model cooks with its picture: drawn in its colours, clear round it"
     remove_src(sandbox, "meta/props/rug.gltf.json");
     REQUIRE(run_cook(vfs).ok());
     CHECK_FALSE(vfs.exists(cooked_path(thumbnail_asset_id(mesh_id), AssetType::Texture).c_str()));
+}
+
+TEST_CASE("terrain layers name a color map, and how far up close the layers take its color") {
+    const Sandbox sandbox;
+    write_src(sandbox, "content/look/ground.material",
+              R"({"params": {"base_color": [0.5, 0.5, 0.5]}, "textures": {}})");
+    write_src(sandbox, "content/look/color.png", png(8, 8, color_texels(8, 3)));
+    write_src(sandbox, "content/look/color.material", R"({"textures": {"base_color": "color.png"}})");
+    write_src(sandbox, "content/look/land.terrainlayers", R"({
+  "color_map": "color.material",
+  "color_map_strength": 0.5,
+  "layers": [{"material": "ground.material", "tile_m": 2}]
+})");
+    Vfs vfs = cooker_vfs(sandbox);
+    REQUIRE(run_cook(vfs).ok());
+    const AssetId look_id = asset_id(guid_of(vfs, "src:/meta/look/land.terrainlayers.json"));
+    const AssetId color_id = asset_id(guid_of(vfs, "src:/meta/look/color.material.json"));
+    {
+        Cooked file(vfs, look_id, AssetType::TerrainLayers);
+        const auto& look = file.load<TerrainLayersAsset>();
+        REQUIRE(look.color_map != TerrainLayersAsset::kNone);
+        CHECK(look.header.dependencies.get(file.data())[look.color_map] ==
+              AssetRef{.id = color_id, .type = AssetType::Material});
+        CHECK(look.color_map_strength == 0.5f);
+    }
+    // Without one: none, at full strength if one comes.
+    write_src(sandbox, "content/look/land.terrainlayers",
+              R"({"layers": [{"material": "ground.material", "tile_m": 2}]})");
+    REQUIRE(run_cook(vfs).ok());
+    {
+        Cooked file(vfs, look_id, AssetType::TerrainLayers);
+        const auto& look = file.load<TerrainLayersAsset>();
+        CHECK(look.color_map == TerrainLayersAsset::kNone);
+        CHECK(look.color_map_strength == 1.0f);
+    }
+    // Out of range, or not a material: said so.
+    write_src(
+        sandbox, "content/look/land.terrainlayers",
+        R"({"color_map": "color.png", "color_map_strength": 2, "layers": [{"material": "ground.material", "tile_m": 2}]})");
+    const CookReport report = run_cook(vfs);
+    CHECK_FALSE(report.ok());
+    CHECK(has_message(report, "content/look/land.terrainlayers", "color_map_strength"));
+    CHECK(has_message(report, "content/look/land.terrainlayers", "material"));
 }
 
 TEST_CASE("textures and materials cook with their pictures: the image fitted, the material on a sphere") {

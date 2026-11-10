@@ -288,13 +288,29 @@ void console_show_command(void* user, const console::Args& args, console::Output
     out.info("console window %s", open ? "open" : "closed");
 }
 
+void physics_stats_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    const physics::PhysicsStats stats = static_cast<DevConsole*>(user)->engine.physics.stats();
+    out.info("bodies %u (%u awake), characters %u, shapes %u, ground tiles %u", stats.bodies, stats.active_bodies,
+             stats.characters, stats.shapes, stats.terrain_tiles);
+}
+
 void add_dev_commands(console::Console& console, DevConsole& dev) {
+    console.add_command("physics.stats", "", "Bodies, characters, shapes and the ground's collision tiles, now.",
+                        &physics_stats_command, &dev);
     console.add_command("stat", "[section | none | default | all]",
                         "Show or hide one section of the frame stats (F1). With nothing after it, lists the sections.",
                         &stat_command, &dev);
     console.add_command("stats", "<section,section,...>", "Show exactly these frame stats sections (as --stats does).",
                         &stats_command, &dev);
     console.add_variable("r.taa", "Temporal anti-aliasing on or off (F3).", &dev.engine.taa, &dev);
+    console.add_variable(
+        "physics.show_colliders",
+        "Draw physics' colliders near the camera: static blue, ground green, moving orange (grey asleep), "
+        "characters yellow.",
+        &dev.engine.show_colliders, &dev);
+    console.add_variable("physics.show_selected_colliders",
+                         "Draw only the application's chosen entities' colliders (the editor's selection).",
+                         &dev.engine.show_selected_colliders, &dev);
     console.add_variable("r.freeze_cull", "Freeze culling where the camera is now, to look around it (F4).",
                          &dev.engine.freeze_cull, &dev);
     console.add_variable("r.fog_low_camera", "Thin the height fog when the camera is low (F5).",
@@ -572,6 +588,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     physics.add_to_world(*world);
+#if DE_BUILD_DEV
+    core::Array<world::DebugLine> debug_lines(
+        core::heap_allocator(core::MemoryTag::Physics)); // kept: no allocation a frame
+#endif
     auto gpu_assets = render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
     if (!gpu_assets) {
         DE_LOG_ERROR("render", "gpu assets: %s", gpu_assets.error().message);
@@ -773,8 +793,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         if (!application.update(engine, static_cast<float>(frame_s))) {
             break; // the application is done (quit)
         }
-        assets->update();        // commits finished reads, unloads what nobody holds, reloads re-cooked files
-        gpu_assets->update();    // meshes whose uploads are in become drawable
+        assets->update();     // commits finished reads, unloads what nobody holds, reloads re-cooked files
+        gpu_assets->update(); // meshes whose uploads are in become drawable
+        // The ground's collision: the terrain the application names (the registry's bytes, current after update()).
+        physics.set_terrain(assets->get<asset::TerrainAsset>(engine.terrain), &*vfs);
         world->advance(frame_s); // fixed ticks, then RenderExtract
 
 #if DE_BUILD_DEV
@@ -860,6 +882,24 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             scene_renderer->set_water(engine.water);
 #if DE_BUILD_DEV
             scene_renderer->set_editor_overlay(engine.editor_overlay);
+            // Physics' colliders around the camera, when asked for.
+            debug_lines.clear();
+            if (const world::RenderFrame& drawn = world->render_frame(); drawn.camera.valid) {
+                const DVec3 camera = drawn.origin + DVec3(drawn.camera.transform[3], drawn.camera.transform[7],
+                                                          drawn.camera.transform[11]);
+                if (engine.show_colliders) {
+                    physics.collect_collider_lines(camera, Engine::kColliderReachM, debug_lines,
+                                                   render::SceneRenderer::kMaxDebugLines);
+                } else if (engine.show_selected_colliders) {
+                    if (engine.collider_ground) {
+                        physics.collect_collider_lines(camera, Engine::kColliderReachM, debug_lines,
+                                                       render::SceneRenderer::kMaxDebugLines, true);
+                    }
+                    physics.collect_entity_collider_lines(world->ecs(), engine.collider_entities, debug_lines,
+                                                          render::SceneRenderer::kMaxDebugLines);
+                }
+            }
+            scene_renderer->set_debug_lines(debug_lines.span());
             engine.editor_overlay.pick = false; // asked once
 #endif
             // The ground: when the application names another, or it's re-cooked.

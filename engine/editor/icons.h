@@ -24,6 +24,8 @@ enum class Icon : uint8_t {
     Camera,
     Center,
     Character,
+    Colliders,
+    CollidersSelected,
     Eye,
     FastForward,
     FocusSelection,

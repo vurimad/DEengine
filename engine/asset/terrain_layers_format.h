@@ -24,8 +24,8 @@ enum class TerrainProjection : uint32_t {
 enum class TerrainLayerFlags : uint32_t {
     None = 0,
     // Its detail channel is a coverage: how much of each texel the layer covers, 0 or 1 but at edges. Up close the rule
-    // draws a sharp edge through it; far off, where a pixel spans texels, the layer takes the share the channel averages
-    // to there, so features thinner than a pixel still show, as a camera sees them, rather than vanishing.
+    // draws a sharp edge through it; far off, where a pixel spans texels, the layer takes the share the channel
+    // averages to there, so features thinner than a pixel still show, as a camera sees them, rather than vanishing.
     DetailCoverage = 1U << 0U,
 };
 DE_ENUM_FLAGS(TerrainLayerFlags)
@@ -76,7 +76,7 @@ static_assert(sizeof(TerrainGrass) == 112);
 // .delayers: the binary form of a .terrainlayers text source. Its materials are its dependencies, loaded with it.
 struct TerrainLayersAsset {
     static constexpr AssetType kType = AssetType::TerrainLayers;
-    static constexpr uint16_t kFormatVersion = 5;
+    static constexpr uint16_t kFormatVersion = 6; // 6: the color map
     static constexpr uint32_t kNone = UINT32_MAX;
 
     AssetHeader header;
@@ -85,23 +85,29 @@ struct TerrainLayersAsset {
                             // four channels stretched over the whole map. kNone: every channel reads 0
     uint32_t details = kNone; // the same, for what the generator found in the land's own shape: where snow lies, where
                               // water runs, where scree gathers, where ridges stand out. Finer than the masks
-    uint32_t lighting = kNone; // the same, for light baked for the environment's sun (shaders/scene/terrain_light.slang):
-                               // how deep in shadow each place lies (r) and how much sky it sees (g). White: all lit
-    uint32_t normals = kNone;  // a material whose normal texture holds the ground's own normal over the whole map, finer
-                               // than its heights: red is the normal's x (east), green its z (south). Far off, where the
-                               // mesh is coarse, it still shades every rib. kNone: the mesh's normals
-    float blend = 0.25f;       // how soft height blending is: the share of a surface's height range that shows through
+    uint32_t lighting =
+        kNone; // the same, for light baked for the environment's sun (shaders/scene/terrain_light.slang):
+               // how deep in shadow each place lies (r) and how much sky it sees (g). White: all lit
+    uint32_t normals = kNone; // a material whose normal texture holds the ground's own normal over the whole map, finer
+                              // than its heights: red is the normal's x (east), green its z (south). Far off, where the
+                              // mesh is coarse, it still shades every rib. kNone: the mesh's normals
+    float blend = 0.25f;      // how soft height blending is: the share of a surface's height range that shows through
     TerrainGrass grass;
     uint32_t colors = kNone; // a material whose metallic-roughness texture holds masks over the whole map the ground's
                              // color is painted from per pixel (shaders/scene/terrain.slang, paint_ground): ridges (r),
                              // drainage (g), scree (b), and as far as alpha says, it takes the layers' color's place;
                              // they still give their normals and roughness. A test for now. kNone: the layers' color
+    uint32_t color_map = kNone; // a material whose base color texture holds the ground's color over the whole map, as
+                                // the tool that made the land shows it (World Creator's color map): far off it's the
+                                // ground's color; up close the layers' textures are tinted to it, keeping their detail,
+                                // as far as color_map_strength says. kNone: the layers' own color
+    float color_map_strength = 1.0f; // 0 to 1: how far up close the layers take the color map's color
 
     // The layers inside the file, and no more than kTerrainMaxLayers; each one's material, and the masks, details,
     // lighting, normals and colors, a Material among the dependencies; every number finite, in range and each rule in
     // order.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(TerrainLayersAsset) == 208);
+static_assert(sizeof(TerrainLayersAsset) == 216);
 
 } // namespace de::asset

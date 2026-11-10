@@ -6,6 +6,7 @@ Jolt on the engine's memory and jobs, stepping with the world (docs/design.md, P
 | --- | --- |
 | `physics.h` | `Physics`, and the components: `Collider` and `RigidBody` for bodies, `CharacterController` for what walks |
 | `jolt_shapes.h` | What the cooker shares with it, with no Jolt types: Jolt's setup, and building a mesh shape's bytes (library `de::physics_shapes`) |
+| `terrain_collision.h` | The ground's collision: Jolt height fields from the terrain's heights file, around what needs them (private to the library) |
 
 ## How it fits
 
@@ -24,6 +25,19 @@ A cell entity with a mesh asks for it with `"collision": "mesh"` (`tools/cooker/
 - **Holding.** A cell has its entities' `.dephys` as dependencies, so it isn't Ready, and its members don't exist, until they're loaded, and they go after its bodies. A `MeshCollider` set from code doesn't hold its asset, like `MeshInstance`: whoever set it does. Its body waits, a look at the registry each tick, and the frame doesn't. Physics keeps a shape while the registry has its asset: on `Unloaded` the shape goes.
 - **A reload** swaps the shape: at the next tick the bodies that use it go, and come back from the new one, and what rested on them wakes. A refused asset that's cooked again, or a failed one whose file appears, gets its bodies then too.
 - **Refused:** a failed or corrupt asset, one from another Jolt, a scale with a zero. Logged, no body, and not asked about again. The rest of the world carries on.
+
+## The ground
+
+`Physics::set_terrain` names the cooked terrain to collide with (the framework calls it each frame with the world's, after the registry's update). The ground then exists only where something needs it:
+
+- **Tiles.** One Jolt `HeightFieldShape` per node of the terrain's finest level: 128 squares a side, so 256 m at 2 m spacing, the same samples the renderer draws at its finest (the border left out), compressed by Jolt to within 1 cm. A static body each, on the static layer, with no entity: a ray that hits the ground has `QueryHit::entity` 0.
+- **Where.** Each tick, before characters move and the step: around every camera (`world::Camera`), character and awake body, tiles within 320 m are read (one block of the heights file, through the VFS's async reads) and built on the job system, and added once they're built. Those within 24 m of a character or awake body are waited for, so nothing falls through ground still loading. A tile nothing has wanted for `kTerrainForgetTicks` (300, 5 s) goes, and one built after nothing wanted it any more is never added. Without a job system, tiles are read and built at once.
+- **What it costs.** About 35 KB of samples and Jolt's compressed field a tile; 30 to 60 tiles around a camera at 1 m spacing. Another terrain, or the same re-cooked, starts over. `physics.stats` in the console prints the tile count.
+- **Not yet.** Holes (caves), materials per square (footsteps), and the coarser levels far off (only what's near anything has collision).
+
+## Seeing the colliders
+
+`Physics::collect_collider_lines` lists what's there to collide with near a point as lines along its triangles: every body's shape (boxes, spheres and capsules as Jolt makes their triangles, meshes, the ground's height fields; a scaled or moved shape broken into its leaves first, as Jolt asks) and every character's, colored by kind (`ColliderColors`: static blue, ground green, moving orange or grey asleep, kinematic violet, characters yellow). The ground's lines fade with their distance from the point (from a tenth of the reach to nothing at 85% of it), and aren't drawn through what hides them (`world::DebugLine::through`): seen edge-on behind a ridge, they'd pile into a bright band. `collect_entity_collider_lines` does the same for given entities wherever they are (each one's body or character, or its nearest parent's). Dev builds draw them over the scene: all within 60 m of the camera (`physics.show_colliders on`), or only the application's chosen entities (`physics.show_selected_colliders on`: the editor's selection); the editor has a toolbar button for each (`render::SceneRenderer::set_debug_lines`).
 
 ## What meshes cost
 

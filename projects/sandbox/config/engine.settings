@@ -6,3 +6,6 @@ world   76d76b87e8562965
 
 # Temporal anti-aliasing at start: on or off (F3 toggles it in dev builds).
 taa     on
+
+# What F6 and F7 drop in dev builds, to see physics: a model's GUID (its meta has it): content/props/boulder_01/boulder_01.gltf
+debug_drop_mesh   6681c1d7-0c12-4528-9523-2642e902ae2d

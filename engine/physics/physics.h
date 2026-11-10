@@ -1,14 +1,18 @@
 #pragma once
 
+#include "core/array.h"
 #include "core/math.h"
+#include "world/render_extract.h"
 
 #include <flecs.h>
 
 #include <cstdint>
+#include <span>
 
 namespace de::asset {
 class AssetRegistry;
 struct AssetNotice;
+struct TerrainAsset;
 } // namespace de::asset
 
 namespace de::core {
@@ -17,6 +21,10 @@ class JobSystem;
 
 namespace de::world {
 class World;
+}
+
+namespace de::platform {
+class Vfs;
 }
 
 namespace de::physics {
@@ -100,6 +108,20 @@ struct PhysicsStats {
     uint32_t transforms_written = 0;
     uint32_t transforms_compared = 0;
     uint32_t broad_phase_rebuilds = 0; // ever: for a first load, which is the only thing worth one
+    uint32_t terrain_tiles = 0;        // the ground's collision: height fields with a body now
+};
+
+// The ground's collision (Physics::set_terrain): a tile nothing has wanted for this many ticks goes.
+inline constexpr uint64_t kTerrainForgetTicks = 300; // 5 s at 60 ticks
+
+// The colors collect_collider_lines gives each kind, rgba8 with red low.
+struct ColliderColors {
+    static constexpr uint32_t kStatic = 0xffe0b040U;    // what doesn't move: a cyan-blue
+    static constexpr uint32_t kGround = 0xff50c050U;    // the terrain's height fields: green
+    static constexpr uint32_t kAwake = 0xff3090ffU;     // a moving body, awake: orange
+    static constexpr uint32_t kAsleep = 0xff909090U;    // a moving body, asleep: grey
+    static constexpr uint32_t kKinematic = 0xffff60d0U; // moved by its Transform: violet
+    static constexpr uint32_t kCharacter = 0xff40ffffU; // a character's capsule: yellow
 };
 
 // What's between a query and what it hit.
@@ -153,6 +175,24 @@ public:
     // The same for a sphere moved along it: the first thing it touches. distance_m is how far its center gets.
     bool sphere_cast(const DVec3& origin, float radius_m, const Vec3& direction, float distance_m, QueryHit& hit,
                      const QueryFilter& filter = {}) const;
+
+    // The ground to collide with (terrain_collision.h): a cooked terrain whose bytes stay valid while it's set (the
+    // registry's), and where its heights are read from; null for none. Cheap to call each frame: another terrain, or
+    // the same cooked again, starts over. The ground then comes, a 256 m tile at a time (at 2 m spacing), around each
+    // camera, character and moving body, built on the job system; what stands or falls on a tile waits for it. Rays
+    // that hit it hit no entity (QueryHit::entity 0).
+    void set_terrain(const asset::TerrainAsset* terrain, platform::Vfs* vfs);
+
+    // What's there to collide with near center, as lines along its triangles, for a debug view: every body's shape
+    // (boxes, spheres and capsules as Jolt makes their triangles, meshes, the ground's height fields) and every
+    // character's, by kind (ColliderColors), up to max_lines; ground_only: the ground's alone. Not for use during a
+    // step.
+    void collect_collider_lines(const DVec3& center, float radius_m, core::Array<world::DebugLine>& out,
+                                uint32_t max_lines, bool ground_only = false) const;
+    // The same for these entities' colliders, wherever they are: each one's body or character, or, if it has none,
+    // its nearest parent's (a body's mesh hangs from it). Not for use during a step.
+    void collect_entity_collider_lines(const flecs::world& world, std::span<const flecs::entity_t> entities,
+                                       core::Array<world::DebugLine>& out, uint32_t max_lines) const;
 
     PhysicsStats stats() const;
 

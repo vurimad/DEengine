@@ -226,9 +226,13 @@ bool Viewer::update(Engine& engine, float frame_s) {
 #if DE_BUILD_DEV
 void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
     if (!rock_mesh_.is_valid()) {
-        // The test level's boulder (content/props/boulder_01).
+        // The project's rock to drop: debug_drop_mesh in its config/engine.settings, a model's GUID (from its meta).
+        // The engine names none of a project's assets.
+        const std::string_view named = setting(engine.settings, "debug_drop_mesh");
         asset::Guid guid;
-        if (!asset::parse_guid("6681c1d7-0c12-4528-9523-2642e902ae2d", guid)) {
+        if (!asset::parse_guid(named, guid)) {
+            DE_LOG_ERROR("physics", "nothing to drop: set debug_drop_mesh in the project's config/engine.settings to a "
+                                    "model's GUID (its meta has it)");
             return;
         }
         rock_mesh_ = engine.assets.load<asset::MeshAsset>(asset::asset_id(guid), platform::IoPriority::Critical);
@@ -236,7 +240,8 @@ void Viewer::drop_rocks(Engine& engine, uint32_t count, bool rubble) {
     }
     const auto* mesh = engine.assets.get<asset::MeshAsset>(rock_mesh_);
     if (mesh == nullptr) {
-        DE_LOG_ERROR("physics", "no rock to drop: the boulder's mesh didn't load");
+        DE_LOG_ERROR("physics", "nothing to drop: debug_drop_mesh's model didn't load (is it cooked?)");
+        rock_mesh_ = {};
         return;
     }
     if (rock_half_.x == 0.0f) {

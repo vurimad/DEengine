@@ -15,7 +15,8 @@
 
 namespace de::world {
 struct RenderFrame;
-}
+struct DebugLine;
+} // namespace de::world
 
 namespace de::render {
 
@@ -282,6 +283,11 @@ public:
     // then). A pick is asked once: it's answered a few frames later, by pick_answer().
     void set_editor_overlay(const EditorOverlay& overlay);
     PickAnswer pick_answer() const;
+    // The debug views' lines (physics' colliders) over the next frames, until set again: drawn over the image without
+    // TAA's jitter, solid where in view and faint where the scene hides them, up to kMaxDebugLines. The span must stay
+    // valid until the next add_passes(); empty: none.
+    static constexpr uint32_t kMaxDebugLines = 256U * 1024U;
+    void set_debug_lines(std::span<const world::DebugLine> lines);
 #endif
 
     // Whether the height fog thins with a low camera (SceneFog::low_camera_keep): on, unless turned off to compare.
@@ -310,6 +316,9 @@ private:
     GraphTexture add_editor_passes(RenderGraph& graph, GraphTexture ids, GraphTexture depth, uint64_t frame_address,
                                    uint32_t slot);
     void add_editor_outline(RenderGraph& graph, GraphTexture mask, GraphTexture target, uint32_t srgb_target);
+    // The debug views' lines over the finished image, tested against the scene's depth.
+    void add_debug_lines(RenderGraph& graph, GraphTexture depth, GraphTexture target, rhi::Format target_format,
+                         uint64_t frame_address, const DVec3& origin, uint32_t slot, uint32_t srgb_target);
 #endif
 
     SceneRendererState* state_ = nullptr;

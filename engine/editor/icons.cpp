@@ -19,6 +19,8 @@ constexpr const char* kNames[] = {
     "camera",
     "center",
     "character",
+    "colliders",
+    "colliders_selected",
     "eye",
     "fast_forward",
     "focus_selection",

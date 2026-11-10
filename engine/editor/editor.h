@@ -243,8 +243,9 @@ private:
     PropertiesPanel properties_;
     Thumbnails thumbnails_; // before the browser, which draws them
     AssetBrowser browser_;
-    bool show_cells_ = false;           // View > Cell Grid
-    bool snap_ground_ = false;          // the toolbar's surface snapping
+    bool show_cells_ = false;  // View > Cell Grid
+    bool snap_ground_ = false; // the toolbar's surface snapping
+    core::Array<flecs::entity_t> collider_entities_{core::heap_allocator(core::MemoryTag::Editor)}; // shown
     float ui_scale_ = 1.0f;             // the user's, on top of the display's
     float applied_ui_scale_ = 0.0f;     // what the style was last made with
     float applied_display_ = 0.0f;      //

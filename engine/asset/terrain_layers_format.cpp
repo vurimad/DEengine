@@ -91,6 +91,12 @@ core::Result<void> TerrainLayersAsset::validate(std::span<const std::byte> file)
     if (colors != kNone && !is_material(colors)) {
         return core::fail(ErrorCode::CorruptData, "terrain colors aren't a material among the dependencies");
     }
+    if (color_map != kNone && !is_material(color_map)) {
+        return core::fail(ErrorCode::CorruptData, "the terrain's color map isn't a material among the dependencies");
+    }
+    if (!within(color_map_strength, 0.0f, 1.0f)) {
+        return core::fail(ErrorCode::CorruptData, "the terrain's color map strength is out of range");
+    }
     if (!within(blend, 0.0f, 1.0f)) {
         return core::fail(ErrorCode::CorruptData, "terrain layers' blend is out of range");
     }

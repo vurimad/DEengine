@@ -1770,3 +1770,57 @@ TEST_CASE("benchmark: physics at scale") {
     }
     mesh_benchmark(big);
 }
+
+TEST_CASE("collider lines: every shape near a point, scaled ones too, colored by kind, and none past the reach") {
+    using de::physics::ColliderColors;
+    Scene scene;
+    scene.box({0.0, -0.5, 0.0}, {5.0f, 0.5f, 5.0f});          // static
+    const flecs::entity ball = scene.sphere({0.0, 3.0, 0.0}); // dynamic, awake as it falls
+    de::world::place(ball, Transform{.position = {0.0, 3.0, 0.0}, .scale = Vec3(2.0f)});
+    scene.box({500.0, 0.0, 0.0}, {1.0f, 1.0f, 1.0f}); // far off
+    scene.ticks(2);
+    de::core::Array<de::world::DebugLine> lines(de::core::heap_allocator(de::core::MemoryTag::Physics));
+    scene.physics.collect_collider_lines({0.0, 0.0, 0.0}, 20.0f, lines, 100000);
+    REQUIRE(lines.size() > 0);
+    CHECK(lines.size() % 3 == 0); // three edges a triangle
+    uint32_t static_lines = 0;
+    uint32_t awake_lines = 0;
+    double highest = -1e9;
+    for (const de::world::DebugLine& line : lines) {
+        CHECK(std::abs(line.from.x) < 100.0); // nothing from the far box
+        static_lines += line.color == ColliderColors::kStatic ? 1U : 0U;
+        if (line.color == ColliderColors::kAwake) {
+            ++awake_lines;
+            highest = std::max({highest, line.from.y, line.to.y});
+        }
+    }
+    CHECK(static_lines == 36); // a box: 12 triangles
+    CHECK(awake_lines > 0);
+    // The ball at its scale: a radius of 1 m, not 0.5.
+    CHECK(highest - where(ball).y == doctest::Approx(1.0).epsilon(0.05));
+    // Capped.
+    lines.clear();
+    scene.physics.collect_collider_lines({0.0, 0.0, 0.0}, 20.0f, lines, 10);
+    CHECK(lines.size() <= 10);
+    // The ground alone: none here.
+    lines.clear();
+    scene.physics.collect_collider_lines({0.0, 0.0, 0.0}, 20.0f, lines, 100000, true);
+    CHECK(lines.empty());
+
+    // Only some entities', wherever they are: the far box, and the ball through something hanging from it.
+    const flecs::entity far_box = scene.box({500.0, 0.0, 0.0}, {1.0f, 1.0f, 1.0f});
+    scene.ticks(1);
+    const flecs::entity shown = scene.ecs().entity();
+    de::world::attach(shown, ball);
+    const flecs::entity_t chosen[] = {far_box.id(), shown.id(), far_box.id()};
+    lines.clear();
+    scene.physics.collect_entity_collider_lines(scene.ecs(), chosen, lines, 100000);
+    uint32_t far_lines = 0;
+    uint32_t ball_lines = 0;
+    for (const de::world::DebugLine& line : lines) {
+        far_lines += line.from.x > 400.0 ? 1U : 0U;
+        ball_lines += line.from.x < 100.0 ? 1U : 0U;
+    }
+    CHECK(far_lines == 36); // once, though it's named twice
+    CHECK(ball_lines > 0);
+}

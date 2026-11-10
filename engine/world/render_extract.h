@@ -218,4 +218,13 @@ struct RenderExtractDesc {
 // updates: it stays drawn where it was.
 void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtractDesc& desc);
 
+// A line for the debug views of dev builds (physics' colliders), in world space: drawn over the scene, faint where
+// something stands in front of it (render::SceneRenderer::set_debug_lines).
+struct DebugLine {
+    DVec3 from{0.0};
+    DVec3 to{0.0};
+    uint32_t color = 0xffffffffU; // rgba8, red in the low byte, as seen (sRGB)
+    bool through = true;          // also drawn, faint, where something hides it
+};
+
 } // namespace de::world

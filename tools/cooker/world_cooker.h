@@ -25,9 +25,9 @@ struct WorldBuild {
     asset::AssetRef terrain_layers;                    // next, if it has them (their ID valid)
     bool sea = false;
     float sea_level_m = 0.0f;
-    asset::AssetRef sea_shore; // the shore map's material, if it has one (its ID valid)
-    asset::AssetRef sea_foam;  // the foam's material, likewise
-    core::Array<SourcePath> read{tools_heap()};        // the sources it names: environment, terrain, layers, cells
+    asset::AssetRef sea_shore;                  // the shore map's material, if it has one (its ID valid)
+    asset::AssetRef sea_foam;                   // the foam's material, likewise
+    core::Array<SourcePath> read{tools_heap()}; // the sources it names: environment, terrain, layers, cells
 };
 
 // A .world text source (JSON): what a world is made of. Paths are relative to the world file.
@@ -60,6 +60,9 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //       "lighting": "light.material",    // the same, for light baked for the environment's sun
 //       "normals": "normals.material",   // its normal texture: the ground's own normal over the whole map (x, z)
 //       "colors": "paint.material",      // its metallic_roughness texture: masks the ground is painted from per pixel
+//       "color_map": "color.material",   // its base_color texture: the ground's color over the whole map (far off; up
+//                                        // close the layers are tinted to it)
+//       "color_map_strength": 1,         // 0 to 1: how far up close the layers take its color
 //       "blend": 0.25,                   // how soft blending by height is, 0 to 1
 //       "layers": [{                     // required
 //         "material": "sand.material",   // required: metallic_roughness holds occlusion, roughness, height
@@ -70,12 +73,11 @@ core::Array<std::byte> cook_world(const WorldBuild& build, asset::AssetId id);
 //         "mask_range": [0.4, 0.6],      // that channel's rule
 //         "detail": "g",                 // r, g, b or a: only as far as this channel of the details says too
 //         "detail_range": [0.2, 0.5],    // that channel's rule
-//         "detail_coverage": true,       // that channel is how much of each texel it covers: far off, it takes the share
-//         "noise": 0.5,                  // how far noise breaks up where these rules fade
-//         "noise_large": 0,              // 0 breaks it up at about 30 m, 1 at about 300 m
-//         "variation": 0.1,              // how far its brightness wanders across the land
-//         "tint": [1, 0.9, 0.8],         // multiplies its color, linear
-//         "projection": "sides"          // "top" (the default) or "sides", for steep ground
+//         "detail_coverage": true,       // that channel is how much of each texel it covers: far off, it takes the
+//         share "noise": 0.5,                  // how far noise breaks up where these rules fade "noise_large": 0, // 0
+//         breaks it up at about 30 m, 1 at about 300 m "variation": 0.1,              // how far its brightness wanders
+//         across the land "tint": [1, 0.9, 0.8],         // multiplies its color, linear "projection": "sides" // "top"
+//         (the default) or "sides", for steep ground
 //       }],
 //       "grass": {                       // blades made around the camera
 //         "density_per_m2": 120,         // required: up close, where it all grows
@@ -98,6 +100,8 @@ struct TerrainLayersBuild {
     uint32_t lighting = asset::TerrainLayersAsset::kNone;
     uint32_t normals = asset::TerrainLayersAsset::kNone;
     uint32_t colors = asset::TerrainLayersAsset::kNone;
+    uint32_t color_map = asset::TerrainLayersAsset::kNone;
+    float color_map_strength = 1.0f;
     float blend = 0.25f;
     asset::TerrainGrass grass;
     core::Array<SourcePath> read{tools_heap()}; // the sources it names

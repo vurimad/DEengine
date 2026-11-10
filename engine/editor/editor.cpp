@@ -99,6 +99,8 @@ struct Settings {
     float drawer_share = 0.4f;
     bool cell_grid = false;
     bool snap_ground = false;
+    bool colliders = false;
+    bool selected_colliders = false;
 };
 
 float to_number(std::string_view text, float fallback) {
@@ -144,6 +146,10 @@ Settings load_settings(const platform::Vfs& vfs) {
             settings.cell_grid = on;
         } else if (key == "snap_ground") {
             settings.snap_ground = on;
+        } else if (key == "colliders") {
+            settings.colliders = on;
+        } else if (key == "selected_colliders") {
+            settings.selected_colliders = on;
         } else if (key == "drawer") {
             settings.drawer_share = std::clamp(to_number(value, settings.drawer_share), 0.15f, 0.85f);
         } else if (key == "handles") {
@@ -165,19 +171,20 @@ Settings load_settings(const platform::Vfs& vfs) {
 void save_settings(const platform::Vfs& vfs, const Settings& settings) {
     constexpr const char* kTools[] = {"select", "move", "rotate", "scale"};
     char text[512];
-    const int length =
-        std::snprintf(text, sizeof(text),
-                      "# The editor's interface scale (on top of the display's), its tool, its axes, where its handles "
-                      "sit and its snapping.\n"
-                      "ui_scale %.2f\ntool %s\nspace %s\nhandles %s\nsnap_move %s %g\nsnap_rotate %s %g\n"
-                      "snap_scale %s %g\ndrawer %.2f\ncell_grid %s\nsnap_ground %s\n",
-                      static_cast<double>(settings.ui_scale), kTools[static_cast<int>(settings.tool)],
-                      settings.space == Space::Local ? "local" : "world",
-                      settings.handles_at == HandlesAt::Center ? "center" : "pivot", settings.snap.move ? "on" : "off",
-                      static_cast<double>(settings.snap.move_m), settings.snap.rotate ? "on" : "off",
-                      static_cast<double>(settings.snap.rotate_deg), settings.snap.scale ? "on" : "off",
-                      static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share),
-                      settings.cell_grid ? "on" : "off", settings.snap_ground ? "on" : "off");
+    const int length = std::snprintf(
+        text, sizeof(text),
+        "# The editor's interface scale (on top of the display's), its tool, its axes, where its handles "
+        "sit and its snapping.\n"
+        "ui_scale %.2f\ntool %s\nspace %s\nhandles %s\nsnap_move %s %g\nsnap_rotate %s %g\n"
+        "snap_scale %s %g\ndrawer %.2f\ncell_grid %s\nsnap_ground %s\ncolliders %s\nselected_colliders %s\n",
+        static_cast<double>(settings.ui_scale), kTools[static_cast<int>(settings.tool)],
+        settings.space == Space::Local ? "local" : "world",
+        settings.handles_at == HandlesAt::Center ? "center" : "pivot", settings.snap.move ? "on" : "off",
+        static_cast<double>(settings.snap.move_m), settings.snap.rotate ? "on" : "off",
+        static_cast<double>(settings.snap.rotate_deg), settings.snap.scale ? "on" : "off",
+        static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share),
+        settings.cell_grid ? "on" : "off", settings.snap_ground ? "on" : "off", settings.colliders ? "on" : "off",
+        settings.selected_colliders ? "on" : "off");
     if (length > 0) {
         static_cast<void>(vfs.write_file(kSettingsPath, std::as_bytes(std::span(text, static_cast<size_t>(length)))));
     }
@@ -336,6 +343,8 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     drawer_share_ = settings.drawer_share;
     show_cells_ = settings.cell_grid;
     snap_ground_ = settings.snap_ground;
+    engine.show_colliders = settings.colliders;
+    engine.show_selected_colliders = settings.selected_colliders;
     show_cells_ = show_cells_ || app::has_flag(args, "--cell-grid");
     if (const char* typed = app::flag_value(args, "--cmd"); typed != nullptr && engine.console_ui != nullptr) {
         engine.console_ui->set_command_line(typed);
@@ -400,7 +409,9 @@ void Editor::shutdown(app::Engine& engine) {
                                    .snap = snap_,
                                    .drawer_share = drawer_share_,
                                    .cell_grid = show_cells_,
-                                   .snap_ground = snap_ground_});
+                                   .snap_ground = snap_ground_,
+                                   .colliders = engine.show_colliders,
+                                   .selected_colliders = engine.show_selected_colliders});
     }
     commands_.clear();
     release_holds();
@@ -636,6 +647,17 @@ DVec3 Editor::handles_origin(const app::Engine& engine, flecs::entity selected) 
 }
 
 void Editor::send_selection(app::Engine& engine) {
+    // The selection's colliders: its entities and what hangs from them (selected_entities_), each found by physics on
+    // itself or its nearest parent.
+    collider_entities_.clear();
+    if (selection_.kind == Selection::Kind::Entity) {
+        collider_entities_.assign(selection_.entities.span());
+        for (const flecs::entity_t id : selected_entities_) {
+            collider_entities_.push(id);
+        }
+    }
+    engine.collider_entities = collider_entities_.span();
+    engine.collider_ground = selection_.kind == Selection::Kind::Terrain;
     engine.editor_overlay.enabled = true;
     engine.editor_overlay.selected = selected_meshes_.span();
     engine.editor_overlay.terrain_selected = selection_.kind == Selection::Kind::Terrain;
@@ -1061,6 +1083,18 @@ void Editor::playground_toolbar(app::Engine& engine) {
         if (icon_button(icons_, "##snap_ground", Icon::SnapTerrain,
                         "Keep what's moved on the ground (the terrain, or what's below it)", snap_ground_)) {
             snap_ground_ = !snap_ground_;
+        }
+        // Physics' colliders: all near the camera, or the selection's.
+        ImGui::SameLine(0.0f, px(8.0f));
+        if (icon_button(icons_, "##colliders", Icon::Colliders,
+                        "Show the colliders near the camera (physics.show_colliders)", engine.show_colliders)) {
+            engine.show_colliders = !engine.show_colliders;
+        }
+        ImGui::SameLine();
+        if (icon_button(icons_, "##colliders_selected", Icon::CollidersSelected,
+                        "Show the selection's colliders (the terrain's near the camera, if it's chosen)",
+                        engine.show_selected_colliders)) {
+            engine.show_selected_colliders = !engine.show_selected_colliders;
         }
 
         // The right: the camera's speed, the view, framing the selection.
