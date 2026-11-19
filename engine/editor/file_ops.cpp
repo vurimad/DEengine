@@ -76,7 +76,7 @@ bool path_rules_hold(std::string_view path) {
 
 bool names_files(std::string_view path) {
     for (const std::string_view extension :
-         {".world", ".cell", ".material", ".terrain", ".terrainlayers", ".environment", ".gltf"}) {
+         {".world", ".cell", ".material", ".terrain", ".terrainlayers", ".environment", ".gltf", ".prefab"}) {
         if (path.ends_with(extension)) {
             return true;
         }

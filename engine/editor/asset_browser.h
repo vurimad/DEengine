@@ -51,6 +51,16 @@ public:
         files_changed_ = false;
         return changed;
     }
+    // A prefab asked for by New Prefab, named but not yet a file ("src:/content/props/shelf.prefab"): the editor
+    // opens it in the prefab editor, whose first save makes it. Once.
+    bool take_new_prefab(core::FixedString<255>& path) {
+        if (new_prefab_.empty()) {
+            return false;
+        }
+        path = new_prefab_;
+        new_prefab_.clear();
+        return true;
+    }
     // Models' pictures on their cards and rows; null: their glyphs.
     void set_thumbnails(Thumbnails* thumbnails) { thumbnails_ = thumbnails; }
 
@@ -144,7 +154,17 @@ private:
     core::Array<SourcePath> deleting_;
     core::Array<SourcePath> users_;
     bool open_delete_ = false;
+    // The New Prefab dialog: the folder it goes in, its name as typed; and the one asked for, until the editor takes
+    // it.
+    Path new_prefab_folder_;
+    char new_prefab_text_[96] = {};
+    bool open_new_prefab_ = false;
+    Path new_prefab_;
     Path show_file_; // to open when next drawn
+    // The file last shown that way, lit for a moment so the eye finds it.
+    uint32_t pinged_ = UINT32_MAX;
+    double pinged_until_s_ = 0.0;
+    void draw_ping(uint32_t entry, ImVec2 min, ImVec2 max) const;
     // Kept from the last session, applied once the folders are read: the folder shown and what was selected there.
     Path start_folder_;
     core::Array<Path> start_selected_;

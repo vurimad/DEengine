@@ -7,11 +7,15 @@
 #include "editor/cell_map_panel.h"
 #include "editor/cell_saver.h"
 #include "editor/commands.h"
+#include "editor/effect_viewer.h"
 #include "editor/entity_record.h"
 #include "editor/gizmo.h"
 #include "editor/hierarchy_panel.h"
 #include "editor/icons.h"
 #include "editor/navigation.h"
+#include "editor/prefab_editor.h"
+#include "editor/preview_pictures.h"
+#include "editor/project_watch.h"
 #include "editor/properties_panel.h"
 #include "editor/selection.h"
 #include "editor/thumbnails.h"
@@ -59,6 +63,7 @@ public:
     bool startup(app::Engine& engine, const app::FrameworkArgs& args) override;
     bool update(app::Engine& engine, float frame_s) override;
     void ui(app::Engine& engine) override;
+    void draw(app::Engine& engine) override;
     void shutdown(app::Engine& engine) override;
     // The window's close button with unsaved edits: asked first (Save, Don't Save, Cancel).
     bool may_close(app::Engine& engine) override;
@@ -92,7 +97,7 @@ private:
     // The world selected in the resources; with unsaved edits, asked first (unsaved_asked: it was).
     void open_world(app::Engine& engine, bool unsaved_asked = false);
     // What waits on the unsaved edits' question, and the question.
-    enum class Pending : uint8_t { None, Quit, OpenWorld };
+    enum class Pending : uint8_t { None, Quit, OpenWorld, OpenProject };
     void unsaved_prompt(app::Engine& engine);
     // Asks the GPU what's at a pixel of the scene's texture; take_pick selects it once the answer is back
     // (Engine::pick_answer).
@@ -172,8 +177,31 @@ private:
     // What the made entities draw with, held while the editor runs (or until another world opens).
     asset::AssetHandle hold(const asset::AssetRef& ref);
     void release_holds();
-    // The cooker over what the last save wrote, in the background (unless it's running).
-    void start_cook(app::Engine& engine);
+    // The cooker in the background (unless it's running): over what the last save wrote, or the whole project.
+    void start_cook(app::Engine& engine, bool whole_project = false);
+    // The whole project cooked, in the background: the status bar's Cook, Ctrl+B, editor.cook.
+    const char* cook_project(app::Engine& engine); // what came of asking, for the console
+    static void cook_command(void* user, const console::Args& args, console::Output& out);
+    // Each frame: the watch over the project's files and, with Cook automatically on, a cook once they've changed.
+    void watch_project(app::Engine& engine);
+    // What the cooker's report says of a cook of the whole project: the status bar's line, each error in the Output.
+    void report_cook(app::Engine& engine, int exit_code);
+    // The status bar's right end: what the cook's doing, Cook automatically, Cook.
+    void cook_controls(app::Engine& engine, float frame_y);
+    // File > Open World: the project's .world files by name. File > Open Project: the projects beside the engine;
+    // another one opens in an editor of its own, and this one closes.
+    void world_menu(app::Engine& engine);
+    void project_menu(app::Engine& engine);
+    void open_project(app::Engine& engine, bool unsaved_asked = false);
+    // What the two menus list: the project's worlds with the IDs the cooker gave them, and the projects' names.
+    void list_worlds(app::Engine& engine);
+    void list_projects(app::Engine& engine);
+    static std::string_view open_project_name(const app::Engine& engine);
+    // editor.open_world [NAME], editor.open_project [NAME]: as the File menu's two; with no name, they list.
+    static void open_world_command(void* user, const console::Args& args, console::Output& out);
+    static void open_project_command(void* user, const console::Args& args, console::Output& out);
+    // The layout, the Resources' and the editor's settings, written now (unless it's a picture's run).
+    void save_user_settings(app::Engine& engine);
     // editor.save, in the console: the same.
     static void save_command(void* user, const console::Args& args, console::Output& out);
     // editor.move NAME X Y Z: that entity to there (world meters), as a command, selected.
@@ -241,7 +269,49 @@ private:
     uint64_t gathered_for_ = 0;                      // which were chosen when gathered
     float gathered_s_ = 0.0f;
     PropertiesPanel properties_;
-    Thumbnails thumbnails_; // before the browser, which draws them
+    // What the chosen entity is made from (its prefab, model, effect: src:/ paths), for its properties: found from
+    // its entry when another is chosen.
+    void update_sources(app::Engine& engine);
+    flecs::entity_t sources_of_ = 0;
+    // Shows a source file in Resources: its folder opened in the drawer, the file lit for a moment.
+    void show_in_resources(std::string_view path);
+    Thumbnails thumbnails_;      // before the browser, which draws them
+    PreviewPictures pictures_;   // draws the ones the cooker can't: effects, prefabs
+    EffectViewer effect_viewer_; // one effect by itself, under a clock of its own (docs/design.md, VFX viewer)
+    // Shows an effect's source in the viewer; false, with the reason in message_, if it can't be.
+    bool view_effect(app::Engine& engine, std::string_view path);
+    static void view_effect_command(void* user, const console::Args& args, console::Output& out);
+    static void effect_command(void* user, const console::Args& args, console::Output& out);
+    PrefabEditor prefab_editor_; // one prefab's source, to make and change (docs/design.md, The prefab editor)
+    // Opens a prefab's source in the prefab editor, or a new one that isn't a file yet; false, with the reason in
+    // message_, if it can't be.
+    bool edit_prefab(app::Engine& engine, std::string_view path);
+    bool new_prefab(app::Engine& engine, std::string_view path);
+    // editor.edit_prefab PATH, editor.new_prefab PATH, and editor.prefab ...: what its window does.
+    static void edit_prefab_command(void* user, const console::Args& args, console::Output& out);
+    static void new_prefab_command(void* user, const console::Args& args, console::Output& out);
+    static void prefab_command(void* user, const console::Args& args, console::Output& out);
+    // Edit > Make Prefab from Selection: a new prefab (not a file until it's saved) whose parts are the chosen
+    // things, placed from the one the handles are on; it opens in the prefab editor. The things themselves stay as
+    // they are. False, with the reason in message_, if nothing chosen can be a part.
+    bool prefab_from_selection(app::Engine& engine, std::string_view path);
+    static void prefab_from_selection_command(void* user, const console::Args& args, console::Output& out);
+    // Its question: the prefab's name, in the folder of what its first part is made from.
+    void ask_make_prefab(app::Engine& engine);
+    void make_prefab_prompt(app::Engine& engine);
+    core::FixedString<255> make_prefab_folder_;
+    char make_prefab_text_[96] = {};
+    bool open_make_prefab_ = false;
+    // Edit > Add Light: a point light a little above where the middle of the Playground meets the ground (or at a
+    // place given), as a command, chosen. Its values are its properties'; a save writes it into its cell.
+    bool add_light(app::Engine& engine, const DVec3* at = nullptr);
+    static void add_light_command(void* user, const console::Args& args, console::Output& out);
+    // Over the Playground: how far each chosen light reaches (a chosen placement's lights too), as rings about it.
+    void draw_light_reach(app::Engine& engine, const View& view, ImDrawList* draw);
+    // What an entity's entry says it's made from (src:/ paths; with a prefab, which variant; with a model, whether
+    // it's solid). False if it has no entry to read.
+    bool read_sources(flecs::entity entity, EntitySources& sources, core::FixedString<31>& variant, bool& solid);
+    static PictureEngine picture_engine(app::Engine& engine);
     AssetBrowser browser_;
     bool show_cells_ = false;  // View > Cell Grid
     bool snap_ground_ = false; // the toolbar's surface snapping
@@ -282,6 +352,25 @@ private:
     uint64_t keyed_changes_ = UINT64_MAX; // commands_.changes() when their keys were noted
     core::Array<flecs::entity_t> scratch_entities_;
     bool quit_ = false;
+    // Cooking what changed outside the editor.
+    ProjectWatch watch_;
+    bool watching_ = false;         // someone's at it: not a picture's run or a counted one
+    bool cook_auto_ = true;         // the status bar's switch: cook when the project's files change
+    uint32_t fps_cap_kept_ = 0;     // Preferences' frame rate limit: what's saved, whatever --fps-cap says for this run
+    bool cook_whole_ = false;       // the cook running is the whole project's (asked for, or a change's), not a save's
+    bool cook_failed_ = false;      // the last one left errors
+    bool cook_marks_due_ = false;   // a cook has ended: the next look says what the files were left as
+    uint32_t cook_marks_look_ = 0;  // that look: the first to start after the cook ended
+    uint64_t cook_start_stamp_ = 0; // the watch's stamp when a cook of the whole project started; 0: not known
+    uint64_t cooked_stamp_ = 0;     // the stamp of what's cooked; 0: not known
+    char cook_state_[96] = {};      // the status bar's: what the last cook came to
+    // File > Open World's and Open Project's, listed as each opens.
+    core::Array<platform::PathString> world_files_{core::heap_allocator(core::MemoryTag::Editor)};
+    core::Array<asset::AssetId> world_ids_{core::heap_allocator(core::MemoryTag::Editor)}; // none: no meta yet
+    bool worlds_listed_ = false;
+    core::Array<core::FixedString<63>> project_names_{core::heap_allocator(core::MemoryTag::Editor)};
+    bool projects_listed_ = false;
+    core::FixedString<63> project_to_open_; // while its unsaved prompt is up
 };
 
 } // namespace de::editor

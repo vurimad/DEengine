@@ -5,6 +5,8 @@ add_library(de_app STATIC
     frame_clock.h
     framework.cpp
     framework.h
+    preview_scene.cpp
+    preview_scene.h
     viewer.cpp
     viewer.h)
 add_library(de::app ALIAS de_app)

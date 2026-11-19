@@ -78,6 +78,22 @@ struct Buffer {
     uint64_t memory_bytes = 0;
 };
 
+// An acceleration structure, in a buffer of its own.
+struct Acceleration {
+    VkAccelerationStructureKHR handle = VK_NULL_HANDLE;
+    VkBuffer buffer = VK_NULL_HANDLE; // its storage
+    VmaAllocation allocation = VK_NULL_HANDLE;
+    // A top level's scratch, kept: it's built again every frame. A bottom level makes one for its one build.
+    VkBuffer scratch = VK_NULL_HANDLE;
+    VmaAllocation scratch_allocation = VK_NULL_HANDLE;
+    uint64_t scratch_address = 0;
+    uint64_t scratch_bytes = 0; // what a build needs
+    uint64_t address = 0;
+    uint64_t memory_bytes = 0;
+    uint32_t capacity = 0; // a top level's instances; a bottom level's runs of triangles
+    bool top_level = false;
+};
+
 struct Pipeline {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineBindPoint bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -115,7 +131,8 @@ struct PendingDestroy {
     VkBuffer buffer = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    uint64_t memory_bytes = 0; // counted in pending_destroy_bytes until freed
+    VkAccelerationStructureKHR acceleration = VK_NULL_HANDLE; // before the buffer it's in
+    uint64_t memory_bytes = 0;                                // counted in pending_destroy_bytes until freed
 };
 
 // Hands out the entries of one kind of table (sampled or storage): an entry is the same position
@@ -150,6 +167,7 @@ struct CommandListImpl {
     bool graphics_bound = false;
     bool index_buffer_bound = false;
     bool compute_bound = false;
+    ListWork work; // CommandList::work()
 };
 
 inline constexpr uint32_t kMaxCommandListsPerFrame = 64;
@@ -230,6 +248,10 @@ struct DeviceImpl {
     Texture& texture(TextureHandle handle);
     Buffer& buffer(BufferHandle handle);
     Pipeline& pipeline(PipelineHandle handle);
+    Acceleration& acceleration(AccelerationHandle handle);
+    // A GPU-only buffer for an acceleration structure's storage or a build's scratch, at the alignment scratch needs.
+    bool create_acceleration_buffer(uint64_t size, bool scratch, const char* name, VkBuffer& buffer,
+                                    VmaAllocation& allocation, uint64_t& address, uint64_t& memory_bytes);
     void set_debug_name(VkObjectType type, uint64_t object, const char* name) const;
     void free_pending(FrameSlot& slot);
     FrameSlot& current_slot() { return frames[frame_index % kFramesInFlight]; }
@@ -254,6 +276,8 @@ struct DeviceImpl {
     core::SlotMap<Texture> textures;
     core::SlotMap<Buffer> buffers;
     core::SlotMap<Pipeline> pipelines;
+    core::SlotMap<Acceleration> accelerations;
+    uint32_t scratch_alignment = 1; // of a build's scratch, as the GPU wants it
     // The one layout every pipeline uses: kMaxPushConstantBytes of push constants for all stages,
     // and the bindless set (set 0).
     VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;

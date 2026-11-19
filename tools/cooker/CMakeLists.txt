@@ -20,6 +20,9 @@ add_library(de_cooker STATIC
     cook_state.h
     cooker.cpp
     cooker.h
+    effect_cooker.cpp
+    effect_cooker.h
+    entity_transform.h
     fbx_import.cpp
     gltf_import.cpp
     json.cpp
@@ -30,6 +33,8 @@ add_library(de_cooker STATIC
     mesh_cooker.h
     model.cpp
     model.h
+    prefab_cooker.cpp
+    prefab_cooker.h
     settings.cpp
     settings.h
     shader_cooker.cpp

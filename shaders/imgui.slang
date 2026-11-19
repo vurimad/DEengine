@@ -13,6 +13,9 @@ struct ImGuiPush
     uint sampler;      // DefaultSampler
     uint srgb_target;  // 1: the target encodes sRGB, so ImGui's sRGB colors go in linear
     uint vertex_base;  // the draw's first vertex: draws use vertex offset 0, so SV_VertexID is the index
+    uint coded_texture; // 1: the texture is one of ImGui's own (its font atlas, a page of pictures): 8-bit colours as
+                        // a screen is sent them, like ImGui's, in a texture that doesn't say so
+    uint reserved;
 };
 
 [[vk::push_constant]]
@@ -49,5 +52,10 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
 [shader("fragment")]
 float4 fragment_main(VertexOutput input) : SV_Target
 {
-    return input.color * sample_texture(push.texture, push.sampler, input.uv);
+    float4 texel = sample_texture(push.texture, push.sampler, input.uv);
+    if (push.srgb_target != 0 && push.coded_texture != 0)
+    {
+        texel.rgb = srgb_to_linear(texel.rgb);
+    }
+    return input.color * texel;
 }

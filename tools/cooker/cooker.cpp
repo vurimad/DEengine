@@ -13,9 +13,11 @@
 #include "cooker/cell_cooker.h"
 #include "cooker/collision_cooker.h"
 #include "cooker/cook_state.h"
+#include "cooker/effect_cooker.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/model.h"
+#include "cooker/prefab_cooker.h"
 #include "cooker/shader_cooker.h"
 #include "cooker/source_tree.h"
 #include "cooker/terrain_cooker.h"
@@ -44,7 +46,8 @@ namespace {
 // bug): every source cooks again. Format versions are hashed in too, per kind.
 // Models' pictures (thumbnail_cooker.h): a change to how they're drawn cooks the models again, nothing else.
 constexpr uint64_t kThumbnailVersion = 1;
-constexpr uint64_t kCookerVersion = 6; // 2: cell children are as static as their parent; 6: longer LOD chains
+// 2: cell children are as static as their parent; 6: longer LOD chains; 7: glTF transmission blends
+constexpr uint64_t kCookerVersion = 7;
 
 constexpr std::string_view kShaderTests = "shaders/tests/";
 
@@ -129,6 +132,10 @@ private:
                 cook_world_source(source);
             } else if (source.kind == SourceKind::Environment) {
                 cook_environment_source(source);
+            } else if (source.kind == SourceKind::Effect) {
+                cook_effect_source(source);
+            } else if (source.kind == SourceKind::Prefab) {
+                cook_prefab_source(source);
             } else if (source.kind == SourceKind::Terrain) {
                 cook_terrain_source(source);
             } else if (source.kind == SourceKind::TerrainLayers) {
@@ -836,12 +843,18 @@ private:
             return;
         }
         const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
-        const auto input_hash = [&](std::span<const SourcePath> meshes) {
+        const auto input_hash = [&](std::span<const SourcePath> named) {
             Hasher hasher("cell");
             hasher.add(source.id.value());
             hasher.add(asset::CellAsset::kFormatVersion);
             hasher.add(source_hash);
-            hash_source_ids(hasher, meshes);
+            hash_source_ids(hasher, named);
+            // Of a prefab it places, its variants' names too: the cell names them, and nothing else of its text.
+            for (const SourcePath& file : named) {
+                if (extension_of(file.view()) == ".prefab") {
+                    hasher.add(prefab_variants(file.view()));
+                }
+            }
             return hasher.value();
         };
         if (const CookRecord* last = previous_.find(path); last != nullptr) {
@@ -856,7 +869,29 @@ private:
             failed(path, &record);
             return;
         }
+        // A variant asked of a prefab that doesn't have it: said here, where the prefab can be read.
+        bool variants_there = true;
+        for (const CellBuild::VariantUse& use : build->variant_uses) {
+            const SourcePath& prefab = build->prefab_sources[use.prefab];
+            const core::Result<core::Array<std::byte>> text = read_source(prefab.view());
+            if (!text || !prefab_has_variant(text->span(), use.variant.view())) {
+                diagnostics_.error(path, "%s: %s has no variant '%s'", use.entity.c_str(), prefab.c_str(),
+                                   use.variant.c_str());
+                variants_there = false;
+            }
+        }
+        if (!variants_there) {
+            failed(path, &record);
+            return;
+        }
+        // The sources it names: a model, an effect or a prefab that's gone, or has another ID, cooks it again.
         record.dependencies.assign(build->mesh_sources.span());
+        for (const SourcePath& effect : build->effect_sources) {
+            record.dependencies.push(effect);
+        }
+        for (const SourcePath& prefab : build->prefab_sources) {
+            record.dependencies.push(prefab);
+        }
         record.input_hash = input_hash(record.dependencies.span());
         next_.put(std::move(record));
         ++stats_.cooked;
@@ -928,6 +963,86 @@ private:
             import_environment(source, bytes->span(), diagnostics_);
         if (!environment ||
             !write(record, source.id, asset::AssetType::Environment, cook_environment(*environment, source.id))) {
+            failed(path, &record);
+            return;
+        }
+        record.input_hash = hasher.value();
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
+
+    // A prefab's variants' names, hashed: read once per run however many cells place it.
+    uint64_t prefab_variants(std::string_view path) {
+        if (const uint64_t* known = prefab_variant_hashes_.find(path_key(path)); known != nullptr) {
+            return *known;
+        }
+        const core::Result<core::Array<std::byte>> bytes = read_whole_file(vfs_, src_path(path).c_str());
+        const uint64_t hash = bytes ? prefab_variants_hash(bytes->span()) : 0;
+        prefab_variant_hashes_.set(path_key(path), hash);
+        return hash;
+    }
+
+    // The prefabs it nests are read to flatten it, so their bytes are its inputs; the models and effects its parts
+    // name only by their IDs.
+    void cook_prefab_source(const Source& source) {
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        const auto input_hash = [&](std::span<const SourcePath> read) {
+            Hasher hasher("prefab");
+            hasher.add(source.id.value());
+            hasher.add(asset::PrefabAsset::kFormatVersion);
+            hasher.add(source_hash);
+            for (const SourcePath& file : read) {
+                if (extension_of(file.view()) == ".prefab") {
+                    hash_files(hasher, std::span(&file, 1));
+                }
+            }
+            hash_source_ids(hasher, read);
+            return hasher.value();
+        };
+        if (const CookRecord* last = previous_.find(path); last != nullptr) {
+            if (const CookRecord* same = unchanged(path, input_hash(last->dependencies.span())); same != nullptr) {
+                keep(*same);
+                return;
+            }
+        }
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
+        const auto read = [this](std::string_view source_path) { return read_source(source_path); };
+        const core::Result<PrefabBuild> build = import_prefab(tree_, source, bytes->span(), read, diagnostics_);
+        if (!build || !write(record, source.id, asset::AssetType::Prefab, cook_prefab(*build, source.id))) {
+            failed(path, &record);
+            return;
+        }
+        record.dependencies.assign(build->read.span());
+        record.input_hash = input_hash(record.dependencies.span());
+        next_.put(std::move(record));
+        ++stats_.cooked;
+    }
+
+    void cook_effect_source(const Source& source) {
+        const std::string_view path = source.path.view();
+        const core::Result<core::Array<std::byte>> bytes = read_source(path);
+        if (!bytes) {
+            failed(path);
+            return;
+        }
+        const uint64_t source_hash = core::hash_bytes(bytes->data(), bytes->size());
+        Hasher hasher("effect");
+        hasher.add(source.id.value());
+        hasher.add(asset::EffectAsset::kFormatVersion);
+        hasher.add(source_hash);
+        if (const CookRecord* same = unchanged(path, hasher.value()); same != nullptr) {
+            keep(*same);
+            return;
+        }
+        CookRecord record{.path = source.path, .guid = source.guid, .source_hash = source_hash};
+        const core::Result<EffectBuild> effect = import_effect(source, bytes->span(), diagnostics_);
+        if (!effect || !write(record, source.id, asset::AssetType::Effect, cook_effect(*effect, source.id))) {
             failed(path, &record);
             return;
         }
@@ -1274,9 +1389,10 @@ private:
     CookState previous_;
     CookState next_;
     SourceTree tree_;
-    core::HashMap<uint64_t, TextureUsage> usages_{tools_heap()};  // texture path -> how it is used
-    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};     // asset ID -> source path key, this run
-    core::HashMap<uint64_t, uint64_t> file_hashes_{tools_heap()}; // path key -> content hash, this run
+    core::HashMap<uint64_t, TextureUsage> usages_{tools_heap()};            // texture path -> how it is used
+    core::HashMap<uint64_t, uint64_t> written_{tools_heap()};               // asset ID -> source path key, this run
+    core::HashMap<uint64_t, uint64_t> file_hashes_{tools_heap()};           // path key -> content hash, this run
+    core::HashMap<uint64_t, uint64_t> prefab_variant_hashes_{tools_heap()}; // path key -> its variants' names, hashed
 };
 
 } // namespace

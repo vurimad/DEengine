@@ -2,6 +2,8 @@ find_package(slang CONFIG REQUIRED)
 
 add_library(de_shader STATIC
     shader_asset.h
+    shader_cache.cpp
+    shader_cache.h
     shader_compiler.cpp
     shader_compiler.h
     shader_library.cpp

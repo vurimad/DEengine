@@ -643,8 +643,8 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
         return core::fail(core::ErrorCode::InvalidArgument, "the environment has errors");
     }
     const JsonReader reader{.object = doc->root(), .path = path, .diagnostics = &diagnostics};
-    static constexpr const char* kKeys[] = {"sun",     "sky", "ground", "shadow_color", "exposure_ev",
-                                            "shadows", "fog", "wind",   "sea"};
+    static constexpr const char* kKeys[] = {"sun",     "sky", "ground", "shadow_color", "exposure_ev", "auto_exposure",
+                                            "shadows", "fog", "wind",   "sea",          "under_roof"};
     reader.check_keys(kKeys, "environment");
     asset::EnvironmentAsset environment;
 
@@ -670,6 +670,32 @@ core::Result<asset::EnvironmentAsset> import_environment(const Source& source, s
     double exposure_ev = 0.0;
     required(reader, "exposure_ev", -20.0, 20.0, exposure_ev);
     environment.exposure_ev = static_cast<float>(exposure_ev);
+    double under_roof = 0.0;
+    if (reader.has("under_roof")) {
+        required(reader, "under_roof", 0.0, 1.0, under_roof);
+    }
+    environment.under_roof = static_cast<float>(under_roof);
+    // How the exposure follows the scene here; left out, the engine's own.
+    if (reader.has("auto_exposure")) {
+        yyjson_val* exposure = yyjson_obj_get(doc->root(), "auto_exposure");
+        const JsonReader exposure_reader{.object = exposure, .path = path, .diagnostics = &diagnostics};
+        static constexpr const char* kExposureKeys[] = {"below_ev", "above_ev", "adaptation"};
+        if (!yyjson_is_obj(exposure)) {
+            diagnostics.error(path, "auto_exposure should be an object: below_ev, above_ev, adaptation");
+        } else {
+            exposure_reader.check_keys(kExposureKeys, "auto_exposure");
+            float* const fields[] = {&environment.exposure_below_ev, &environment.exposure_above_ev,
+                                     &environment.exposure_adaptation};
+            const double most[] = {20.0, 20.0, 1.0};
+            for (size_t k = 0; k < std::size(kExposureKeys); ++k) {
+                double value = 0.0;
+                if (exposure_reader.has(kExposureKeys[k]) &&
+                    required(exposure_reader, kExposureKeys[k], 0.0, most[k], value)) {
+                    *fields[k] = static_cast<float>(value);
+                }
+            }
+        }
+    }
 
     yyjson_val* shadows = yyjson_obj_get(doc->root(), "shadows");
     if (!yyjson_is_obj(shadows)) {

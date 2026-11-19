@@ -592,10 +592,13 @@ TEST_CASE("a mesh with its vertices split all over still gets a long LOD chain, 
     const auto parts = mesh.parts.get(file.data());
     CHECK(lods.size() >= 6); // what the default setting allows, this far
     CHECK(lods.size() <= 8);
+    CHECK(lods[0].seams_moved == 0); // as it came
     for (size_t i = 1; i < lods.size(); ++i) {
         CAPTURE(i);
         CHECK(lods[i].error >= lods[i - 1].error);
         CHECK(parts[lods[i].first_part].index_count < parts[lods[i - 1].first_part].index_count * 3 / 4);
+        // It only got there by moving its seams, and says so: what reads its surface's colour takes another level.
+        CHECK(lods[i].seams_moved == 1);
     }
 }
 
@@ -643,6 +646,7 @@ TEST_CASE("a mesh that simplifies well keeps its uv seams in every LOD") {
     const auto mesh_indices = mesh.indices.get(file.data());
     REQUIRE(lods.size() >= 4);
     for (size_t l = 0; l < 4; ++l) {
+        CHECK(lods[l].seams_moved == 0);
         const MeshPart& part = parts[lods[l].first_part];
         uint32_t crossing = 0;
         for (uint32_t i = 0; i < part.index_count; i += 3) {
@@ -1572,6 +1576,10 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     {"name": "mist_f", "fog_volume": {"density_per_m": 0.2, "edge_m": "wide"}},
     {"name": "mist_g", "fog_volume": {"density_per_m": 0.2, "noise_amount": 2, "noise_size_m": 0, "drift_mps": [1, 2], "height_fade_m": -1}},
     {"name": "mist_h", "fog_volume": {"density_per_m": 0.2, "noise_size_m": 1e-60}},
+    {"name": "mist_i", "fog_volume": {"density_per_m": 0.2, "under_roof": 2}},
+    {"name": "mist_j", "fog_volume": {"density_per_m": 0}},
+    {"name": "pool_a", "water": 1},
+    {"name": "pool_b", "water": {"shape": "circle", "waves": 2, "depth": 1}},
   ],
 })");
     write_src(sandbox, "content/world/cell_5_5.cell", R"({
@@ -1581,7 +1589,9 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
      "fog_volume": {"shape": "ellipsoid", "density_per_m": 0.2, "edge_m": 2, "tint": [0.5, 0.6, 0.7],
                     "noise_amount": 0.75, "noise_size_m": 5, "drift_mps": [0.5, 0.25, 1.5], "height_fade_m": 3}},
     {"name": "fog wall", "position": [710, 0, 700], "fog_volume": {"density_per_m": 0.1}},
-    {"name": "plain", "position": [720, 0, 700]},
+    {"name": "plain", "position": [720, 0, 700], "fog_volume": {"density_per_m": 0, "under_roof": 0.75}},
+    {"name": "lake", "position": [730, 40, 700], "scale": [60, 1, 40], "water": {"shape": "ellipse", "waves": 0.3}},
+    {"name": "trough", "position": [740, 2, 700], "water": {"shape": "rectangle"}},
   ],
 })");
     Vfs vfs = cooker_vfs(sandbox);
@@ -1612,6 +1622,12 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
     CHECK(has_message(report, broken, "mist_g: fog_volume noise_amount should be from 0 to 1"));
     CHECK(has_message(report, broken, "mist_g: fog_volume drift_mps should be 3 numbers"));
     CHECK(has_message(report, broken, "mist_g: fog_volume height_fade_m should be 0 or more"));
+    CHECK(has_message(report, broken, "mist_i: fog_volume under_roof should be 0 to 1"));
+    CHECK(has_message(report, broken, "mist_j: fog_volume needs a density_per_m above 0")); // with nothing else to say
+    CHECK(has_message(report, broken, "pool_a: water should be an object"));
+    CHECK(has_message(report, broken, "pool_b: water shape should be ellipse or rectangle"));
+    CHECK(has_message(report, broken, "pool_b: water waves should be from 0 to 1"));
+    CHECK(has_message(report, broken, "unknown water setting 'depth'"));
     CHECK_FALSE(has_message(report, "content/world/cell_5_5.cell", ""));
     CHECK(report.stats.failed == 1);
     CHECK_FALSE(has_message(report, "content/world/cell_1_2.cell", ""));
@@ -1623,12 +1639,17 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
         Cooked mist_file(vfs, asset_id(guid_of(vfs, "src:/meta/world/cell_5_5.cell.json")), AssetType::Cell);
         const auto& mist_cell = mist_file.load<CellAsset>();
         const auto volumes = mist_cell.fog_volumes.get(mist_file.data());
-        REQUIRE(volumes.size() == 2);
+        REQUIRE(volumes.size() == 3);
         const auto placed = mist_cell.entities.get(mist_file.data());
-        REQUIRE(placed.size() == 3);
+        REQUIRE(placed.size() == 5);
         CHECK(placed[0].fog_volume == 0);
         CHECK(placed[1].fog_volume == 1);
-        CHECK(placed[2].fog_volume == CellEntity::kNone);
+        // A place under a roof, with no fog of its own: a volume all the same.
+        REQUIRE(placed[2].fog_volume == 2);
+        CHECK(volumes[2].density_per_m == 0.0f);
+        CHECK(volumes[2].under_roof == 0.75f);
+        CHECK(volumes[0].under_roof < 0.0f); // unsaid by default: the environment's
+        CHECK(placed[3].fog_volume == CellEntity::kNone);
         CHECK(volumes[0].shape == de::asset::CellFogShape::Ellipsoid);
         CHECK(volumes[0].density_per_m == 0.2f);
         CHECK(volumes[0].edge_m == 2.0f);
@@ -1644,6 +1665,17 @@ TEST_CASE("cells place models by path, parents first, and cook again when a mode
         CHECK(volumes[1].noise_size_m > 0.0f);
         CHECK(volumes[1].drift_mps[0] == 0.0f);
         CHECK(volumes[1].height_fade_m == 0.0f);
+        // Lakes and ponds: an ellipse by default, a few waves.
+        const auto water = mist_cell.water_bodies.get(mist_file.data());
+        REQUIRE(water.size() == 2);
+        CHECK(placed[0].water_body == CellEntity::kNone);
+        CHECK(placed[3].water_body == 0);
+        CHECK(placed[4].water_body == 1);
+        CHECK(placed[3].fog_volume == CellEntity::kNone);
+        CHECK(water[0].shape == de::asset::CellWaterShape::Ellipse);
+        CHECK(water[0].waves == 0.3f);
+        CHECK(water[1].shape == de::asset::CellWaterShape::Rectangle);
+        CHECK(water[1].waves == 0.15f);
     }
     {
         Cooked file(vfs, cell_id, AssetType::Cell);

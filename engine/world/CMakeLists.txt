@@ -6,6 +6,8 @@ add_library(de_world STATIC
     cell.h
     flecs_os.cpp
     flecs_os.h
+    prefab.cpp
+    prefab.h
     render_extract.cpp
     render_extract.h
     terrain_heights.cpp

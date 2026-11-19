@@ -38,6 +38,7 @@ debug.freeze_cull           key:F4
 debug.toggle_fog_low_camera key:F5
 debug.drop_rocks            key:F6
 debug.drop_rubble           key:F7
+debug.frame_debugger        key:F8
 
 # Raw stick readout, deengine --show-sticks (dev builds)
 debug.stick_left_x          gamepad:leftx

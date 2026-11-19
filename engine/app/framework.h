@@ -7,6 +7,7 @@
 #include <flecs.h>
 
 #include <cstdint>
+#include <span>
 #include <string_view>
 
 namespace de::core {
@@ -39,6 +40,7 @@ class Physics;
 }
 namespace de::tools {
 class ConsoleUi;
+class FrameDebugger;
 class StatsPanel;
 } // namespace de::tools
 namespace de::world {
@@ -52,6 +54,8 @@ namespace de::app {
 //   --frames N       exit after N frames (smoke runs; validation errors fail the run)
 //   --no-vsync       present without waiting for vertical blank
 //   --no-validation  skip the Vulkan validation layer in debug and dev builds
+//   --no-shader-cache  compile every shader from its source at start, taking none from user:/shader_cache
+//   --shader-compiles N  at most N shaders compiled at once (default: a quarter of the workers, 4 at most)
 //   --game-dir DIR   folder mounted as game:/ (default ./cooked; a dev build without one there uses its source tree's)
 //   --project DIR    dev builds: the project to open, its folder or .deproject file, relative to the working
 //                    directory or the engine's repository (default: the build's, projects/sandbox); its sources
@@ -82,7 +86,10 @@ struct FrameworkArgs {
     bool fullscreen = false; // --fullscreen: the display's own size, whatever the window's
     bool vsync = true;
     uint32_t fps_cap = 0; // --fps-cap 60: no more frames a second than this, on a machine others use; 0: none
+    // Dev builds: --frame-debugger starts with the frame debugger open (tools/frame_debugger.h), for pictures of it.
     bool validation = true;
+    bool shader_cache = true;     // --no-shader-cache: off
+    uint32_t shader_compiles = 0; // --shader-compiles N; 0: the default
     bool show_sticks = false;
 #if DE_BUILD_DEV
     EyesFlags eyes;
@@ -145,13 +152,43 @@ struct Engine {
     // What each frame draws, as the application sets it.
     render::SceneLighting lighting;
     render::SceneView view = render::SceneView::Lit;
-    bool taa = false;                  // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
-    asset::AssetHandle terrain;        // the ground, a .deterrain the application keeps loaded; none: no ground
-    asset::AssetHandle terrain_layers; // how it looks, a .delayers the application keeps loaded; none: a plain look
-    render::SceneWater water;          // the world's water: none at first
-    bool fog_low_camera = true;        // SceneRenderer::set_fog_low_camera
+    bool taa = false;                   // temporal anti-aliasing; `taa on` in config/engine.settings starts it on
+    int32_t debug_jitter = 0;           // one of TAA's sub-pixel offsets with TAA off: SceneRenderer::set_debug_jitter
+    bool local_shadow_cache = true;     // SceneRenderer::set_local_shadow_cache
+    int32_t most_shadowed_lights = 256; // SceneRenderer::set_most_shadowed_lights
+    uint32_t fps_cap = 0;       // no more frames a second than this (--fps-cap; the editor's Preferences); 0: none
+    asset::AssetHandle terrain; // the ground, a .deterrain the application keeps loaded; none: no ground
+    asset::AssetHandle terrain_layers;    // how it looks, a .delayers the application keeps loaded; none: a plain look
+    render::SceneWater water;             // the world's water: none at first
+    bool fog_low_camera = true;           // SceneRenderer::set_fog_low_camera
+    bool path_traced = false;             // the lit picture path traced, not rasterized: SceneRenderer::set_path_traced
+    bool lighting_compare = false;        // the rasterized light against the path tracer's: set_lighting_compare
+    int32_t path_tracer_bounces = 16;     // the most a path takes (0: direct light only): PathTracer::set_max_bounces
+    int32_t path_tracer_bounces_set = -1; // what was last given it
+    bool light_boxes = true;              // the light boxes read where they hold a point: set_light_boxes_on
+    bool ambient_occlusion = true;        // on the screen (GTAO): SceneRenderer::set_ambient_occlusion
+    bool radiance_cascades = false;       // bounced light from them: SceneRenderer::set_radiance_cascades
+    // Their tuning (render::RadianceCascadesSettings has what each is).
+    int32_t rc_scale = 0;
+    int32_t rc_azimuths = 4;
+    float rc_interval_px = 2.0f;
+    int32_t rc_max_step_px = 16;
+    int32_t rc_march_steps = 32;
+    int32_t rc_cascades = 10;
+    float rc_thickness_m = 100.0f;
+    float rc_tolerance = 1.5f;
+    float rc_sky = 1.0f;
+    float rc_bounce = 1.0f;
+    bool rc_bounces = true; // light bounces more than once (RadianceCascadesSettings::bounces)
+    bool rc_white_sky = false;
+    bool rc_material_occlusion = true;
+    bool specular_ambient = true; // surfaces reflect the ambient: SceneRenderer::set_specular_ambient
+    bool auto_exposure = true;    // following the scene: SceneRenderer::set_auto_exposure
 #if DE_BUILD_DEV
-    bool freeze_cull = false; // a debug view of the cull: SceneRenderer::set_cull_frozen
+    bool freeze_cull = false;  // a debug view of the cull: SceneRenderer::set_cull_frozen
+    bool water_bands = false;  // the shore waves' bands in color: SceneWater::show_bands
+    bool surf_film = true;     // the surf from its film: SceneWater::surf_film
+    bool hide_terrain = false; // the ground left out of the picture: SceneRenderer::set_terrain_hidden
     // Physics' colliders drawn over the scene within kColliderReachM of the camera (the editor's toolbar,
     // physics.show_colliders in the console), as lines along their triangles, colored by kind.
     bool show_colliders = false;
@@ -170,6 +207,10 @@ struct Engine {
     tools::ConsoleUi* console_ui = nullptr;
     // The frame stats, for an application that draws them in a panel of its own (the editor's Playground).
     tools::StatsPanel* stats_panel = nullptr;
+    // The frame debugger (tools/frame_debugger.h): the frame's passes, their GPU time and work, their textures. The
+    // framework draws its window while it's open (F8, the console's frame_debugger, --frame-debugger); an
+    // application opens and closes it from its own menus.
+    tools::FrameDebugger* frame_debugger = nullptr;
     // The editor's selection outline and picks (SceneRenderer::set_editor_overlay): off unless it asks. A pick asked
     // for is sent once; its answer comes back frames later in pick_answer, whose count grows by one each time.
     render::EditorOverlay editor_overlay{};
@@ -208,10 +249,21 @@ public:
     // ImGui windows (the editor's panels). Engine::viewport puts the scene in one of them.
     virtual void ui(Engine& /*engine*/) {}
 #endif
+    // Every frame that draws, once the frame has begun and its uploads are recorded, before the frame's own passes:
+    // what the application draws into textures of its own, each through a graph of its own (app/preview_scene.h), for
+    // this frame's UI or scene to show.
+    virtual void draw(Engine& /*engine*/) {}
     // After the last frame (or a failed start: whenever startup() ran), while the engine is still
     // up: let go of what it holds.
     virtual void shutdown(Engine& /*engine*/) {}
 };
+
+#if DE_BUILD_DEV
+// What the game's picture says about itself in its corner (tools::draw_viewport_notice), written into text, or null
+// when it has nothing to say: shaders still compiling for the first time (the picture lacks what they draw until
+// they're in), else the frozen cull.
+const char* viewport_notice(const Engine& engine, std::span<char> text);
+#endif
 
 // Brings the engine up, runs the application in the frame loop until the window closes, the
 // application ends the run or --frames are done, and takes it down. The process's exit code: failure if anything

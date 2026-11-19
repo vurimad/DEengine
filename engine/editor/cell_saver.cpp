@@ -1,6 +1,7 @@
 #include "editor/cell_saver.h"
 
 #include "asset/cell_format.h"
+#include "asset/prefab_format.h"
 #include "asset/registry.h"
 #include "core/array.h"
 #include "core/fixed_string.h"
@@ -11,6 +12,7 @@
 #include "editor/source_files.h"
 #include "platform/vfs.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 
@@ -156,7 +158,24 @@ size_t fog_edits(const asset::CellFogVolume& cooked, const world::FogVolume& now
     number("noise_amount", cooked.noise_amount, now.noise_amount);
     list("drift_mps", cooked.drift_mps, now.drift_mps);
     number("height_fade_m", cooked.height_fade_m, now.height_fade_m);
+    number("under_roof", cooked.under_roof, now.under_roof);
     return count;
+}
+
+// Whether a light is what its cooked cell has.
+bool same_light(const asset::LightDesc& cooked, const world::LocalLight& now) {
+    const asset::LightDesc is = now.desc();
+    return same_floats(is.color, cooked.color, 3) && same_floats(&is.intensity, &cooked.intensity, 1) &&
+           same_floats(&is.radius_m, &cooked.radius_m, 1) && same_floats(&is.cone_deg, &cooked.cone_deg, 1) &&
+           same_floats(&is.cone_soft, &cooked.cone_soft, 1) && same_floats(&is.flicker, &cooked.flicker, 1) &&
+           same_floats(&is.flicker_hz, &cooked.flicker_hz, 1) && same_floats(&is.shadow, &cooked.shadow, 1);
+}
+
+// An entity's light as its entry writes it: the whole object, in the one layout a light is written in.
+void write_light(CellSource& source, uint32_t index, const world::LocalLight& light) {
+    char text[kLightTextSize];
+    const size_t length = light_text(light.desc(), text);
+    static_cast<void>(source.set_entity_member(index, "light", {text, length}));
 }
 
 // A folder as an entry writes it: removed when it's empty, else set (quoted).
@@ -170,6 +189,29 @@ void write_folder(CellSource& source, uint32_t index, const char* path) {
     if (length > 0 && static_cast<size_t>(length) < sizeof(quoted)) {
         static_cast<void>(source.set_entity_member(index, "folder", {quoted, static_cast<size_t>(length)}));
     }
+}
+
+// The variant a placement asks for, as an entry writes it: removed when it asks for none (or for one its prefab
+// doesn't have: there's no name to write), else its name (quoted).
+void write_variant(CellSource& source, uint32_t index, const asset::AssetRegistry& assets,
+                   const world::PrefabInstance& placed) {
+    const auto* prefab = assets.get<asset::PrefabAsset>(placed.prefab);
+    if (placed.variant != 0 && prefab != nullptr) {
+        for (const asset::PrefabVariant& variant : prefab->variants.get(prefab)) {
+            if (variant.name_hash != placed.variant) {
+                continue;
+            }
+            const std::string_view name = prefab->name(prefab, variant);
+            char quoted[64];
+            const int length =
+                std::snprintf(quoted, sizeof(quoted), "\"%.*s\"", static_cast<int>(name.size()), name.data());
+            if (length > 0 && static_cast<size_t>(length) < sizeof(quoted)) {
+                static_cast<void>(source.set_entity_member(index, "variant", {quoted, static_cast<size_t>(length)}));
+            }
+            return;
+        }
+    }
+    static_cast<void>(source.remove_entity_member(index, "variant"));
 }
 
 // A cell file open while saving, edited in memory and written at the end.
@@ -394,7 +436,9 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             TransformParts parts;
             FogEdit fog[8];
             size_t fog_count = 0;
-            const char* folder = nullptr; // its folder, when it isn't the one its file has
+            const char* folder = nullptr;                   // its folder, when it isn't the one its file has
+            const world::PrefabInstance* variant = nullptr; // the placement, when it asks for another variant now
+            const world::LocalLight* light = nullptr;       // its light, when it isn't as cooked
         };
         core::Array<Change> changes(saver_heap());
         core::Array<Refile> leaving(saver_heap());
@@ -438,10 +482,20 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
                 folder != nullptr && std::strcmp(folder->path, folder->filed) != 0) {
                 change.folder = folder->path;
             }
+            if (const auto* placed = entity.try_get<world::PrefabInstance>();
+                placed != nullptr && placed->variant != entry.variant) {
+                change.variant = placed;
+            }
+            const std::span<const asset::LightDesc> lights = cooked->lights.get(cooked);
+            if (const auto* lit = entity.try_get<world::LocalLight>();
+                lit != nullptr && (entry.light >= lights.size() || !same_light(lights[entry.light], *lit))) {
+                change.light = lit;
+            }
             const bool moved_here = change.parts.position || change.parts.rotation || change.parts.scale;
             // One leaving its cell is checked against the file too, though it may not have moved within it.
             const bool leaves = !leaving.empty() && leaving[leaving.size() - 1].source_index == entry.source_index;
-            if (moved_here || change.fog_count > 0 || change.folder != nullptr || leaves) {
+            if (moved_here || change.fog_count > 0 || change.folder != nullptr || change.variant != nullptr ||
+                change.light != nullptr || leaves) {
                 changes.push(change);
             }
         }
@@ -481,6 +535,12 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
             }
             if (change.folder != nullptr) {
                 write_folder(file.source, change.source_index, change.folder);
+            }
+            if (change.variant != nullptr) {
+                write_variant(file.source, change.source_index, assets, *change.variant);
+            }
+            if (change.light != nullptr) {
+                write_light(file.source, change.source_index, *change.light);
             }
         }
         if (file.source.view() != std::string_view(was.data(), was.size())) {
@@ -533,8 +593,8 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
         ++report.cells_made;
         return static_cast<uint32_t>(files.size() - 1);
     };
-    // An entry just put into a file: named apart from what's there (its new name returned), and its mesh found from
-    // the file's folder rather than from_folder.
+    // An entry just put into a file: named apart from what's there (its new name returned), and its mesh, its effect
+    // and its prefab found from the file's folder rather than from_folder.
     const auto settle = [&](OpenFile& to, uint32_t placed, const Name& name, std::string_view from_folder) {
         Name unique = name;
         if (!name.empty()) {
@@ -560,18 +620,22 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
                 }
             }
         }
-        const std::string_view mesh = to.source.mesh(placed);
         const std::string_view to_folder = folder_of(to.path.view());
-        if (!mesh.empty() && from_folder != to_folder) {
+        for (const std::string_view key :
+             {std::string_view("mesh"), std::string_view("effect"), std::string_view("prefab")}) {
+            const std::string_view named = to.source.string_member(placed, key);
+            if (named.empty() || from_folder == to_folder) {
+                continue;
+            }
             char full[platform::kMaxPathLength];
             char relative[platform::kMaxPathLength + 2];
             size_t full_length = 0;
             size_t relative_length = 0;
-            if (joined_path(from_folder, mesh, full, full_length) &&
+            if (joined_path(from_folder, named, full, full_length) &&
                 relative_path(to_folder, {full, full_length}, {relative + 1, sizeof(relative) - 2}, relative_length)) {
                 relative[0] = '"';
                 relative[relative_length + 1] = '"';
-                static_cast<void>(to.source.set_entity_member(placed, "mesh", {relative, relative_length + 2}));
+                static_cast<void>(to.source.set_entity_member(placed, key, {relative, relative_length + 2}));
             }
         }
         to.changed = true;
@@ -753,6 +817,12 @@ CellSaveReport save_cells(const flecs::world& ecs, const asset::AssetRegistry& a
         static_cast<void>(settle(files[target], placed, name, made.folder));
         if (const auto* folder = entity.try_get<EditorFolder>()) {
             write_folder(files[target].source, placed, folder->path);
+        }
+        if (const auto* instance = entity.try_get<world::PrefabInstance>()) {
+            write_variant(files[target].source, placed, assets, *instance);
+        }
+        if (const auto* lit = entity.try_get<world::LocalLight>()) {
+            write_light(files[target].source, placed, *lit); // as it is now, whatever its entry was made with
         }
         ++report.added;
         ++report.entities_changed;

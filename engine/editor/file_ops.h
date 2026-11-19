@@ -29,7 +29,7 @@ struct SourceMove {
 };
 
 // Text sources: JSON (with comments) that can name other files by relative path: .world .cell .material .terrain
-// .terrainlayers .environment, and .gltf (its buffers and images).
+// .terrainlayers .environment .prefab, and .gltf (its buffers and images).
 bool names_files(std::string_view path);
 
 // The meta of a source: "src:/content/a/b.gltf" is "src:/meta/a/b.gltf.json", a folder "src:/content/a" is

@@ -122,12 +122,13 @@ struct RenderGraphDesc {
 };
 
 // The passes a frame's GPU times cover (later ones aren't timed).
-inline constexpr uint32_t kMaxTimedPasses = 32;
+inline constexpr uint32_t kMaxTimedPasses = 96;
 
 // How long a pass took on the GPU: from a timestamp before its barriers to one after its commands.
 struct PassGpuTime {
     core::FixedString<31> name; // the pass's, cut to fit
     float ms = 0.0f;
+    uint32_t pass = 0; // its place among its frame's passes (pass_info()), culled ones counted
 };
 
 struct RenderGraphStats {
@@ -138,6 +139,39 @@ struct RenderGraphStats {
     uint32_t pooled_buffers = 0;
     uint32_t pool_creations = 0; // transient resources created since the graph was, in total
     uint32_t skipped_passes = 0; // in the last frame: a transient they use couldn't be made (logged)
+};
+
+// The frame's graph as it was built and run, for debug views (tools/frame_debugger.h): its passes in the order they
+// were added, what each used and recorded, and its resources. Read between execute() and the next begin(); the names
+// point into the graph's frame memory and go with it.
+struct GraphPassInfo {
+    const char* name = "";
+    uint32_t use_count = 0;
+    bool ran = false;   // after execute(): not culled, nor skipped for a transient that couldn't be made
+    rhi::ListWork work; // what its execute recorded: draws, dispatches, copies
+};
+
+struct GraphUseInfo {
+    bool is_texture = true;
+    uint32_t resource = 0; // GraphTexture::index, or GraphBuffer::index
+    rhi::ResourceState state = rhi::ResourceState::Undefined;
+    rhi::ShaderStages stages = rhi::ShaderStages::None;
+    rhi::TextureRange range{}; // textures: the mips and layers used
+    bool writes = false;       // a write state: the pass is a writer of it
+};
+
+struct GraphTextureInfo {
+    const char* name = "";
+    rhi::TextureDesc desc; // its size after reference scaling; debug_name is null
+    bool imported = false;
+    bool used = false; // by a pass that ran
+};
+
+struct GraphBufferInfo {
+    const char* name = "";
+    rhi::BufferDesc desc; // debug_name is null
+    bool imported = false;
+    bool used = false;
 };
 
 // The frame graph (docs/design.md, Rendering: render graph v1). Each frame:
@@ -214,6 +248,22 @@ public:
     float gpu_frame_ms() const;
     // Logs the last frame's graph: passes (culled ones too), their uses, the resources.
     void dump() const;
+
+    // The frame's graph, for debug views (GraphPassInfo and the rest, above).
+    uint32_t pass_count() const;
+    GraphPassInfo pass_info(uint32_t pass) const;
+    GraphUseInfo pass_use(uint32_t pass, uint32_t use) const;
+    uint32_t texture_count() const;
+    GraphTextureInfo texture_info(uint32_t texture) const;
+    uint32_t buffer_count() const;
+    GraphBufferInfo buffer_info(uint32_t buffer) const;
+
+    // Called at the end of every add_pass with the pass it added, so a debug view can add a pass of its own right
+    // after one it watches: that pass reads a texture as the watched one left it, before a later pass writes over it
+    // (the frame debugger's texture view). Not called for the passes the hook itself adds. Stays until set again;
+    // null: none.
+    using PassHook = void (*)(void* user, RenderGraph& graph, uint32_t pass);
+    void set_pass_hook(PassHook hook, void* user);
 
 private:
     using ExecuteFn = void (*)(const void* closure, PassContext& context);

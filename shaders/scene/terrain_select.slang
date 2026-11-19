@@ -126,7 +126,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
         draw.skirt_m = clamp((reach.y - reach.x) * 0.25, 2.0 * info.spacing_m, 16.0 * info.spacing_m);
         const float3 center = (low + high) * 0.5;
         const float3 half_size = (high - low) * 0.5 + float3(0.0, draw.skirt_m * 0.5, 0.0);
-        for (uint v = 0; v < kCullViewCount; ++v)
+        for (uint v = 0; v < kTerrainViewCount; ++v)
         {
             if (box_in_view(push.views + v, center - float3(0.0, draw.skirt_m * 0.5, 0.0), half_size))
             {

@@ -1,6 +1,7 @@
 #include "editor/properties_panel.h"
 
 #include "app/framework.h"
+#include "asset/prefab_format.h"
 #include "asset/terrain_format.h"
 #include "core/hash.h"
 #include "core/profile.h"
@@ -8,8 +9,10 @@
 #include "editor/outline.h"
 #include "editor/source_files.h"
 #include "editor/theme.h"
+#include "editor/thumbnails.h"
 #include "platform/vfs.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -394,24 +397,6 @@ bool inline_fields_active(int count) {
         ImGui::PopID();
     }
     return active;
-}
-
-// A compact checkbox centred on the row's frame line.
-bool compact_checkbox(bool& value) {
-    const ImVec2 cursor = ImGui::GetCursorScreenPos();
-    const float frame = ImGui::GetFrameHeight();
-    const float box = std::max(px(12.0f), std::floor(ImGui::GetFontSize() * 0.95f));
-    const float padding = std::max(0.0f, std::floor((box - ImGui::GetFontSize()) * 0.5f));
-    ImGui::SetCursorScreenPos(
-        ImVec2(cursor.x, cursor.y + std::floor((frame - (ImGui::GetFontSize() + (padding * 2.0f))) * 0.5f)));
-    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(padding, padding));
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(ThemeColor::Recessed));
-    ImGui::PushStyleColor(ImGuiCol_Border, color(ThemeColor::ControlActive));
-    const bool changed = ImGui::Checkbox("##value", &value);
-    ImGui::PopStyleColor(2);
-    ImGui::PopStyleVar(2);
-    return changed;
 }
 
 // Text in the value column, centred on the row's frame line.
@@ -860,7 +845,8 @@ void PropertiesPanel::draw_entity(const app::Engine& engine, Selection& selectio
             }
             ImGui::PopID();
         };
-        // The Transform first, then the rest in the entity's order.
+        // What it's made from, the Transform, then the rest in the entity's order.
+        draw_made_from(engine, entity, commands);
         if (entity.has(transform_id)) {
             draw_component(transform_id);
         }
@@ -903,6 +889,185 @@ void PropertiesPanel::draw_entity(const app::Engine& engine, Selection& selectio
     }
     ImGui::EndChild();
     ImGui::PopStyleVar();
+}
+
+void PropertiesPanel::draw_made_from(const app::Engine& engine, flecs::entity entity, CommandStack& commands) {
+    if (sources_.entity != entity.id() || filter_[0] != '\0') {
+        return;
+    }
+    const auto ask = [&](PropertiesRequest::Kind kind, std::string_view path) {
+        request_.kind = kind;
+        static_cast<void>(request_.path.assign(path));
+    };
+    // A source: its picture if it has one, its file (a link that shows it in Resources) and the folder it's in.
+    const auto source = [&](std::string_view path) {
+        const size_t slash = path.rfind('/');
+        const std::string_view file = slash == std::string_view::npos ? path : path.substr(slash + 1);
+        std::string_view folder = slash == std::string_view::npos ? std::string_view() : path.substr(0, slash);
+        if (folder.starts_with("src:/")) {
+            folder.remove_prefix(5);
+        }
+        const float extent = px(44.0f);
+        const float inset = px(20.0f);
+        const ImVec2 at = ImGui::GetCursorScreenPos();
+        float text_x = at.x + inset;
+        Thumbnails::Picture picture;
+        if (thumbnails_ != nullptr && thumbnails_->find(path, picture)) {
+            ImDrawList* draw = ImGui::GetWindowDrawList();
+            const ImVec2 min(at.x + inset, at.y + px(4.0f));
+            draw->AddRectFilled(min, ImVec2(min.x + extent, min.y + extent), color_u32(ThemeColor::Control),
+                                px(theme().metrics.control_rounding));
+            draw->AddImage(picture.texture, min, ImVec2(min.x + extent, min.y + extent), picture.uv_min,
+                           picture.uv_max);
+            text_x = min.x + extent + px(10.0f);
+        }
+        char name[160];
+        static_cast<void>(std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(file.size()), file.data()));
+        ImGui::SetCursorScreenPos(ImVec2(text_x, at.y + px(8.0f)));
+        ImGui::PushID(name);
+        if (ImGui::TextLink(name)) {
+            ask(PropertiesRequest::Kind::ShowFile, path);
+        }
+        ImGui::PopID();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+            tooltip("%.*s\nShow it in Resources", static_cast<int>(path.size()), path.data());
+        }
+        ImGui::SetCursorScreenPos(ImVec2(text_x, at.y + px(8.0f) + ImGui::GetFontSize() + px(4.0f)));
+        ImGui::TextColored(color(ThemeColor::TextSecondary), "%.*s", static_cast<int>(folder.size()), folder.data());
+        ImGui::SetCursorScreenPos(ImVec2(at.x, at.y + extent + px(8.0f)));
+        ImGui::Dummy(ImVec2(0.0f, 0.0f));
+    };
+    // Its buttons, side by side under it.
+    const auto buttons = [&](const char* first, PropertiesRequest::Kind first_kind, std::string_view path) {
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + px(20.0f));
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + px(2.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(6.0f), 0.0f));
+        if (first != nullptr) {
+            if (ImGui::Button(first)) {
+                ask(first_kind, path);
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::Button("Show in Resources")) {
+            ask(PropertiesRequest::Kind::ShowFile, path);
+        }
+        ImGui::PopStyleVar();
+        ImGui::Dummy(ImVec2(0.0f, px(6.0f)));
+    };
+
+    const flecs::world& ecs = engine.world.ecs();
+    const auto* placed = entity.try_get<world::PrefabInstance>();
+    if (placed != nullptr && !sources_.prefab.empty() && begin_category("Prefab")) {
+        source(sources_.prefab.view());
+        const auto* prefab = engine.assets.get<asset::PrefabAsset>(placed->prefab);
+        if (prefab == nullptr) {
+            const PropertyRow row = begin_property_row("Parts", 0, nullptr, ThemeColor::Text, label_fraction_);
+            value_label(row, "Not loaded: cook the project", ThemeColor::TextSecondary);
+            end_property_row(row);
+        } else {
+            const std::span<const asset::PrefabVariant> variants = prefab->variants.get(prefab);
+            const std::span<const asset::PrefabPart> parts = prefab->parts.get(prefab);
+            // The variant it asks for: one of the prefab's, or none (all of it).
+            char current[48] = "None";
+            for (const asset::PrefabVariant& variant : variants) {
+                if (variant.name_hash == placed->variant) {
+                    const std::string_view name = prefab->name(prefab, variant);
+                    static_cast<void>(
+                        std::snprintf(current, sizeof(current), "%.*s", static_cast<int>(name.size()), name.data()));
+                }
+            }
+            const PropertyRow variant_row =
+                begin_property_row("Variant", 0, nullptr, ThemeColor::Text, label_fraction_);
+            uint32_t chosen = placed->variant;
+            ImGui::BeginDisabled(variants.empty());
+            if (begin_combo("##variant", variants.empty() ? "None (it has no variants)" : current,
+                            property_value_width(variant_row))) {
+                if (ImGui::Selectable("None", placed->variant == 0)) {
+                    chosen = 0;
+                }
+                for (const asset::PrefabVariant& variant : variants) {
+                    const std::string_view name = prefab->name(prefab, variant);
+                    char label[48];
+                    static_cast<void>(
+                        std::snprintf(label, sizeof(label), "%.*s", static_cast<int>(name.size()), name.data()));
+                    if (ImGui::Selectable(label, variant.name_hash == placed->variant)) {
+                        chosen = variant.name_hash;
+                    }
+                }
+                end_combo();
+            }
+            ImGui::EndDisabled();
+            if (property_label_hovered(variant_row)) {
+                tooltip("The same prefab with some of its parts left out. Variants are made in the prefab editor.");
+            }
+            end_property_row(variant_row);
+            if (chosen != placed->variant) {
+                world::PrefabInstance changed = *placed;
+                changed.variant = chosen;
+                commands.seal();
+                static_cast<void>(commands.set_component(entity, ecs.component<world::PrefabInstance>().id(),
+                                                         std::as_bytes(std::span(&changed, 1))));
+                commands.seal();
+            }
+            // Its parts: how many, and each by name with what it is, greyed where this placement's variant leaves
+            // it out.
+            const uint32_t left_out = prefab->variant_bit(prefab, placed->variant);
+            uint32_t there = 0;
+            for (const asset::PrefabPart& part : parts) {
+                there += (part.absent_in & left_out) == 0 ? 1U : 0U;
+            }
+            char count[64];
+            if (there == parts.size()) {
+                static_cast<void>(std::snprintf(count, sizeof(count), "%zu", parts.size()));
+            } else {
+                static_cast<void>(std::snprintf(count, sizeof(count), "%u of %zu", there, parts.size()));
+            }
+            const PropertyRow parts_row =
+                begin_property_row("Parts", 0, &parts_open_, ThemeColor::Text, label_fraction_);
+            value_label(parts_row, count, ThemeColor::Text);
+            end_property_row(parts_row);
+            constexpr size_t kMostListed = 48;
+            for (size_t p = 0; parts_open_ && p < std::min(parts.size(), kMostListed); ++p) {
+                const asset::PrefabPart& part = parts[p];
+                const std::string_view name = prefab->name(prefab, part);
+                char label[96];
+                static_cast<void>(
+                    std::snprintf(label, sizeof(label), "%.*s", static_cast<int>(name.size()), name.data()));
+                const bool has_mesh = part.mesh != asset::PrefabPart::kNone;
+                const bool has_effect = part.effect != asset::PrefabPart::kNone;
+                const bool gone = (part.absent_in & left_out) != 0;
+                static constexpr const char* kKinds[8] = {
+                    "Nothing", "Model",        "Effect",        "Model, effect",
+                    "Light",   "Model, light", "Effect, light", "Model, effect, light"};
+                const char* what = kKinds[(has_mesh ? 1U : 0U) | (has_effect ? 2U : 0U) |
+                                          (part.light != asset::PrefabPart::kNone ? 4U : 0U)];
+                char text[64];
+                static_cast<void>(std::snprintf(text, sizeof(text), "%s%s", what, gone ? " (left out)" : ""));
+                ImGui::PushID(static_cast<int>(p));
+                const PropertyRow row = begin_property_row(
+                    label, 1, nullptr, gone ? ThemeColor::TextDisabled : ThemeColor::Text, label_fraction_);
+                value_label(row, text, gone ? ThemeColor::TextDisabled : ThemeColor::TextSecondary);
+                end_property_row(row);
+                ImGui::PopID();
+            }
+            if (parts_open_ && parts.size() > kMostListed) {
+                char more[48];
+                static_cast<void>(std::snprintf(more, sizeof(more), "and %zu more", parts.size() - kMostListed));
+                const PropertyRow row = begin_property_row("", 1, nullptr, ThemeColor::Text, label_fraction_);
+                value_label(row, more, ThemeColor::TextSecondary);
+                end_property_row(row);
+            }
+        }
+        buttons("Edit Prefab", PropertiesRequest::Kind::EditPrefab, sources_.prefab.view());
+    }
+    if (entity.has<world::MeshInstance>() && !sources_.mesh.empty() && begin_category("Model")) {
+        source(sources_.mesh.view());
+        buttons(nullptr, PropertiesRequest::Kind::None, sources_.mesh.view());
+    }
+    if (entity.has<world::EffectInstance>() && !sources_.effect.empty() && begin_category("Effect")) {
+        source(sources_.effect.view());
+        buttons("View", PropertiesRequest::Kind::ViewEffect, sources_.effect.view());
+    }
 }
 
 bool PropertiesPanel::draw_file(const app::Engine& engine, const Selection& selection) {
@@ -951,9 +1116,12 @@ bool PropertiesPanel::draw_file(const app::Engine& engine, const Selection& sele
         } else {
             text_row("Asset ID", "No meta yet: the cooker makes one", ThemeColor::TextSecondary);
         }
-        if (has_meta && kind == "World") {
-            const PropertyRow row = begin_property_row("World", 0, nullptr, ThemeColor::Text, label_fraction_);
-            open = ImGui::Button("Open", ImVec2(std::min(px(96.0f), property_value_width(row)), 0.0f));
+        if (has_meta && (kind == "World" || kind == "Effect")) {
+            // A world opens in place of the one shown; an effect in the effect viewer.
+            const PropertyRow row =
+                begin_property_row(kind == "World" ? "World" : "Effect", 0, nullptr, ThemeColor::Text, label_fraction_);
+            open = ImGui::Button(kind == "World" ? "Open" : "View",
+                                 ImVec2(std::min(px(96.0f), property_value_width(row)), 0.0f));
             end_property_row(row);
         }
     }

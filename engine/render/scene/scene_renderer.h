@@ -6,7 +6,15 @@
 #include "core/result.h"
 #include "render/graph/render_graph.h"
 #include "render/rhi/rhi.h"
+#include "render/scene/auto_exposure.h"
+#include "render/scene/gtao.h"
+#include "render/scene/light_boxes.h"
+#include "render/scene/local_lights.h"
+#include "render/scene/particles.h"
+#include "render/scene/path_tracer.h"
+#include "render/scene/radiance_cascades.h"
 #include "render/scene/terrain.h"
+#include "render/scene/trace_scene.h"
 #include "render/scene/water.h"
 #include "render/shader/shader_library.h"
 
@@ -81,17 +89,35 @@ struct SceneWind {
     float turbulence = 0.0f;   // 0 to 1
 };
 
+// What's behind everything, instead of the sky: one colour at the top of the picture and another at the bottom, the
+// same wherever the camera looks. For a thing shown by itself (the editor's previews), where a horizon would be a line
+// through it. Linear, and exposed and tonemapped with the rest, as the sky is. Off by default.
+struct SceneBackdrop {
+    bool enabled = false;
+    float top[3] = {};
+    float bottom[3] = {};
+};
+
 struct SceneLighting {
     float sun_direction[3] = {-0.55f, 0.32f, -0.75f}; // toward the sun, normalized when used: low, ahead
     float sun_color[3] = {4.6f, 3.6f, 2.4f};          // late afternoon gold
     float sky_color[3] = {0.30f, 0.40f, 0.62f};       // ambient from above
     float ground_color[3] = {0.12f, 0.10f, 0.07f};    // ambient from below
     float shadow_color[3] = {0.05f, 0.06f, 0.09f};    // what shadowed sunlight keeps: a cool tint, not black
+    // How far the place is closed to the sky, 0 to 1 (asset::EnvironmentAsset::under_roof): while the radiance
+    // cascades light the picture, what they can't see, the fog, particles and water take 1 - this of the sky's
+    // ambient, but for inside a fog volume that says its own.
+    float under_roof = 0.0f;
     float exposure_ev = 0.0f;
+    // How the auto exposure follows the scene here (AutoExposureInput); negative: the engine's own settings.
+    float exposure_below_ev = -1.0f;
+    float exposure_above_ev = -1.0f;
+    float exposure_adaptation = -1.0f;
     SceneShadows shadows{}; // the sun's
     SceneFog fog{};
     SceneWind wind{}; // not light, but the environment says it with the rest
     SceneSea sea{};   // nor this
+    SceneBackdrop backdrop{};
 };
 
 // An environment asset (.deenv) as the renderer's lighting.
@@ -113,6 +139,9 @@ enum class SceneView : uint32_t {
     Cascades,     // which shadow cascade each pixel uses (red, green, blue, yellow)
     Motion,       // screen motion since last frame, about grey (red: right, green: down)
     TerrainLevel, // base color, with terrain tinted by which level of its quadtree each patch is
+    Traced,       // what rays see: a ray a pixel into the scene's acceleration structure (only where it traces)
+    Indirect,     // the ambient that falls on each surface, whatever its colour: the probes' light where there is any
+    AmbientOcclusion, // how open each surface is to the ambient, near things on the screen (GTAO): white open
     Count,
 };
 
@@ -125,6 +154,15 @@ struct SceneRendererDesc {
     // What terrain streams through. Without them, there's no terrain.
     rhi::Uploader* uploader = nullptr;
     platform::Vfs* vfs = nullptr;
+    // Where an effect's handle leads to its asset (render/scene/particles.h). Without it, there are no particles.
+    asset::AssetRegistry* assets = nullptr;
+    // The particles' pool, in blocks of kParticleBlockSize (32 bytes a particle): made once.
+    uint32_t particle_pool_blocks = kParticlePoolBlocks;
+    // How many steps a frame an emitter behind its clock catches up by (ParticleSystemDesc::catch_up_steps).
+    uint32_t particle_catch_up_steps = kParticleCatchUpSteps;
+    // Rays against the scene (docs/design.md, Global illumination), where the GPU has ray queries: for the game's
+    // renderer. A preview's has no use for it yet.
+    bool ray_tracing = false;
     // Made once, 100 bytes each: 51 MiB. An instance whose slot is past it isn't drawn, until something asks for all
     // the instances, and even then it keeps that slot: this is a limit to stay under, not one to touch.
     uint32_t max_instances = 512U * 1024U;
@@ -143,6 +181,7 @@ struct SceneRendererStats {
     // What the cull kept, read back from a recent frame: a frame or two late, and 0 for the first frames.
     uint32_t visible_draws = 0;
     uint32_t visible_fading_draws = 0; // of those, what's fading between LODs: both LODs of each
+    uint32_t visible_blend_draws = 0;  // of those, what blends: drawn after the fog, the farthest first
     uint32_t visible_shadow_draws = 0;
     // What those come to for the GPU: everything of one mesh part in one list is one instanced draw.
     uint32_t merged_draws = 0;
@@ -152,6 +191,16 @@ struct SceneRendererStats {
     uint32_t visible_shadow_triangles = 0;
     float froxel_reach_m = 0.0f; // the froxel grid's reach (no farther than the shadows); 0: no grid
     TerrainStats terrain;
+    ParticleStats particles;
+    LocalLightStats lights;
+    TraceStats trace;                     // all 0 where nothing is traced
+    uint32_t path_tracer_samples = 0;     // a pixel, while path traced (set_path_traced); 0 when not
+    const char* path_tracer_restart = ""; // why it last started again (PathTracer::restart_reason)
+    uint32_t path_tracer_restarts = 0;
+    uint32_t path_tracer_bounces = 0; // the most a path takes (PathTracer::max_bounces)
+    LightingCompareStats compare;     // set_lighting_compare's numbers, a few frames late; pixels 0 when off
+    LightBoxStats light_boxes;
+    RadianceCascadesStats radiance_cascades; // all 0 while they're off
 };
 
 // The most planes it takes to bound what can shadow a slice of the view.
@@ -190,6 +239,10 @@ struct SceneRendererState;
 //                   HDR target, and the sky where nothing was drawn
 //   water behind    with a sea: the lit image and the depth kept, for the water to see through
 //   water           the sea's surface onto the lit image, with its depth and motion (shaders/scene/water.slang)
+//   transparents    what blends (asset::AlphaMode::Blend), over the fogged image, the farthest first, lit as it's
+//                   drawn and writing no depth (shaders/scene/transparent.slang)
+//   particles       every effect's (render/scene/particles.h): stepped in compute when a step is due, then drawn
+//                   over the same image, the farthest emitter first (shaders/scene/particles.slang)
 //   tonemap         exposure and a filmic curve into the target (or a G-buffer channel: SceneView)
 // It looks through the frame's camera (down its -Z). Per-frame data (view, light, instance
 // transforms) goes through a mapped buffer per frame in flight, grown as needed: no allocation
@@ -293,6 +346,58 @@ public:
     // Whether the height fog thins with a low camera (SceneFog::low_camera_keep): on, unless turned off to compare.
     void set_fog_low_camera(bool on);
 
+    // Whether the exposure follows how bright the scene is (AutoExposure), round the environment's. Off until turned
+    // on (the game and the editor turn it on; a preview or a test keeps the environment's exposure, the same every
+    // frame). Turned on, it takes its target at once.
+    void set_auto_exposure(bool on);
+    void set_auto_exposure_settings(const AutoExposureSettings& settings);
+    // The exposure the picture had a few frames ago, as a power of 2, and where it was going; false with none.
+    bool auto_exposure_state(GpuExposureState& state) const;
+
+    // Whether the ambient light is occluded by what's near on the screen (GTAO): on, unless turned off to compare.
+    void set_ambient_occlusion(bool on);
+    void set_ambient_occlusion_settings(const GtaoSettings& settings);
+
+    // Whether light that has bounced comes from screen-space radiance cascades (RadianceCascades; docs/design.md,
+    // Global illumination: radiance cascades) in place of the flat ambient and the light boxes: off by default, the
+    // GI a project chooses for top-down games. In the lit view and the indirect light view.
+    void set_radiance_cascades(bool on);
+    void set_radiance_cascades_settings(const RadianceCascadesSettings& settings);
+
+    // Whether surfaces reflect the ambient light (the specular ambient): on, unless turned off to set the diffuse
+    // light against the path tracer, which has none yet.
+    void set_specular_ambient(bool on);
+
+    // One of TAA's sub-pixel offsets with TAA off (1 to 16: which of its samples; 0: none), so a still shows what
+    // the passes make of the offset alone: a picture that changes with it flickers under TAA, and pops as the
+    // camera moves.
+    void set_debug_jitter(uint32_t sample);
+
+    // Whether the local lights' shadow tiles are kept from frame to frame and drawn again only where something that
+    // casts changed (on); off, every tile every frame, to compare.
+    void set_local_shadow_cache(bool on);
+    // The most local lights that have shadows in a frame (LocalLights::set_most_shadowed).
+    void set_most_shadowed_lights(uint32_t lights);
+
+    // Whether the lit picture is path traced (PathTracer: a renderer of its own, adding up over frames) rather than
+    // rasterized; only where rays are traced. Off by default. While on, TAA, the light boxes and GTAO aren't run: it
+    // smooths its own edges and its light has bounced already.
+    void set_path_traced(bool on);
+    // The light boxes from now on (LightBoxes: baked over the frames after, read in place of the flat ambient where
+    // they hold a point); only where rays are traced. light_boxes: whether they're read (on unless turned off to
+    // compare).
+    void set_light_boxes(std::span<const LightBoxDesc> boxes);
+    void set_light_boxes_on(bool on);
+    void rebake_light_boxes();
+    // Whether the picture shows how far the rasterized light is from the path tracer's (a heat map: grey agrees, blue
+    // too dark, red too bright, full at a stop off), the path tracer adding up hidden behind it; the numbers in
+    // stats().compare. Only where rays are traced; off by default. TAA is off while it's on.
+    void set_lighting_compare(bool on);
+
+    // Whether the ground is left out of the picture (and its shadows), to see what's under it: the water, say. The
+    // terrain stays set: the water still reads its extent and its shore map.
+    void set_terrain_hidden(bool hidden);
+
     // The terrain to show, or null for none. file holds it, and must stay valid and unchanged until the next call.
     // Waits for what's in flight: only when the terrain changes.
     void set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file);
@@ -307,6 +412,12 @@ public:
     bool instances_stale() const;
 
     SceneRendererStats stats() const;
+
+    // The path tracer (set_path_traced), to start it again, set its bounces and read its mean; null where nothing is
+    // traced.
+    PathTracer* path_tracer();
+    // The particle system, for tests to read its pool; null without a registry (SceneRendererDesc::assets).
+    const ParticleSystem* particles() const;
 
 private:
     explicit SceneRenderer(SceneRendererState* state) : state_(state) {}

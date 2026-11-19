@@ -123,6 +123,11 @@ public:
     // swapped in. What was built from an asset is up to date while this is unchanged.
     uint32_t revision(AssetHandle handle) const;
 
+    // The size and write time of the file its contents were read from; zeros unless Ready with nothing newer on its
+    // way in. What was made from an asset can be kept between runs by it: while the file's are the same, so are its
+    // contents.
+    platform::FileInfo file_info(AssetHandle handle) const;
+
     // The assets it depends on, held for it, in its header's order; empty until its file is loaded.
     // A dependency that would close a cycle (a corrupt file) is left out, so don't index this by a
     // header position: find() the header's entry.

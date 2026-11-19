@@ -225,6 +225,54 @@ size_t format_number(double value, int decimals, std::span<char> out) {
     return length;
 }
 
+size_t light_text(const asset::LightDesc& light, std::span<char> out) {
+    size_t length = 0;
+    const auto text = [&](std::string_view words) {
+        const size_t room = out.size() - 1 - length;
+        const size_t count = std::min(words.size(), room);
+        std::memcpy(out.data() + length, words.data(), count);
+        length += count;
+    };
+    const auto number = [&](std::string_view key, float value, int decimals) {
+        text(", \"");
+        text(key);
+        text("\": ");
+        char written[48];
+        text(std::string_view(written, format_number(static_cast<double>(value), decimals, written)));
+    };
+    text("{\"color\": [");
+    for (int channel = 0; channel < 3; ++channel) {
+        char written[48];
+        text(channel > 0 ? ", " : "");
+        text(std::string_view(written,
+                              format_number(static_cast<double>(light.color[channel]), kScaleDecimals, written)));
+    }
+    text("]");
+    number("intensity", light.intensity, kScaleDecimals);
+    number("radius_m", light.radius_m, kPositionDecimals);
+    char zero[48];
+    const std::string_view none(zero, format_number(0.0, kAngleDecimals, zero));
+    char cone[48];
+    if (std::string_view(cone, format_number(static_cast<double>(light.cone_deg), kAngleDecimals, cone)) != none) {
+        number("cone_deg", light.cone_deg, kAngleDecimals);
+        number("cone_soft", light.cone_soft, kScaleDecimals);
+    }
+    char flicker[48];
+    if (std::string_view(flicker, format_number(static_cast<double>(light.flicker), kScaleDecimals, flicker)) != none) {
+        number("flicker", light.flicker, kScaleDecimals);
+        number("flicker_hz", light.flicker_hz, kAngleDecimals);
+    }
+    char one[48];
+    const std::string_view all(one, format_number(1.0, kScaleDecimals, one));
+    char shadow[48];
+    if (std::string_view(shadow, format_number(static_cast<double>(light.shadow), kScaleDecimals, shadow)) != all) {
+        number("shadow", light.shadow, kScaleDecimals);
+    }
+    text("}");
+    out[length] = '\0';
+    return length;
+}
+
 Vec3 rotation_deg_of(const Quat& rotation, const Vec3& near_deg) {
     // q = Y(yaw) * X(pitch) * Z(roll): its matrix's third column is (sin y cos x, -sin x, cos y cos x) and its second
     // row is (cos x sin z, cos x cos z, -sin x).

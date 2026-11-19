@@ -24,7 +24,7 @@ constexpr uint32_t kMaxStages = 2;
 
 enum class Build : uint8_t {
     Idle,
-    Queued,    // a source changed: waiting for its turn (one rebuild runs at a time)
+    Queued,    // a source changed, or it hasn't built yet: waiting for its turn (as many run as the compiler lets)
     Compiling, // a background job owns Program::pending
     Done,      // the job finished: the rendering thread swaps it in or drops it
 };
@@ -86,8 +86,14 @@ struct Program {
     uint32_t stage_count = 0;
     rhi::GraphicsPipelineDesc graphics_state; // shader code and debug name filled in per build
 
+    // How many asked for it (create_graphics, create_compute): it goes when the last of them destroys it.
+    uint32_t users = 1;
+    ProgramHandle self; // its own handle: what the next to ask for the same is given
+
     rhi::PipelineHandle pipeline; // invalid until a build succeeds
     ShaderReflection reflections[kMaxStages];
+    bool first_build = false; // its first build is queued or running in the background
+    bool build_first = false; // that one goes ahead of the others waiting
 
     // Every source file the program depends on, with the info its last build read, and what the
     // last check saw. Rendering thread only.
@@ -107,8 +113,11 @@ struct LibraryState {
     ShaderCompiler* compiler = nullptr; // null: programs load from cooked .deshader files
     ShaderLibraryDesc desc;
     core::SlotMap<Program*> programs{render_heap()};
-    Program* building = nullptr; // the one rebuild in flight
+    uint32_t in_flight = 0;           // builds a background job has, or has finished and update() hasn't taken in yet
+    uint32_t most_in_flight = 1;      // as many as the compiler compiles at once; one for cooked files
+    bool sessions_to_release = false; // several built at once: the compiler's extra sessions go when they're done
     uint32_t queued = 0;
+    uint32_t first_builds = 0; // programs whose first build is queued or in flight
     uint64_t next_poll_ns = 0;
     uint32_t reloads = 0;
     uint32_t failed_reloads = 0;
@@ -219,8 +228,8 @@ core::Result<CompiledProgram> load_cooked(const LibraryState& state, const Progr
 }
 
 // Compiles every stage of the program in one go, or loads it cooked. Runs on the creating thread
-// or as a job.
-void compile(Program& program, PendingBuild& out) {
+// or as a job. cached_only: only if the compiler has it cached, without compiling (out.ok false if it hasn't).
+void compile(Program& program, PendingBuild& out, bool cached_only = false) {
     ShaderDefine defines[kMaxShaderDefines];
     for (uint32_t i = 0; i < program.define_count; ++i) {
         defines[i] = {.name = program.defines[i].name.c_str(), .value = program.defines[i].value.c_str()};
@@ -232,13 +241,12 @@ void compile(Program& program, PendingBuild& out) {
     out.report = CompileReport{.dependencies = core::Array<ShaderDependency>(render_heap()),
                                .diagnostics = core::Array<char>(render_heap())};
     const std::span<const ShaderDefine> define_span(defines, program.define_count);
+    const CompileRequest request{
+        .module = program.module.c_str(), .entries = std::span(entries, program.stage_count), .defines = define_span};
     core::Result<CompiledProgram> compiled =
-        program.library->compiler == nullptr
-            ? load_cooked(*program.library, program, out.report, define_span)
-            : program.library->compiler->compile({.module = program.module.c_str(),
-                                                  .entries = std::span(entries, program.stage_count),
-                                                  .defines = define_span},
-                                                 &out.report);
+        program.library->compiler == nullptr ? load_cooked(*program.library, program, out.report, define_span)
+        : cached_only                        ? program.library->compiler->read_cached(request, &out.report)
+                                             : program.library->compiler->compile(request, &out.report);
     out.ok = compiled.ok();
     if (compiled) {
         out.program = std::move(*compiled);
@@ -407,6 +415,12 @@ void finish_build(LibraryState& state, Program& program) {
         build.ok ? create_pipeline(state, program, build.program)
                  : core::Result<rhi::PipelineHandle>(core::fail(core::ErrorCode::InvalidArgument, "compile failed"));
     const double elapsed_ms = static_cast<double>(platform::time_ns() - program.build_start_ns) / 1e6;
+    // A first build that ran in the background isn't a reload: it counts and reads as a program's creation does.
+    const bool first = program.first_build;
+    if (first) {
+        program.first_build = false;
+        --state.first_builds;
+    }
     if (pipeline) {
         state.device->destroy(program.pipeline);
         program.pipeline = *pipeline;
@@ -414,8 +428,17 @@ void finish_build(LibraryState& state, Program& program) {
             program.reflections[i] = std::move(build.program.stages[i].reflection);
         }
         watch_build(state, program, build.report);
-        ++state.reloads;
-        DE_LOG_INFO("shader", "%s reloaded in %.0f ms", program.module.c_str(), elapsed_ms);
+        if (first) {
+            DE_LOG_DEBUG("shader", "%s built in %.0f ms, %u more to build", program.module.c_str(), elapsed_ms,
+                         state.first_builds);
+        } else {
+            ++state.reloads;
+            DE_LOG_INFO("shader", "%s reloaded in %.0f ms", program.module.c_str(), elapsed_ms);
+        }
+    } else if (first) {
+        watch_failure(state, program, build.report);
+        DE_LOG_ERROR("shader", "%s: the first build failed; it will be rebuilt when its sources change",
+                     program.module.c_str());
     } else {
         watch_failure(state, program, build.report);
         ++state.failed_reloads;
@@ -426,37 +449,55 @@ void finish_build(LibraryState& state, Program& program) {
     program.build.store(Build::Idle, std::memory_order_relaxed);
 }
 
+// Starts queued builds, as many as may be in flight at once.
 void start_next_build(LibraryState& state) {
-    if (state.building != nullptr || state.queued == 0) {
-        return;
-    }
-    for (Program* program : state.programs) {
-        if (program->build.load(std::memory_order_relaxed) == Build::Queued) {
-            --state.queued;
-            state.building = program;
-            DE_LOG_INFO("shader", "%s changed: rebuilding", program->module.c_str());
-            program->build_start_ns = platform::time_ns();
-            program->build.store(Build::Compiling, std::memory_order_relaxed);
-            // Background: only idle workers run it, so a long compile never stalls a frame.
-            state.jobs->submit_background(core::Job{
-                .entry = &build_job, .context = program, .counter = &program->counter, .name = "shader rebuild"});
+    while (state.in_flight < state.most_in_flight && state.queued > 0) {
+        // The next in line: one asked to build first, else the first that waits.
+        Program* next = nullptr;
+        for (Program* program : state.programs) {
+            if (program->build.load(std::memory_order_relaxed) == Build::Queued &&
+                (next == nullptr || (program->build_first && program->first_build && !next->build_first))) {
+                next = program;
+            }
+        }
+        if (next == nullptr) {
             return;
         }
+        --state.queued;
+        ++state.in_flight;
+        if (!next->first_build) {
+            DE_LOG_INFO("shader", "%s changed: rebuilding", next->module.c_str());
+        }
+        next->build_start_ns = platform::time_ns();
+        next->build.store(Build::Compiling, std::memory_order_relaxed);
+        // Background: only idle workers run it, so a long compile never stalls a frame.
+        state.jobs->submit_background(
+            core::Job{.entry = &build_job, .context = next, .counter = &next->counter, .name = "shader rebuild"});
+        state.sessions_to_release = state.sessions_to_release || state.in_flight > 1;
     }
 }
 
-// Finishes the build in flight if it's done (or waits for it), then starts the next queued one.
+// Takes in the builds in flight that are done (waiting for them all first, if asked), then starts queued ones.
 void advance_builds(LibraryState& state, bool wait) {
-    if (state.building != nullptr) {
-        if (wait) {
-            state.jobs->wait(state.building->counter);
-        }
-        if (state.building->build.load(std::memory_order_acquire) == Build::Done) {
-            finish_build(state, *state.building);
-            state.building = nullptr;
+    if (state.in_flight > 0) {
+        for (Program* program : state.programs) {
+            Build build = program->build.load(std::memory_order_acquire);
+            if (wait && build == Build::Compiling) {
+                state.jobs->wait(program->counter);
+                build = program->build.load(std::memory_order_acquire);
+            }
+            if (build == Build::Done) {
+                finish_build(state, *program);
+                --state.in_flight;
+            }
         }
     }
     start_next_build(state);
+    // A burst of builds is over: the compiler needn't hold on to the sessions it made for it.
+    if (state.sessions_to_release && state.compiler != nullptr && state.in_flight == 0 && state.queued == 0) {
+        state.sessions_to_release = false;
+        state.compiler->release_idle_sessions();
+    }
 }
 
 void queue_changed(LibraryState& state) {
@@ -489,12 +530,25 @@ void free_program(Program* program) {
     render_heap().deallocate(program, sizeof(Program), alignof(Program));
 }
 
-// The first build runs now, on the calling thread. A program whose first build fails is kept,
-// without a pipeline, and watched like any other: fixing the shader brings it to life.
+// The first build runs now, on the calling thread: or, with background_first_builds and nothing cached for it, in
+// the background like a rebuild, its pipeline coming with a later update(). A program whose first build fails is
+// kept, without a pipeline, and watched like any other: fixing the shader brings it to life.
 ProgramHandle add_program(LibraryState& state, Program* program) {
     program->build_start_ns = platform::time_ns();
-    compile(*program, program->pending);
+    const bool background = state.desc.background_first_builds && state.compiler != nullptr;
+    compile(*program, program->pending, background);
     PendingBuild& build = program->pending;
+    if (background && !build.ok) {
+        // Not cached: it waits its turn behind the builds already queued.
+        build = PendingBuild{};
+        program->first_build = true;
+        program->build.store(Build::Queued, std::memory_order_relaxed);
+        ++state.queued;
+        ++state.first_builds;
+        program->self = from_slot(state.programs.insert(program));
+        start_next_build(state);
+        return program->self;
+    }
     core::Result<rhi::PipelineHandle> pipeline =
         build.ok ? create_pipeline(state, *program, build.program)
                  : core::Result<rhi::PipelineHandle>(core::fail(core::ErrorCode::InvalidArgument, "compile failed"));
@@ -510,7 +564,43 @@ ProgramHandle add_program(LibraryState& state, Program* program) {
                      program->module.c_str());
     }
     build = PendingBuild{};
-    return from_slot(state.programs.insert(program));
+    program->self = from_slot(state.programs.insert(program));
+    return program->self;
+}
+
+// The program there already is for what's asked, if any: the same module, entries and defines (in the order given),
+// and for a graphics program the same pipeline state. Their debug names may differ: the first one's stays.
+Program* same_program(LibraryState& state, bool graphics, const char* module, std::span<const ShaderDefine> defines,
+                      std::span<const char* const> entries, const rhi::GraphicsPipelineDesc* pipeline) {
+    for (Program* program : state.programs) {
+        if (program->graphics != graphics || program->stage_count != entries.size() ||
+            program->define_count != defines.size() || program->module.view() != std::string_view(module)) {
+            continue;
+        }
+        bool same = true;
+        for (size_t i = 0; i < entries.size() && same; ++i) {
+            same = program->entries[i].view() == std::string_view(entries[i]);
+        }
+        for (size_t i = 0; i < defines.size() && same; ++i) {
+            same = program->defines[i].name.view() == std::string_view(defines[i].name) &&
+                   program->defines[i].value.view() ==
+                       std::string_view(defines[i].value != nullptr ? defines[i].value : "1");
+        }
+        if (same && pipeline != nullptr) {
+            const rhi::GraphicsPipelineDesc& has = program->graphics_state;
+            same = has.color_count == pipeline->color_count && has.depth_format == pipeline->depth_format &&
+                   has.depth_test == pipeline->depth_test && has.depth_write == pipeline->depth_write &&
+                   has.depth_compare == pipeline->depth_compare && has.topology == pipeline->topology &&
+                   has.cull == pipeline->cull && has.front_counter_clockwise == pipeline->front_counter_clockwise;
+            for (uint32_t i = 0; i < rhi::kMaxColorAttachments && same; ++i) {
+                same = has.color_formats[i] == pipeline->color_formats[i] && has.blend[i] == pipeline->blend[i];
+            }
+        }
+        if (same) {
+            return program;
+        }
+    }
+    return nullptr;
 }
 
 bool valid_names(const char* module, std::span<const ShaderDefine> defines, const char* const* entries,
@@ -606,6 +696,7 @@ ShaderLibrary ShaderLibrary::make(rhi::Device& device, platform::Vfs& vfs, core:
     state->jobs = &jobs;
     state->compiler = compiler;
     state->desc = desc;
+    state->most_in_flight = compiler != nullptr ? compiler->parallel_compiles() : 1;
     return ShaderLibrary(state);
 }
 
@@ -626,8 +717,10 @@ ShaderLibrary::~ShaderLibrary() {
     if (state_ == nullptr) {
         return;
     }
-    if (state_->building != nullptr) {
-        state_->jobs->wait(state_->building->counter);
+    for (Program* program : state_->programs) {
+        if (program->build.load(std::memory_order_acquire) == Build::Compiling) {
+            state_->jobs->wait(program->counter); // a build in flight: its result is dropped
+        }
     }
     for (Program* program : state_->programs) {
         state_->device->destroy(program->pipeline);
@@ -652,7 +745,12 @@ core::Result<ProgramHandle> ShaderLibrary::create_graphics(const GraphicsProgram
     if (!valid_names(desc.module, desc.defines, entries, 2)) {
         return core::fail(core::ErrorCode::InvalidArgument, "a program name, entry or define is missing or too long");
     }
+    if (Program* same = same_program(*state_, true, desc.module, desc.defines, entries, &desc.state)) {
+        ++same->users;
+        return same->self;
+    }
     Program* program = new_program(*state_, desc.module, desc.defines, desc.state.debug_name);
+    program->build_first = desc.build_first;
     program->graphics = true;
     program->graphics_state = desc.state;
     program->entries[0].assign(desc.vertex_entry);
@@ -669,7 +767,12 @@ core::Result<ProgramHandle> ShaderLibrary::create_compute(const ComputeProgramDe
     if (!valid_names(desc.module, desc.defines, entries, 1)) {
         return core::fail(core::ErrorCode::InvalidArgument, "a program name, entry or define is missing or too long");
     }
+    if (Program* same = same_program(*state_, false, desc.module, desc.defines, entries, nullptr)) {
+        ++same->users;
+        return same->self;
+    }
     Program* program = new_program(*state_, desc.module, desc.defines, desc.debug_name);
+    program->build_first = desc.build_first;
     program->graphics = false;
     program->entries[0].assign(desc.entry);
     program->stages[0] = rhi::ShaderStage::Compute;
@@ -683,11 +786,18 @@ void ShaderLibrary::destroy(ProgramHandle handle) {
     if (program == nullptr) {
         return;
     }
-    if (program == state.building) {
-        state.jobs->wait(program->counter); // its result is dropped
-        state.building = nullptr;
-    } else if (program->build.load(std::memory_order_relaxed) == Build::Queued) {
+    if (--program->users > 0) {
+        return; // someone else asked for the same, and still has it
+    }
+    if (const Build build = program->build.load(std::memory_order_acquire);
+        build == Build::Compiling || build == Build::Done) {
+        state.jobs->wait(program->counter); // in flight: its result is dropped
+        --state.in_flight;
+    } else if (build == Build::Queued) {
         --state.queued;
+    }
+    if (program->first_build) {
+        --state.first_builds;
     }
     state.programs.remove(to_slot(handle));
     state.device->destroy(program->pipeline);
@@ -736,7 +846,7 @@ void ShaderLibrary::reload_now() {
     LibraryState& state = *state_;
     queue_changed(state);
     start_next_build(state);
-    while (state.building != nullptr) {
+    while (state.in_flight > 0) {
         advance_builds(state, true);
     }
 }
@@ -746,7 +856,8 @@ ShaderLibraryStats ShaderLibrary::stats() const {
         .programs = static_cast<uint32_t>(state_->programs.size()),
         .reloads = state_->reloads,
         .failed_reloads = state_->failed_reloads,
-        .compiling = state_->queued + (state_->building != nullptr ? 1U : 0U),
+        .compiling = state_->queued + state_->in_flight,
+        .first_builds = state_->first_builds,
     };
 }
 

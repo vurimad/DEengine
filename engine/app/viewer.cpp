@@ -29,17 +29,21 @@ Viewer::Viewer() : free_camera_({0.0, 0.0, 0.0}, 0.0f, 0.0f) {}
 
 bool Viewer::startup(Engine& engine, const FrameworkArgs& args) {
     const char* const flag = flag_value(args, "--world");
-    const std::string_view text = flag != nullptr ? std::string_view(flag) : setting(engine.settings, "world");
-    asset::AssetId id;
-    if (!asset::parse_asset_id(text, id)) {
-        DE_LOG_ERROR("world",
-                     "no world to load: --world, or world in config/engine.settings, takes an asset ID "
-                     "(16 hex digits): '%.*s'",
-                     static_cast<int>(text.size()), text.data());
-        return false;
-    }
-    if (!load_world(engine, id)) {
-        return false;
+    // What was open last (the editor's), unless a world is named; the settings' if that one has gone.
+    const bool first_opened = flag == nullptr && first_world_.is_valid() && load_world(engine, first_world_);
+    if (!first_opened) {
+        const std::string_view text = flag != nullptr ? std::string_view(flag) : setting(engine.settings, "world");
+        asset::AssetId id;
+        if (!asset::parse_asset_id(text, id)) {
+            DE_LOG_ERROR("world",
+                         "no world to load: --world, or world in config/engine.settings, takes an asset ID "
+                         "(16 hex digits): '%.*s'",
+                         static_cast<int>(text.size()), text.data());
+            return false;
+        }
+        if (!load_world(engine, id)) {
+            return false;
+        }
     }
 
     quit_ = engine.input.add_action("quit"_sid, platform::ActionKind::Button);

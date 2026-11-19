@@ -102,6 +102,30 @@ bool property_reset_button(const PropertyRow& row, bool differs);
 
 void section_header(const char* label);
 void secondary_text(const char* text);
+// How wide toggle_chip() draws a label.
+float chip_width(const char* label);
+// A toolbar that wraps: items a frame high laid left to right from a margin, onto another line when the next
+// doesn't fit before limit_x (window coordinates, as ImGui::SetCursorPos takes). place() puts the cursor where the
+// next item goes; bottom() is where what's under the toolbar starts.
+class FlowRow {
+public:
+    FlowRow(float margin, float limit_x);
+    // The next item, this wide, this far from the one before it on its line.
+    void place(float item_width, float gap);
+    float bottom() const;
+
+private:
+    float margin_;
+    float limit_x_;
+    float x_;
+    float y_;
+    bool first_ = true;
+};
+// A compact checkbox centred on a row's frame line (its ID is "##value": one to an ID scope). True when it changed.
+bool compact_checkbox(bool& value);
+// A word that's a switch or a button, a frame high: lit while on, a step lighter under the mouse, greyed while
+// disabled (ImGui::BeginDisabled). Its tip shows either way. True when pressed.
+bool toggle_chip(const char* label, bool on, const char* tip);
 
 // ---- Resource glyphs ----
 

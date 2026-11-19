@@ -13,11 +13,29 @@ struct TonemapPush
     uint gb2;
     float exposure;    // multiplier: 2^EV
     uint view;         // 0 lit, 1 base color, 2 normal, 3 roughness, 4 metalness, 5 occlusion, 6 translucency,
-                       // 7 shadow mask, 8 cascades, 9 motion
+                       // 7 shadow mask, 8 cascades, 9 motion, 13 ambient occlusion, 14 hdr shown as data
     uint srgb_target;  // the target encodes to sRGB: data views are decoded first, so they show as stored
     uint shadow_mask;  // r: sunlight seen, g: cascade
     uint motion;       // rg: uv now minus uv last frame
+    uint ao;           // scene.gtao's occlusion (view 13), if ao_on
+    uint ao_on;
+    uint reserved;
+    float* adapted;    // auto exposure's (scene.exposure_adapt), times exposure; none: exposure alone
 };
+
+// What the picture is multiplied by: auto exposure's, once it has one.
+float exposure_now()
+{
+    if (push.adapted != nullptr)
+    {
+        const float adapted = *push.adapted;
+        if (adapted > 0.0)
+        {
+            return adapted * push.exposure;
+        }
+    }
+    return push.exposure;
+}
 
 [[vk::push_constant]]
 ConstantBuffer<TonemapPush> push;
@@ -52,6 +70,14 @@ float3 aces(float3 x)
 float4 fragment_main(VertexOutput input) : SV_Target
 {
     const int2 texel = int2(input.position.xy);
+    if (push.view == 14)
+    {
+        return show_data(load_texture(push.hdr, texel).rgb); // the lighting compare's heat map
+    }
+    if (push.view == 13)
+    {
+        return show_data((push.ao_on != 0 ? load_texture(push.ao, texel).r : 1.0).xxx);
+    }
     if (push.view == 9)
     {
         // Motion, ten times over, about grey: a tenth of the screen in a frame reaches the ends.
@@ -94,5 +120,5 @@ float4 fragment_main(VertexOutput input) : SV_Target
         }
     }
     const float3 hdr = clamp(load_texture(push.hdr, texel).rgb, 0.0, kHalfMax);
-    return float4(aces(hdr * push.exposure), 1.0);
+    return float4(aces(hdr * exposure_now()), 1.0);
 }

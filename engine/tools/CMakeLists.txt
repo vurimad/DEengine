@@ -13,6 +13,8 @@ add_library(de_tools STATIC
     console_ui.h
     debug_ui.cpp
     debug_ui.h
+    frame_debugger.cpp
+    frame_debugger.h
     free_camera.cpp
     free_camera.h
     screenshot.cpp

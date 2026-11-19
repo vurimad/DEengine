@@ -22,6 +22,7 @@ enum class GpuMaterialFlags : uint32_t {
     Masked = 1U << 0U,      // alpha test against alpha_cutoff
     DoubleSided = 1U << 1U, // lit from both sides
     Wind = 1U << 2U,        // moves in the wind (wind_bend_m, wind_flutter_m)
+    Blend = 1U << 3U,       // mixed over what's behind it by its alpha: drawn in the transparent pass, not the G-buffer
 };
 DE_ENUM_FLAGS(GpuMaterialFlags)
 
@@ -75,10 +76,11 @@ inline constexpr uint32_t kDrawKindCount = 4; // opaque, opaque double-sided, ma
 
 inline constexpr uint32_t kNoMeshSlot = UINT32_MAX;
 
-// The most parts of each kind a mesh draws in any LOD.
+// The most parts of each kind a mesh draws in any LOD; what blends is no kind of these, and counted apart.
 struct GpuMeshKinds {
     uint32_t parts[kDrawKindCount] = {};
-    bool has_lods = false; // more than LOD 0, so it can fade between them
+    uint32_t blend_parts = 0; // GpuMaterialFlags::Blend: the transparent pass's
+    bool has_lods = false;    // more than LOD 0, so it can fade between them
 };
 
 constexpr uint32_t draw_kind(GpuMaterialFlags flags) {
@@ -99,8 +101,11 @@ static_assert(sizeof(GpuMeshLod) == 12);
 // passes as its vertex offset.
 struct GpuMesh {
     uint32_t vertex_offset = 0;
-    uint32_t table_slot = 0; // in the mesh table
-    GpuMeshKinds kinds;      // by what the material table says now
+    uint32_t vertex_count = 0;     // from there
+    uint32_t first_table_part = 0; // its parts in the part table: a LOD's first_part counts from it
+    uint32_t table_slot = 0;       // in the mesh table
+    uint32_t seams_moved_lods = 0; // a bit a LOD (its first 32): asset::MeshLod::seams_moved
+    GpuMeshKinds kinds;            // by what the material table says now
     float bounds_min[3] = {};
     float bounds_max[3] = {};
     float bounds_center[3] = {}; // of the bounding sphere
@@ -169,14 +174,23 @@ public:
 
     // Null unless the mesh is uploaded (or for a stale handle).
     const GpuMesh* mesh(asset::AssetHandle mesh) const;
+    // Whether a frame drawn now shows the mesh: it's uploaded, and its entry in the mesh table has reached the GPU.
+    // mesh() says so as soon as that entry is on its way, which is what a renderer plans its draws by; uploads go
+    // oldest first, a budget's worth a frame, so while much else is uploading (a world coming in) the entry lands
+    // frames later, and until it does the cull finds nothing to draw. For what shows a thing once and keeps the
+    // picture.
+    bool mesh_on_gpu(asset::AssetHandle mesh) const;
     uint64_t material_table_address() const;
     // A material's index in that table, for as long as it's loaded; 0, the default, if it isn't.
     uint32_t material_slot(asset::AssetId material) const;
     // Whether that entry has every texture the material names, rather than defaults standing in while they upload: for
     // a map a default would misread, such as a flat normal over ground that isn't flat.
     bool material_complete(asset::AssetId material) const;
+    // The same, and the material table as the GPU has it by now says so: as mesh_on_gpu() is to mesh().
+    bool material_on_gpu(asset::AssetId material) const;
     // The geometry pool. Vertices are asset::MeshVertex, pulled by address and SV_VulkanVertexID; indices are 32-bit.
     uint64_t pool_vertex_address() const;
+    rhi::BufferHandle pool_vertex_buffer() const;
     rhi::BufferHandle pool_index_buffer() const;
     // A mesh's slot in the mesh table, for as long as it's loaded, reloads and all: what an instance can keep. It may
     // be asked for before the mesh has loaded. Until the mesh can be drawn, its entry says it has no LODs. kNoMeshSlot

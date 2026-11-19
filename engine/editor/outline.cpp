@@ -6,6 +6,7 @@
 #include "editor/entity_record.h"
 #include "physics/physics.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 
@@ -48,6 +49,9 @@ void Outline::rebuild(const flecs::world& ecs) {
 
     items_.clear();
     ecs.each([this](flecs::entity entity, const world::Transform&) {
+        if (entity.has<world::PrefabPart>()) {
+            return; // its placement stands for it: a placed prefab is one thing
+        }
         flecs::entity_t parent = 0;
         if (const auto* attached = entity.try_get<flecs::Parent>()) {
             parent = attached->value;
@@ -156,14 +160,23 @@ const char* entity_kind(flecs::entity entity) {
     if (entity.has<world::Camera>()) {
         return "Camera";
     }
+    if (entity.has<world::PrefabInstance>()) {
+        return "Prefab";
+    }
     if (entity.has<world::FogVolume>()) {
         return "Fog volume";
+    }
+    if (entity.has<world::WaterBody>()) {
+        return "Water";
     }
     if (entity.has<physics::RigidBody>()) {
         return "Body";
     }
     if (entity.has<world::MeshInstance>()) {
         return "Mesh";
+    }
+    if (entity.has<world::EffectInstance>()) {
+        return "Effect";
     }
     return "Entity";
 }

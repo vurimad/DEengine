@@ -1,5 +1,6 @@
 #pragma once
 
+#include "asset/light_format.h"
 #include "asset/registry.h"
 #include "core/array.h"
 #include "core/hash_map.h"
@@ -8,6 +9,7 @@
 
 #include <flecs.h>
 
+#include <algorithm>
 #include <cstdint>
 
 namespace de::core {
@@ -40,6 +42,101 @@ struct FogVolume {
     float noise_amount = 0.0f;               // 0: smooth, to 1: as much as noise can eat away
     float drift_mps[3] = {0.0f, 0.0f, 0.0f}; // how its noise moves through it: wind, in the world's axes
     float height_fade_m = 0.0f;              // how far down from its top it thins from nothing; 0: not at all
+    float under_roof = -1.0f; // how far its place is closed to the sky, 0 to 1 (asset::CellFogVolume); negative: unsaid
+};
+
+// A lake or a pond: still water, its surface flat at the entity's height, as wide as its world scale along x and z
+// (half extents), turned with its yaw. It shows only where the ground is lower than it.
+struct WaterBody {
+    bool ellipse = true; // else a rectangle
+    float waves = 0.15f; // 0: glassy, to 1: the sea's own waves
+};
+
+// An effect's own clock (docs/design.md, VFX foundation): its age follows the world's time from a moment it was set
+// at, at its own rate. Its particles are what that age gives, whenever and however it got there: held still, slowed,
+// set back or far ahead, it shows exactly what playing to that age would have left. The default is as old as the
+// world: what stands in a cell has always been burning, whenever its cell came in. What starts at some moment (a
+// burst, an impact) is set to that moment with start().
+struct EffectClock {
+    double since_s = 0.0; // the world's time it counts from
+    double age_s = 0.0;   // how old it was then
+    float rate = 1.0f;    // of the world's time: 0 holds it still, 0.5 is half speed
+
+    // How old it is at a world's time: never younger than nothing.
+    double age_at(double time_s) const {
+        return std::max(0.0, age_s + ((time_s - since_s) * static_cast<double>(rate)));
+    }
+    // From a world's time on: at this age, and then as before.
+    void seek(double time_s, double age) {
+        since_s = time_s;
+        age_s = std::max(0.0, age);
+    }
+    // From a world's time on: at another rate, from the age it has reached.
+    void set_rate(double time_s, float new_rate) {
+        seek(time_s, age_at(time_s));
+        rate = std::max(0.0f, new_rate);
+    }
+    // Starts it at a world's time: new, at its usual rate.
+    void start(double time_s) { *this = EffectClock{.since_s = time_s}; }
+};
+
+// Plays an effect where the entity is (docs/design.md, VFX foundation): its emitters spawn there, in the entity's
+// axes, at its scale. The handle doesn't hold the effect: whatever spawned the entity does (its cell).
+struct EffectInstance {
+    asset::AssetHandle effect; // an asset::EffectAsset
+    EffectClock clock{};
+    // Emitters left out of the picture, a bit each by their place in the effect: they go on being simulated. For
+    // looking at one of them by itself (the editor's effect viewer).
+    uint32_t hidden_emitters = 0;
+};
+
+// A local light where the entity is (docs/design.md, Local lights): a point that shines every way, or with a cone a
+// spot along the entity's -Z. As asset::LightDesc, which is what files keep. It scales with its entity as if the whole
+// thing were made bigger: its radius by the scale, its light by the scale squared, so a prefab placed at half size is
+// lit the same, at half size.
+struct LocalLight {
+    float color[3] = {1.0f, 1.0f, 1.0f}; // linear
+    float intensity = 1.0f;  // what it gives a surface facing it from 1 m, in the sun's units; falls with the square
+    float radius_m = 4.0f;   // where its light has come down to nothing
+    float cone_deg = 0.0f;   // 0: a point light; else a spot's angle from its axis to where it ends
+    float cone_soft = 0.25f; // how much of that angle is the fade at its edge
+    float flicker = 0.0f;    // 0: steady, to 1: the share of its light a flicker takes away at most
+    float flicker_hz = 8.0f;
+    float shadow = 1.0f; // how much of a shadow it casts: 0 none (asset::LightDesc)
+
+    bool operator==(const LocalLight&) const = default;
+
+    static LocalLight from(const asset::LightDesc& light) {
+        return {.color = {light.color[0], light.color[1], light.color[2]},
+                .intensity = light.intensity,
+                .radius_m = light.radius_m,
+                .cone_deg = light.cone_deg,
+                .cone_soft = light.cone_soft,
+                .flicker = light.flicker,
+                .flicker_hz = light.flicker_hz,
+                .shadow = light.shadow};
+    }
+    asset::LightDesc desc() const {
+        return {.color = {color[0], color[1], color[2]},
+                .intensity = intensity,
+                .radius_m = radius_m,
+                .cone_deg = cone_deg,
+                .cone_soft = cone_soft,
+                .flicker = flicker,
+                .flicker_hz = flicker_hz,
+                .shadow = shadow};
+    }
+};
+static_assert(sizeof(LocalLight) == sizeof(asset::LightDesc));
+
+// How far along a flicker a light is at a time, from 0 to 1: three slow waves that never line up, each light (seed)
+// at its own place in them. The same time gives the same value.
+float light_flicker(double time_s, float hz, uint32_t seed);
+
+// An entity's place among effects, which the renderer keeps its particles by between frames. Comes and goes with its
+// EffectInstance, given and freed by observers.
+struct EffectSlot {
+    uint32_t slot = 0;
 };
 
 // A point of view. The active one (ActiveCamera) is what render extraction looks through.
@@ -125,6 +222,38 @@ struct RenderFogVolume {
     float noise_amount = 0.0f;
     float noise_offset_tiles[3] = {}; // past the render origin, in the world's axes, wrapped to [0, 4)
     float height_fade_m = 0.0f;
+    float under_roof = -1.0f; // negative: it doesn't say
+};
+
+// One lake or pond this frame, relative to the frame's render origin.
+struct RenderWaterBody {
+    float center[3] = {};                 // x, z: its middle; y: its surface
+    float half_extents[2] = {1.0f, 1.0f}; // along its own x and z, in meters
+    float axis[2] = {1.0f, 0.0f};         // its own x in the world's (x, z): its yaw
+    bool ellipse = true;
+    float waves = 0.15f;
+};
+
+// One effect this frame (docs/design.md, VFX foundation): which, where, and whose. An effect that isn't in a frame's
+// list is gone: its particles go with it.
+struct RenderEffect {
+    RenderTransform transform = {}; // where its emitters are: its entity's place
+    asset::AssetHandle effect;      // an asset::EffectAsset
+    uint32_t slot = 0; // its entity's place among effects (EffectSlot): the same every frame, so its particles carry on
+    uint32_t seed = 0; // what makes its particles differ from another's of the same effect
+    EffectClock clock{};          // how old it is at the frame's time (RenderFrame::time_s)
+    uint32_t hidden_emitters = 0; // EffectInstance's
+};
+
+// One local light this frame, relative to the frame's render origin, as it shines now (its flicker taken in).
+struct RenderLight {
+    float position[3] = {};
+    float radius_m = 1.0f;
+    float color[3] = {};             // times its intensity
+    float direction[3] = {0, 0, -1}; // a spot's axis: the way it shines
+    float cos_outer = -2.0f;         // of a spot's angle; a point light: below any cosine
+    float cone_scale = 1.0f;         // 1 / (the cosine of where its edge starts to fade - cos_outer); a point light: 1
+    float shadow = 1.0f;             // how much of a shadow it casts, 0 to 1: at 0 it takes no shadow tiles
 };
 
 // What RenderExtract hands the renderer each frame (docs/design.md, World model): the world seen
@@ -146,6 +275,9 @@ struct RenderFrame {
     bool instance_out_of_reach =
         false; // one of these is past kRenderReachM from the origin, so it draws in the wrong place
     core::Array<RenderFogVolume> fog_volumes{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<RenderWaterBody> water_bodies{core::heap_allocator(core::MemoryTag::Render)};
+    core::Array<RenderEffect> effects{core::heap_allocator(core::MemoryTag::Render)}; // every one there is
+    core::Array<RenderLight> lights{core::heap_allocator(core::MemoryTag::Render)};   // every one there is
 };
 
 // The render origin follows the camera in steps of this, so floats near it stay precise (0.06 mm at
@@ -185,6 +317,8 @@ struct RenderExtractScratch {
     core::Array<uint32_t> free_slots{core::heap_allocator(core::MemoryTag::Render)};
     core::Array<uint32_t> freed_slots{core::heap_allocator(core::MemoryTag::Render)}; // since the last frame
     uint32_t next_slot = 0;
+    core::Array<uint32_t> free_effect_slots{core::heap_allocator(core::MemoryTag::Render)};
+    uint32_t next_effect_slot = 0;
     MovedRows moved_rows;
     bool resync = false; // send all of them, next frame
     bool warned_out_of_reach = false;

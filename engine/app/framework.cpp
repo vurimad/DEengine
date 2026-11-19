@@ -34,6 +34,7 @@
 #include "tools/agent_server.h"
 #include "tools/console_ui.h"
 #include "tools/debug_ui.h"
+#include "tools/frame_debugger.h"
 #include "tools/stats_panel.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
@@ -41,6 +42,7 @@
 
 #include <imgui.h>
 
+#include <algorithm>
 #include <charconv>
 #include <cstdio>
 #include <cstdlib>
@@ -54,6 +56,12 @@ namespace de::app {
 using namespace core::literals;
 
 namespace {
+
+// The most shaders compiled at once: each takes a worker and one of Slang's sessions for as long as it lasts, and
+// leaves the process some 250 MB larger until it ends. Measured on the dev machine, the editor's 42 programs from
+// nothing cached: 11 s one at a time, 8 s at two, 6 s at four, and no sooner at six (the largest program alone
+// takes a good part of that).
+constexpr uint32_t kShaderCompilesAtOnce = 4;
 
 std::string_view as_text(const core::Array<std::byte>& bytes) {
     return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
@@ -123,6 +131,12 @@ struct DevConsole {
     tools::CameraPose goto_pose{};
     bool go = false; // goto_pose is next frame's camera
     bool quit = false;
+    core::FixedString<255> save_path; // r.path_tracer_save: where the path tracer's mean is to go; empty: none asked
+    render::LightBoxDesc boxes[render::kMaxLightBoxes] = {}; // r.light_box: the boxes asked for
+    uint32_t box_count = 0;
+    bool boxes_changed = false;
+    bool rebake = false;
+    bool save_asked = false; // and the path tracer has been asked for it
 };
 
 // A scene view's name as the console takes it: "base color" -> "base_color".
@@ -233,6 +247,127 @@ void view_command(void* user, const console::Args& args, console::Output& out) {
     out.info("r.view = %s (%s)", view_word(dev.engine.view).c_str(), names);
 }
 
+void light_box_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    if (args.size() == 1 && (args[0] == "clear" || args[0] == "rebake")) {
+        if (args[0] == "clear") {
+            dev.box_count = 0;
+            dev.boxes_changed = true;
+            out.info("no light boxes");
+        } else {
+            dev.rebake = true;
+            out.info("the light boxes bake again");
+        }
+        return;
+    }
+    double corners[6] = {};
+    bool ok = args.size() >= 6 && args.size() <= 8;
+    for (size_t i = 0; i < 6 && ok; ++i) {
+        ok = console::Args::parse_double(args[i], corners[i]);
+    }
+    float voxel_m = 0.25f;
+    if (ok && args.size() >= 7) {
+        ok = console::Args::parse_float(args[6], voxel_m) && voxel_m > 0.0f;
+    }
+    // A box fitted round a room has its walls a little inside it: by default it fades over two voxels at its edge.
+    float fade_m = 2.0f * voxel_m;
+    if (ok && args.size() == 8) {
+        ok = console::Args::parse_float(args[7], fade_m) && fade_m >= 0.0f;
+    }
+    if (!ok || dev.box_count >= render::kMaxLightBoxes) {
+        out.error(
+            "r.light_box takes a box's lowest and highest corners (x y z x y z, meters), its voxel and how far it "
+            "fades at its edge (meters; 0.25 and two voxels); or clear, or rebake. At most %u boxes",
+            render::kMaxLightBoxes);
+        return;
+    }
+    dev.boxes[dev.box_count++] = {.min_m = DVec3(std::min(corners[0], corners[3]), std::min(corners[1], corners[4]),
+                                                 std::min(corners[2], corners[5])),
+                                  .max_m = DVec3(std::max(corners[0], corners[3]), std::max(corners[1], corners[4]),
+                                                 std::max(corners[2], corners[5])),
+                                  .voxel_m = voxel_m,
+                                  .fade_m = fade_m};
+    dev.boxes_changed = true;
+    out.info("light box %u added: it bakes over the next frames (r.light_box clear takes them all away)",
+             dev.box_count);
+}
+
+void path_tracer_save_command(void* user, const console::Args& args, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    const std::string_view path = args.empty() ? std::string_view("user:/captures/path_traced.pfm") : args[0];
+    if (path.size() >= 255) {
+        out.error("that path is too long");
+        return;
+    }
+    dev.save_path = core::FixedString<255>(path);
+    out.info("the path tracer's mean goes to %.*s once read back (a few frames; the picture must be path traced or "
+             "compared)",
+             static_cast<int>(path.size()), path.data());
+}
+
+// r.path_tracer_save: asks the path tracer for its mean, and once it has it, writes it as a PFM (a header, then RGB
+// floats, the bottom row first).
+void save_path_traced(render::SceneRenderer& renderer, DevConsole& dev, const platform::Vfs& vfs) {
+    render::PathTracer* tracer = renderer.path_tracer();
+    if (tracer == nullptr) {
+        dev.save_path = {};
+        return;
+    }
+    if (!dev.save_path.empty() && !dev.save_asked) {
+        tracer->request_save();
+        dev.save_asked = true;
+    }
+    core::Array<float> rgba(core::heap_allocator(core::MemoryTag::Platform));
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t samples = 0;
+    if (!dev.save_asked || !tracer->take_saved(rgba, width, height, samples)) {
+        return;
+    }
+    char header[64] = {};
+    const int header_size = std::snprintf(header, sizeof(header), "PF\n%u %u\n-1.0\n", width, height);
+    core::Array<std::byte> file(core::heap_allocator(core::MemoryTag::Platform));
+    file.resize(static_cast<size_t>(header_size) + (size_t{width} * height * 3 * sizeof(float)));
+    std::memcpy(file.data(), header, static_cast<size_t>(header_size));
+    std::byte* out = file.data() + header_size;
+    for (uint32_t row = 0; row < height; ++row) {
+        const float* from = rgba.data() + (size_t{height - 1 - row} * width * 4);
+        for (uint32_t x = 0; x < width; ++x) {
+            std::memcpy(out, from + (size_t{x} * 4), 3 * sizeof(float));
+            out += 3 * sizeof(float);
+        }
+    }
+    const core::Result<void> written = vfs.write_file(dev.save_path.c_str(), file.span());
+    if (written) {
+        DE_LOG_INFO("render", "the path tracer's mean, %u samples a pixel, %u x %u, written to %s", samples, width,
+                    height, dev.save_path.c_str());
+    } else {
+        DE_LOG_ERROR("render", "the path tracer's mean couldn't be written to %s: %s", dev.save_path.c_str(),
+                     written.error().message);
+    }
+    dev.save_path = {};
+    dev.save_asked = false;
+}
+
+// Where the camera is and how it's turned, as --camera and camera.goto take it: for a person to hand a view to an
+// agent, or an agent to read the one a person is looking at.
+void where_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto& dev = *static_cast<DevConsole*>(user);
+    const flecs::world& ecs = dev.engine.world.ecs();
+    const auto* active = ecs.try_get<world::ActiveCamera>();
+    const auto* place = active != nullptr && active->entity != 0 && ecs.is_alive(active->entity)
+                            ? ecs.entity(active->entity).try_get<world::WorldTransform>()
+                            : nullptr;
+    if (place == nullptr) {
+        out.error("there's no camera");
+        return;
+    }
+    const Vec3 forward = place->rotation * Vec3(0.0f, 0.0f, -1.0f);
+    const double yaw_deg = glm::degrees(static_cast<double>(std::atan2(-forward.x, -forward.z)));
+    const double pitch_deg = glm::degrees(static_cast<double>(std::asin(std::clamp(forward.y, -1.0f, 1.0f))));
+    out.info("%.4f,%.4f,%.4f,%.3f,%.3f", place->position.x, place->position.y, place->position.z, yaw_deg, pitch_deg);
+}
+
 void goto_command(void* user, const console::Args& args, console::Output& out) {
     auto& dev = *static_cast<DevConsole*>(user);
     double place[3] = {};
@@ -303,6 +438,18 @@ void add_dev_commands(console::Console& console, DevConsole& dev) {
     console.add_command("stats", "<section,section,...>", "Show exactly these frame stats sections (as --stats does).",
                         &stats_command, &dev);
     console.add_variable("r.taa", "Temporal anti-aliasing on or off (F3).", &dev.engine.taa, &dev);
+    console.add_variable("r.local_shadow_cache",
+                         "Keep the local lights' shadow tiles from frame to frame, drawing again only where something "
+                         "that casts changed; 0: every tile every frame, to compare.",
+                         &dev.engine.local_shadow_cache, &dev);
+    console.add_variable("r.local_shadow_lights",
+                         "The most local lights that have shadows in a frame, the most covering first; the rest light "
+                         "without.",
+                         &dev.engine.most_shadowed_lights, 0, 256, &dev);
+    console.add_variable("r.jitter",
+                         "With r.taa 0, one of TAA's sub-pixel offsets held (1 to 16; 0: none): what changes with it "
+                         "in a still flickers under TAA.",
+                         &dev.engine.debug_jitter, 0, 16, &dev);
     console.add_variable(
         "physics.show_colliders",
         "Draw physics' colliders near the camera: static blue, ground green, moving orange (grey asleep), "
@@ -315,12 +462,103 @@ void add_dev_commands(console::Console& console, DevConsole& dev) {
                          &dev.engine.freeze_cull, &dev);
     console.add_variable("r.fog_low_camera", "Thin the height fog when the camera is low (F5).",
                          &dev.engine.fog_low_camera, &dev);
+    console.add_variable("r.path_traced",
+                         "The picture path traced (adding up over frames while nothing changes) rather than "
+                         "rasterized; only where the GPU traces rays.",
+                         &dev.engine.path_traced, &dev);
+    console.add_variable(
+        "r.compare",
+        "Show how far the rasterized light is from the path tracer's: grey agrees, blue too dark, red "
+        "too bright (full at a stop); numbers in the stats' rays section. Hold still while it adds up.",
+        &dev.engine.lighting_compare, &dev);
+    console.add_variable("r.path_tracer_bounces",
+                         "The most bounces a path takes in the path tracer; 0: direct light alone (to compare the "
+                         "rasterized direct light with GI off).",
+                         &dev.engine.path_tracer_bounces, 0, 64, &dev);
+    console.add_variable("r.auto_exposure", "The exposure follows how bright the scene is; 0: the environment's.",
+                         &dev.engine.auto_exposure, &dev);
+    console.add_variable("r.ao", "Ambient occlusion on the screen (GTAO); 0: none, to compare.",
+                         &dev.engine.ambient_occlusion, &dev);
+    console.add_variable("r.radiance_cascades",
+                         "Bounced light from screen-space radiance cascades, in place of the flat ambient.",
+                         &dev.engine.radiance_cascades, &dev);
+    console.add_variable(
+        "r.rc_scale",
+        "The screen's pixels to one of the picture the radiance cascades work on, each way: 1 to 4, or "
+        "0 for the most that keeps that picture 360 pixels high or more. Their cost goes with its pixels.",
+        &dev.engine.rc_scale, 0, 4, &dev);
+    console.add_variable("r.rc_azimuths",
+                         "The first radiance cascade's directions on the screen; each cascade has twice the one "
+                         "before's.",
+                         &dev.engine.rc_azimuths, 2, 16, &dev);
+    console.add_variable("r.rc_interval",
+                         "The first radiance cascade's reach, in its picture's pixels; each cascade's is twice the one "
+                         "before's.",
+                         &dev.engine.rc_interval_px, 1.0f, 64.0f, &dev);
+    console.add_variable("r.rc_max_step",
+                         "The most of the screen's pixels between a radiance cascade march's samples, up to 512.",
+                         &dev.engine.rc_max_step_px, 1, 512, &dev);
+    console.add_variable("r.rc_march_steps",
+                         "The most samples a radiance cascade's march takes (0: as many as r.rc_max_step makes it); "
+                         "past it they stand farther apart.",
+                         &dev.engine.rc_march_steps, 0, 1024, &dev);
+    console.add_variable("r.rc_cascades", "The most radiance cascades: fewer reach less far across the picture.",
+                         &dev.engine.rc_cascades, 1, 12, &dev);
+    console.add_variable("r.rc_thickness",
+                         "How far behind its surface a thing on the screen still stands for the radiance cascades, "
+                         "in meters.",
+                         &dev.engine.rc_thickness_m, 0.01f, 1000.0f, &dev);
+    console.add_variable("r.rc_tolerance",
+                         "How far off a probe's plane a probe of the cascade above still counts, in its spacings.",
+                         &dev.engine.rc_tolerance, 0.05f, 100.0f, &dev);
+    console.add_variable(
+        "r.rc_sky",
+        "What the radiance cascades multiply the sky's light by, and with them on the sky's ambient on "
+        "fog, particles, water and what's see-through: 0 in a hall with a roof.",
+        &dev.engine.rc_sky, 0.0f, 64.0f, &dev);
+    console.add_variable("r.rc_bounce", "What the radiance cascades multiply the light of what's on the screen by.",
+                         &dev.engine.rc_bounce, 0.0f, 64.0f, &dev);
+    console.add_variable("r.rc_bounces",
+                         "The radiance cascades' light bounces more than once (last frame's light is met by this "
+                         "frame's marches); 0: once, to compare with the path tracer held to one bounce.",
+                         &dev.engine.rc_bounces, &dev);
+    console.add_variable("r.rc_white_sky",
+                         "The radiance cascades' sky white from every way: with r.view indirect, what's open.",
+                         &dev.engine.rc_white_sky, &dev);
+    console.add_variable("r.rc_material_ao",
+                         "The radiance cascades' light times the material's own occlusion; 0: without, to compare "
+                         "with the path tracer.",
+                         &dev.engine.rc_material_occlusion, &dev);
+    console.add_variable("r.specular_ambient",
+                         "Surfaces reflect the ambient light; 0: they don't, to compare the diffuse light with the "
+                         "path tracer, which has none yet.",
+                         &dev.engine.specular_ambient, &dev);
+    console.add_variable("r.water_bands", "Color the bands the shore's waves come in by, over the sea.",
+                         &dev.engine.water_bands, &dev);
+    console.add_variable("r.surf_film", "The surf from its baked film; 0: the simulated surf, to compare.",
+                         &dev.engine.surf_film, &dev);
+    console.add_variable("r.hide_terrain", "Leave the ground out of the picture, to see the water under it.",
+                         &dev.engine.hide_terrain, &dev);
     console.add_command("r.view", "[name]",
                         "Show the scene lit or as one buffer: base_color, normal, roughness... (F2).", &view_command,
                         &dev);
+    console.add_command("camera.where", "",
+                        "Say where the camera is and how it's turned: x,y,z,yaw,pitch, as --camera takes it.",
+                        &where_command, &dev);
     console.add_command("camera.goto", "<x> <y> <z> [yaw pitch]",
                         "Move the camera to a place in meters; yaw and pitch in degrees turn it too.", &goto_command,
                         &dev);
+    console.add_command("r.light_box", "<x y z x y z> [voxel] [fade] | clear | rebake",
+                        "Bake the light that bounces into a box (its lowest and highest corners in meters; a voxel of "
+                        "0.25 m unless said), read in place of the flat ambient where it holds a point.",
+                        &light_box_command, &dev);
+    console.add_variable("r.light_boxes",
+                         "Read the light boxes where they hold a point; 0: the flat ambient, to compare.",
+                         &dev.engine.light_boxes, &dev);
+    console.add_command("r.path_tracer_save", "[file]",
+                        "Write the path tracer's mean as it is (linear light, a float image: PFM) to a file "
+                        "(user:/captures/path_traced.pfm), to compare with an offline render.",
+                        &path_tracer_save_command, &dev);
     console.add_command("quit", "", "Close the engine.", &quit_command, &dev);
 }
 #endif
@@ -357,6 +595,10 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
         out.fps_cap = static_cast<uint32_t>(std::strtoul(cap, nullptr, 10));
     }
     out.validation = DE_BUILD_DEV != 0 && !has_flag(out, "--no-validation");
+    out.shader_cache = !has_flag(out, "--no-shader-cache");
+    if (const char* compiles = flag_value(out, "--shader-compiles")) {
+        out.shader_compiles = static_cast<uint32_t>(std::strtoul(compiles, nullptr, 10));
+    }
     out.show_sticks = DE_BUILD_DEV != 0 && has_flag(out, "--show-sticks");
     out.fullscreen = has_flag(out, "--fullscreen");
 #if DE_BUILD_DEV
@@ -437,6 +679,16 @@ bool parse_args(int argc, char** argv, FrameworkArgs& out) {
     return true;
 }
 
+#if DE_BUILD_DEV
+const char* viewport_notice(const Engine& engine, std::span<char> text) {
+    if (const uint32_t waiting = engine.shaders.stats().first_builds; waiting > 0) {
+        std::snprintf(text.data(), text.size(), "COMPILING SHADERS: %u LEFT", waiting);
+        return text.data();
+    }
+    return engine.freeze_cull ? "CULL FROZEN (F4)" : nullptr;
+}
+#endif
+
 const char* flag_value(const FrameworkArgs& args, const char* flag) {
     for (int i = 1; i + 1 < args.argc; ++i) {
         if (std::strcmp(args.argv[i], flag) == 0) {
@@ -478,7 +730,17 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     platform::Project project;
     if (DE_BUILD_DEV != 0) {
         const char* given = args.project != nullptr ? args.project : DE_DEFAULT_PROJECT;
-        if (const core::Result<platform::Project> found = platform::find_project(given, engine_root)) {
+        // The editor, started with no project named (a double click), opens the one it had open last. Not a picture's
+        // run or a counted one: those open what they always did.
+        const bool editing = has_flag(args, "--editor") && args.frames == 0 && !has_flag(args, "--still") &&
+                             !has_flag(args, "--screenshot") && !has_flag(args, "--camera-path");
+        core::Result<platform::Project> found = platform::find_project(given, engine_root);
+        if (editing && args.project == nullptr) {
+            if (core::Result<platform::Project> last = platform::last_project()) {
+                found = std::move(last);
+            }
+        }
+        if (found) {
             project = *found;
             src_root = project.root.c_str();
             DE_LOG_INFO("engine", "project %s: %s", project.name.c_str(), project.root.c_str());
@@ -508,7 +770,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     core::Result<shader::ShaderCompiler> compiler =
         core::fail(core::ErrorCode::Unsupported, "no engine:/ to compile shaders from");
     if (engine_root != nullptr) {
-        compiler = shader::ShaderCompiler::create(*vfs);
+        // Compiled programs are kept in the user's folder between runs: a start compiles only what changed.
+        // What isn't kept compiles several at a time, on a quarter of the workers at most: the frame has the rest.
+        compiler = shader::ShaderCompiler::create(
+            *vfs, {.cache_folder = args.shader_cache ? "user:/shader_cache" : nullptr,
+                   .parallel_compiles = args.shader_compiles != 0
+                                            ? args.shader_compiles
+                                            : std::clamp(jobs.worker_count() / 4, 1U, kShaderCompilesAtOnce)});
     }
     if (!compiler && engine_root != nullptr) {
         // Sources are there but can't be compiled: no hot reload.
@@ -537,6 +805,11 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
     const bool scripted = eyes.scripted();
     const bool swapchain_copy_src = eyes.takes_pictures();
+    // What someone opened to work in is what a start with no project named opens next time: not a picture's or a
+    // counted run's.
+    if (src_root != nullptr && has_flag(args, "--editor") && !scripted && args.frames == 0) {
+        platform::remember_project(project);
+    }
 #else
     const bool scripted = false;
     const bool swapchain_copy_src = false;
@@ -556,9 +829,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_ERROR("engine", "no usable GPU: %s", device.error().message);
         return EXIT_FAILURE;
     }
-    core::Result<shader::ShaderLibrary> shaders = compiler
-                                                      ? shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler)
-                                                      : shader::ShaderLibrary::create_cooked(*device, *vfs, jobs);
+    // A window someone is at stays responsive while shaders compile for the first time (seconds, with nothing
+    // cached): they build in the background and the picture fills in as they arrive. A run that takes pictures or
+    // counts its frames compiles as it creates them, so its first frame draws everything.
+    const shader::ShaderLibraryDesc library_desc{.background_first_builds = !scripted && args.frames == 0};
+    core::Result<shader::ShaderLibrary> shaders =
+        compiler ? shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, library_desc)
+                 : shader::ShaderLibrary::create_cooked(*device, *vfs, jobs);
     if (!shaders) {
         DE_LOG_ERROR("engine", "can't start: %s", shaders.error().message); // a cook started just now, say
         return EXIT_FAILURE;
@@ -568,7 +845,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         DE_LOG_ERROR("render", "uploader: %s", uploader.error().message);
         return EXIT_FAILURE;
     }
-    auto graph = render::RenderGraph::create(*device);
+    // --no-gpu-timing: no timestamps round the passes, to see what a frame takes without them.
+    auto graph = render::RenderGraph::create(
+        *device, {.gpu_timing = render::RenderGraphDesc{}.gpu_timing && !has_flag(args, "--no-gpu-timing")});
     if (!graph) {
         DE_LOG_ERROR("render", "render graph: %s", graph.error().message);
         return EXIT_FAILURE;
@@ -598,8 +877,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         return EXIT_FAILURE;
     }
     std::optional<render::SceneRenderer> scene_renderer;
-    auto created = render::SceneRenderer::create(
-        {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .uploader = &*uploader, .vfs = &*vfs});
+    auto created = render::SceneRenderer::create({.device = &*device,
+                                                  .shaders = &*shaders,
+                                                  .gpu_assets = &*gpu_assets,
+                                                  .uploader = &*uploader,
+                                                  .vfs = &*vfs,
+                                                  .assets = &*assets,
+                                                  .ray_tracing = true});
     if (created) {
         scene_renderer.emplace(std::move(*created));
         scene_renderer->set_lod_error_pixels(args.lod_error_pixels);
@@ -646,10 +930,13 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                   .lighting = {},
                   .view = render::SceneView::Lit,
                   .taa = setting(as_text(settings), "taa") == "on",
+                  .fps_cap = args.fps_cap,
                   .terrain = {},
                   .terrain_layers = {},
                   .water = {},
-                  .fog_low_camera = true};
+                  .fog_low_camera = true,
+                  .ambient_occlusion = true,
+                  .auto_exposure = true};
     asset::AssetHandle shown_terrain;
     uint32_t shown_terrain_revision = 0;
     asset::AssetHandle shown_layers;
@@ -663,14 +950,37 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     engine.frame_stats = !scripted || has_flag(args, "--stats");
     stats_panel.set_sections(args.stats_sections != 0 ? args.stats_sections : tools::kStatsDefault);
     engine.scripted = scripted;
+    // Each pass's GPU time over a scripted run that asked for stats, logged at the end so a script reads what the
+    // stats panel shows in a picture: the mean of the last whole window of frames, not of the run (a GPU that was
+    // idle takes seconds to bring its clock up, and the frames until then are slow).
+    constexpr uint32_t kPassTimeWindow = 512;
+    struct PassTimeSum {
+        core::FixedString<31> name;
+        double ms = 0.0;      // summed over the window being filled
+        double last_ms = 0.0; // the mean over the last one filled
+    };
+    PassTimeSum pass_time_sums[render::kMaxTimedPasses];
+    size_t pass_time_count = 0;
+    uint32_t pass_time_frames = 0; // in the window being filled
+    bool pass_time_window = false; // one has been filled
+    // And the frames' own time, start to start, the same way.
+    double frame_time_sum_s = 0.0;
+    double frame_time_last_ms = 0.0;
+    uint32_t frame_time_frames = 0;
+    const bool log_pass_times = scripted && has_flag(args, "--stats");
     tools::ConsoleUi console_ui(console);
     console_ui.load_history(*vfs);
     engine.console_ui = &console_ui;
     engine.stats_panel = &stats_panel;
+    // The frame debugger: closed, and costing nothing, until it's asked for.
+    tools::FrameDebugger frame_debugger = tools::FrameDebugger::create(*device, engine.shaders);
+    frame_debugger.add_commands(console);
+    frame_debugger.set_open(has_flag(args, "--frame-debugger"));
+    engine.frame_debugger = &frame_debugger;
     // The engine's log, into the console's (the Output panel, the console window).
     console::LogFeed log_feed(core::heap_allocator(core::MemoryTag::Tools));
     const LogFeedScope log_feed_scope(log_feed);
-    DevConsole dev_console{.engine = engine, .stats = stats_panel};
+    DevConsole dev_console{.engine = engine, .stats = stats_panel, .save_path = {}};
     add_dev_commands(console, dev_console);
     console.add_command("console.show", "[on | off]", "Open or close the console window (the ` key).",
                         &console_show_command, &console_ui);
@@ -686,6 +996,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         }
     }
     const platform::ActionId toggle_stats = input.add_action("debug.toggle_stats"_sid, platform::ActionKind::Button);
+    const platform::ActionId toggle_frame_debugger =
+        input.add_action("debug.frame_debugger"_sid, platform::ActionKind::Button);
     // The raw stick readout (--show-sticks), for measuring drift: the deadzone is off, so these show
     // the true resting values.
     const platform::ActionId sticks[4] = {input.add_action("debug.stick_left_x"_sid, platform::ActionKind::Axis),
@@ -743,7 +1055,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // What the camera and the world move by.
         // Minimized, nothing is presented: there are no refreshes to count. Capped, frames aren't paced by them either.
         const double clock_s = frame_clock.step(
-            measured_s, device->vsync() && !window->minimized() && args.fps_cap == 0 ? window->refresh_hz() : 0.0);
+            measured_s, device->vsync() && !window->minimized() && engine.fps_cap == 0 ? window->refresh_hz() : 0.0);
 #if DE_BUILD_DEV
         const double frame_s = eyes.frame_s(clock_s);
         engine.camera_pose = eyes.begin_frame();
@@ -806,6 +1118,9 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 stats_panel.set_sections(tools::kStatsDefault); // after "stat none"
             }
         }
+        if (input.state(toggle_frame_debugger).pressed) {
+            frame_debugger.set_open(!frame_debugger.open());
+        }
         if (args.show_sticks && platform::time_ns() >= next_stick_report_ns) {
             next_stick_report_ns = platform::time_ns() + platform::kNsPerSecond / 2;
             DE_LOG_INFO(
@@ -853,6 +1168,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // The debug UI's frame; its textures go to the uploader before record().
         if (debug_ui.begin_frame(*window, static_cast<float>(measured_s))) {
             application.ui(engine);
+            frame_debugger.draw(); // its window, while it's open: over the game, or among the editor's panels
             // Over the game's picture: the editor's panel, when it's shown in one, or the window.
             const SceneViewport& shown = engine.viewport;
             const ImGuiViewport* window_view = ImGui::GetMainViewport();
@@ -864,9 +1180,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 if (engine.frame_stats) {
                     stats_panel.draw_overlay(picture.x, picture.y, picture.z, picture.w);
                 }
-                if (engine.freeze_cull) {
+                char notice_text[64];
+                if (const char* notice = viewport_notice(engine, notice_text); notice != nullptr) {
                     tools::draw_viewport_notice(ImGui::GetBackgroundDrawList(), picture.x, picture.y, picture.z,
-                                                "CULL FROZEN (F4)");
+                                                notice);
                 }
             }
             console_ui.draw(picture.x, picture.y, picture.z, picture.w);
@@ -879,7 +1196,45 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         // What the application asks of the renderer, in every build.
         if (scene_renderer) {
             scene_renderer->set_fog_low_camera(engine.fog_low_camera);
+            scene_renderer->set_path_traced(engine.path_traced);
+            scene_renderer->set_lighting_compare(engine.lighting_compare);
+            scene_renderer->set_light_boxes_on(engine.light_boxes);
+            if (render::PathTracer* tracer = scene_renderer->path_tracer();
+                tracer != nullptr && engine.path_tracer_bounces != engine.path_tracer_bounces_set) {
+                tracer->set_max_bounces(static_cast<uint32_t>(engine.path_tracer_bounces)); // starts it again
+                engine.path_tracer_bounces_set = engine.path_tracer_bounces;
+            }
+            scene_renderer->set_ambient_occlusion(engine.ambient_occlusion);
+            scene_renderer->set_radiance_cascades(engine.radiance_cascades);
+            render::RadianceCascadesSettings cascades;
+            cascades.scale = static_cast<uint32_t>(engine.rc_scale);
+            cascades.azimuths = static_cast<uint32_t>(engine.rc_azimuths);
+            cascades.interval_px = engine.rc_interval_px;
+            cascades.max_step_px = static_cast<uint32_t>(engine.rc_max_step_px);
+            cascades.max_march_steps = static_cast<uint32_t>(engine.rc_march_steps);
+            cascades.max_cascades = static_cast<uint32_t>(engine.rc_cascades);
+            cascades.thickness_m = engine.rc_thickness_m;
+            cascades.plane_tolerance = engine.rc_tolerance;
+            cascades.sky = engine.rc_sky;
+            cascades.bounce = engine.rc_bounce;
+            cascades.bounces = engine.rc_bounces;
+            cascades.white_sky = engine.rc_white_sky;
+            cascades.material_occlusion = engine.rc_material_occlusion;
+            scene_renderer->set_radiance_cascades_settings(cascades);
+            scene_renderer->set_specular_ambient(engine.specular_ambient);
+            scene_renderer->set_debug_jitter(static_cast<uint32_t>(std::max(engine.debug_jitter, 0)));
+            scene_renderer->set_local_shadow_cache(engine.local_shadow_cache);
+            scene_renderer->set_most_shadowed_lights(static_cast<uint32_t>(std::max(engine.most_shadowed_lights, 0)));
+            scene_renderer->set_auto_exposure(engine.auto_exposure);
+#if DE_BUILD_DEV
+            render::SceneWater water = engine.water;
+            water.show_bands = engine.water_bands;
+            water.surf_film = engine.surf_film;
+            scene_renderer->set_water(water);
+            scene_renderer->set_terrain_hidden(engine.hide_terrain);
+#else
             scene_renderer->set_water(engine.water);
+#endif
 #if DE_BUILD_DEV
             scene_renderer->set_editor_overlay(engine.editor_overlay);
             // Physics' colliders around the camera, when asked for.
@@ -933,7 +1288,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                         context.list.end_rendering();
                     });
             };
-            // The scene at the window's size, or at the viewport's, into its texture.
+            application.draw(engine); // its own textures first: this frame's passes may show them
+                                      // The scene at the window's size, or at the viewport's, into its texture.
 #if DE_BUILD_DEV
             const bool in_viewport = scene_in_viewport;
             graph->begin(in_viewport ? viewport_desc.width : device->swapchain_width(),
@@ -947,6 +1303,7 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                                                                      .final_state = rhi::ResourceState::Present,
                                                                      .discard = true});
 #if DE_BUILD_DEV
+            frame_debugger.begin_frame(*graph, device->swapchain_format()); // before the first pass: it watches them
             render::GraphTexture scene_target = back;
             if (in_viewport) {
                 // Left where the UI reads it; the window under the UI is cleared.
@@ -970,18 +1327,40 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                     world->resync_render_instances();
                 }
 #if DE_BUILD_DEV
+                save_path_traced(*scene_renderer, dev_console, *vfs);
+                if (dev_console.boxes_changed) {
+                    scene_renderer->set_light_boxes(std::span(dev_console.boxes, dev_console.box_count));
+                    dev_console.boxes_changed = false;
+                }
+                if (dev_console.rebake) {
+                    scene_renderer->rebake_light_boxes();
+                    dev_console.rebake = false;
+                }
+#endif
+#if DE_BUILD_DEV
                 engine.pick_answer = scene_renderer->pick_answer();
 #endif
             } else {
                 clear(scene_target); // no scene renderer: cleared
             }
 #if DE_BUILD_DEV
+            // What the UI shows of the graph's: the scene in its panel, the frame debugger's view.
+            render::GraphTexture ui_shows[2];
+            size_t ui_shows_count = 0;
+            if (in_viewport) {
+                ui_shows[ui_shows_count++] = scene_target;
+            }
+            if (const render::GraphTexture view = frame_debugger.shown(); view.is_valid()) {
+                ui_shows[ui_shows_count++] = view;
+            }
             debug_ui.add_pass(*graph, back, device->swapchain_format(),
-                              in_viewport ? std::span<const render::GraphTexture>(&scene_target, 1)
-                                          : std::span<const render::GraphTexture>{});
+                              std::span<const render::GraphTexture>(ui_shows, ui_shows_count));
             eyes.add_picture_pass(*device, *graph, back, backbuffer);
 #endif
             graph->execute();
+#if DE_BUILD_DEV
+            frame_debugger.end_frame(*graph);
+#endif
             if (scene_renderer) { // a frame that drew: minimized, these would repeat the last one's
                 const render::SceneRendererStats drawn = scene_renderer->stats();
                 DE_PROFILE_PLOT("draws to cull", static_cast<int64_t>(drawn.draws));
@@ -998,6 +1377,10 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 DE_PROFILE_PLOT("terrain blocks wanted", static_cast<int64_t>(drawn.terrain.wanted));
                 DE_PROFILE_PLOT("merged shadow draws", static_cast<int64_t>(drawn.merged_shadow_draws));
                 DE_PROFILE_PLOT("draws lost", static_cast<int64_t>(drawn.draws_lost));
+                DE_PROFILE_PLOT("lights lit", static_cast<int64_t>(drawn.lights.lit));
+                DE_PROFILE_PLOT("particles", static_cast<int64_t>(drawn.particles.particles));
+                DE_PROFILE_PLOT("particle blocks stepped", static_cast<int64_t>(drawn.particles.blocks_stepped));
+                DE_PROFILE_PLOT("particle blocks drawn", static_cast<int64_t>(drawn.particles.blocks_drawn));
                 DE_PROFILE_PLOT("visible triangles", static_cast<int64_t>(drawn.visible_triangles));
                 DE_PROFILE_PLOT("visible shadow triangles", static_cast<int64_t>(drawn.visible_shadow_triangles));
                 static_cast<void>(drawn);
@@ -1011,8 +1394,8 @@ int run_framework(Application& application, const FrameworkArgs& args) {
             world->resync_render_instances();           // what changes while nothing's drawn would be lost
             platform::sleep_ns(5 * platform::kNsPerMs); // minimized: nothing to show, don't spin a core
         }
-        if (args.fps_cap > 0) {
-            const uint64_t period_ns = platform::kNsPerSecond / args.fps_cap;
+        if (engine.fps_cap > 0) {
+            const uint64_t period_ns = platform::kNsPerSecond / engine.fps_cap;
             if (const uint64_t spent_ns = platform::time_ns() - frame_start_ns; spent_ns < period_ns) {
                 platform::sleep_ns(period_ns - spent_ns);
             }
@@ -1022,10 +1405,16 @@ int run_framework(Application& application, const FrameworkArgs& args) {
         ++title_frames;
         if (const uint64_t now = platform::time_ns(); now - title_start_ns >= platform::kNsPerSecond) {
             const double seconds = static_cast<double>(now - title_start_ns) * 1e-9;
-            char title[96];
-            std::snprintf(title, sizeof(title), "DEengine  |  %.0f fps  %.2f ms",
-                          static_cast<double>(title_frames) / seconds,
-                          seconds * 1000.0 / static_cast<double>(title_frames));
+            char title[128];
+            const int length = std::snprintf(title, sizeof(title), "DEengine  |  %.0f fps  %.2f ms",
+                                             static_cast<double>(title_frames) / seconds,
+                                             seconds * 1000.0 / static_cast<double>(title_frames));
+            // And the shaders still compiling for the first time: the picture is missing what they draw.
+            if (const uint32_t waiting = shaders->stats().first_builds;
+                waiting > 0 && length > 0 && static_cast<size_t>(length) < sizeof(title)) {
+                std::snprintf(title + length, sizeof(title) - static_cast<size_t>(length),
+                              "  |  compiling shaders: %u left", waiting);
+            }
             window->set_title(title);
             title_frames = 0;
             title_start_ns = now;
@@ -1042,21 +1431,88 @@ int run_framework(Application& application, const FrameworkArgs& args) {
                 : nullptr;
         const render::SceneRendererStats cull_stats =
             scene_renderer ? scene_renderer->stats() : render::SceneRendererStats{};
-        stats_panel.record(
-            {.frame_ms = static_cast<float>(measured_s * 1000.0),
-             .heap_allocations = allocations,
-             .device = device->stats(),
-             .memory = device->memory_stats(),
-             .graph = graph->stats(),
-             .uploads = uploader->stats(),
-             .gpu_passes = graph->gpu_times(),
-             .gpu_frame_ms = graph->gpu_frame_ms(),
-             .has_camera = camera_place != nullptr,
-             .camera_position = camera_place != nullptr ? camera_place->position : DVec3(0.0),
-             .camera_rotation = camera_place != nullptr ? camera_place->rotation : Quat(1.0f, 0.0f, 0.0f, 0.0f),
-             .cull_frozen = engine.freeze_cull,
-             .visible_shadow_draws = cull_stats.visible_shadow_draws,
-             .visible_shadow_triangles = cull_stats.visible_shadow_triangles});
+        render::GpuExposureState exposure_now{};
+        const bool exposure_known = scene_renderer && scene_renderer->auto_exposure_state(exposure_now);
+        stats_panel.record({
+            .frame_ms = static_cast<float>(measured_s * 1000.0),
+            .heap_allocations = allocations,
+            .device = device->stats(),
+            .memory = device->memory_stats(),
+            .graph = graph->stats(),
+            .uploads = uploader->stats(),
+            .gpu_passes = graph->gpu_times(),
+            .gpu_frame_ms = graph->gpu_frame_ms(),
+            .has_camera = camera_place != nullptr,
+            .camera_position = camera_place != nullptr ? camera_place->position : DVec3(0.0),
+            .camera_rotation = camera_place != nullptr ? camera_place->rotation : Quat(1.0f, 0.0f, 0.0f, 0.0f),
+            .has_exposure = exposure_known,
+            .exposure_ev = exposure_now.log2_exposure,
+            .exposure_target_ev = exposure_now.target_log2,
+            .cull_frozen = engine.freeze_cull,
+            .visible_shadow_draws = cull_stats.visible_shadow_draws,
+            .visible_shadow_triangles = cull_stats.visible_shadow_triangles,
+            .particle_effects = cull_stats.particles.effects,
+            .particle_emitters = cull_stats.particles.emitters,
+            .particle_emitters_drawn = cull_stats.particles.emitters_drawn,
+            .particle_emitters_starved = cull_stats.particles.emitters_starved,
+            .particles = cull_stats.particles.particles,
+            .particle_blocks = cull_stats.particles.blocks,
+            .particle_pool_blocks = cull_stats.particles.pool_blocks,
+            .lights = cull_stats.lights.lights,
+            .lights_lit = cull_stats.lights.lit,
+            .lights_dropped = cull_stats.lights.dropped,
+            .lights_shadowed = cull_stats.lights.shadowed,
+            .shadow_faces = cull_stats.lights.shadow_faces,
+            .trace_meshes = cull_stats.trace.meshes,
+            .trace_waiting = cull_stats.trace.waiting,
+            .trace_instances = cull_stats.trace.instances,
+            .trace_triangles = cull_stats.trace.triangles,
+            .path_tracer_samples = cull_stats.path_tracer_samples,
+            .path_tracer_restart = cull_stats.path_tracer_restart,
+            .path_tracer_restarts = cull_stats.path_tracer_restarts,
+            .path_tracer_bounces = cull_stats.path_tracer_bounces,
+            .light_boxes = cull_stats.light_boxes.boxes,
+            .light_box_voxels = cull_stats.light_boxes.voxels,
+            .light_boxes_baked = cull_stats.light_boxes.baked,
+            .compare_pixels = cull_stats.compare.pixels,
+            .compare_mean_stops = cull_stats.compare.mean_stops,
+            .compare_over_10 = cull_stats.compare.over_10,
+            .compare_over_25 = cull_stats.compare.over_25,
+            .compare_darker_10 = cull_stats.compare.darker_10,
+            .compare_brighter_10 = cull_stats.compare.brighter_10,
+        });
+        if (log_pass_times) {
+            frame_time_sum_s += measured_s;
+            if (++frame_time_frames == kPassTimeWindow) {
+                frame_time_last_ms = frame_time_sum_s * 1000.0 / static_cast<double>(kPassTimeWindow);
+                frame_time_sum_s = 0.0;
+                frame_time_frames = 0;
+            }
+            const std::span<const render::PassGpuTime> times = graph->gpu_times();
+            bool same = times.size() == pass_time_count;
+            for (size_t i = 0; same && i < times.size(); ++i) {
+                same = pass_time_sums[i].name.view() == times[i].name.view();
+            }
+            if (!same) { // the frame's passes changed: start over with these
+                pass_time_count = times.size();
+                pass_time_frames = 0;
+                pass_time_window = false;
+                for (size_t i = 0; i < times.size(); ++i) {
+                    pass_time_sums[i] = {.name = times[i].name};
+                }
+            }
+            for (size_t i = 0; i < times.size(); ++i) {
+                pass_time_sums[i].ms += static_cast<double>(times[i].ms);
+            }
+            if (++pass_time_frames == kPassTimeWindow) {
+                for (size_t i = 0; i < times.size(); ++i) {
+                    pass_time_sums[i].last_ms = pass_time_sums[i].ms / static_cast<double>(kPassTimeWindow);
+                    pass_time_sums[i].ms = 0.0;
+                }
+                pass_time_frames = 0;
+                pass_time_window = true;
+            }
+        }
 #endif
         DE_PROFILE_FRAME();
         ++frame;
@@ -1109,6 +1565,40 @@ int run_framework(Application& application, const FrameworkArgs& args) {
     }
     if (gpu_stats.meshes_dropped > 0) {
         DE_LOG_WARN("render", "%u meshes didn't fit in the geometry pool", gpu_stats.meshes_dropped);
+    }
+    if (scene_stats.compare.pixels > 0) {
+        // What r.compare last measured, for a run that's scripted: its picture's numbers, in the log.
+        DE_LOG_INFO("render",
+                    "compared with path traced: %.3f stops off on average; %.1f%% off by over 10%%, %.1f%% by over "
+                    "25%%; %.1f%% too dark by 10%%, %.1f%% too bright",
+                    static_cast<double>(scene_stats.compare.mean_stops),
+                    static_cast<double>(scene_stats.compare.over_10 * 100.0f),
+                    static_cast<double>(scene_stats.compare.over_25 * 100.0f),
+                    static_cast<double>(scene_stats.compare.darker_10 * 100.0f),
+                    static_cast<double>(scene_stats.compare.brighter_10 * 100.0f));
+    }
+#if DE_BUILD_DEV
+    if (log_pass_times && frame_time_last_ms > 0.0) {
+        DE_LOG_INFO("render", "frame time: %.3f ms, the mean of the run's last whole window of %u frames",
+                    frame_time_last_ms, kPassTimeWindow);
+    }
+    if (log_pass_times && (pass_time_window || pass_time_frames > 0)) {
+        double total = 0.0;
+        for (size_t i = 0; i < pass_time_count; ++i) {
+            const double ms = pass_time_window ? pass_time_sums[i].last_ms
+                                               : pass_time_sums[i].ms / static_cast<double>(pass_time_frames);
+            total += ms;
+            DE_LOG_INFO("render", "gpu pass %2u %-31s %7.3f ms", static_cast<uint32_t>(i),
+                        pass_time_sums[i].name.c_str(), ms);
+        }
+        DE_LOG_INFO("render", "gpu passes: %.3f ms in all, the mean of %u frames%s", total,
+                    pass_time_window ? kPassTimeWindow : pass_time_frames,
+                    pass_time_window ? " (the last whole window of the run)" : "");
+    }
+#endif
+    if (compiler) {
+        const shader::ShaderCompilerStats compiles = compiler->stats();
+        DE_LOG_INFO("shader", "%u programs compiled, %u taken from the cache", compiles.compiled, compiles.from_cache);
     }
     const rhi::DeviceStats stats = device->stats();
     DE_LOG_INFO("engine", "shutting down after %llu frames, %llu world ticks (%u validation errors, %u warnings)",

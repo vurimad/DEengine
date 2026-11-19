@@ -86,6 +86,7 @@ struct CompiledProgram {
 struct ShaderDependency {
     platform::PathString path{}; // "engine:/shaders/common/color.slang"
     platform::FileInfo info{};
+    uint64_t content_hash = 0; // of what was read (core::hash_bytes): what the cache knows the file by
 };
 
 // What a compile reports besides its result, failed compiles included: the files it read (so a
@@ -101,6 +102,24 @@ struct ShaderCompilerDesc {
     // Defines DE_SHADER_CHECKS to 1 (0 otherwise): shaders check what they can afford to, such
     // as bindless indices against their table (shaders/common/bindless.slang).
     bool checks = DE_BUILD_DEV != 0;
+    // A folder to keep compiled programs in between runs ("user:/shader_cache"), or null for none
+    // (shader_cache.h). A program compiled before is then read back, not compiled, as long as every
+    // source that compile read still has the same content; one that compiled with warnings isn't
+    // kept, so its warnings are seen every time. For the engine, which compiles the same programs at
+    // every start; tools that compile once (the cooker) leave it off.
+    const char* cache_folder = nullptr;
+    // How many compiles may run at once, from as many threads (1 to kMaxParallelCompiles). Each takes one of Slang's
+    // global sessions, which is single-threaded: the first is made with the compiler, the others when that many
+    // compiles first overlap (a fraction of a second and some tens of megabytes each, kept from then on). A caller
+    // that asks for more at once waits its turn. 1: one at a time, as tools that compile in order want.
+    uint32_t parallel_compiles = 1;
+};
+
+inline constexpr uint32_t kMaxParallelCompiles = 16;
+
+struct ShaderCompilerStats {
+    uint32_t compiled = 0;   // programs Slang compiled (failed compiles included)
+    uint32_t from_cache = 0; // programs read back from the cache folder
 };
 
 // Compiles Slang shaders to the RHI backend's bytecode, with reflection (docs/design.md, Shaders,
@@ -109,8 +128,10 @@ struct ShaderCompilerDesc {
 // Conventions for shaders: column-major matrices (mul(matrix, vector), like GLM), push constants
 // in one [[vk::push_constant]] ConstantBuffer, resources reached bindlessly (by index or pointer).
 //
-// Thread-safe: compiles run one at a time (Slang's global session is single-threaded), so run
-// them as background jobs to keep long compiles off the thread that renders. Move-only.
+// Thread-safe: up to ShaderCompilerDesc::parallel_compiles compiles run at once, each on a Slang
+// global session of its own (one is single-threaded), and the rest wait their turn; run them as
+// background jobs to keep long compiles off the thread that renders. Reading the cache doesn't wait
+// for them. Move-only.
 class ShaderCompiler {
 public:
     // Fails if Slang can't start (its runtime library or standard modules are missing).
@@ -124,6 +145,20 @@ public:
 
     // Errors and warnings are logged under "shader" and, with a report, collected in it.
     core::Result<CompiledProgram> compile(const CompileRequest& request, CompileReport* report = nullptr);
+
+    // The program compile() would give, if the cache has it for the sources as they are now; NotFound if it
+    // doesn't (or there's no cache folder), without compiling. Never waits for a compile running on another
+    // thread: for a caller that would sooner compile in the background than block (ShaderLibrary's first builds).
+    core::Result<CompiledProgram> read_cached(const CompileRequest& request, CompileReport* report = nullptr);
+
+    // Lets go of the sessions no compile is using, all but one, with what each keeps loaded (some tens of megabytes).
+    // For when a burst of compiles is over (a start with nothing cached); the next burst makes them again, a
+    // fraction of a second each. Thread-safe.
+    void release_idle_sessions();
+
+    ShaderCompilerStats stats() const;
+    // How many compiles run at once (ShaderCompilerDesc::parallel_compiles, held to its range).
+    uint32_t parallel_compiles() const;
 
 private:
     explicit ShaderCompiler(CompilerState* state) : state_(state) {}

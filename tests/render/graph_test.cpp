@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <string_view>
 
 using namespace de::rhi;
 using de::render::GraphBuffer;
@@ -747,5 +748,162 @@ TEST_CASE("passes are timed on the GPU, and their times arrive once the frame is
     }
     CHECK(untimed->gpu_times().empty());
     device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("the frame's graph can be read back: its passes, what they used and what they recorded") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const BufferHandle readback = make_readback(*device, 64);
+
+    device->begin_frame();
+    graph->begin(4, 4);
+    const GraphBuffer out =
+        graph->import_buffer({.buffer = readback, .name = "readback", .final_state = ResourceState::HostRead});
+    const TextureData& kept = add_clear(*graph, "clear");
+    const TextureData& dropped = add_clear(*graph, "unused"); // nothing reads it: culled
+    add_copy_out(*graph, kept.texture, out);
+    // Between begin() and execute(), the passes so far are there to read.
+    CHECK(graph->pass_count() == 3);
+    graph->execute();
+    device->end_frame();
+
+    REQUIRE(graph->pass_count() == 3);
+    const de::render::GraphPassInfo clear = graph->pass_info(0);
+    CHECK((std::string_view(clear.name) == "clear"));
+    CHECK(clear.ran);
+    REQUIRE(clear.use_count == 1);
+    CHECK(clear.work.draws == 0); // a clear through begin_rendering draws nothing
+    CHECK(clear.work.copies == 0);
+    const de::render::GraphUseInfo cleared = graph->pass_use(0, 0);
+    CHECK(cleared.is_texture);
+    CHECK(cleared.writes);
+    CHECK(cleared.state == ResourceState::RenderTarget);
+    CHECK(cleared.resource == kept.texture.index);
+    CHECK(cleared.range.mip_count == 1);
+
+    CHECK((std::string_view(graph->pass_info(1).name) == "unused"));
+    CHECK_FALSE(graph->pass_info(1).ran);
+    CHECK(graph->pass_info(1).work.copies == 0);
+
+    const de::render::GraphPassInfo copy = graph->pass_info(2);
+    CHECK(copy.ran);
+    REQUIRE(copy.use_count == 2);
+    CHECK(copy.work.copies == 1);
+    CHECK_FALSE(graph->pass_use(2, 0).writes); // the texture, as a copy's source
+    CHECK(graph->pass_use(2, 0).is_texture);
+    CHECK(graph->pass_use(2, 1).writes); // the buffer it copies into
+    CHECK_FALSE(graph->pass_use(2, 1).is_texture);
+    CHECK(graph->pass_use(2, 1).resource == out.index);
+
+    REQUIRE(graph->texture_count() == 2);
+    const de::render::GraphTextureInfo texture = graph->texture_info(kept.texture.index);
+    CHECK((std::string_view(texture.name) == "small color"));
+    CHECK(texture.desc.width == 4);
+    CHECK(texture.desc.format == Format::RGBA8Unorm);
+    CHECK_FALSE(texture.imported);
+    CHECK(texture.used);
+    CHECK_FALSE(graph->texture_info(dropped.texture.index).used);
+    REQUIRE(graph->buffer_count() == 1);
+    const de::render::GraphBufferInfo buffer = graph->buffer_info(out.index);
+    CHECK((std::string_view(buffer.name) == "readback"));
+    CHECK(buffer.imported);
+    CHECK(buffer.used);
+    CHECK(buffer.desc.size == 64);
+
+    device->wait_idle();
+    CHECK(all_pixels(*device, readback, 16, kClearRgba));
+    device->destroy(readback);
+    check_clean(*device);
+}
+
+namespace {
+
+// What the pass hook of the test below keeps: where its own pass copies to, and how often it was called.
+struct Watcher {
+    GraphBuffer out;
+    uint32_t calls = 0;
+};
+
+// After the pass named "first": a copy of the texture it wrote, as it left it.
+void watch_first(void* user, RenderGraph& graph, uint32_t pass) {
+    auto& watcher = *static_cast<Watcher*>(user);
+    ++watcher.calls;
+    if (std::string_view(graph.pass_info(pass).name) == "first") {
+        add_copy_out(graph, GraphTexture{graph.pass_use(pass, 0).resource}, watcher.out);
+    }
+}
+
+} // namespace
+
+TEST_CASE("a pass hook adds a pass right after the one it watches: a texture as that pass left it") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    auto graph = RenderGraph::create(*device);
+    REQUIRE(graph.ok());
+    const BufferHandle at_first = make_readback(*device, 64);
+    const BufferHandle at_end = make_readback(*device, 64);
+    Watcher watcher;
+    graph->set_pass_hook(&watch_first, &watcher);
+
+    for (int frame = 0; frame < 2; ++frame) {
+        CAPTURE(frame);
+        watcher.calls = 0;
+        device->begin_frame();
+        graph->begin(4, 4);
+        watcher.out = graph->import_buffer({.buffer = at_first,
+                                            .name = "at first",
+                                            .state = frame == 0 ? ResourceState::Undefined : ResourceState::HostRead,
+                                            .final_state = ResourceState::HostRead});
+        const GraphBuffer out =
+            graph->import_buffer({.buffer = at_end,
+                                  .name = "at end",
+                                  .state = frame == 0 ? ResourceState::Undefined : ResourceState::HostRead,
+                                  .final_state = ResourceState::HostRead});
+        const TextureData& first = add_clear(*graph, "first");
+        // The same texture, written over: black.
+        graph->add_pass(
+            "second", [&](PassBuilder& pass) { pass.use(first.texture, ResourceState::RenderTarget); },
+            [texture = first.texture](PassContext& context) {
+                const ColorAttachment attachment{.texture = context.texture(texture), .clear = {.a = 1.0f}};
+                context.list.begin_rendering({.colors = std::span(&attachment, 1)});
+                context.list.end_rendering();
+            });
+        add_copy_out(*graph, first.texture, out);
+        graph->execute();
+        device->end_frame();
+        device->wait_idle();
+
+        // Called for the three passes added here, not for the one it added itself, which is in the graph
+        // right after the pass it watched.
+        CHECK(watcher.calls == 3);
+        REQUIRE(graph->pass_count() == 4);
+        CHECK((std::string_view(graph->pass_info(1).name) == "copy out"));
+        CHECK(graph->pass_info(1).ran);
+        CHECK((std::string_view(graph->pass_info(2).name) == "second"));
+        CHECK(all_pixels(*device, at_first, 16, kClearRgba));
+        CHECK(all_pixels(*device, at_end, 16, 0xFF000000));
+    }
+
+    // Taken away again: it isn't called.
+    graph->set_pass_hook(nullptr, nullptr);
+    watcher.calls = 0;
+    device->begin_frame();
+    graph->begin(4, 4);
+    add_clear(*graph, "first");
+    graph->execute();
+    device->end_frame();
+    CHECK(watcher.calls == 0);
+    CHECK(graph->pass_count() == 1);
+
+    device->wait_idle();
+    device->destroy(at_first);
+    device->destroy(at_end);
     check_clean(*device);
 }

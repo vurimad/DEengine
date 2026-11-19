@@ -1,3 +1,4 @@
+#include "core/allocator.h"
 #include "core/job_system.h"
 #include "platform/time.h"
 #include "render/rhi/device.h"
@@ -8,9 +9,12 @@
 
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -267,6 +271,53 @@ TEST_CASE("a graphics program draws through the RHI, culling by winding") {
     check_clean(*device);
 }
 
+TEST_CASE("asked for the same program twice, the library gives one, kept until both have let it go") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const Sandbox sandbox;
+    Vfs vfs = make_repo_vfs(sandbox);
+    ShaderCompiler compiler = make_compiler(vfs);
+    de::core::JobSystem jobs({.worker_count = 1});
+    auto library = ShaderLibrary::create(*device, vfs, jobs, compiler, {.hot_reload = false});
+    REQUIRE(library.ok());
+    de::rhi::GraphicsPipelineDesc state{.color_count = 1, .debug_name = "one"};
+    state.color_formats[0] = de::rhi::Format::RGBA8Unorm;
+    const auto first = library->create_graphics({.module = "tests.solid_color", .state = state});
+    REQUIRE(first.ok());
+    // The same again, as a second renderer would ask: the same program, whatever it's called.
+    state.debug_name = "two";
+    const auto second = library->create_graphics({.module = "tests.solid_color", .state = state});
+    REQUIRE(second.ok());
+    CHECK((*second == *first));
+    CHECK(library->stats().programs == 1);
+    // Anything different about it is another program: its pipeline state, its defines.
+    de::rhi::GraphicsPipelineDesc blended = state;
+    blended.blend[0] = de::rhi::BlendMode::Premultiplied;
+    const auto third = library->create_graphics({.module = "tests.solid_color", .state = blended});
+    REQUIRE(third.ok());
+    CHECK_FALSE((*third == *first));
+    const de::shader::ShaderDefine defines[] = {{.name = "SOMETHING", .value = "2"}};
+    const auto fourth = library->create_graphics({.module = "tests.solid_color", .defines = defines, .state = state});
+    REQUIRE(fourth.ok());
+    CHECK_FALSE((*fourth == *first));
+    CHECK(library->stats().programs == 3);
+    // Let go of once, it's still there for the other; let go of twice, it's gone.
+    const de::rhi::PipelineHandle pipeline = library->pipeline(*first);
+    REQUIRE(pipeline.is_valid());
+    library->destroy(*first);
+    CHECK((library->pipeline(*second) == pipeline));
+    CHECK(library->stats().programs == 3);
+    library->destroy(*second);
+    CHECK_FALSE(library->pipeline(*second).is_valid());
+    CHECK(library->stats().programs == 2);
+    library->destroy(*third);
+    library->destroy(*fourth);
+    CHECK(library->stats().programs == 0);
+    device->wait_idle();
+}
+
 TEST_CASE("a compute program writes a buffer through its device address") {
     auto device = make_device();
     if (!device) {
@@ -294,6 +345,355 @@ TEST_CASE("a compute program writes a buffer through its device address") {
     device->destroy(*buffer);
     library->destroy(*program);
     device->wait_idle();
+    check_clean(*device);
+}
+
+TEST_CASE("compiled programs are kept between runs, and compiled again when a source they read changes") {
+    const Sandbox sandbox;
+    Vfs vfs = sandbox.make_vfs();
+    // kept.slang writes value.slang's constant: the program depends on both files.
+    constexpr std::string_view kKept = "import value;\n"
+                                       "struct Push { uint* output; uint value; uint count; };\n"
+                                       "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
+                                       "[shader(\"compute\")]\n[numthreads(4, 2, 1)]\n"
+                                       "void compute_main() { push.output[0] = kValue; }\n";
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = 1;\n");
+    write_source(vfs, "engine:/shaders/kept.slang", kKept);
+    const ShaderEntry entry[] = {{.name = "compute_main", .stage = ShaderStage::Compute}};
+    const CompileRequest request{.module = "kept", .entries = entry};
+    const ShaderCompilerDesc with_cache{.cache_folder = "user:/shader_cache"};
+    const auto same_code = [](const CompiledProgram& a, const CompiledProgram& b) {
+        return a.stages.size() == 1 && b.stages.size() == 1 && a.stages[0].code.size() == b.stages[0].code.size() &&
+               std::memcmp(a.stages[0].code.data(), b.stages[0].code.data(),
+                           a.stages[0].code.size() * sizeof(uint32_t)) == 0;
+    };
+
+    auto first_run = ShaderCompiler::create(vfs, with_cache);
+    REQUIRE(first_run.ok());
+    CompileReport compiled_report;
+    const auto compiled = first_run->compile(request, &compiled_report);
+    REQUIRE(compiled.ok());
+    CHECK(first_run->stats().compiled == 1);
+    CHECK(first_run->stats().from_cache == 0);
+
+    // Asked again, it's read back: the same code and reflection, and the same sources reported, for hot reload.
+    CompileReport kept_report;
+    const auto kept = first_run->compile(request, &kept_report);
+    REQUIRE(kept.ok());
+    CHECK(first_run->stats().compiled == 1);
+    CHECK(first_run->stats().from_cache == 1);
+    CHECK(same_code(*compiled, *kept));
+    const ShaderReflection& reflection = kept->stages[0].reflection;
+    CHECK(kept->stages[0].entry == "compute_main");
+    CHECK(reflection.stage == ShaderStage::Compute);
+    CHECK(reflection.thread_group_size[0] == 4);
+    CHECK(reflection.thread_group_size[1] == 2);
+    CHECK(reflection.push_constant_bytes == 16);
+    REQUIRE(field(reflection, "count") != nullptr);
+    CHECK(field(reflection, "count")->offset == 12);
+    REQUIRE(kept_report.dependencies.size() == compiled_report.dependencies.size());
+    CHECK(has_dependency(kept_report, "engine:/shaders/kept.slang"));
+    CHECK(has_dependency(kept_report, "engine:/shaders/value.slang"));
+    for (const ShaderDependency& read : compiled_report.dependencies) {
+        bool found = false;
+        for (const ShaderDependency& reported : kept_report.dependencies) {
+            found = found || (reported.path == read.path.view() && reported.info.size == read.info.size &&
+                              reported.info.modified_time == read.info.modified_time &&
+                              reported.content_hash == read.content_hash && read.content_hash != 0);
+        }
+        CHECK(found);
+    }
+
+    // Another run reads it back too. Another request (a define) is another program.
+    auto second_run = ShaderCompiler::create(vfs, with_cache);
+    REQUIRE(second_run.ok());
+    const auto again = second_run->compile(request);
+    REQUIRE(again.ok());
+    CHECK(second_run->stats().compiled == 0);
+    CHECK(second_run->stats().from_cache == 1);
+    CHECK(same_code(*compiled, *again));
+    const ShaderDefine defines[] = {{.name = "OTHER"}};
+    REQUIRE(second_run->compile({.module = "kept", .entries = entry, .defines = defines}).ok());
+    CHECK(second_run->stats().compiled == 1);
+
+    // A source it imports changes, to one of the same size: it's compiled again, and that is what's kept.
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = 2;\n");
+    const auto edited = second_run->compile(request);
+    REQUIRE(edited.ok());
+    CHECK(second_run->stats().compiled == 2);
+    CHECK_FALSE(same_code(*compiled, *edited));
+    const auto edited_kept = second_run->compile(request);
+    REQUIRE(edited_kept.ok());
+    CHECK(second_run->stats().from_cache == 2);
+    CHECK(same_code(*edited, *edited_kept));
+
+    // A compile that fails isn't kept, and doesn't take the place of the one that is.
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = ;\n");
+    CHECK_FALSE(second_run->compile(request).ok());
+    write_source(vfs, "engine:/shaders/value.slang", "public static const uint kValue = 2;\n");
+    REQUIRE(second_run->compile(request).ok());
+    CHECK(second_run->stats().from_cache == 3);
+
+    // Damaged files are compiled over: each one cut short here.
+    uint32_t files = 0;
+    REQUIRE(vfs.list("user:/shader_cache",
+                     [&](const char* name, bool is_directory) {
+                         if (is_directory) {
+                             return;
+                         }
+                         de::platform::PathString path("user:/shader_cache/");
+                         REQUIRE(path.append(name));
+                         auto bytes = vfs.read_whole_file(path.c_str(), de::core::heap_allocator());
+                         REQUIRE(bytes.ok());
+                         REQUIRE(bytes->size() > 16);
+                         REQUIRE(vfs.write_file(path.c_str(), bytes->span().first(bytes->size() / 2)).ok());
+                         ++files;
+                     })
+                .ok());
+    CHECK(files == 2); // the program, and the one with a define
+    auto third_run = ShaderCompiler::create(vfs, with_cache);
+    REQUIRE(third_run.ok());
+    const auto recompiled = third_run->compile(request);
+    REQUIRE(recompiled.ok());
+    CHECK(third_run->stats().compiled == 1);
+    CHECK(third_run->stats().from_cache == 0);
+    CHECK(same_code(*edited, *recompiled));
+    REQUIRE(third_run->compile(request).ok());
+    CHECK(third_run->stats().from_cache == 1);
+
+    // Without a folder nothing is kept, and nothing read back.
+    auto uncached = ShaderCompiler::create(vfs);
+    REQUIRE(uncached.ok());
+    REQUIRE(uncached->compile(request).ok());
+    REQUIRE(uncached->compile(request).ok());
+    CHECK(uncached->stats().compiled == 2);
+    CHECK(uncached->stats().from_cache == 0);
+}
+
+TEST_CASE("compiles run side by side, each to the code it gives alone") {
+    const Sandbox sandbox;
+    Vfs vfs = make_repo_vfs(sandbox);
+    // The engine's own shaders, the larger ones among them: what several sessions at once have to get right.
+    struct Module {
+        const char* name;
+        ShaderEntry entries[2];
+        uint32_t entry_count;
+    };
+    const ShaderEntry vertex{.name = "vertex_main", .stage = ShaderStage::Vertex};
+    const ShaderEntry fragment{.name = "fragment_main", .stage = ShaderStage::Fragment};
+    const ShaderEntry compute{.name = "compute_main", .stage = ShaderStage::Compute};
+    const Module modules[] = {
+        {.name = "scene.water", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.deferred_light", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.fog", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.taa", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.tonemap", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.water_behind", .entries = {vertex, fragment}, .entry_count = 2},
+        {.name = "scene.cull", .entries = {compute}, .entry_count = 1},
+        {.name = "scene.fog_inject", .entries = {compute}, .entry_count = 1},
+        {.name = "tests.fill_buffer", .entries = {compute}, .entry_count = 1},
+    };
+    constexpr size_t kCount = std::size(modules);
+    const auto request = [&](size_t i) {
+        return CompileRequest{.module = modules[i].name,
+                              .entries = std::span(modules[i].entries, modules[i].entry_count)};
+    };
+
+    // Each alone, one after another.
+    auto alone = ShaderCompiler::create(vfs);
+    REQUIRE(alone.ok());
+    CHECK(alone->parallel_compiles() == 1);
+    de::core::Result<CompiledProgram> expected[kCount] = {
+        de::core::fail(de::core::ErrorCode::Unknown, ""), de::core::fail(de::core::ErrorCode::Unknown, ""),
+        de::core::fail(de::core::ErrorCode::Unknown, ""), de::core::fail(de::core::ErrorCode::Unknown, ""),
+        de::core::fail(de::core::ErrorCode::Unknown, ""), de::core::fail(de::core::ErrorCode::Unknown, ""),
+        de::core::fail(de::core::ErrorCode::Unknown, ""), de::core::fail(de::core::ErrorCode::Unknown, ""),
+        de::core::fail(de::core::ErrorCode::Unknown, "")};
+    for (size_t i = 0; i < kCount; ++i) {
+        expected[i] = alone->compile(request(i));
+        REQUIRE(expected[i].ok());
+    }
+
+    // All at once, three times over, four at a time: more compiles than sessions, so sessions are made as compiles
+    // first overlap, waited for, and used again.
+    auto together = ShaderCompiler::create(vfs, {.parallel_compiles = 4});
+    REQUIRE(together.ok());
+    CHECK(together->parallel_compiles() == 4);
+    de::core::JobSystem jobs({.worker_count = 6});
+    struct Run {
+        ShaderCompiler* compiler;
+        const Module* modules;
+        de::core::Result<CompiledProgram>* expected;
+        std::atomic<uint32_t> same{0};
+        std::atomic<uint32_t> reported{0};
+    } run{.compiler = &*together, .modules = modules, .expected = expected};
+    constexpr size_t kRounds = 3;
+    jobs.parallel_for(
+        kCount * kRounds, 1,
+        [](size_t begin, size_t end, void* context) {
+            auto& shared = *static_cast<Run*>(context);
+            for (size_t job = begin; job < end; ++job) {
+                const size_t i = job % kCount;
+                CompileReport report;
+                const auto compiled = shared.compiler->compile(
+                    {.module = shared.modules[i].name,
+                     .entries = std::span(shared.modules[i].entries, shared.modules[i].entry_count)},
+                    &report);
+                if (!compiled.ok() || compiled->stages.size() != shared.expected[i]->stages.size()) {
+                    continue;
+                }
+                bool same = true;
+                for (size_t stage = 0; stage < compiled->stages.size(); ++stage) {
+                    const auto& code = compiled->stages[stage].code;
+                    const auto& wanted = (*shared.expected[i]).stages[stage].code;
+                    same = same && code.size() == wanted.size() &&
+                           std::memcmp(code.data(), wanted.data(), code.size() * sizeof(uint32_t)) == 0 &&
+                           compiled->stages[stage].reflection.push_constant_bytes ==
+                               (*shared.expected[i]).stages[stage].reflection.push_constant_bytes;
+                }
+                shared.same.fetch_add(same ? 1 : 0);
+                // Each compile's own sources, not another's that ran beside it.
+                bool own = !report.dependencies.empty();
+                for (const ShaderDependency& dependency : report.dependencies) {
+                    own = own && dependency.content_hash != 0;
+                }
+                shared.reported.fetch_add(own ? 1 : 0);
+            }
+        },
+        &run);
+    CHECK(run.same.load() == kCount * kRounds);
+    CHECK(run.reported.load() == kCount * kRounds);
+    CHECK(together->stats().compiled == kCount * kRounds);
+
+    // Out of range, it's held to what there can be.
+    auto many = ShaderCompiler::create(vfs, {.parallel_compiles = 1000});
+    REQUIRE(many.ok());
+    CHECK(many->parallel_compiles() == kMaxParallelCompiles);
+    auto none = ShaderCompiler::create(vfs, {.parallel_compiles = 0});
+    REQUIRE(none.ok());
+    CHECK(none->parallel_compiles() == 1);
+}
+
+TEST_CASE("first builds can run in the background, their pipelines arriving on a later update") {
+    auto device = make_device();
+    if (!device) {
+        return;
+    }
+    const Sandbox sandbox;
+    Vfs vfs = sandbox.make_vfs();
+    constexpr std::string_view kFill = "struct Push { uint* output; uint value; uint count; };\n"
+                                       "[[vk::push_constant]] ConstantBuffer<Push> push;\n"
+                                       "[shader(\"compute\")]\n[numthreads(1, 1, 1)]\n"
+                                       "void compute_main() { push.output[0] = push.value; }\n";
+    write_source(vfs, "engine:/shaders/slow.slang", kFill);
+    write_source(vfs, "engine:/shaders/urgent.slang", kFill);
+    write_source(vfs, "engine:/shaders/broken.slang", "this is not a shader\n");
+    auto compiler = ShaderCompiler::create(vfs, {.cache_folder = "user:/shader_cache"});
+    REQUIRE(compiler.ok());
+    de::core::JobSystem jobs({.worker_count = 2});
+    const auto buffer = device->create_buffer(
+        {.size = 16, .usage = de::rhi::BufferUsage::Storage, .memory = de::rhi::MemoryLocation::Readback});
+    REQUIRE(buffer.ok());
+    // Frames go by until no more than `left` first builds are still to come.
+    const auto frames_until = [](ShaderLibrary& library, uint32_t left) {
+        const uint64_t start_ns = de::platform::time_ns();
+        while (library.stats().first_builds > left &&
+               de::platform::time_ns() - start_ns < 120 * de::platform::kNsPerSecond) {
+            library.update();
+            de::platform::sleep_ns(de::platform::kNsPerMs);
+        }
+        return library.stats().first_builds <= left;
+    };
+    const ShaderLibraryDesc in_background{.hot_reload = false, .background_first_builds = true};
+    {
+        auto library = ShaderLibrary::create(*device, vfs, jobs, *compiler, in_background);
+        REQUIRE(library.ok());
+        // Nothing is cached yet: each comes back at once, with no pipeline, and they build one after another.
+        const auto slow = library->create_compute({.module = "slow"});
+        const auto broken = library->create_compute({.module = "broken"});
+        const auto urgent = library->create_compute({.module = "urgent", .build_first = true});
+        REQUIRE(slow.ok());
+        REQUIRE(broken.ok());
+        REQUIRE(urgent.ok());
+        CHECK(library->stats().first_builds == 3);
+        CHECK(library->stats().compiling == 3);
+        // Even if its compile is done by now, a pipeline comes in with update(), on this thread.
+        CHECK_FALSE(library->pipeline(*slow).is_valid());
+
+        // The first one created was already compiling; after it, the one that asked to go first.
+        REQUIRE(frames_until(*library, 2));
+        CHECK(library->pipeline(*slow).is_valid());
+        CHECK_FALSE(library->pipeline(*urgent).is_valid());
+        REQUIRE(frames_until(*library, 1));
+        CHECK(library->pipeline(*urgent).is_valid());
+        // A first build that fails leaves the program without a pipeline, as one that blocked would.
+        REQUIRE(frames_until(*library, 0));
+        CHECK(library->stats().compiling == 0);
+        CHECK_FALSE(library->pipeline(*broken).is_valid());
+        // None of it was a reload.
+        CHECK(library->stats().reloads == 0);
+        CHECK(library->stats().failed_reloads == 0);
+
+        run_fill(*device, library->pipeline(*slow), *buffer, 7, 1);
+        CHECK(read_u32(*device, *buffer, 0) == 7);
+
+        // One destroyed while it waits is gone from the count. (With a define of its own: asked for as it was, it
+        // would be the broken one there already is.)
+        const de::shader::ShaderDefine another[] = {{.name = "ANOTHER"}};
+        const auto dropped = library->create_compute({.module = "broken", .defines = another});
+        REQUIRE(dropped.ok());
+        CHECK(library->stats().first_builds == 1);
+        library->destroy(*dropped);
+        CHECK(library->stats().first_builds == 0);
+        CHECK(library->stats().compiling == 0);
+    }
+    // With a compiler that compiles several at once, as many build at once; they all arrive.
+    {
+        write_source(vfs, "engine:/shaders/side_a.slang", kFill);
+        write_source(vfs, "engine:/shaders/side_b.slang", kFill);
+        write_source(vfs, "engine:/shaders/side_c.slang", kFill);
+        auto several = ShaderCompiler::create(vfs, {.parallel_compiles = 3});
+        REQUIRE(several.ok());
+        auto library = ShaderLibrary::create(*device, vfs, jobs, *several, in_background);
+        REQUIRE(library.ok());
+        const auto a = library->create_compute({.module = "side_a"});
+        const auto b = library->create_compute({.module = "side_b"});
+        const auto c = library->create_compute({.module = "side_c"});
+        const auto broken = library->create_compute({.module = "broken"});
+        REQUIRE(a.ok());
+        REQUIRE(b.ok());
+        REQUIRE(c.ok());
+        REQUIRE(broken.ok());
+        CHECK(library->stats().first_builds == 4);
+        CHECK(library->stats().compiling == 4);
+        // One destroyed while its build is in flight leaves the rest to finish.
+        library->destroy(*b);
+        CHECK(library->stats().first_builds == 3);
+        REQUIRE(frames_until(*library, 0));
+        CHECK(library->stats().compiling == 0);
+        CHECK(library->pipeline(*a).is_valid());
+        CHECK(library->pipeline(*c).is_valid());
+        CHECK_FALSE(library->pipeline(*broken).is_valid());
+        run_fill(*device, library->pipeline(*c), *buffer, 5, 1);
+        CHECK(read_u32(*device, *buffer, 0) == 5);
+        // reload_now() waits for whatever is in flight, too.
+        const auto late = library->create_compute({.module = "side_b"});
+        REQUIRE(late.ok());
+        library->reload_now();
+        CHECK(library->stats().compiling == 0);
+        CHECK(library->pipeline(*late).is_valid());
+    }
+    // What the compiler has cached is there at once, all the same.
+    {
+        auto library = ShaderLibrary::create(*device, vfs, jobs, *compiler, in_background);
+        REQUIRE(library.ok());
+        const auto slow = library->create_compute({.module = "slow"});
+        REQUIRE(slow.ok());
+        CHECK(library->pipeline(*slow).is_valid());
+        CHECK(library->stats().first_builds == 0);
+        run_fill(*device, library->pipeline(*slow), *buffer, 9, 1);
+        CHECK(read_u32(*device, *buffer, 0) == 9);
+    }
     check_clean(*device);
 }
 

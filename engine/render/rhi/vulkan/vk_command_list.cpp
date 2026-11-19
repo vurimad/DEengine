@@ -462,6 +462,8 @@ void CommandList::draw(uint32_t vertex_count, uint32_t instance_count, uint32_t 
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
+    ++impl_->work.draws;
+    impl_->work.vertices += uint64_t{vertex_count} * instance_count;
     vkCmdDraw(impl_->cmd, vertex_count, instance_count, first_vertex, first_instance);
 }
 
@@ -479,6 +481,8 @@ void CommandList::draw_indexed(uint32_t index_count, uint32_t instance_count, ui
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(impl_->in_rendering && impl_->graphics_bound, "draws need begin_rendering and a graphics pipeline");
     DE_ASSERT_MSG(impl_->index_buffer_bound, "indexed draws need bind_index_buffer");
+    ++impl_->work.draws;
+    impl_->work.vertices += uint64_t{index_count} * instance_count;
     vkCmdDrawIndexed(impl_->cmd, index_count, instance_count, first_index, vertex_offset, first_instance);
 }
 
@@ -487,7 +491,128 @@ void CommandList::dispatch(uint32_t groups_x, uint32_t groups_y, uint32_t groups
     DE_ASSERT_MSG(impl_->queue != QueueType::Transfer, "transfer lists only copy");
     DE_ASSERT_MSG(!impl_->in_rendering && impl_->compute_bound,
                   "dispatches need a compute pipeline, outside begin_rendering");
+    ++impl_->work.dispatches;
     vkCmdDispatch(impl_->cmd, groups_x, groups_y, groups_z);
+}
+
+// As instances lie in a buffer: what Vulkan reads is what rhi.h says.
+static_assert(sizeof(AccelerationInstance) == sizeof(VkAccelerationStructureInstanceKHR));
+static_assert(offsetof(AccelerationInstance, bottom_level) ==
+              offsetof(VkAccelerationStructureInstanceKHR, accelerationStructureReference));
+
+namespace {
+
+// A build reads what earlier commands wrote (uploads, a compute pass's instances, the bottom levels a top level
+// names), and what follows reads what it wrote: everything before waits, and everything after.
+void acceleration_barrier(VkCommandBuffer cmd, bool before) {
+    const VkMemoryBarrier2 barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask =
+            before ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+        .srcAccessMask = before ? VK_ACCESS_2_MEMORY_WRITE_BIT : VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+        .dstStageMask =
+            before ? VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+        .dstAccessMask = before ? (VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                                   VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR | VK_ACCESS_2_SHADER_READ_BIT)
+                                : VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR,
+    };
+    const VkDependencyInfo dependency{
+        .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &barrier};
+    vkCmdPipelineBarrier2(cmd, &dependency);
+}
+
+} // namespace
+
+void CommandList::build_bottom_level(AccelerationHandle handle, std::span<const AccelerationTriangles> geometry) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer && !impl_->in_rendering,
+                  "acceleration structures are built on graphics lists, outside begin_rendering");
+    DeviceImpl& device = *impl_->device;
+    const Acceleration& acceleration = device.acceleration(handle);
+    DE_ASSERT_MSG(!acceleration.top_level && geometry.size() == acceleration.capacity,
+                  "a bottom level is built from the runs of triangles it was created for");
+    VkAccelerationStructureGeometryKHR geometries[kMaxAccelerationGeometry];
+    uint32_t triangle_counts[kMaxAccelerationGeometry];
+    VkAccelerationStructureBuildRangeInfoKHR ranges[kMaxAccelerationGeometry];
+    for (size_t i = 0; i < geometry.size(); ++i) {
+        const AccelerationTriangles& run = geometry[i];
+        const Buffer& vertices = device.buffer(run.vertices);
+        const Buffer& indices = device.buffer(run.indices);
+        geometries[i] = VkAccelerationStructureGeometryKHR{
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+            .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+            .geometry = {.triangles = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+                                       .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+                                       .vertexData = {.deviceAddress = vertices.address + run.vertex_offset},
+                                       .vertexStride = run.vertex_stride,
+                                       .maxVertex = run.vertex_count - 1,
+                                       .indexType = VK_INDEX_TYPE_UINT32,
+                                       .indexData = {.deviceAddress = indices.address + run.index_offset}}},
+            .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+        };
+        triangle_counts[i] = run.index_count / 3;
+        ranges[i] = VkAccelerationStructureBuildRangeInfoKHR{.primitiveCount = triangle_counts[i]};
+    }
+    // Its scratch: for this one build, freed when the frame is done.
+    VkBuffer scratch = VK_NULL_HANDLE;
+    VmaAllocation scratch_allocation = VK_NULL_HANDLE;
+    uint64_t scratch_address = 0;
+    uint64_t scratch_memory = 0;
+    if (!device.create_acceleration_buffer(acceleration.scratch_bytes, true, "bottom level scratch", scratch,
+                                           scratch_allocation, scratch_address, scratch_memory)) {
+        return; // logged: the structure stays empty, and nothing is hit in it
+    }
+    device.current_slot().pending.push(PendingDestroy{.buffer = scratch, .allocation = scratch_allocation});
+    const VkAccelerationStructureBuildGeometryInfoKHR build_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .dstAccelerationStructure = acceleration.handle,
+        .geometryCount = static_cast<uint32_t>(geometry.size()),
+        .pGeometries = geometries,
+        .scratchData = {.deviceAddress = scratch_address},
+    };
+    const VkAccelerationStructureBuildRangeInfoKHR* range_list = ranges;
+    acceleration_barrier(impl_->cmd, true);
+    vkCmdBuildAccelerationStructuresKHR(impl_->cmd, 1, &build_info, &range_list);
+    acceleration_barrier(impl_->cmd, false);
+}
+
+void CommandList::build_top_level(AccelerationHandle handle, BufferHandle instances, uint64_t offset, uint32_t count) {
+    DE_ASSERT(impl_ != nullptr);
+    DE_ASSERT_MSG(impl_->queue != QueueType::Transfer && !impl_->in_rendering,
+                  "acceleration structures are built on graphics lists, outside begin_rendering");
+    DeviceImpl& device = *impl_->device;
+    const Acceleration& acceleration = device.acceleration(handle);
+    const Buffer& buffer = device.buffer(instances);
+    DE_ASSERT_MSG(acceleration.top_level && count <= acceleration.capacity,
+                  "a top level holds at most the instances it was created for");
+    DE_ASSERT_MSG(core::has_any(buffer.desc.usage, BufferUsage::AccelerationInput) &&
+                      offset + (uint64_t{count} * sizeof(AccelerationInstance)) <= buffer.desc.size,
+                  "a top level's instances lie in a buffer with AccelerationInput usage");
+    const VkAccelerationStructureGeometryKHR geometry{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+        .geometry = {.instances = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR,
+                                   .arrayOfPointers = VK_FALSE,
+                                   .data = {.deviceAddress = buffer.address + offset}}},
+    };
+    const VkAccelerationStructureBuildGeometryInfoKHR build_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .dstAccelerationStructure = acceleration.handle,
+        .geometryCount = 1,
+        .pGeometries = &geometry,
+        .scratchData = {.deviceAddress = acceleration.scratch_address},
+    };
+    const VkAccelerationStructureBuildRangeInfoKHR range{.primitiveCount = count};
+    const VkAccelerationStructureBuildRangeInfoKHR* range_list = &range;
+    acceleration_barrier(impl_->cmd, true);
+    vkCmdBuildAccelerationStructuresKHR(impl_->cmd, 1, &build_info, &range_list);
+    acceleration_barrier(impl_->cmd, false);
 }
 
 // As the arguments lie in a buffer: what Vulkan reads is what rhi.h says, field by field.
@@ -555,6 +680,8 @@ void CommandList::draw_indirect(BufferHandle args, uint64_t offset, uint32_t dra
     DE_ASSERT(impl_ != nullptr);
     const uint32_t used_stride =
         check_indirect_draws(*impl_, args, offset, draw_count, stride, sizeof(DrawIndirectArgs));
+    ++impl_->work.indirect_calls;
+    impl_->work.indirect_max += draw_count;
     vkCmdDrawIndirect(impl_->cmd, impl_->device->buffer(args).buffer, offset, draw_count, used_stride);
 }
 
@@ -563,6 +690,8 @@ void CommandList::draw_indexed_indirect(BufferHandle args, uint64_t offset, uint
     DE_ASSERT_MSG(impl_->index_buffer_bound, "indexed draws need bind_index_buffer");
     const uint32_t used_stride =
         check_indirect_draws(*impl_, args, offset, draw_count, stride, sizeof(DrawIndexedIndirectArgs));
+    ++impl_->work.indirect_calls;
+    impl_->work.indirect_max += draw_count;
     vkCmdDrawIndexedIndirect(impl_->cmd, impl_->device->buffer(args).buffer, offset, draw_count, used_stride);
 }
 
@@ -573,6 +702,8 @@ void CommandList::draw_indirect_count(BufferHandle args, uint64_t offset, Buffer
         check_indirect_draws(*impl_, args, offset, max_draws, stride, sizeof(DrawIndirectArgs));
     check_indirect_count(*impl_, args, offset, count_buffer, count_offset, max_draws, used_stride,
                          sizeof(DrawIndirectArgs));
+    ++impl_->work.indirect_calls;
+    impl_->work.indirect_max += max_draws;
     vkCmdDrawIndirectCount(impl_->cmd, impl_->device->buffer(args).buffer, offset,
                            impl_->device->buffer(count_buffer).buffer, count_offset, max_draws, used_stride);
 }
@@ -585,6 +716,8 @@ void CommandList::draw_indexed_indirect_count(BufferHandle args, uint64_t offset
         check_indirect_draws(*impl_, args, offset, max_draws, stride, sizeof(DrawIndexedIndirectArgs));
     check_indirect_count(*impl_, args, offset, count_buffer, count_offset, max_draws, used_stride,
                          sizeof(DrawIndexedIndirectArgs));
+    ++impl_->work.indirect_calls;
+    impl_->work.indirect_max += max_draws;
     vkCmdDrawIndexedIndirectCount(impl_->cmd, impl_->device->buffer(args).buffer, offset,
                                   impl_->device->buffer(count_buffer).buffer, count_offset, max_draws, used_stride);
 }
@@ -599,6 +732,7 @@ void CommandList::dispatch_indirect(BufferHandle args, uint64_t offset) {
     DE_ASSERT_MSG(offset % 4 == 0, "indirect arguments are 4-byte aligned");
     DE_ASSERT_MSG(offset + sizeof(DispatchIndirectArgs) <= buffer.desc.size,
                   "indirect arguments have to fit in the buffer");
+    ++impl_->work.dispatches;
     vkCmdDispatchIndirect(impl_->cmd, buffer.buffer, offset);
 }
 
@@ -616,6 +750,7 @@ void CommandList::copy_buffer(BufferHandle src, uint64_t src_offset, BufferHandl
         .regionCount = 1,
         .pRegions = &region,
     };
+    ++impl_->work.copies;
     vkCmdCopyBuffer2(impl_->cmd, &info);
 }
 
@@ -623,6 +758,7 @@ void CommandList::fill_buffer(BufferHandle buffer, uint64_t offset, uint64_t siz
     DE_ASSERT(impl_ != nullptr);
     DE_ASSERT_MSG(!impl_->in_rendering, "fills inside begin_rendering/end_rendering");
     DE_ASSERT_MSG(offset % 4 == 0 && size % 4 == 0, "fill_buffer works in whole 32-bit words");
+    ++impl_->work.copies;
     vkCmdFillBuffer(impl_->cmd, impl_->device->buffer(buffer).buffer, offset, size, value);
 }
 
@@ -640,6 +776,7 @@ void CommandList::copy_buffer_to_texture(BufferHandle src, TextureHandle dst, co
         .regionCount = 1,
         .pRegions = &vk_region,
     };
+    ++impl_->work.copies;
     vkCmdCopyBufferToImage2(impl_->cmd, &info);
 }
 
@@ -704,6 +841,7 @@ void CommandList::blit_texture(TextureHandle src, TextureHandle dst, const Textu
         .pRegions = &region,
         .filter = VK_FILTER_LINEAR,
     };
+    ++impl_->work.copies;
     vkCmdBlitImage2(impl_->cmd, &info);
 }
 
@@ -721,7 +859,13 @@ void CommandList::copy_texture_to_buffer(TextureHandle src, BufferHandle dst, co
         .regionCount = 1,
         .pRegions = &vk_region,
     };
+    ++impl_->work.copies;
     vkCmdCopyImageToBuffer2(impl_->cmd, &info);
+}
+
+ListWork CommandList::work() const {
+    DE_ASSERT(impl_ != nullptr);
+    return impl_->work;
 }
 
 void CommandList::begin_debug_label(const char* name, Color color) {

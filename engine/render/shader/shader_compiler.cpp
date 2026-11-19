@@ -1,17 +1,20 @@
 #include "render/shader/shader_compiler.h"
 
 #include "core/allocator.h"
+#include "core/hash.h"
 #include "core/inline_array.h"
 #include "core/log.h"
 #include "core/profile.h"
 #include "platform/time.h"
 #include "platform/vfs.h"
+#include "render/shader/shader_cache.h"
 
 #include <slang-com-ptr.h>
 #include <slang.h>
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -151,7 +154,8 @@ public:
         const bool ok = read.ok() && *read == info->size;
         // A file that exists but couldn't be read (locked, mid-write) is recorded with a zero info,
         // so the next check sees it as changed and the compile is tried again.
-        record(vfs_path, ok ? *info : platform::FileInfo{});
+        record(vfs_path, ok ? *info : platform::FileInfo{},
+               ok ? core::hash_bytes(blob->bytes().data(), blob->bytes().size()) : 0);
         if (!ok) {
             blob->release();
             return SLANG_FAIL;
@@ -161,17 +165,18 @@ public:
     }
 
 private:
-    void record(const platform::PathString& path, const platform::FileInfo& info) {
+    void record(const platform::PathString& path, const platform::FileInfo& info, uint64_t content_hash) {
         if (dependencies_ == nullptr) {
             return;
         }
         for (ShaderDependency& dependency : *dependencies_) {
             if (dependency.path == path.view()) {
                 dependency.info = info;
+                dependency.content_hash = content_hash;
                 return;
             }
         }
-        dependencies_->push(ShaderDependency{.path = path, .info = info});
+        dependencies_->push(ShaderDependency{.path = path, .info = info, .content_hash = content_hash});
     }
 
     platform::Vfs* vfs_;
@@ -207,7 +212,11 @@ public:
         add_text(whole.substr(0, std::min(whole.find(kNul), whole.size())), failed);
     }
 
+    // Whether Slang said anything, warnings included.
+    bool any() const { return any_; }
+
     void add_text(std::string_view text, bool failed) {
+        any_ = true;
         if (failed) {
             DE_LOG_ERROR("shader", "%.*s", static_cast<int>(text.size()), text.data());
         } else {
@@ -230,6 +239,7 @@ public:
 
 private:
     core::Array<char>* out_;
+    bool any_ = false;
 };
 
 uint32_t to_u32(size_t value) {
@@ -330,56 +340,136 @@ bool find_module_entries(slang::IModule* module, EntryPoints& entry_points, Name
     return true;
 }
 
+// One of Slang's global sessions and what goes with it. A global session is single-threaded, so one compile has it
+// at a time; several of them run side by side, each on its own thread for as long as its compile lasts.
+struct SlangSession {
+    explicit SlangSession(platform::Vfs& vfs) : file_system(vfs) {}
+
+    Slang::ComPtr<slang::IGlobalSession> global;
+    SlangProfileID profile = SLANG_PROFILE_UNKNOWN;
+    VfsFileSystem file_system; // records what its compile in progress reads
+    bool busy = false;         // a compile has it; under CompilerState::sessions_mutex
+};
+
 } // namespace
 
 struct CompilerState {
-    explicit CompilerState(platform::Vfs& vfs) : file_system(vfs) {}
+    explicit CompilerState(platform::Vfs& vfs_in) : vfs(&vfs_in) {}
 
     ShaderCompilerDesc desc;
-    std::mutex mutex; // one compile at a time: Slang's global session is single-threaded
-    Slang::ComPtr<slang::IGlobalSession> global_session;
-    SlangProfileID profile = SLANG_PROFILE_UNKNOWN;
-    VfsFileSystem file_system;
+    platform::Vfs* vfs;
+    // The sessions compiles take turns on: the first made with the compiler, the rest as compiles first overlap,
+    // up to session_limit. All under sessions_mutex; a compile that finds none free and no room for another waits
+    // on session_freed.
+    std::mutex sessions_mutex;
+    std::condition_variable session_freed;
+    core::Array<SlangSession*> sessions{render_heap()};
+    uint32_t session_limit = 1;
+    uint32_t sessions_being_made = 0;
+    const char* compiler_tag = ""; // Slang's build tag: the first session's own text, there as long as it is
+    // The cache (shader_cache.h): its files are read and written through the VFS, from any thread.
+    platform::PathString cache_folder;           // empty: none
+    std::atomic<bool> cache_write_failed{false}; // warned once
+    std::atomic<uint32_t> compiled{0};
+    std::atomic<uint32_t> from_cache{0};
 };
 
-core::Result<ShaderCompiler> ShaderCompiler::create(platform::Vfs& vfs, const ShaderCompilerDesc& desc) {
-    DE_PROFILE_ZONE("shader compiler create");
-    const uint64_t start_ns = platform::time_ns();
-    auto* state = ::new (render_heap().allocate(sizeof(CompilerState), alignof(CompilerState))) CompilerState(vfs);
-    state->desc = desc;
-    ShaderCompiler compiler(state); // frees the state on every early return below
-    if (SLANG_FAILED(slang::createGlobalSession(state->global_session.writeRef()))) {
-        DE_LOG_ERROR("shader", "Slang could not start: its runtime library or standard modules are missing");
-        return core::fail(core::ErrorCode::Unsupported, "the Slang compiler could not start");
+namespace {
+
+// A source's content hash now, and its size and write time. False if it isn't there or can't be read.
+// Read and hashed every time, never taken from its size and write time: a file written twice within the file
+// clock's step has the same ones for different contents, and a stale program for a fresh source is a shader that
+// doesn't match the C++ it shares its layouts with. The sources are a few hundred kilobytes, already in the OS's
+// cache.
+bool source_now(const CompilerState& state, const platform::PathString& path, platform::FileInfo& info,
+                uint64_t& hash) {
+    const core::Result<platform::FileInfo> now = state.vfs->file_info(path.c_str());
+    if (!now || now->is_directory) {
+        return false;
     }
-    // Vulkan 1.3 accepts SPIR-V 1.6.
-    state->profile = state->global_session->findProfile("spirv_1_6");
-    if (state->profile == SLANG_PROFILE_UNKNOWN) {
-        return core::fail(core::ErrorCode::Unsupported, "this Slang has no SPIR-V 1.6 profile");
+    info = *now;
+    const core::Result<core::Array<std::byte>> bytes = state.vfs->read_whole_file(path.c_str(), render_heap());
+    if (!bytes) {
+        return false;
     }
-    DE_LOG_INFO("shader", "Slang %s ready in %.0f ms", state->global_session->getBuildTagString(),
-                static_cast<double>(platform::time_ns() - start_ns) / 1e6);
-    return compiler;
+    hash = core::hash_bytes(bytes->data(), bytes->size());
+    return true;
 }
 
-ShaderCompiler::~ShaderCompiler() {
-    if (state_ != nullptr) {
-        state_->~CompilerState();
-        render_heap().deallocate(state_, sizeof(CompilerState), alignof(CompilerState));
+// A request's key and file in the cache. False without a cache folder.
+bool cache_entry(const CompilerState& state, const CompileRequest& request, ShaderCacheKey& key,
+                 platform::PathString& file) {
+    if (state.cache_folder.empty()) {
+        return false;
+    }
+    key = shader_cache_key(request, state.desc, state.compiler_tag);
+    constexpr char kDigits[] = "0123456789abcdef";
+    char name[17] = {};
+    for (int i = 0; i < 16; ++i) {
+        name[i] = kDigits[(key.file >> (60 - 4 * i)) & 15U];
+    }
+    file = state.cache_folder;
+    return file.append('/') && file.append(std::string_view(name, 16)) && file.append(".shadercache");
+}
+
+// A new global session, ready to compile; null if Slang can't make one (logged by the caller that needs it).
+SlangSession* make_session(CompilerState& state) {
+    auto* session =
+        ::new (render_heap().allocate(sizeof(SlangSession), alignof(SlangSession))) SlangSession(*state.vfs);
+    if (SLANG_SUCCEEDED(slang::createGlobalSession(session->global.writeRef()))) {
+        // Vulkan 1.3 accepts SPIR-V 1.6.
+        session->profile = session->global->findProfile("spirv_1_6");
+        if (session->profile != SLANG_PROFILE_UNKNOWN) {
+            return session;
+        }
+    }
+    session->~SlangSession();
+    render_heap().deallocate(session, sizeof(SlangSession), alignof(SlangSession));
+    return nullptr;
+}
+
+// A session for one compile, its own until it's given back. Waits if they're all taken and there are as many as
+// may run at once.
+SlangSession* take_session(CompilerState& state) {
+    std::unique_lock lock(state.sessions_mutex);
+    for (;;) {
+        for (SlangSession* session : state.sessions) {
+            if (!session->busy) {
+                session->busy = true;
+                return session;
+            }
+        }
+        if (state.sessions.size() + state.sessions_being_made < state.session_limit) {
+            // Another one, made outside the lock: it takes a fraction of a second, and the others go on meanwhile.
+            ++state.sessions_being_made;
+            lock.unlock();
+            SlangSession* made = make_session(state);
+            lock.lock();
+            --state.sessions_being_made;
+            if (made != nullptr) {
+                made->busy = true;
+                state.sessions.push(made);
+                return made;
+            }
+            // Slang wouldn't make another: as many at once as there are, from now on.
+            state.session_limit = static_cast<uint32_t>(state.sessions.size() + state.sessions_being_made);
+            DE_LOG_WARN("shader", "Slang couldn't start another session: %u compiles at once from now on",
+                        state.session_limit);
+            continue;
+        }
+        state.session_freed.wait(lock);
     }
 }
 
-ShaderCompiler::ShaderCompiler(ShaderCompiler&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
-
-ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&& other) noexcept {
-    if (this != &other) {
-        const ShaderCompiler discarded(std::exchange(state_, std::exchange(other.state_, nullptr)));
+void give_session(CompilerState& state, SlangSession* session) {
+    {
+        const std::scoped_lock lock(state.sessions_mutex);
+        session->busy = false;
     }
-    return *this;
+    state.session_freed.notify_one();
 }
 
-core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& request, CompileReport* report) {
-    DE_PROFILE_ZONE("shader compile");
+core::Result<void> check_request(const CompileRequest& request) {
     if (!fits(request.module) || request.entries.size() > kMaxShaderEntries ||
         request.defines.size() > kMaxShaderDefines) {
         return core::fail(
@@ -396,16 +486,161 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
             return core::fail(core::ErrorCode::InvalidArgument, "a define needs a name");
         }
     }
+    return {};
+}
+
+// The program from the cache, if it's there and every source it was compiled from is as it was then; dependencies
+// then holds those sources as a compile would have recorded them.
+bool load_cached(const CompilerState& state, const platform::PathString& path, const ShaderCacheKey& key,
+                 CompiledProgram& program, core::Array<ShaderDependency>& dependencies) {
+    const core::Result<core::Array<std::byte>> bytes = state.vfs->read_whole_file(path.c_str(), render_heap());
+    if (!bytes) {
+        return false; // not compiled before: the usual miss
+    }
+    core::Array<CachedSource> sources(render_heap());
+    if (!decode_cached_program(bytes->span(), key, render_heap(), program, sources)) {
+        return false; // damaged, or from another version: compiled over
+    }
+    core::Array<ShaderDependency> read(render_heap());
+    read.reserve(sources.size());
+    for (const CachedSource& source : sources) {
+        ShaderDependency& dependency = read.emplace(ShaderDependency{.path = source.path});
+        if (!source_now(state, source.path, dependency.info, dependency.content_hash) ||
+            dependency.content_hash != source.content_hash) {
+            return false; // a source changed
+        }
+    }
+    for (const ShaderDependency& dependency : read) {
+        dependencies.push(dependency);
+    }
+    return true;
+}
+
+void store_cached(CompilerState& state, const platform::PathString& path, const ShaderCacheKey& key,
+                  const CompiledProgram& program, std::span<const ShaderDependency> dependencies) {
+    for (const ShaderDependency& dependency : dependencies) {
+        if (dependency.info.size == 0 && dependency.info.modified_time == 0) {
+            return; // a source that couldn't be read: nothing to know it by
+        }
+    }
+    const core::Array<std::byte> bytes = encode_cached_program(key, program, dependencies, render_heap());
+    const core::Result<void> written = state.vfs->write_file(path.c_str(), bytes.span());
+    if (!written && !state.cache_write_failed.exchange(true, std::memory_order_relaxed)) {
+        DE_LOG_WARN("shader", "compiled shaders can't be kept in %s (%s): they'll be compiled again next time",
+                    state.cache_folder.c_str(), written.error().message);
+    }
+}
+
+} // namespace
+
+core::Result<ShaderCompiler> ShaderCompiler::create(platform::Vfs& vfs, const ShaderCompilerDesc& desc) {
+    DE_PROFILE_ZONE("shader compiler create");
+    const uint64_t start_ns = platform::time_ns();
+    auto* state = ::new (render_heap().allocate(sizeof(CompilerState), alignof(CompilerState))) CompilerState(vfs);
+    state->desc = desc;
+    state->desc.cache_folder = nullptr; // kept as its own copy: the caller's text needn't outlive this call
+    ShaderCompiler compiler(state);     // frees the state on every early return below
+    if (desc.cache_folder != nullptr && !state->cache_folder.assign(desc.cache_folder)) {
+        return core::fail(core::ErrorCode::InvalidArgument, "the shader cache folder's path is too long");
+    }
+    state->session_limit = std::clamp(desc.parallel_compiles, 1U, kMaxParallelCompiles);
+    state->desc.parallel_compiles = state->session_limit;
+    // The first session now: it says whether Slang runs at all, and which Slang it is.
+    SlangSession* first = make_session(*state);
+    if (first == nullptr) {
+        DE_LOG_ERROR("shader", "Slang could not start: its runtime library or standard modules are missing, or it "
+                               "has no SPIR-V 1.6 profile");
+        return core::fail(core::ErrorCode::Unsupported, "the Slang compiler could not start");
+    }
+    state->sessions.push(first);
+    state->compiler_tag = first->global->getBuildTagString();
+    DE_LOG_INFO("shader", "Slang %s ready in %.0f ms", state->compiler_tag,
+                static_cast<double>(platform::time_ns() - start_ns) / 1e6);
+    return compiler;
+}
+
+ShaderCompiler::~ShaderCompiler() {
+    if (state_ != nullptr) {
+        for (SlangSession* session : state_->sessions) {
+            session->~SlangSession();
+            render_heap().deallocate(session, sizeof(SlangSession), alignof(SlangSession));
+        }
+        state_->~CompilerState();
+        render_heap().deallocate(state_, sizeof(CompilerState), alignof(CompilerState));
+    }
+}
+
+ShaderCompiler::ShaderCompiler(ShaderCompiler&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
+
+ShaderCompiler& ShaderCompiler::operator=(ShaderCompiler&& other) noexcept {
+    if (this != &other) {
+        const ShaderCompiler discarded(std::exchange(state_, std::exchange(other.state_, nullptr)));
+    }
+    return *this;
+}
+
+core::Result<CompiledProgram> ShaderCompiler::read_cached(const CompileRequest& request, CompileReport* report) {
+    DE_PROFILE_ZONE("shader read cached");
+    if (const core::Result<void> valid = check_request(request); !valid) {
+        return core::fail(valid.error());
+    }
+    CompilerState& state = *state_;
+    const uint64_t start_ns = platform::time_ns();
+    ShaderCacheKey cache_key;
+    platform::PathString cache_file;
+    core::Array<ShaderDependency> unreported(render_heap());
+    CompiledProgram program;
+    if (!cache_entry(state, request, cache_key, cache_file) ||
+        !load_cached(state, cache_file, cache_key, program, report != nullptr ? report->dependencies : unreported)) {
+        return core::fail(core::ErrorCode::NotFound, "the program isn't in the shader cache as its sources are now");
+    }
+    state.from_cache.fetch_add(1, std::memory_order_relaxed);
+    DE_LOG_DEBUG("shader", "%s (%zu entry points) from the cache in %.1f ms", request.module, program.stages.size(),
+                 static_cast<double>(platform::time_ns() - start_ns) / 1e6);
+    return program;
+}
+
+core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& request, CompileReport* report) {
+    DE_PROFILE_ZONE("shader compile");
+    if (const core::Result<void> valid = check_request(request); !valid) {
+        return core::fail(valid.error());
+    }
 
     CompilerState& state = *state_;
-    const std::scoped_lock lock(state.mutex);
-    const uint64_t start_ns = platform::time_ns();
+    uint64_t start_ns = platform::time_ns();
+    // What the compile reads: the report's, or with a cache and no report, the cache's own.
+    core::Array<ShaderDependency> unreported(render_heap());
+    ShaderCacheKey cache_key;
+    platform::PathString cache_file;
+    // Whether this compile's result goes into the cache.
+    const bool keep = cache_entry(state, request, cache_key, cache_file);
+    core::Array<ShaderDependency>* dependencies =
+        report != nullptr ? &report->dependencies : (keep ? &unreported : nullptr);
+    if (keep) {
+        // Before Slang's lock: a program that's kept doesn't wait behind one that's compiling.
+        CompiledProgram program;
+        if (load_cached(state, cache_file, cache_key, program, *dependencies)) {
+            state.from_cache.fetch_add(1, std::memory_order_relaxed);
+            DE_LOG_DEBUG("shader", "%s (%zu entry points) from the cache in %.1f ms", request.module,
+                         program.stages.size(), static_cast<double>(platform::time_ns() - start_ns) / 1e6);
+            return program;
+        }
+    }
+    // A session of its own until it's done: given back, with nothing left recording into this compile's
+    // dependencies, on every way out.
+    struct Turn {
+        CompilerState& state;
+        SlangSession* session;
+        ~Turn() {
+            session->file_system.set_dependencies(nullptr);
+            give_session(state, session);
+        }
+    } const turn{.state = state, .session = take_session(state)};
+    SlangSession& slang_session = *turn.session;
+    start_ns = platform::time_ns(); // the compile's own time, not the wait for its turn
+    state.compiled.fetch_add(1, std::memory_order_relaxed);
     Diagnostics messages(report != nullptr ? &report->diagnostics : nullptr);
-    state.file_system.set_dependencies(report != nullptr ? &report->dependencies : nullptr);
-    struct ClearDependencies {
-        VfsFileSystem& file_system;
-        ~ClearDependencies() { file_system.set_dependencies(nullptr); }
-    } const clear_dependencies{state.file_system};
+    slang_session.file_system.set_dependencies(dependencies);
 
     // A fresh session per compile: sessions cache the modules they load, and a reload must see the edits.
     core::InlineArray<slang::CompilerOptionEntry, 4> options(render_heap());
@@ -415,7 +650,7 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
                   .value = {.kind = slang::CompilerOptionValueKind::String, .stringValue0 = "41012"}});
     const slang::TargetDesc target{
         .format = SLANG_SPIRV,
-        .profile = state.profile,
+        .profile = slang_session.profile,
     };
     options.push(
         {.name = slang::CompilerOptionName::Optimization,
@@ -439,12 +674,12 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
     session_desc.searchPathCount = 1;
     session_desc.preprocessorMacros = macros.data();
     session_desc.preprocessorMacroCount = static_cast<SlangInt>(macros.size());
-    session_desc.fileSystem = &state.file_system;
+    session_desc.fileSystem = &slang_session.file_system;
     session_desc.compilerOptionEntries = options.data();
     session_desc.compilerOptionEntryCount = static_cast<uint32_t>(options.size());
 
     Slang::ComPtr<slang::ISession> session;
-    if (SLANG_FAILED(state.global_session->createSession(session_desc, session.writeRef()))) {
+    if (SLANG_FAILED(slang_session.global->createSession(session_desc, session.writeRef()))) {
         return core::fail(core::ErrorCode::Unknown, "a Slang session could not be created");
     }
 
@@ -534,7 +769,43 @@ core::Result<CompiledProgram> ShaderCompiler::compile(const CompileRequest& requ
     }
     DE_LOG_DEBUG("shader", "compiled %s (%zu entry points) in %.1f ms", request.module, entries.size(),
                  static_cast<double>(platform::time_ns() - start_ns) / 1e6);
+    // Kept for next time, unless Slang had something to say: a warning read back from the cache would never be
+    // seen again.
+    if (keep && !messages.any()) {
+        store_cached(state, cache_file, cache_key, result, dependencies->span());
+    }
     return result;
+}
+
+void ShaderCompiler::release_idle_sessions() {
+    CompilerState& state = *state_;
+    core::InlineArray<SlangSession*, kMaxParallelCompiles> idle(render_heap());
+    {
+        const std::scoped_lock lock(state.sessions_mutex);
+        // From the end, so the first stays where it is: the one whose text compiler_tag is.
+        for (size_t i = state.sessions.size(); i > 1; --i) {
+            if (!state.sessions[i - 1]->busy) {
+                idle.push(state.sessions[i - 1]);
+                state.sessions.remove_swap(i - 1);
+            }
+        }
+    }
+    for (SlangSession* session : idle) {
+        session->~SlangSession();
+        render_heap().deallocate(session, sizeof(SlangSession), alignof(SlangSession));
+    }
+    if (!idle.empty()) {
+        DE_LOG_DEBUG("shader", "let go of %zu Slang sessions", idle.size());
+    }
+}
+
+uint32_t ShaderCompiler::parallel_compiles() const {
+    return state_->desc.parallel_compiles;
+}
+
+ShaderCompilerStats ShaderCompiler::stats() const {
+    return {.compiled = state_->compiled.load(std::memory_order_relaxed),
+            .from_cache = state_->from_cache.load(std::memory_order_relaxed)};
 }
 
 } // namespace de::shader

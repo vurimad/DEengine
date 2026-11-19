@@ -5,10 +5,17 @@
 // Over frames the samples move around inside the froxel, and the light blends into last frame's at the
 // same place, so shafts come out smooth from few samples. Extinction is exact, so it takes no history.
 // Fog volumes add their extinction and tint here: lit and shadowed like the rest, at the grid's resolution.
+// The fog's ambient is the environment's, as under an open sky; where a light box holds it (scene.light_boxes) it's
+// scaled by the light baked there against the open sky's, so the air in a hall is as dark as its walls and outdoors the
+// fog is as it was tuned. The local lights light it too, those of the froxel's cluster (scene.local_lights), as
+// they do a surface: a candle glows in the mist round it.
 
 import common.bindless;
 import common.fog;
+import scene.light_boxes;
+import scene.local_lights;
 import scene.scene_common;
+import scene.sky;
 
 struct FogInjectPush
 {
@@ -31,7 +38,10 @@ struct FogInjectPush
 [[vk::push_constant]]
 ConstantBuffer<FogInjectPush> push;
 
+// How many places through a froxel's depth its light is taken at: with last frame's light to mix with (each frame's
+// places are other ones, and nine tenths of the light is kept), two; with none, four.
 static const uint kSamples = 4;
+static const uint kSamplesKept = 2;
 // All the volumes in a froxel, in extinction per meter: past this, a half float couldn't hold it.
 static const float kMostVolumeDensity = 12.0;
 // How much of last frame's light a froxel keeps.
@@ -50,6 +60,32 @@ float sun_visibility(SceneFrame* frame, float3 position, float view_depth)
     const float2 tile_uv = float2(clip.x * 0.5 + 0.5, 0.5 - clip.y * 0.5);
     const float seen = sample_shadow(push.atlas, atlas_uv(frame, cascade, tile_uv), clip.z);
     return cascade == kCascadeCount - 1 ? lerp(seen, 1.0, cascade_band(frame, cascade, view_depth)) : seen;
+}
+
+// The local lights' light that fog at a point scatters toward the camera: each light of the point's cluster, as it
+// reaches the point, spread evenly every way (a fog's droplets scatter mostly forward, but a light's glow is what
+// the eye reads, and it reads it from every side). No shadows: as on surfaces, a light reaches through walls.
+float3 local_lights_in_fog(SceneFrame* frame, float3 position)
+{
+    const uint words = frame.light_grid.w;
+    if (words == 0)
+    {
+        return float3(0.0);
+    }
+    const uint first = light_cluster(frame, position) * words;
+    float3 sum = float3(0.0);
+    for (uint word = 0; word < words; ++word)
+    {
+        uint mask = frame.light_clusters[first + word];
+        while (mask != 0)
+        {
+            const uint bit = firstbitlow(mask);
+            mask &= mask - 1;
+            float3 toward;
+            sum += light_reaching(frame.lights[word * 32 + bit], position, toward);
+        }
+    }
+    return sum * (1.0 / (4.0 * 3.14159265));
 }
 
 // Last frame's light at a point, if it was in the grid and in fog then.
@@ -159,18 +195,37 @@ void compute_main(uint3 froxel: SV_DispatchThreadID)
         samples_from = lerp(samples_from, volume_span.x, volume_share);
         samples_to = lerp(samples_to, volume_span.y, volume_share);
     }
+    // What a light box holds where the froxel's fog is, against the open sky's: up and down, which for light
+    // scattered every way alike is about its mean. Once a froxel: it changes slowly across one.
+    float3 ambient_share = float3(1.0);
+    {
+        const float3 middle = camera + sample_ray.direction * (0.5 * (samples_from + samples_to));
+        const BoxLight around = light_box_light(frame, middle, float3(0.0, 1.0, 0.0), float3(0.0, -1.0, 0.0));
+        if (around.weight > 0.0)
+        {
+            const float3 open = 0.5 * (hemisphere(frame, float3(0.0, 1.0, 0.0)) + hemisphere(frame, float3(0.0, -1.0, 0.0)));
+            const float3 held = 0.5 * (around.diffuse + around.mirror);
+            ambient_share = lerp(float3(1.0), clamp(held / max(open, float3(1e-4)), 0.0, 4.0), around.weight);
+        }
+    }
+    // How open to the sky the froxel's fog is: once a froxel, as the light box's share (a roof's edge is softer than
+    // a froxel is deep). The ambient comes times the world's own openness: here, the place's own in its stead.
+    const float open = open_sky(frame, camera + sample_ray.direction * (0.5 * (samples_from + samples_to))) /
+                       max(frame.sky_color.w, kLeastSkyShare);
+    const uint samples = has_history ? kSamplesKept : kSamples;
     float weight_sum = 0.0;
     float3 light_sum = float3(0.0);
-    for (uint i = 0; i < kSamples; ++i)
+    for (uint i = 0; i < samples; ++i)
     {
-        const float distance = lerp(samples_from, samples_to, (float(i) + place.z) / float(kSamples));
+        const float distance = lerp(samples_from, samples_to, (float(i) + place.z) / float(samples));
         const float view_depth = distance * sample_ray.view_per_ray;
         const float3 position = camera + sample_ray.direction * distance;
         const float height = position.y - frame.fog.density.w;
         // The world's fog only within its span: outside it, there's none to share the light with a volume.
         const float world_density = distance >= fog_near && distance <= fog_far ? fog_density(frame.fog, height) : 0.0;
         const float weight = world_density + volume_density;
-        float3 light = fog_ambient_light(frame.fog, height);
+        float3 light =
+            fog_ambient_light(frame.fog, height) * ambient_share * open + local_lights_in_fog(frame, position);
         // Where the sun's haze starts is about the world's fog; a volume is lit from the first meter.
         const float sun_share = distance >= frame.fog.sun_back.w ? 1.0 : volume_density / max(weight, 1e-6);
         if (sun_share > 0.0)

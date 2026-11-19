@@ -1,5 +1,6 @@
 find_package(imgui CONFIG REQUIRED)
 find_package(unofficial-bc7enc-rdo CONFIG REQUIRED)
+find_package(yyjson CONFIG REQUIRED)
 
 # The editor (deengine --editor, dev builds): panels over the running engine, and the commands every change goes
 # through. The ship build doesn't call it, so none of it links in.
@@ -16,6 +17,8 @@ add_library(de_editor STATIC
     commands.h
     editor.cpp
     editor.h
+    effect_viewer.cpp
+    effect_viewer.h
     entity_record.h
     file_ops.cpp
     file_ops.h
@@ -27,8 +30,18 @@ add_library(de_editor STATIC
     icons.h
     navigation.cpp
     navigation.h
+    orbit_camera.cpp
+    orbit_camera.h
     outline.cpp
     outline.h
+    prefab_document.cpp
+    prefab_document.h
+    prefab_editor.cpp
+    prefab_editor.h
+    preview_pictures.cpp
+    preview_pictures.h
+    project_watch.cpp
+    project_watch.h
     properties_panel.cpp
     properties_panel.h
     selection.h
@@ -44,4 +57,4 @@ add_library(de::editor ALIAS de_editor)
 
 target_link_libraries(de_editor
     PUBLIC de::app de::asset de::core de::platform de::world de::compile_options imgui::imgui
-    PRIVATE de::physics de::render_scene unofficial::bc7enc-rdo::bc7enc_rdo)
+    PRIVATE de::physics de::render_scene unofficial::bc7enc-rdo::bc7enc_rdo yyjson::yyjson)

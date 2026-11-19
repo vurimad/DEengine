@@ -10,7 +10,6 @@
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
-#include <cstring>
 #include <limits>
 #include <utility>
 
@@ -66,6 +65,46 @@ void lock_seams(std::span<const ModelVertex> vertices, std::span<const uint32_t>
     for (size_t v = 0; v < vertices.size(); ++v) {
         locks[v] = owner[position_of[v]] == kShared ? meshopt_SimplifyVertex_Lock : 0;
     }
+}
+
+// Which piece of the surface each vertex is in: the vertices LOD 0's triangles join, one way or another, are one
+// piece. Where the source split its vertices all round a patch (a uv island, a face with normals of its own), the
+// patch is a piece. Each vertex gets the vertex that stands for its piece.
+void find_pieces(std::span<const uint32_t> indices, size_t vertex_count, core::Array<uint32_t>& piece) {
+    piece.resize_uninit(vertex_count);
+    for (size_t v = 0; v < vertex_count; ++v) {
+        piece[v] = static_cast<uint32_t>(v);
+    }
+    const auto root = [&piece](uint32_t v) {
+        while (piece[v] != v) {
+            piece[v] = piece[piece[v]]; // half the way there for whoever asks next
+            v = piece[v];
+        }
+        return v;
+    };
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const uint32_t first = root(indices[i]);
+        for (size_t corner = 1; corner < 3; ++corner) {
+            const uint32_t other = root(indices[i + corner]);
+            if (other != first) {
+                piece[other] = first;
+            }
+        }
+    }
+    for (size_t v = 0; v < vertex_count; ++v) {
+        piece[v] = root(static_cast<uint32_t>(v));
+    }
+}
+
+// Whether a triangle of these joins vertices of two pieces: a seam between them has moved.
+bool joins_pieces(std::span<const uint32_t> indices, std::span<const uint32_t> piece) {
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const uint32_t first = piece[indices[i]];
+        if (piece[indices[i + 1]] != first || piece[indices[i + 2]] != first) {
+            return true;
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -190,7 +229,7 @@ void bake_wind(std::span<ModelVertex> vertices, std::span<const uint32_t> indice
         by_position[i] = static_cast<uint32_t>(i);
     }
     const auto same_place = [&](uint32_t a, uint32_t b) {
-        return std::memcmp(vertices[a].position, vertices[b].position, sizeof(vertices[a].position)) == 0;
+        return std::ranges::equal(vertices[a].position, vertices[b].position);
     };
     std::ranges::sort(by_position, [&](uint32_t a, uint32_t b) {
         return std::ranges::lexicographical_compare(vertices[a].position, vertices[b].position);
@@ -341,6 +380,9 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
     // split there), the vertices stay put, so no LOD opens a crack along a material seam.
     core::Array<uint8_t> locks(tools_heap());
     lock_seams(vertices.span(), indices.span(), parts.span(), locks);
+    // What LOD 0 keeps apart, so a level that joins it across can say so (MeshLod::seams_moved).
+    core::Array<uint32_t> piece(tools_heap());
+    find_pieces(indices.span(), vertices.size(), piece);
     core::Array<uint32_t> simplified(tools_heap());
     core::Array<uint32_t> permissive(tools_heap());
     core::Array<float> part_errors(tools_heap()); // at the last level
@@ -363,6 +405,7 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
         const auto first_part = static_cast<uint32_t>(mesh_parts.size());
         const size_t first_index = indices.size();
         float error = 0.0f;
+        bool seams_moved = false;
         for (size_t p = 0; p < parts.size(); ++p) {
             const PartBuild& part = parts[p];
             const auto target = static_cast<size_t>(static_cast<float>(part.index_count) * keep) / 3 * 3;
@@ -387,6 +430,8 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
                     std::swap(simplified, permissive);
                     count = permissive_count;
                     part_error = permissive_error;
+                    // Free to move its seams, it may not have: only a triangle across two pieces says it did.
+                    seams_moved = seams_moved || joins_pieces({simplified.data(), count}, piece.span());
                 }
             }
             part_errors[p] = part_error;
@@ -415,7 +460,8 @@ core::Result<core::Array<std::byte>> cook_mesh(const ModelData& model, std::span
         // Never less than the LOD before: a renderer stops at the first one that's too coarse.
         lods.push(asset::MeshLod{.error = std::max(error, lods.back().error),
                                  .first_part = first_part,
-                                 .part_count = static_cast<uint32_t>(mesh_parts.size()) - first_part});
+                                 .part_count = static_cast<uint32_t>(mesh_parts.size()) - first_part,
+                                 .seams_moved = seams_moved ? 1U : 0U});
         previous_indices = level_indices;
     }
 

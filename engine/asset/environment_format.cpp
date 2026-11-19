@@ -24,6 +24,12 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
         return core::fail(ErrorCode::CorruptData, "environment's sun direction isn't unit length");
     }
     bool colors = std::isfinite(exposure_ev);
+    // Auto exposure's limits: the engine's (negative) or their own, in range.
+    const auto engine_or = [](float value, float most) { return std::isfinite(value) && value <= most; };
+    if (!engine_or(exposure_below_ev, 20.0f) || !engine_or(exposure_above_ev, 20.0f) ||
+        !engine_or(exposure_adaptation, 1.0f)) {
+        return core::fail(ErrorCode::CorruptData, "environment's auto exposure settings are out of range");
+    }
     for (const float* color : {sun_color, shadow_color, sky_color, ground_color}) {
         for (int i = 0; i < 3; ++i) {
             colors = colors && finite_at_least(color[i], 0.0f);
@@ -31,6 +37,9 @@ core::Result<void> EnvironmentAsset::validate(std::span<const std::byte> /*file*
     }
     if (!colors) {
         return core::fail(ErrorCode::CorruptData, "environment has a negative or non-finite color");
+    }
+    if (!(std::isfinite(under_roof) && under_roof >= 0.0f && under_roof <= 1.0f)) {
+        return core::fail(ErrorCode::CorruptData, "environment's under_roof isn't 0 to 1");
     }
     using L = ShadowLimits;
     const bool shadows = shadow_resolution >= L::kMinResolution && shadow_resolution <= L::kMaxResolution &&

@@ -47,7 +47,9 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     const GpuMeshPart part = push.parts[key % push.part_count];
     const uint list = draw_list_of(group, push.materials[part.material].flags);
     const GpuDrawList draws = push.lists[list];
-    const uint draw_count = push.merged != 0 ? 1 : records;
+    // What blends is sorted draw by draw, so it never merges.
+    const bool merged = push.merged != 0 && group != kBlendGroup;
+    const uint draw_count = merged ? 1 : records;
     uint first_draw;
     InterlockedAdd(push.counts[list], draw_count, first_draw);
     // A material changed kind, or there are more parts in a list than a call can draw: it's left out, and takes no records.
@@ -63,7 +65,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     {
         DrawIndexedArgs args;
         args.index_count = part.index_count;
-        args.instance_count = !fits ? 0 : (push.merged != 0 ? records : 1);
+        args.instance_count = !fits ? 0 : (merged ? records : 1);
         args.first_index = part.first_index;
         args.vertex_offset = int(part.vertex_offset);
         args.first_instance = first_record + d; // a draw's instances read consecutive records from here
@@ -73,7 +75,7 @@ void compute_main(uint3 thread: SV_DispatchThreadID)
     if (fits)
     {
         push.part_keys[key] = first_record;
-        const uint view = group < 2 ? 0 : 1;
+        const uint view = group < 2 || group == kBlendGroup ? 0 : 1;
         InterlockedAdd(push.counts[kCountRecordsPerList + list], records, ignored);
         InterlockedAdd(push.counts[kCountDraws + view], draw_count, ignored);
         InterlockedAdd(push.counts[kCountTriangles + view], records * (part.index_count / 3), ignored);

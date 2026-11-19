@@ -1,8 +1,11 @@
 #include "cooker/cell_cooker.h"
 
 #include "asset/collision_format.h"
+#include "asset/prefab_format.h"
 #include "cooker/blob_writer.h"
+#include "cooker/entity_transform.h"
 #include "cooker/json.h"
+#include "cooker/light_source.h"
 #include "cooker/source_tree.h"
 #include "core/hash_map.h"
 #include "core/math.h"
@@ -31,15 +34,6 @@ struct Parsed {
     StaticSetting static_setting = StaticSetting::Unset;
     bool wants_collision = false;
 };
-
-// A float from a JSON number, if it fits.
-bool to_float(double value, float& out) {
-    if (!std::isfinite(value) || std::abs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
-        return false;
-    }
-    out = static_cast<float>(value);
-    return true;
-}
 
 class CellImport {
 public:
@@ -93,7 +87,8 @@ private:
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
         // "folder" is the editor's, for its hierarchy: read there, not cooked.
         static constexpr const char* kKeys[] = {"name",   "mesh",   "position",   "rotation",  "rotation_deg", "scale",
-                                                "parent", "static", "fog_volume", "collision", "folder"};
+                                                "parent", "static", "fog_volume", "collision", "folder",       "water",
+                                                "effect", "prefab", "variant",    "light"};
         reader.check_keys(kKeys, "cell entity");
         Parsed& parsed = parsed_.back();
         parsed.name = reader.string("name", "");
@@ -116,64 +111,23 @@ private:
         }
 
         CellEntity& entity = parsed.entity;
-        if (reader.has("position") && !read_numbers(yyjson_obj_get(object, "position"), entity.position, 3)) {
-            bad("position should be [x, y, z]");
-        }
-        if (reader.has("rotation") && reader.has("rotation_deg")) {
-            bad("has both rotation and rotation_deg");
-        } else if (reader.has("rotation")) {
-            double q[4] = {};
-            const bool read = read_numbers(yyjson_obj_get(object, "rotation"), q, 4);
-            // In doubles: large components would overflow a float's square.
-            const double norm = std::sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]);
-            if (!read || !std::isfinite(norm) || !(norm > 1e-6)) {
-                bad("rotation should be a quaternion [x, y, z, w], not all zero");
-            } else {
-                for (size_t c = 0; c < 4; ++c) {
-                    entity.rotation[c] = static_cast<float>(q[c] / norm);
-                }
-            }
-        } else if (reader.has("rotation_deg")) {
-            double read_degrees[3] = {};
-            float degrees[3] = {};
-            if (!read_numbers(yyjson_obj_get(object, "rotation_deg"), read_degrees, 3) ||
-                !(std::abs(read_degrees[0]) <= 1e6 && std::abs(read_degrees[1]) <= 1e6 &&
-                  std::abs(read_degrees[2]) <= 1e6)) {
-                bad("rotation_deg should be [x, y, z] in degrees");
-            } else {
-                for (size_t c = 0; c < 3; ++c) {
-                    degrees[c] = static_cast<float>(read_degrees[c]);
-                }
-                const Quat q = glm::angleAxis(glm::radians(degrees[1]), Vec3(0.0f, 1.0f, 0.0f)) *
-                               glm::angleAxis(glm::radians(degrees[0]), Vec3(1.0f, 0.0f, 0.0f)) *
-                               glm::angleAxis(glm::radians(degrees[2]), Vec3(0.0f, 0.0f, 1.0f));
-                const Quat unit = glm::normalize(q);
-                entity.rotation[0] = unit.x;
-                entity.rotation[1] = unit.y;
-                entity.rotation[2] = unit.z;
-                entity.rotation[3] = unit.w;
-            }
-        }
-        if (yyjson_val* scale = yyjson_obj_get(object, "scale"); scale != nullptr) {
-            double read_scale[3] = {};
-            if (yyjson_is_num(scale)) {
-                read_scale[0] = read_scale[1] = read_scale[2] = yyjson_get_num(scale);
-            } else if (!read_numbers(scale, read_scale, 3)) {
-                bad("scale should be a number or [x, y, z]");
-            }
-            if (!to_float(read_scale[0], entity.scale[0]) || !to_float(read_scale[1], entity.scale[1]) ||
-                !to_float(read_scale[2], entity.scale[2])) {
-                bad("scale is too large for a float");
-            } else if (entity.scale[0] == 0.0f || entity.scale[1] == 0.0f || entity.scale[2] == 0.0f) {
-                bad("scale has a zero (it couldn't be undone, for attaching)");
-            }
-        }
+        read_entity_transform(object, reader, entity.position, entity.rotation, entity.scale, bad);
         if (reader.has("static")) {
             parsed.static_setting = reader.boolean("static", true) ? StaticSetting::Yes : StaticSetting::No;
         }
 
         if (yyjson_val* fog = yyjson_obj_get(object, "fog_volume"); fog != nullptr) {
             read_fog_volume(fog, entity, label);
+        }
+        if (yyjson_val* water = yyjson_obj_get(object, "water"); water != nullptr) {
+            read_water_body(water, entity, label);
+        }
+        // "light": a local light where the entity is (cooker/light_source.h has its keys).
+        if (yyjson_val* light = yyjson_obj_get(object, "light"); light != nullptr) {
+            asset::LightDesc read;
+            read_light(light, path_, diagnostics_, read, bad);
+            entity.light = static_cast<uint32_t>(build_.lights.size());
+            build_.lights.push(read);
         }
 
         if (reader.has("collision")) {
@@ -205,6 +159,80 @@ private:
                 }
             }
         }
+
+        if (reader.has("effect")) {
+            const std::string_view reference = reader.string("effect", "");
+            SourcePath effect_path;
+            const Source* effect = nullptr;
+            if (join_relative(folder_of(path_), reference, effect_path)) {
+                effect = tree_.find(effect_path.view());
+            }
+            if (effect == nullptr || effect->kind != SourceKind::Effect) {
+                diagnostics_.error(
+                    path_, "%s: effect '%.*s' should name an effect source (.vfx), relative to the cell's folder",
+                    label.c_str(), static_cast<int>(reference.size()), reference.data());
+            } else {
+                entity.effect = effect_index(*effect);
+            }
+        }
+
+        if (reader.has("prefab")) {
+            if (reader.has("mesh") || reader.has("collision") || reader.has("effect") || reader.has("fog_volume") ||
+                reader.has("water") || reader.has("light")) {
+                bad("places a prefab: a mesh, an effect, a light, fog or water belong to entities of their own");
+            }
+            const std::string_view reference = reader.string("prefab", "");
+            SourcePath prefab_path;
+            const Source* prefab = nullptr;
+            if (join_relative(folder_of(path_), reference, prefab_path)) {
+                prefab = tree_.find(prefab_path.view());
+            }
+            if (prefab == nullptr || prefab->kind != SourceKind::Prefab) {
+                diagnostics_.error(path_,
+                                   "%s: prefab '%.*s' should name a prefab source (.prefab), relative to the cell's "
+                                   "folder",
+                                   label.c_str(), static_cast<int>(reference.size()), reference.data());
+            } else {
+                entity.prefab = prefab_index(*prefab);
+                const std::string_view variant = reader.string("variant", "");
+                if (variant.size() > asset::PrefabLimits::kMaxIdLength) {
+                    bad("variant is too long a name for one");
+                } else if (!variant.empty()) {
+                    entity.variant = asset::prefab_variant_hash(variant);
+                    CellBuild::VariantUse use{.prefab = entity.prefab};
+                    static_cast<void>(use.variant.assign(variant));
+                    static_cast<void>(use.entity.assign(label.view()));
+                    build_.variant_uses.push(use);
+                }
+            }
+        } else if (reader.has("variant")) {
+            bad("names a variant, which only an entity that places a prefab has");
+        }
+    }
+
+    // "water": {"shape": "ellipse", "waves": 0.15}: a lake or pond, its size the entity's scale.
+    void read_water_body(yyjson_val* object, CellEntity& entity, const auto& label) {
+        if (!yyjson_is_obj(object)) {
+            diagnostics_.error(path_, "%s: water should be an object", label.c_str());
+            return;
+        }
+        static constexpr const char* kKeys[] = {"shape", "waves"};
+        const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
+        reader.check_keys(kKeys, "water");
+        asset::CellWaterBody water;
+        const std::string_view shape = reader.string("shape", "ellipse");
+        if (shape == "rectangle") {
+            water.shape = asset::CellWaterShape::Rectangle;
+        } else if (shape != "ellipse") {
+            diagnostics_.error(path_, "%s: water shape should be ellipse or rectangle", label.c_str());
+        }
+        const double waves = reader.number("waves", static_cast<double>(water.waves));
+        if (!(waves >= 0.0 && waves <= 1.0)) {
+            diagnostics_.error(path_, "%s: water waves should be from 0 to 1", label.c_str());
+        }
+        water.waves = static_cast<float>(waves);
+        entity.water_body = static_cast<uint32_t>(build_.water_bodies.size());
+        build_.water_bodies.push(water);
     }
 
     void read_fog_volume(yyjson_val* object, CellEntity& entity, const auto& label) {
@@ -212,8 +240,9 @@ private:
             diagnostics_.error(path_, "%s: fog_volume should be an object", label.c_str());
             return;
         }
-        static constexpr const char* kKeys[] = {"shape",        "density_per_m", "edge_m",    "tint",
-                                                "noise_size_m", "noise_amount",  "drift_mps", "height_fade_m"};
+        static constexpr const char* kKeys[] = {"shape",     "density_per_m", "edge_m",
+                                                "tint",      "noise_size_m",  "noise_amount",
+                                                "drift_mps", "height_fade_m", "under_roof"};
         const JsonReader reader{.object = object, .path = path_, .diagnostics = &diagnostics_};
         reader.check_keys(kKeys, "fog volume");
         asset::CellFogVolume volume;
@@ -225,7 +254,9 @@ private:
         }
         const double density = reader.number("density_per_m", 0.0);
         const double edge = reader.number("edge_m", 1.0);
-        if (density <= 0.0 || density > static_cast<double>(asset::kMaxFogVolumeDensityPerM) ||
+        // No fog of its own is a volume only if it says something else of its place: that it's under a roof.
+        const bool only_a_place = density == 0.0 && reader.has("under_roof");
+        if ((density <= 0.0 && !only_a_place) || density > static_cast<double>(asset::kMaxFogVolumeDensityPerM) ||
             !to_float(density, volume.density_per_m)) {
             diagnostics_.error(path_, "%s: fog_volume needs a density_per_m above 0, up to 4", label.c_str());
         }
@@ -259,6 +290,12 @@ private:
         const double height_fade = reader.number("height_fade_m", 0.0);
         if (!to_float(height_fade, volume.height_fade_m) || height_fade < 0.0) {
             diagnostics_.error(path_, "%s: fog_volume height_fade_m should be 0 or more", label.c_str());
+        }
+        if (reader.has("under_roof")) {
+            const double under_roof = reader.number("under_roof", 0.0);
+            if (!to_float(under_roof, volume.under_roof) || under_roof < 0.0 || under_roof > 1.0) {
+                diagnostics_.error(path_, "%s: fog_volume under_roof should be 0 to 1", label.c_str());
+            }
         }
         entity.fog_volume = static_cast<uint32_t>(build_.fog_volumes.size());
         build_.fog_volumes.push(volume);
@@ -308,6 +345,32 @@ private:
         build_.meshes.push(ref);
         build_.mesh_sources.push(mesh.path);
         return static_cast<uint32_t>(build_.meshes.size() - 1);
+    }
+
+    // Into build_.prefabs for now, likewise: the dependencies have the meshes, the collision and the effects first.
+    uint32_t prefab_index(const Source& prefab) {
+        const asset::AssetRef ref{.id = prefab.id, .type = asset::AssetType::Prefab};
+        for (size_t i = 0; i < build_.prefabs.size(); ++i) {
+            if (build_.prefabs[i] == ref) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        build_.prefabs.push(ref);
+        build_.prefab_sources.push(prefab.path);
+        return static_cast<uint32_t>(build_.prefabs.size() - 1);
+    }
+
+    // Into build_.effects for now, as collision_index: the dependencies have the meshes and the collision first.
+    uint32_t effect_index(const Source& effect) {
+        const asset::AssetRef ref{.id = effect.id, .type = asset::AssetType::Effect};
+        for (size_t i = 0; i < build_.effects.size(); ++i) {
+            if (build_.effects[i] == ref) {
+                return static_cast<uint32_t>(i);
+            }
+        }
+        build_.effects.push(ref);
+        build_.effect_sources.push(effect.path);
+        return static_cast<uint32_t>(build_.effects.size() - 1);
     }
 
     // Into build_.collisions for now: the file's dependencies have the meshes first (write_in_order).
@@ -425,6 +488,13 @@ private:
             if (entity.collision != CellEntity::kNone) {
                 entity.collision += static_cast<uint32_t>(build_.meshes.size());
             }
+            if (entity.effect != CellEntity::kNone) {
+                entity.effect += static_cast<uint32_t>(build_.meshes.size() + build_.collisions.size());
+            }
+            if (entity.prefab != CellEntity::kNone) {
+                entity.prefab +=
+                    static_cast<uint32_t>(build_.meshes.size() + build_.collisions.size() + build_.effects.size());
+            }
             entity.source_index = source_index;
             entity.name_offset = static_cast<uint32_t>(build_.names.size());
             entity.name_length = static_cast<uint16_t>(parsed.name.size());
@@ -469,10 +539,18 @@ core::Array<std::byte> cook_cell(const CellBuild& build, asset::AssetId id) {
     asset.entities = writer.append(build.entities.span());
     asset.names = writer.append(build.names.span());
     asset.fog_volumes = writer.append(build.fog_volumes.span());
+    asset.water_bodies = writer.append(build.water_bodies.span());
+    asset.lights = writer.append(build.lights.span());
     core::Array<asset::AssetRef> dependencies(tools_heap());
     dependencies.assign(build.meshes.span());
     for (const asset::AssetRef& collision : build.collisions) {
         dependencies.push(collision);
+    }
+    for (const asset::AssetRef& effect : build.effects) {
+        dependencies.push(effect);
+    }
+    for (const asset::AssetRef& prefab : build.prefabs) {
+        dependencies.push(prefab);
     }
     return writer.finish(asset, id, dependencies.span());
 }

@@ -18,15 +18,17 @@ void list_tree(const platform::Vfs& vfs, std::string_view root, bool report_bad_
 
 // What the cooker makes of a source file, by extension.
 enum class SourceKind : uint8_t {
-    Texture,     // .png .jpg .jpeg .tga .bmp
-    Gltf,        // .gltf .glb
-    Fbx,         // .fbx
-    Material,    // .material: our own text material (JSON)
-    Cell,        // .cell: the entities placed in one cell of the world (JSON)
-    World,       // .world: a world's cells, start and environment (JSON)
-    Environment, // .environment: how a place is lit (JSON)
-    Terrain,     // .terrain: a height image and how to read it (JSON)
+    Texture,       // .png .jpg .jpeg .tga .bmp
+    Gltf,          // .gltf .glb
+    Fbx,           // .fbx
+    Material,      // .material: our own text material (JSON)
+    Cell,          // .cell: the entities placed in one cell of the world (JSON)
+    World,         // .world: a world's cells, start and environment (JSON)
+    Environment,   // .environment: how a place is lit (JSON)
+    Terrain,       // .terrain: a height image and how to read it (JSON)
     TerrainLayers, // .terrainlayers: how the ground looks, as rules over layers (JSON)
+    Effect,        // .vfx: an effect's emitters (JSON)
+    Prefab,        // .prefab: a composed thing's parts (JSON)
 };
 
 const char* source_kind_name(SourceKind kind);

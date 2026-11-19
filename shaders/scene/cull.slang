@@ -1,7 +1,8 @@
 // The GPU cull: every instance against every view (the camera and each shadow cascade), by its mesh's
 // bounding sphere: a cascade's view is what can shadow something it lights. What's in a view uses the parts of its
 // mesh's coarsest LOD that's good enough there. While a LOD takes over from the one before, it uses the parts of both,
-// in a group of their own.
+// in a group of their own. Parts that blend (kMaterialBlend) go to a group of their own, for the camera alone: they're
+// drawn after everything else, one LOD of them, and cast no shadow.
 //
 // It runs twice around scene.cull_assign, so everything of one part in one group is one instanced draw: first it counts
 // them, then that gives each its draw and where its records go, and then it writes those records. Both runs have to
@@ -100,7 +101,13 @@ void add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
     for (uint p = 0; p < lod.part_count; ++p)
     {
         const uint part_index = lod.first_part + p;
-        const uint key = group * push.part_count + part_index;
+        const bool blends = (push.frame.materials[push.parts[part_index].material].flags & kMaterialBlend) != 0;
+        // Of two LODs fading into each other, only the one coming in: mixed over each other, they'd show twice.
+        if (blends && (view_index != 0 || fade < 0.0))
+        {
+            continue;
+        }
+        const uint key = (blends ? kBlendGroup : group) * push.part_count + part_index;
         if (push.writing == 0)
         {
             uint before;
@@ -119,7 +126,7 @@ void add_parts(uint view_index, GpuMeshLod lod, uint instance, float fade)
             GpuDraw record;
             record.instance = instance;
             record.material = push.parts[part_index].material;
-            record.fade = fade;
+            record.fade = blends ? 0.0 : fade;
             push.records[slot] = record;
         }
     }

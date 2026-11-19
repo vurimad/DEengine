@@ -1,5 +1,6 @@
 #pragma once
 
+#include "asset/light_format.h"
 #include "core/allocator.h"
 #include "core/array.h"
 #include "core/function_ref.h"
@@ -63,6 +64,11 @@ bool joined_path(std::string_view folder, std::string_view relative, std::span<c
 
 // A number as a source writes it, to that many decimals: into out (64 chars is plenty), its length returned.
 size_t format_number(double value, int decimals, std::span<char> out);
+// A local light as a source writes it (a cell's entity, a prefab's part): {"color": [r, g, b], "intensity": i,
+// "radius_m": r}, then a spot's cone_deg and cone_soft and a flicker's flicker and flicker_hz, only for those. Its
+// length; out holds at least kLightTextSize.
+inline constexpr size_t kLightTextSize = 320;
+size_t light_text(const asset::LightDesc& light, std::span<char> out);
 
 class CellSource {
 public:

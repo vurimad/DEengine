@@ -224,10 +224,67 @@ void StatsPanel::draw_contents() {
              last_.camera_position.y, last_.camera_position.z,
              static_cast<double>(glm::degrees(std::atan2(-forward.x, -forward.z))),
              static_cast<double>(glm::degrees(std::asin(std::clamp(forward.y, -1.0f, 1.0f)))));
+        if (last_.has_exposure) {
+            line(kTextInk, "exposure %+.1f EV  (going to %+.1f)", static_cast<double>(last_.exposure_ev),
+                 static_cast<double>(last_.exposure_target_ev));
+        }
     }
     if (showing(kStatsCull) && last_.cull_frozen) {
         line(kWarnInk, "cull frozen (F4): %u shadow draws, %u triangles", last_.visible_shadow_draws,
              last_.visible_shadow_triangles);
+    }
+
+    // Only where there are effects: nothing to say of a world without any.
+    if (showing(kStatsParticles) && last_.particle_effects > 0) {
+        heading("Particles");
+        line(kTextInk, "%u effects, %u emitters near, %u in view", last_.particle_effects, last_.particle_emitters,
+             last_.particle_emitters_drawn);
+        line(kTextInk, "about %u alive, %u of %u blocks of the pool", last_.particles, last_.particle_blocks,
+             last_.particle_pool_blocks);
+        if (last_.particle_emitters_starved > 0) {
+            line(kWarnInk, "%u emitters wait: the pool has no room for them", last_.particle_emitters_starved);
+        }
+    }
+
+    // Only where there are lights.
+    if (showing(kStatsLights) && last_.lights > 0) {
+        heading("Lights");
+        line(kTextInk, "%u local lights, %u lighting the view, %u with shadows (%u faces)", last_.lights,
+             last_.lights_lit, last_.lights_shadowed, last_.shadow_faces);
+        if (last_.lights_dropped > 0) {
+            line(kWarnInk, "%u more reach the view than a frame lights with: the farthest are unlit",
+                 last_.lights_dropped);
+        }
+    }
+
+    // Only where rays are traced.
+    if (showing(kStatsRays) && (last_.trace_meshes + last_.trace_waiting + last_.trace_instances) > 0) {
+        heading("Rays");
+        line(kTextInk, "%u meshes of %.1f thousand triangles, %u instance slots in the top level", last_.trace_meshes,
+             static_cast<double>(last_.trace_triangles) / 1000.0, last_.trace_instances);
+        if (last_.trace_waiting > 0) {
+            line(kTextInk, "%u meshes wait for their bottom level", last_.trace_waiting);
+        }
+        if (last_.path_tracer_samples > 0) {
+            line(last_.path_tracer_bounces == 0 ? kWarnInk : kTextInk,
+                 "path traced: %u samples a pixel, %s; started again %u times, last for: %s", last_.path_tracer_samples,
+                 last_.path_tracer_bounces == 0 ? "direct light only (0 bounces)" : "light bounces",
+                 last_.path_tracer_restarts, last_.path_tracer_restart);
+        }
+        if (last_.light_boxes > 0) {
+            line(kTextInk, "%u light boxes of %u voxels, %.0f%% baked", last_.light_boxes, last_.light_box_voxels,
+                 static_cast<double>(last_.light_boxes_baked * 100.0f));
+        }
+        if (last_.compare_pixels > 0) {
+            line(kTextInk,
+                 "compared with path traced: %.2f stops off on average; %.0f%% off by over 10%%, %.0f%% "
+                 "by over 25%%",
+                 static_cast<double>(last_.compare_mean_stops), static_cast<double>(last_.compare_over_10 * 100.0f),
+                 static_cast<double>(last_.compare_over_25 * 100.0f));
+            line(kTextInk, "  %.0f%% too dark by 10%% (blue), %.0f%% too bright (red)",
+                 static_cast<double>(last_.compare_darker_10 * 100.0f),
+                 static_cast<double>(last_.compare_brighter_10 * 100.0f));
+        }
     }
 
     if (showing(kStatsMemory)) {

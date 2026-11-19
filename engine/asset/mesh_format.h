@@ -38,7 +38,10 @@ struct MeshLod {
     float error = 0.0f; // meters, object space: how far this LOD may lie from LOD 0
     uint32_t first_part = 0;
     uint32_t part_count = 0;
-    uint32_t reserved = 0;
+    // 1: its seams moved as it was simplified: a triangle of it joins vertices from two pieces of the surface that
+    // LOD 0 keeps apart (uv islands, faces with normals of their own). Drawn small that doesn't show; what's read off
+    // its surface up close (a texture's colour, by a ray) is wrong there.
+    uint32_t seams_moved = 0;
 };
 
 // The material a slot uses unless an instance overrides it.
@@ -55,7 +58,7 @@ enum class MeshFlags : uint32_t {
 // overdraw and fetch order), a LOD chain, bounds, parts and material slots. Indices are 32-bit.
 struct MeshAsset {
     static constexpr AssetType kType = AssetType::Mesh;
-    static constexpr uint16_t kFormatVersion = 2; // 2: typed dependencies
+    static constexpr uint16_t kFormatVersion = 3; // 3: a LOD says whether its seams moved
 
     AssetHeader header;
     MeshBounds bounds;

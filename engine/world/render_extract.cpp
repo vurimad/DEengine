@@ -5,6 +5,8 @@
 #include "core/log.h"
 #include "core/profile.h"
 
+#include <glm/gtc/constants.hpp>
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -64,6 +66,18 @@ void extract_camera(const flecs::world& ecs, float alpha, RenderFrame& frame) {
 
 } // namespace
 
+float light_flicker(double time_s, float hz, uint32_t seed) {
+    // Each light a place of its own in the waves, a few hundred turns in at most so a float holds what's left.
+    const double turns = (time_s * static_cast<double>(hz)) + (static_cast<double>(seed & 0xffffU) / 64.0);
+    const auto wave = [turns](double rate, double start) {
+        const double at = (turns * rate) + start;
+        return static_cast<float>(std::sin((at - std::floor(at)) * glm::two_pi<double>()));
+    };
+    // Rates with no common period within hours; the shares add to a half each side of a half.
+    return std::clamp(0.5f + (0.25f * wave(1.0, 0.0)) + (0.15f * wave(2.31, 0.37)) + (0.10f * wave(4.13, 0.71)), 0.0f,
+                      1.0f);
+}
+
 void register_render_components(flecs::world& ecs) {
     ecs.component<RenderSlot>("de::RenderSlot");
     ecs.component<MeshInstance>("de::MeshInstance")
@@ -79,7 +93,22 @@ void register_render_components(flecs::world& ecs) {
         .member<float>("noise_size_m")
         .member<float>("noise_amount")
         .member<float>("drift_mps", 3)
-        .member<float>("height_fade_m");
+        .member<float>("height_fade_m")
+        .member<float>("under_roof");
+    ecs.component<WaterBody>("de::WaterBody").member<bool>("ellipse").member<float>("waves");
+    ecs.component<LocalLight>("de::LocalLight")
+        .member<float>("color", 3)
+        .member<float>("intensity")
+        .member<float>("radius_m")
+        .member<float>("cone_deg")
+        .member<float>("cone_soft")
+        .member<float>("flicker")
+        .member<float>("flicker_hz")
+        .member<float>("shadow");
+    ecs.component<EffectSlot>("de::EffectSlot");
+    ecs.component<EffectInstance>("de::EffectInstance")
+        .member<asset::AssetHandle>("effect")
+        .add(flecs::With, ecs.component<EffectSlot>());
 }
 
 namespace {
@@ -263,6 +292,21 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
     ecs.observer<MeshInstance>("de::DropRenderSlot")
         .event(flecs::OnRemove)
         .each([](flecs::entity entity, MeshInstance&) { entity.remove<RenderSlot>(); });
+    // And one among effects from when it gets an EffectInstance.
+    ecs.observer<EffectSlot>("de::GiveEffectSlot").event(flecs::OnAdd).each([scratch = desc.scratch](EffectSlot& slot) {
+        if (!scratch->free_effect_slots.empty()) {
+            slot.slot = scratch->free_effect_slots.back();
+            scratch->free_effect_slots.pop();
+        } else {
+            slot.slot = scratch->next_effect_slot++;
+        }
+    });
+    ecs.observer<EffectSlot>("de::FreeEffectSlot")
+        .event(flecs::OnRemove)
+        .each([scratch = desc.scratch](EffectSlot& slot) { scratch->free_effect_slots.push(slot.slot); });
+    ecs.observer<EffectInstance>("de::DropEffectSlot")
+        .event(flecs::OnRemove)
+        .each([](flecs::entity entity, EffectInstance&) { entity.remove<EffectSlot>(); });
     // No terms, so it runs every frame, meshes or not: the camera (which may move the origin), and a fresh list of what
     // changed.
     ecs.system("de::ExtractRenderView").kind(phase).run([desc](flecs::iter& it) {
@@ -273,8 +317,37 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
         desc.frame->time_s = *desc.time_s;
         desc.frame->instances.clear(); // keeps its capacity: no allocation once the world has settled
         desc.frame->fog_volumes.clear();
+        desc.frame->water_bodies.clear();
+        desc.frame->effects.clear();
+        desc.frame->lights.clear();
         desc.frame->instance_out_of_reach = false;
     });
+    // Every effect there is, each frame: the renderer steps and draws what's near, and what's missing from the list
+    // has gone. Where it's seen, like anything else that moves.
+    ecs.system<const WorldTransform, const PreviousWorldTransform, const EffectInstance, const EffectSlot>(
+           "de::ExtractRenderEffects")
+        .kind(phase)
+        .run([desc](flecs::iter& it) {
+            DE_PROFILE_ZONE("render extract effects");
+            while (it.next()) {
+                const auto currents = it.field<const WorldTransform>(0);
+                const auto previouses = it.field<const PreviousWorldTransform>(1);
+                const auto effects = it.field<const EffectInstance>(2);
+                const auto slots = it.field<const EffectSlot>(3);
+                for (const auto entity_row : it) {
+                    const WorldTransform seen =
+                        interpolate(previouses[entity_row].value, currents[entity_row], *desc.alpha);
+                    RenderEffect out{.effect = effects[entity_row].effect,
+                                     .slot = slots[entity_row].slot,
+                                     // Its own, so two of one effect don't flicker as one; the same while it lives.
+                                     .seed = static_cast<uint32_t>(core::mix64(it.entity(entity_row).id())),
+                                     .clock = effects[entity_row].clock,
+                                     .hidden_emitters = effects[entity_row].hidden_emitters};
+                    to_render_transform(seen, out.transform);
+                    desc.frame->effects.push(out);
+                }
+            }
+        });
     // A few, not worth a job. Moving ones are where they're seen, like anything else.
     ecs.system<const WorldTransform, const PreviousWorldTransform, const FogVolume>("de::ExtractRenderFogVolumes")
         .kind(phase)
@@ -292,7 +365,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                     DE_ASSERT(volume.density_per_m >= 0.0f && volume.edge_m >= 0.0f && volume.noise_size_m > 0.0f &&
                               volume.noise_amount >= 0.0f && volume.noise_amount <= 1.0f &&
                               volume.height_fade_m >= 0.0f && std::isfinite(volume.drift_mps[0]) &&
-                              std::isfinite(volume.drift_mps[1]) && std::isfinite(volume.drift_mps[2]));
+                              std::isfinite(volume.drift_mps[1]) && std::isfinite(volume.drift_mps[2]) &&
+                              std::isfinite(volume.under_roof));
                     const WorldTransform seen = interpolate(previous.value, current, *desc.alpha);
                     const Vec3 center(seen.position - desc.frame->origin);
                     const glm::mat3 to_axes = glm::mat3_cast(glm::conjugate(seen.rotation));
@@ -302,7 +376,8 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                                         .ellipsoid = volume.ellipsoid,
                                         .noise_tiles_per_m = noise_tiles_per_m,
                                         .noise_amount = volume.noise_amount,
-                                        .height_fade_m = volume.height_fade_m};
+                                        .height_fade_m = volume.height_fade_m,
+                                        .under_roof = volume.under_roof};
                     for (int row = 0; row < 3; ++row) {
                         const Vec3 axis(to_axes[0][row], to_axes[1][row], to_axes[2][row]);
                         out.to_local[static_cast<size_t>(row) * 4 + 0] = axis.x;
@@ -321,6 +396,77 @@ void add_render_extract(flecs::world& ecs, flecs::entity phase, const RenderExtr
                         out.noise_offset_tiles[row] = wrapped < 4.0f ? wrapped : 0.0f; // it can round up to 4
                     }
                     desc.frame->fog_volumes.push(out);
+                }
+            }
+        });
+    // Every local light there is, each frame, as it shines now: the renderer keeps those that reach what's in view.
+    ecs.system<const WorldTransform, const PreviousWorldTransform, const LocalLight>("de::ExtractRenderLights")
+        .kind(phase)
+        .run([desc](flecs::iter& it) {
+            DE_PROFILE_ZONE("render extract lights");
+            while (it.next()) {
+                const auto currents = it.field<const WorldTransform>(0);
+                const auto previouses = it.field<const PreviousWorldTransform>(1);
+                const auto lights = it.field<const LocalLight>(2);
+                for (const auto entity_row : it) {
+                    const LocalLight& light = lights[entity_row];
+                    // Cooked ones are checked at load; one set from code, here.
+                    DE_ASSERT(light.desc().valid());
+                    const WorldTransform seen =
+                        interpolate(previouses[entity_row].value, currents[entity_row], *desc.alpha);
+                    // As if the whole thing were made bigger: farther by the scale, brighter by its square.
+                    const float scale =
+                        std::max({std::abs(seen.scale.x), std::abs(seen.scale.y), std::abs(seen.scale.z)});
+                    float shine = light.intensity * scale * scale;
+                    if (light.flicker > 0.0f) {
+                        const auto seed = static_cast<uint32_t>(core::mix64(it.entity(entity_row).id()));
+                        shine *= 1.0f - (light.flicker * light_flicker(*desc.time_s, light.flicker_hz, seed));
+                    }
+                    const Vec3 center(seen.position - desc.frame->origin);
+                    const Vec3 axis = seen.rotation * Vec3(0.0f, 0.0f, -1.0f);
+                    RenderLight out{.position = {center.x, center.y, center.z},
+                                    .radius_m = light.radius_m * scale,
+                                    .color = {light.color[0] * shine, light.color[1] * shine, light.color[2] * shine},
+                                    .direction = {axis.x, axis.y, axis.z},
+                                    .shadow = light.shadow};
+                    if (light.cone_deg > 0.0f) {
+                        // All of its light inside where the edge's fade starts, none past the cone.
+                        const float outer = glm::radians(light.cone_deg);
+                        const float inner = outer * (1.0f - light.cone_soft);
+                        out.cos_outer = std::cos(outer);
+                        out.cone_scale = 1.0f / std::max(std::cos(inner) - out.cos_outer, 1e-4f);
+                    }
+                    desc.frame->lights.push(out);
+                }
+            }
+        });
+    // A few, like fog volumes. A lake doesn't move, but one placed in the editor may.
+    ecs.system<const WorldTransform, const PreviousWorldTransform, const WaterBody>("de::ExtractRenderWaterBodies")
+        .kind(phase)
+        .run([desc](flecs::iter& it) {
+            DE_PROFILE_ZONE("render extract water bodies");
+            while (it.next()) {
+                const auto currents = it.field<const WorldTransform>(0);
+                const auto previouses = it.field<const PreviousWorldTransform>(1);
+                const auto bodies = it.field<const WaterBody>(2);
+                for (const auto entity_row : it) {
+                    const WaterBody& body = bodies[entity_row];
+                    DE_ASSERT(body.waves >= 0.0f && body.waves <= 1.0f);
+                    const WorldTransform seen =
+                        interpolate(previouses[entity_row].value, currents[entity_row], *desc.alpha);
+                    const Vec3 center(seen.position - desc.frame->origin);
+                    // Only its yaw: water lies flat whatever its entity's tilt.
+                    const Vec3 x_axis = seen.rotation * Vec3(1.0f, 0.0f, 0.0f);
+                    const float flat = std::sqrt((x_axis.x * x_axis.x) + (x_axis.z * x_axis.z));
+                    RenderWaterBody out{.center = {center.x, center.y, center.z},
+                                        .half_extents = {std::abs(seen.scale.x), std::abs(seen.scale.z)},
+                                        .ellipse = body.ellipse,
+                                        .waves = body.waves};
+                    if (flat > 1e-4f) {
+                        out.axis[0] = x_axis.x / flat;
+                        out.axis[1] = x_axis.z / flat;
+                    }
+                    desc.frame->water_bodies.push(out);
                 }
             }
         });

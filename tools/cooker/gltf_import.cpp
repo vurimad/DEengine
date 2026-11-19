@@ -20,6 +20,8 @@ namespace de::cooker {
 namespace {
 
 constexpr std::string_view kSrcPrefix = "src:/";
+// How much of its opacity a surface that transmits all light gives up: the rest is what keeps a pane of glass visible.
+constexpr float kClearestGlass = 0.85f;
 
 struct ReadContext {
     const platform::Vfs* vfs = nullptr;
@@ -252,6 +254,13 @@ private:
                                                                             : asset::AlphaMode::Opaque;
         material.alpha_cutoff = source.alpha_cutoff;
         material.double_sided = source.double_sided != 0;
+        // Glass (KHR_materials_transmission): nothing bends light through a surface yet, so what lets light through is
+        // mixed over what's behind it instead, the more clearly the more it transmits, and still shines.
+        if (source.has_transmission && source.transmission.transmission_factor > 0.0f &&
+            material.alpha_mode == asset::AlphaMode::Opaque) {
+            material.alpha_mode = asset::AlphaMode::Blend;
+            material.base_color[3] *= 1.0f - (kClearestGlass * std::min(source.transmission.transmission_factor, 1.0f));
+        }
     }
 
     bool visit(const cgltf_node& node) {

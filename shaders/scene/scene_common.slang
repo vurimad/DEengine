@@ -3,6 +3,26 @@
 
 import common.fog;
 
+// A local light (scene.local_lights), relative to the render origin. Matches render::GpuLocalLight.
+public struct LocalLight
+{
+    public float4 position_radius; // xyz: where it is; w: where its light ends, in meters
+    public float4 color_cone;      // rgb: its colour times its intensity; w: a spot's fade, 1 over its width in cosine
+    public float4 direction_cone;  // xyz: a spot's axis, the way it shines; w: the cosine of its cone (below any: a point)
+    public float4 shadow;          // x: its first face in the local shadow atlas (below 0: no shadow); y: its faces (6 a
+                                   // point, 1 a spot); z: the tangent of half a face's field of view; w: the faces' near
+};
+
+// A light box (scene.light_boxes): what has bounced and the sky's light, baked into voxels. Matches
+// render::GpuLightBox.
+public struct GpuLightBox
+{
+    public float4 origin_voxel; // xyz: its lowest corner, relative to the render origin; w: a voxel's size
+    public uint4 size;          // voxels each way; w: all of them
+    public uint4 maps;          // its 3D maps (sampled): a with whether it's inside something, b's x, y, z
+    public float4 params;       // x: over how much of its edge it fades out
+};
+
 // Matches render::SceneFrame (engine/render/scene/scene_renderer.cpp).
 public struct SceneFrame
 {
@@ -11,7 +31,10 @@ public struct SceneFrame
     public float4 camera_position;  // xyz, relative to the render origin
     public float4 sun_direction;    // xyz: toward the sun
     public float4 sun_color;        // rgb: illuminance, in exposure-relative units
-    public float4 sky_color;        // rgb: ambient from above
+    public float4 sky_color;        // rgb: ambient from above; w: how open to the sky the world is where no volume
+                                    // says (scene.sky's open_sky): 1, or while the radiance cascades light the
+                                    // picture what the environment says (0 under a roof) times their factor for
+                                    // the sky
     public float4 ground_color;     // rgb: ambient from below
     public float4 shadow_color;     // rgb: what shadowed sunlight keeps
     // Sun shadows: kCascadeCount cascades, each a tile of the shadow atlas.
@@ -36,6 +59,52 @@ public struct SceneFrame
     public uint2 terrain_origin_steps; // the terrain's corner, in render steps
     public uint2 terrain_size_steps;
     public float2 sea; // x: the sea's level, relative to the render origin; y: 1 if there is one
+    // The surf's simulation (scene.shore_sim): its window's corner relative to the render origin and in cells of the
+    // world, its surface this frame and last (bindless), and 1 in shore_sim if it runs.
+    public float2 shore_corner;
+    public int2 shore_corner_cell;
+    public uint shore_surface;
+    public uint shore_previous_surface;
+    public uint shore_sim;
+    public uint shore_padding;
+    // A plain backdrop instead of the sky (render::SceneBackdrop): what's behind a thing shown by itself.
+    public float4 backdrop_top;    // rgb: at the top of the picture, w: 1 if there is a backdrop
+    public float4 backdrop_bottom; // rgb: at the bottom
+    // Local lights (scene.local_lights): this frame's, and for each cluster of the view a bit per light that
+    // reaches it.
+    public LocalLight* lights;
+    public uint* light_clusters; // light_grid.w words a cluster
+    public uint4 light_grid;     // xyz: clusters across, up and deep; w: words a cluster, 0 with no lights
+    public float4 light_slices;  // a depth's slice is log2(depth) * x + y
+    // What rays are traced against (scene.trace): only where the renderer traces, and never read elsewhere.
+    public TraceScene* trace;
+    public float4* local_shadow_views; // 5 rows a face of the local shadow atlas: 4 render-origin space to its clip
+                                       // space, then its tile (x, y, size in texels)
+    public GpuLightBox* light_boxes;   // this frame's (scene.light_boxes)
+    public uint light_box_count;
+    public uint sky_volume_count;      // the first this many of fog_volumes say how open to the sky their place is
+    public FogVolumeData* fog_volumes; // this frame's fog volumes (the fog's own passes are handed them too)
+};
+
+// A mesh as rays see it, by its slot in the mesh table. Matches render::GpuMeshTrace.
+public struct MeshTrace
+{
+    public uint64_t bottom_level; // its acceleration structure's address; 0: none yet
+    public uint first_part;       // in the part table: the parts of the level of detail rays see, a run each
+    public uint part_count;
+};
+
+// The scene for rays (scene.trace), a frame's. Matches render::GpuTraceScene.
+public struct TraceScene
+{
+    public uint64_t top_level; // the acceleration structure over the frame's instances; 0: nothing built yet
+    public GpuInstance* instances;
+    public uint* instance_meshes;
+    public MeshTrace* mesh_trace;
+    public GpuMeshPart* parts;
+    public MeshVertex* vertices;
+    public uint* indices;
+    public GpuMaterial* materials;
 };
 
 public static const uint kCascadeCount = 4;
@@ -109,20 +178,32 @@ public struct GpuMeshPart
     public uint vertex_offset; // its mesh's first vertex in the geometry pool
 };
 
-public static const uint kCullViewCount = 1 + kCascadeCount; // the camera, then each cascade
+// Local lights' shadows: faces of a cube (a point light's six) or a spot's one, each a tile of the local shadow atlas
+// and a shadow view of the cull after the cascades. As in local_lights.h.
+public static const uint kLocalShadowFaces = 192;
+public static const uint kShadowViewCount = kCascadeCount + kLocalShadowFaces;
+public static const uint kCullViewCount = 1 + kShadowViewCount; // the camera, then each cascade, then each local face
+public static const uint kTerrainViewCount = 1 + kCascadeCount; // terrain casts into the cascades alone
 public static const uint kNoMesh = 0xffffffffu;
 
 // Draws of one part in one group merge into one instanced draw. The camera's plain draws, what's fading, and each cascade
-// are a group each.
+// are a group each. Then what blends (kMaterialBlend), for the camera alone: a group and a list of its own, which
+// doesn't merge, since the transparent pass draws each on its own, the farthest first (scene.blend_sort).
 public static const uint kDrawKinds = 4;
-public static const uint kDrawListCount = 2 * kDrawKinds + 2 * kCascadeCount;
-public static const uint kCullGroups = 2 + kCascadeCount;
+public static const uint kBlendList = 2 * kDrawKinds + 2 * kShadowViewCount;
+public static const uint kDrawListCount = kBlendList + 1;
+public static const uint kBlendGroup = 2 + kShadowViewCount;
+public static const uint kCullGroups = kBlendGroup + 1;
 public static const uint kPartLost = 0xffffffffu; // in place of where a part's records start: no room for it
 
 // Which draw list a group's part lands in. The camera's groups have a list for every pipeline state ([masked][double-sided]);
-// a cascade's casters differ only by the alpha test. As in scene_renderer.cpp.
+// a cascade's casters differ only by the alpha test; what blends has one list. As in scene_renderer.cpp.
 public uint draw_list_of(uint group, uint material_flags)
 {
+    if (group == kBlendGroup)
+    {
+        return kBlendList;
+    }
     const uint masked = (material_flags & kMaterialMasked) != 0 ? 1u : 0u;
     const uint double_sided = (material_flags & kMaterialDoubleSided) != 0 ? 1u : 0u;
     return group < 2 ? group * kDrawKinds + masked * 2 + double_sided : 2 * kDrawKinds + 2 * (group - 2) + masked;
@@ -162,10 +243,28 @@ public float2 cascade_tile(uint cascade)
     return float2(float(cascade & 1u), float(cascade >> 1u)) * 0.5;
 }
 
+// A point in a face of the local shadow atlas's clip space.
+public float4 local_shadow_clip(SceneFrame* frame, uint face, float3 position)
+{
+    const float4 p = float4(position, 1.0);
+    float4* rows = frame.local_shadow_views + face * 5;
+    return float4(dot(rows[0], p), dot(rows[1], p), dot(rows[2], p), dot(rows[3], p));
+}
+
+// A face's tile in the local shadow atlas: x, y and size, in texels.
+public float3 local_shadow_tile(SceneFrame* frame, uint face)
+{
+    return frame.local_shadow_views[face * 5 + 4].xyz;
+}
+
 // Shaders read the frame through its pointer, never a copy: a copy indexed by cascade would sit in
 // scratch memory.
 public float4 cascade_clip(SceneFrame* frame, uint cascade, float3 position)
 {
+    if (cascade >= kCascadeCount)
+    {
+        return local_shadow_clip(frame, cascade - kCascadeCount, position); // a local light's face
+    }
     const float4 p = float4(position, 1.0);
     return float4(dot(frame.cascade_view_proj[cascade * 4 + 0], p), dot(frame.cascade_view_proj[cascade * 4 + 1], p),
                   dot(frame.cascade_view_proj[cascade * 4 + 2], p), dot(frame.cascade_view_proj[cascade * 4 + 3], p));
@@ -204,6 +303,7 @@ public struct GpuMaterial
 public static const uint kMaterialMasked = 1u;
 public static const uint kMaterialDoubleSided = 2u;
 public static const uint kMaterialWind = 4u; // moves in the wind: wind_bend_m or wind_flutter_m above 0
+public static const uint kMaterialBlend = 8u; // mixed over what's behind it by its alpha: the transparent pass's
 
 public float4 unorm8x4(uint packed)
 {

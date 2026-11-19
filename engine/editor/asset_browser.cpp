@@ -461,7 +461,53 @@ void AssetBrowser::draw_file_dialogs(Selection& selection) {
         ImGui::OpenPopup("Delete##file");
         open_delete_ = false;
     }
+    if (open_new_prefab_) {
+        ImGui::OpenPopup("New Prefab##file");
+        open_new_prefab_ = false;
+    }
     const ImVec2 middle = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(middle, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("New Prefab##file", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        const std::string_view folder = new_prefab_folder_.view().substr(std::string_view("src:/").size());
+        ImGui::Text("A new prefab in %.*s", static_cast<int>(folder.size()), folder.data());
+        ImGui::SetNextItemWidth(screen_px(320.0f));
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        const bool entered = ImGui::InputText("##name", new_prefab_text_, sizeof(new_prefab_text_),
+                                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        // Its name with the extension, whether that was typed or not.
+        char cleaned[128];
+        size_t length = 0;
+        Path made = new_prefab_folder_;
+        bool valid = clean_file_name(new_prefab_text_, cleaned, length);
+        std::string_view name(cleaned, valid ? length : 0);
+        if (name.ends_with(".prefab")) {
+            name.remove_suffix(std::string_view(".prefab").size());
+        }
+        valid = valid && !name.empty() && made.append('/') && made.append(name) && made.append(".prefab");
+        const bool taken = valid && vfs_ != nullptr && vfs_->exists(made.c_str());
+        if (!valid) {
+            ImGui::TextColored(color(ThemeColor::TextSecondary), "Lowercase letters, digits, _ - and . only");
+        } else if (taken) {
+            ImGui::TextColored(color(ThemeColor::Warning), "%.*s.prefab is there already",
+                               static_cast<int>(name.size()), name.data());
+        } else {
+            ImGui::TextColored(color(ThemeColor::TextSecondary), "%.*s.prefab: it's a file once it's saved",
+                               static_cast<int>(name.size()), name.data());
+        }
+        ImGui::BeginDisabled(!valid || taken);
+        const bool make = (ImGui::Button("Make") || entered) && valid && !taken;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        } else if (make) {
+            new_prefab_ = made;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
     ImGui::SetNextWindowPos(middle, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (ImGui::BeginPopupModal("Rename##file", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
         const std::string_view old_name = renaming_.view().substr(renaming_.view().rfind('/') + 1);
@@ -545,9 +591,9 @@ bool AssetBrowser::model_picture(uint32_t entry, Thumbnails::Picture& out) {
     if (thumbnails_ == nullptr || entries_[entry].directory) {
         return false;
     }
-    // What the cooker draws a picture of (asset::thumbnail_asset_id).
+    // What the cooker draws a picture of (asset::thumbnail_asset_id), and what the renderer does (preview_pictures.h).
     const std::string_view kind = file_kind(name_of(entry));
-    if (kind != "Model" && kind != "Texture" && kind != "Material") {
+    if (kind != "Model" && kind != "Texture" && kind != "Material" && kind != "Effect" && kind != "Prefab") {
         return false;
     }
     Path path;
@@ -1188,6 +1234,16 @@ void AssetBrowser::item_interaction(uint32_t entry, bool clicked, bool double_cl
     }
 }
 
+void AssetBrowser::draw_ping(uint32_t entry, ImVec2 min, ImVec2 max) const {
+    if (entry != pinged_ || ImGui::GetTime() >= pinged_until_s_) {
+        return;
+    }
+    // An outline in the accent that fades out.
+    const auto left = static_cast<float>(pinged_until_s_ - ImGui::GetTime());
+    ImGui::GetWindowDrawList()->AddRect(min, max, color_u32(ThemeColor::Accent, std::clamp(left / 0.6f, 0.0f, 1.0f)),
+                                        px(theme().metrics.control_rounding), 0, std::max(2.0f, px(2.0f)));
+}
+
 void AssetBrowser::item_drag_source(uint32_t entry) {
     if (!ImGui::IsItemActive() || !ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
         return;
@@ -1208,9 +1264,14 @@ void AssetBrowser::item_context_menu(uint32_t entry, Selection& selection) {
     Path path;
     const bool have_path = path_of(entry, path);
     const bool directory = entries_[entry].directory;
-    const bool world = !directory && file_kind(name_of(entry)) == "World";
-    // Open: a folder, or a world; other files have nothing to open here.
-    if ((directory || world) && ImGui::MenuItem(directory ? "Open Folder" : "Open World")) {
+    const std::string_view kind = directory ? std::string_view() : file_kind(name_of(entry));
+    // Open: a folder, a world, an effect in its viewer, a prefab in its editor; other files have nothing to open here.
+    const char* open = directory          ? "Open Folder"
+                       : kind == "World"  ? "Open World"
+                       : kind == "Effect" ? "View Effect"
+                       : kind == "Prefab" ? "Edit Prefab"
+                                          : nullptr;
+    if (open != nullptr && ImGui::MenuItem(open)) {
         open_item(entry, selection);
     }
     if (ImGui::MenuItem("Copy Path", nullptr, false, have_path)) {
@@ -1219,6 +1280,14 @@ void AssetBrowser::item_context_menu(uint32_t entry, Selection& selection) {
     ImGui::Separator();
     if (ImGui::MenuItem("New Folder", nullptr, false, true)) {
         new_folder(directory ? entry : entries_[entry].parent);
+    }
+    if (ImGui::MenuItem("New Prefab...", nullptr, false, true)) {
+        // Named first; the prefab editor then opens it, and its first save makes the file.
+        const uint32_t folder = directory ? entry : entries_[entry].parent;
+        if (folder < entries_.size() && path_of(folder, new_prefab_folder_)) {
+            static_cast<void>(std::snprintf(new_prefab_text_, sizeof(new_prefab_text_), "new_prefab"));
+            open_new_prefab_ = true;
+        }
     }
     if (ImGui::MenuItem("Rename", "F2", false, entry != 0 && have_path)) {
         start_rename(entry);
@@ -1312,6 +1381,7 @@ void AssetBrowser::draw_list(Selection& selection) {
             if (directory) {
                 folder_drop_target(entry, selection);
             }
+            draw_ping(entry, min, max);
             char name[128];
             const std::string_view entry_name = name_of(entry);
             static_cast<void>(
@@ -1406,6 +1476,7 @@ void AssetBrowser::draw_grid(Selection& selection) {
                 if (directory) {
                     folder_drop_target(entry, selection);
                 }
+                draw_ping(entry, min, max);
                 char name[128];
                 const std::string_view entry_name = name_of(entry);
                 static_cast<void>(
@@ -1523,6 +1594,8 @@ bool AssetBrowser::draw(const platform::Vfs& vfs, Selection& selection) {
         if (const uint32_t entry = find(show_file_.view()); entry != UINT32_MAX) {
             reveal(entry);
             navigate(entries_[entry].parent, false);
+            pinged_ = entry;
+            pinged_until_s_ = ImGui::GetTime() + 1.6;
         }
         show_file_ = {};
     }

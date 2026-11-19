@@ -6,7 +6,7 @@ The render hardware interface: the only door to the graphics API (docs/design.md
 
 | File | What it gives |
 | --- | --- |
-| `rhi.h` | Formats and `format_info`, texture, buffer and pipeline descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` / `PipelineHandle` |
+| `rhi.h` | Formats and `format_info`, texture, buffer and pipeline descriptions, `ResourceState`, barriers, attachments, `Capabilities`, the generational `TextureHandle` / `BufferHandle` / `PipelineHandle` / `AccelerationHandle`, acceleration structures' descriptions (`AccelerationTriangles`, `BottomLevelDesc`, `TopLevelDesc`, `AccelerationInstance`) |
 | `device.h` | `Device`: creation (windowed or headless), resources, deferred destruction, frames, swapchain, stats |
 | `command_list.h` | `CommandList`: barriers (queue ownership transfers included), dynamic rendering, pipelines, cull mode, push constants, index buffers, draws, dispatches, copies, fills, blits, debug labels; `BarrierBatch`, `ScopedDebugLabel` |
 | `upload.h` | `Uploader`: CPU data into textures and buffers through a staging ring, within a byte budget per frame, on the transfer queue when there is one (docs/design.md, Rendering: GPU uploads) |
@@ -57,8 +57,20 @@ device.end_frame();                                      // one submit for all l
 - `DeviceDesc::gpu_validation` turns on GPU-assisted validation: shaders check their pointer accesses (out of bounds), descriptor indexing and more as they run. Very slow; a test proves it catches an out-of-bounds pointer write.
 - One pipeline layout for every pipeline: 128 bytes of push constants visible to all stages, no per-pipeline descriptor layouts. Pipelines take compiled shader code (from `render/shader`), attachment formats and fixed state; viewport, scissor and cull mode are dynamic (a pipeline's cull mode is set as it binds; `set_cull_mode` overrides it until the next bind). No vertex input layouts: vertices are pulled from buffers by address.
 - Validation is on by default in debug and dev builds when the layer is installed (Vulkan SDK). Its messages go to the log under `vulkan` and are counted in `DeviceStats`; the tests require zero, with synchronization validation on. `deengine --frames N` fails when validation reported errors.
+- What a list recorded: `CommandList::work()` (`ListWork`) counts draws, indirect calls with the most draws they can make, dispatches and copies as they are recorded. The render graph gives each pass its share, for the frame debugger.
 - GPU timestamps: `CommandList::write_timestamp()` (graphics lists, up to `kMaxTimestampsPerFrame` a frame) writes into the frame slot's query pool; when `begin_frame()` reuses the slot, the GPU has finished that frame, so its values are read without waiting (`Device::completed_timestamps()`, nanoseconds after the frame's first, safe across a narrow counter's wrap) and the queries reset on the host.
 - Object names and command-list labels reach RenderDoc and Nsight whenever `VK_EXT_debug_utils` is available, in every build.
+
+## Acceleration structures
+
+Only with `Capabilities::ray_query`; without it `create_bottom_level` and `create_top_level` fail (`Unsupported`) and whoever asked goes on without rays.
+
+- **A bottom level** is a mesh: up to 64 runs of indexed triangles (`AccelerationTriangles`: 32-bit indices, vertices that begin with their position as three floats), in buffers with `BufferUsage::AccelerationInput`. A hit says which run and which triangle of it, so a run is a mesh's part. Created for its runs (their counts decide its size), then built by a command list, once.
+- **A top level** is the scene: up to `max_instances` `AccelerationInstance`s (a 3 x 4 transform, 24 bits a hit reports, a mask, the address of a bottom level; an address of 0 is no instance), read from a buffer the caller fills, on the CPU or in a compute pass. `build_top_level` builds it whole each time: nothing is refitted.
+- **Builds order themselves.** Each build waits for whatever wrote its inputs earlier in the frame, and what follows waits for it, so there are no resource states to declare for them and the render graph needs none. A top level keeps its scratch memory (it's built every frame); a bottom level's build makes its own, freed when the frame is done.
+- **A shader reaches a top level by its address** (`Device::acceleration_address`, in Slang `RaytracingAccelerationStructure(address)`), as it reaches a buffer: the bindless rule holds, no descriptor slot.
+- Destroyed like anything else: the handle stops resolving at once, the memory goes when the frames in flight are done. `DeviceStats::live_accelerations` counts them.
+- Not yet: compaction, refitting, one scratch shared by a frame's bottom-level builds, anything but triangles (boxes for procedural shapes), ray tracing pipelines (ray queries in any shader stage are what's there).
 
 ## Indirect draws
 

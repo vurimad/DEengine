@@ -54,6 +54,12 @@ bool prepare(SOCKET socket) {
                0;
 }
 
+// A TCP socket that no program started from this one inherits: a listener a child held would keep its port, with
+// nobody answering on it, after this program has gone (the editor starts the cooker, and other editors).
+SOCKET new_socket() {
+    return WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+}
+
 sockaddr_in loopback(uint16_t port) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
@@ -131,7 +137,7 @@ core::Result<TcpStream> TcpStream::connect_loopback(uint16_t port) {
     if (!winsock_ready()) {
         return core::fail(core::ErrorCode::Unsupported, "Winsock didn't start");
     }
-    const SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const SOCKET socket = new_socket();
     if (socket == kNoSocket) {
         return core::fail(core::ErrorCode::IoError, "no socket");
     }
@@ -172,7 +178,7 @@ core::Result<TcpListener> TcpListener::listen_loopback(uint16_t port) {
     if (!winsock_ready()) {
         return core::fail(core::ErrorCode::Unsupported, "Winsock didn't start");
     }
-    const SOCKET socket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const SOCKET socket = new_socket();
     if (socket == kNoSocket) {
         return core::fail(core::ErrorCode::IoError, "no socket");
     }
@@ -200,6 +206,9 @@ TcpStream TcpListener::accept() {
     if (socket == kNoSocket) {
         return {};
     }
+    // Not inherited either: an accepted socket doesn't take that from its listener.
+    SetHandleInformation(reinterpret_cast<HANDLE>(socket), // NOLINT(performance-no-int-to-ptr): a socket is a handle
+                         HANDLE_FLAG_INHERIT, 0);
     if (!prepare(socket)) {
         closesocket(socket);
         return {};

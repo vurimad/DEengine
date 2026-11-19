@@ -8,16 +8,18 @@ Cooked asset formats (docs/design.md, Asset formats): the files the cooker (`too
 | --- | --- |
 | `asset_id.h` | `Guid` (a source's identity, in its meta) and `AssetId` (what runtime code loads by): the main asset's ID from its GUID, sub-assets' from a name, shaders' from the module name |
 | `format.h` | `AssetHeader` (the common header), `OffsetSpan<T>`, `load_in_place<T>()`, `cooked_path()`, content hashes |
-| `mesh_format.h` | `.demesh`: 32-byte vertices, 32-bit indices, LODs, parts, material slots, bounds |
+| `mesh_format.h` | `.demesh`: 32-byte vertices, 32-bit indices, LODs (each with its error, and whether its seams moved: `MeshLod::seams_moved`), parts, material slots, bounds |
 | `texture_format.h` | `.detex`: a 2D texture with its mip chain, BCn or RGBA8 |
 | `material_format.h` | `.demat`: template, parameters and textures by name; the PBR names the cooker writes |
 | `cell_format.h` | `.decell`: the entities placed in one cell (transform, parent, mesh, collision, name, flags); its meshes and their collision are its dependencies |
 | `collision_format.h` | `.dephys`: a mesh's collision, as a Jolt shape's bytes only `engine/physics` reads, and the ID it has from its mesh's |
 | `world_format.h` | `.deworld`: a world's cells by coordinate (sorted, named but not dependencies: they stream), its start, its environment and terrain (its dependencies) |
+| `effect_format.h` | `.devfx`: an effect's emitters (rate, lifetimes, capacity, prewarm, reach, look) and their modules as three runs of words the particle shaders walk as they are (`EffectModule`, `EffectRunKind`); `validate_effect_run` checks every record, so nothing past loading has to (`EffectLimits`); `kEffectStepS`, the simulation's step |
+| `prefab_format.h` | `.deprefab`: a composed thing's parts in one flat list (`PrefabPart`: a mesh, its collision, an effect, placed from the prefab's origin, named by its path of IDs, with a bit for each variant that leaves it out), its variants, and the meshes, collision and effects as dependencies (`PrefabLimits`) |
 | `environment_format.h` | `.deenv`: sun direction and color, sky and ground ambient, shadow color, exposure, sun shadow settings (`ShadowLimits`), fog (`FogLimits`) |
 | `shader_format.h` | `.deshader`: a module's entry points in SPIR-V per permutation, with reflection |
 | `terrain_format.h` | `.deterrain`: a pyramid's levels, nodes and patch bounds, and `.deheights`: its blocks of heights, read one at a time |
-| `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload |
+| `registry.h` | `AssetRegistry`: load by ID with dependencies, reference counts, states and events, hot reload; `file_info()`, the size and write time of the file an asset's contents came from (what was made from it can be kept between runs by that) |
 
 ## Rules and invariants
 

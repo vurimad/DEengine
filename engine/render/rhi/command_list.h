@@ -85,6 +85,16 @@ public:
                                      uint64_t count_offset, uint32_t max_draws, uint32_t stride = 0);
     void dispatch_indirect(BufferHandle args, uint64_t offset);
 
+    // Acceleration structures (rhi.h), outside begin_rendering. Each build waits for whatever wrote its inputs
+    // earlier in the frame, and what follows it (later builds, shaders that trace) waits for it: no states to
+    // declare for them.
+    // A bottom level from its runs of triangles: those it was created for (their counts and strides), in buffers
+    // with AccelerationInput usage whose contents are there.
+    void build_bottom_level(AccelerationHandle acceleration, std::span<const AccelerationTriangles> geometry);
+    // A top level from `count` AccelerationInstances at offset in a buffer with AccelerationInput usage, every
+    // bottom level they name built. Built whole each time: nothing of what it was is kept.
+    void build_top_level(AccelerationHandle acceleration, BufferHandle instances, uint64_t offset, uint32_t count);
+
     // Buffers must be in CopySrc / CopyDst state.
     void copy_buffer(BufferHandle src, uint64_t src_offset, BufferHandle dst, uint64_t dst_offset, uint64_t size);
     // Fills size bytes (a multiple of 4) with a repeated 32-bit value. The buffer must be in CopyDst state.
@@ -98,6 +108,9 @@ public:
     // Named regions, shown in RenderDoc, Nsight and validation messages. Must nest within the list.
     void begin_debug_label(const char* name, Color color = kDefaultLabelColor);
     void end_debug_label();
+
+    // What the list has recorded so far: draws, dispatches, copies (rhi.h: ListWork).
+    ListWork work() const;
 
 private:
     friend struct DeviceImpl;

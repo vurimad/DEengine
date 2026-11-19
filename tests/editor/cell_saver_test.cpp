@@ -1,4 +1,5 @@
 #include "asset/cell_format.h"
+#include "asset/prefab_format.h"
 #include "asset/registry.h"
 #include "cooker/cooker.h"
 #include "core/job_system.h"
@@ -13,6 +14,7 @@
 #include "platform/vfs.h"
 #include "support/sandbox.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -22,6 +24,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -697,4 +700,128 @@ TEST_CASE("saving writes a changed folder into the entity's entry, and takes an 
   ]
 }
 )");
+}
+
+TEST_CASE("saving writes a light's changed values into its entry, and leaves one that's as it was alone") {
+    Scene scene;
+    scene.write_source("content/world/camp.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "lamp", "position": [64, 2, 64], "light": {"intensity": 2, "radius_m": 6}},
+    {"name": "torch", "position": [60, 2, 60], "light": {"color": [1, 0.5, 0.2], "radius_m": 4, "flicker": 0.4}} // as it is
+  ]
+}
+)");
+    scene.cook();
+    de::editor::CellSources sources(heap());
+    REQUIRE(sources.scan(scene.vfs));
+    static_cast<void>(de::world::load_cell(scene.world.ecs(), id_of(scene, "src:/content/world/camp.cell")));
+    scene.settle();
+    // Spawned with what the file says, the rest a light's own.
+    const flecs::entity lamp = scene.member("lamp");
+    const de::world::LocalLight was = lamp.get<de::world::LocalLight>();
+    CHECK(was.intensity == 2.0f);
+    CHECK(was.radius_m == 6.0f);
+    CHECK(was.color[1] == 1.0f);
+    CHECK(scene.member("torch").get<de::world::LocalLight>().flicker == doctest::Approx(0.4f));
+    // Nothing changed: nothing written.
+    CHECK(de::editor::save_cells(scene.world.ecs(), scene.assets, scene.vfs, sources, {}).files_written == 0);
+
+    de::world::LocalLight edited = was;
+    edited.color[2] = 0.5f;
+    edited.intensity = 3.5f;
+    edited.cone_deg = 30.0f;
+    lamp.set(edited);
+    const de::editor::CellSaveReport report =
+        de::editor::save_cells(scene.world.ecs(), scene.assets, scene.vfs, sources, {});
+    CHECK(report.files_written == 1);
+    CHECK(scene.read_source("src:/content/world/camp.cell") == R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "lamp", "position": [64, 2, 64], "light": {"color": [1, 1, 0.5], "intensity": 3.5, "radius_m": 6, "cone_deg": 30, "cone_soft": 0.25}},
+    {"name": "torch", "position": [60, 2, 60], "light": {"color": [1, 0.5, 0.2], "radius_m": 4, "flicker": 0.4}} // as it is
+  ]
+}
+)");
+    // What it wrote cooks, and comes back as edited.
+    scene.cook();
+    scene.settle();
+    const de::world::LocalLight now = scene.member("lamp").get<de::world::LocalLight>();
+    CHECK(now.intensity == 3.5f);
+    CHECK(now.cone_deg == 30.0f);
+    CHECK(now.color[2] == 0.5f);
+}
+
+TEST_CASE("a placed prefab's variant is a command: its parts follow it, and saving writes it into its entry") {
+    Scene scene;
+    scene.write_source("content/world/glow.vfx", R"({
+  "emitters": [{"name": "glow", "rate_per_s": 6, "lifetime_s": 1, "modules": [{"type": "size", "m": 0.5}]}]
+})");
+    scene.write_source("content/world/lamp.prefab", R"({
+  "parts": {"light": {"effect": "glow.vfx"}, "spark": {"effect": "glow.vfx", "position": [0, 1, 0]}},
+  "variants": {"dim": {"spark": null}}
+})");
+    scene.write_source("content/world/camp.cell", R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "lamp_a", "prefab": "lamp.prefab", "position": [64, 0, 64]},
+    {"name": "lamp_b", "prefab": "lamp.prefab", "variant": "dim", "position": [60, 0, 60]}
+  ]
+}
+)");
+    scene.cook();
+    de::editor::CellSources sources(heap());
+    REQUIRE(sources.scan(scene.vfs));
+    static_cast<void>(de::world::load_cell(scene.world.ecs(), id_of(scene, "src:/content/world/camp.cell")));
+    scene.settle();
+    const flecs::world& ecs = scene.world.ecs();
+    const auto parts_of = [&](flecs::entity placement) {
+        uint32_t parts = 0;
+        de::world::each_prefab_part(ecs, placement.get<de::world::PrefabInstance>().first_part,
+                                    [&parts](flecs::entity) { ++parts; });
+        return parts;
+    };
+    const flecs::entity lamp_a = scene.member("lamp_a");
+    const flecs::entity lamp_b = scene.member("lamp_b");
+    CHECK(parts_of(lamp_a) == 2);
+    CHECK(parts_of(lamp_b) == 1);
+
+    // As the Properties' Variant does: the placement's component set through the commands.
+    de::editor::CommandStack commands(heap());
+    const flecs::id_t placed_id = ecs.component<de::world::PrefabInstance>().id();
+    const auto ask = [&](flecs::entity placement, uint32_t variant) {
+        de::world::PrefabInstance asked = placement.get<de::world::PrefabInstance>();
+        asked.variant = variant;
+        REQUIRE(commands.set_component(placement, placed_id, std::as_bytes(std::span(&asked, 1))));
+        commands.seal();
+    };
+    ask(lamp_a, de::asset::prefab_variant_hash("dim"));
+    ask(lamp_b, 0);
+    scene.world.tick();
+    CHECK(parts_of(lamp_a) == 1); // its parts made again, as the variant has them
+    CHECK(parts_of(lamp_b) == 2);
+    // Undone and done again, they follow.
+    REQUIRE(commands.undo(ecs));
+    scene.world.tick();
+    CHECK(parts_of(lamp_b) == 1);
+    REQUIRE(commands.redo(ecs));
+    scene.world.tick();
+    CHECK(parts_of(lamp_b) == 2);
+
+    const de::editor::CellSaveReport report =
+        de::editor::save_cells(scene.world.ecs(), scene.assets, scene.vfs, sources, {});
+    CHECK(report.files_written == 1);
+    CHECK(scene.read_source("src:/content/world/camp.cell") == R"({
+  "coord": [0, 0],
+  "entities": [
+    {"name": "lamp_a", "prefab": "lamp.prefab", "position": [64, 0, 64], "variant": "dim"},
+    {"name": "lamp_b", "prefab": "lamp.prefab", "position": [60, 0, 60]}
+  ]
+}
+)");
+    // What it wrote cooks, and comes back as asked.
+    scene.cook();
+    scene.settle();
+    CHECK(parts_of(scene.member("lamp_a")) == 1);
+    CHECK(parts_of(scene.member("lamp_b")) == 2);
 }

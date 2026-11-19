@@ -43,6 +43,9 @@ public:
     // doesn't load: the old one is gone either way.
     bool open_world(Engine& engine, asset::AssetId id);
     asset::AssetId world_id() const { return world_id_; }
+    // The world startup() opens in place of the settings' (the editor's: what it had open last), unless --world names
+    // one. If it doesn't load, the settings' world opens after all.
+    void set_first_world(asset::AssetId id) { first_world_ = id; }
 #endif
 
 private:
@@ -56,6 +59,7 @@ private:
 
     asset::AssetHandle world_;
     asset::AssetId world_id_;
+    asset::AssetId first_world_; // set_first_world()
     // Loads a world before the first frame (or when the editor opens one), the camera at its start.
     bool load_world(Engine& engine, asset::AssetId id);
 #if DE_BUILD_DEV

@@ -23,6 +23,8 @@ constexpr Kind kKinds[] = {
     {.extension = ".terrainlayers", .name = "Terrain layers"},
     {.extension = ".heightpng", .name = "Height map"},
     {.extension = ".material", .name = "Material"},
+    {.extension = ".vfx", .name = "Effect"},
+    {.extension = ".prefab", .name = "Prefab"},
     {.extension = ".png", .name = "Texture"},
     {.extension = ".jpg", .name = "Texture"},
     {.extension = ".tga", .name = "Texture"},

@@ -120,6 +120,10 @@ core::Array<std::byte> cook_terrain_layers(const TerrainLayersBuild& build, asse
 //       "ground": {"color": [0.12, 0.1, 0.07]},             // defaults to 1), and from below
 //       "shadow_color": [0.05, 0.06, 0.09],                 // what shadowed sunlight keeps
 //       "exposure_ev": 0,
+//       "under_roof": 0,                    // optional, 0 to 1: how far the place is closed to the sky (a dungeon: 1);
+//                                           // a fog volume in a cell can say otherwise for its own place
+//       "auto_exposure": {"below_ev": 2, "above_ev": 2, "adaptation": 0.5}, // optional, each part too: how far
+//                                           // the exposure may follow the scene from exposure_ev (else the engine's)
 //       "shadows": {"resolution": 2048, "distance_m": 140, "split_lambda": 0.75, "blend_band": 0.12,
 //                   "caster_reach_m": 200, "penumbra_per_m": 0.06, "max_penumbra_texels": 6},
 //       "fog": {"density_per_m": 0.00008, "height_density_per_m": 0.004, "height_falloff_per_m": 0.08,  // per meter

@@ -79,6 +79,19 @@ struct TerrainStats {
 };
 
 // What a frame's terrain passes use, in the graph. Not valid: no terrain to draw.
+// The terrain's heights as the GPU holds them, for a compute pass to read the ground
+// (shaders/scene/terrain_common.slang: TerrainLevelInfo, the nodes, where each node's heights are, the heights): buffer
+// addresses, and where the map lies.
+struct TerrainHeights {
+    uint64_t levels = 0;
+    uint64_t nodes = 0;
+    uint64_t slots = 0; // this frame in flight's
+    uint64_t heights = 0;
+    uint32_t origin_steps[2] = {};
+    uint32_t size_steps[2] = {};
+    uint32_t finest_level = 0;
+};
+
 struct TerrainFrame {
     GraphBuffer args;
     GraphBuffer draws;
@@ -111,11 +124,13 @@ public:
     // How the ground looks from now on; null gives it a plain look. Copied: the file needn't stay.
     void set_layers(const asset::TerrainLayersAsset* layers, std::span<const std::byte> file);
 
-    // The light map the frame carries (shaders/scene/terrain_light.slang): its material's slot, and the terrain's corner
-    // and size in render steps. False while there is none, or it hasn't loaded.
+    // The light map the frame carries (shaders/scene/terrain_light.slang): its material's slot, and the terrain's
+    // corner and size in render steps. False while there is none, or it hasn't loaded.
     bool light_map(uint32_t& slot, uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const;
     // Where the terrain lies, in render steps: its corner and its size. False (left as they are) without one.
     bool extent(uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) const;
+    // Its heights on the GPU this frame, for reading the ground in a pass. False without a terrain.
+    bool heights(TerrainHeights& out) const;
 
     // A frame's streaming: collects what's been read, publishes what's been uploaded, and starts what's wanted most.
     // No allocation per frame once it's settled.
@@ -125,7 +140,8 @@ public:
     // there's nothing to show, or the select pipeline is missing (a shader that failed).
     TerrainFrame add_select_passes(RenderGraph& graph, rhi::PipelineHandle select, uint64_t frame, uint64_t views);
 
-    // Makes this frame's grass around the camera, if the look has any, after the select passes. frame and views as those.
+    // Makes this frame's grass around the camera, if the look has any, after the select passes. frame and views as
+    // those.
     void add_grass_passes(RenderGraph& graph, rhi::PipelineHandle scatter, uint64_t frame, uint64_t views,
                           TerrainFrame& out);
     // For the pass that calls draw_grass(); before its use_draws() or after, it doesn't matter.

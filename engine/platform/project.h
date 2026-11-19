@@ -19,4 +19,10 @@ struct Project {
 // there's no such folder, or no <name>.deproject in it.
 core::Result<Project> find_project(const char* given, const char* engine_root);
 
+// The project the editor had open last, for a start that names none: kept as one line in the user's data folder
+// (<user data>/DEengine/editor/last_project), read before anything is mounted. NotFound until remember_project() has
+// kept one, or once that folder is no project any more.
+core::Result<Project> last_project();
+void remember_project(const Project& project);
+
 } // namespace de::platform

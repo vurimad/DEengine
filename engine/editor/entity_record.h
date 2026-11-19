@@ -35,8 +35,15 @@ struct EntityRecord {
     world::Transform transform; // in the world: it comes back a root, where it stood
     asset::AssetId mesh;        // invalid: none
     asset::AssetId collision;
+    asset::AssetId effect; // what it plays; invalid: none
+    asset::AssetId prefab; // the prefab it places (its parts are made from it, never recorded); invalid: none
+    uint32_t variant = 0;  // and which of its variants (asset::prefab_variant_hash; 0: the prefab as it is)
     bool has_fog = false;
     world::FogVolume fog;
+    bool has_water = false;
+    world::WaterBody water;
+    bool has_light = false;
+    world::LocalLight light;
     bool is_static = true;
     // A cell's member: its cell, which of the cooked cell's entities it is, the cell's revision then, where it is in
     // the cell's file and its name there (the save checks the file still has it).

@@ -199,6 +199,10 @@ const char* source_kind_name(SourceKind kind) {
         return "terrain";
     case SourceKind::TerrainLayers:
         return "terrain layers";
+    case SourceKind::Effect:
+        return "effect";
+    case SourceKind::Prefab:
+        return "prefab";
     }
     return "unknown";
 }
@@ -224,6 +228,8 @@ bool source_kind_of(std::string_view path, SourceKind& kind) {
         {.extension = ".environment", .kind = SourceKind::Environment},
         {.extension = ".terrain", .kind = SourceKind::Terrain},
         {.extension = ".terrainlayers", .kind = SourceKind::TerrainLayers},
+        {.extension = ".vfx", .kind = SourceKind::Effect},
+        {.extension = ".prefab", .kind = SourceKind::Prefab},
     };
     for (const Entry& entry : kKinds) {
         if (entry.extension == extension) {

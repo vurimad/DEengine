@@ -33,6 +33,9 @@ struct GraphicsProgramDesc {
     const char* fragment_entry = "fragment_main";
     std::span<const ShaderDefine> defines{};
     rhi::GraphicsPipelineDesc state{}; // everything but the shader code, which the library fills in
+    // With ShaderLibraryDesc::background_first_builds: its first build goes ahead of those already waiting (the
+    // UI's, so the wait can be shown).
+    bool build_first = false;
 };
 
 struct ComputeProgramDesc {
@@ -40,19 +43,29 @@ struct ComputeProgramDesc {
     const char* entry = "compute_main";
     std::span<const ShaderDefine> defines{};
     const char* debug_name = nullptr;
+    bool build_first = false; // as GraphicsProgramDesc's
 };
 
 struct ShaderLibraryDesc {
     // Watch the sources of every program and rebuild changed ones while the game runs.
     bool hot_reload = DE_BUILD_DEV != 0;
     uint32_t poll_interval_ms = 250; // how often update() checks the sources
+    // A program's first build runs in the background, as its rebuilds do, unless the compiler has the program
+    // cached (reading it back takes a millisecond): create_graphics() and create_compute() return at once,
+    // pipeline() is invalid until update() has taken the build in, and stats().first_builds counts those still to
+    // come; as many build at once as the compiler compiles at once (ShaderCompilerDesc::parallel_compiles). For a
+    // window that has to stay responsive while nothing is cached yet: every program compiled on the thread that pumps
+    // its events is seconds of a window that doesn't answer. Off, the first build blocks: for tools, tests and runs
+    // that must draw from their first frame. Only when compiling from source.
+    bool background_first_builds = false;
 };
 
 struct ShaderLibraryStats {
     uint32_t programs = 0;
     uint32_t reloads = 0;        // programs rebuilt and swapped in after a source change
     uint32_t failed_reloads = 0; // rebuilds that failed: the last good pipeline stayed
-    uint32_t compiling = 0;      // rebuilds queued or running in the background
+    uint32_t compiling = 0;      // builds queued or running in the background, first builds among them
+    uint32_t first_builds = 0;   // programs still waiting for their first build (background_first_builds)
 };
 
 // Shader programs with live reload (docs/design.md, Shaders, materials & VFX): edit a .slang file
@@ -64,10 +77,10 @@ struct ShaderLibraryStats {
 // a re-cooked file is picked up the same way an edited source is, as long as it's cooked from the
 // sources this build was compiled from: otherwise the running pipelines stay.
 //
-// Create programs at load time (the first compile blocks). Call update() once per frame on the
-// thread that renders (the main thread today). Pipelines are created and destroyed on that thread only; rebuilds run
-// one at a time as background jobs, which only idle workers pick up, so they never stall a frame. Move-only; the
-// device, VFS, job system and compiler must outlive it.
+// Create programs at load time (the first compile blocks, unless background_first_builds). Call update() once per frame
+// on the thread that renders (the main thread today). Pipelines are created and destroyed on that thread only; rebuilds
+// run as background jobs (as many at once as the compiler compiles at once), which only idle workers pick up, so they
+// never stall a frame. Move-only; the device, VFS, job system and compiler must outlive it.
 class ShaderLibrary {
 public:
     static core::Result<ShaderLibrary> create(rhi::Device& device, platform::Vfs& vfs, core::JobSystem& jobs,
@@ -85,14 +98,20 @@ public:
     ShaderLibrary(const ShaderLibrary&) = delete;
     ShaderLibrary& operator=(const ShaderLibrary&) = delete;
 
-    // Compiles now and builds the pipeline. Fails only for a bad description (a missing or
+    // Compiles now and builds the pipeline (or, with background_first_builds, queues the compile:
+    // the pipeline comes with a later update()). Fails only for a bad description (a missing or
     // over-long name). If the shader doesn't compile, the errors are logged and the program is
     // kept without a pipeline: it is watched like any other, and a fix to its sources brings it to
     // life. Check pipeline() before drawing with it.
+    //
+    // Asked for the same thing again (the same module, entries, defines and pipeline state: a second renderer's
+    // programs), it gives the same program: one compile and one pipeline, however many use it, kept until each of
+    // them has destroyed it.
     core::Result<ProgramHandle> create_graphics(const GraphicsProgramDesc& desc);
     core::Result<ProgramHandle> create_compute(const ComputeProgramDesc& desc);
 
-    // Destroys the program and its pipeline (once the GPU is done with it). Waits for a rebuild in flight.
+    // Lets go of the program: once for each time it was created. With the last, it and its pipeline go (once the GPU
+    // is done with it), after waiting for a rebuild in flight.
     void destroy(ProgramHandle program);
 
     // The program's current pipeline; invalid for a stale handle or a program that has never built.

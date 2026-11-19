@@ -4,10 +4,12 @@
 #include "core/log.h"
 #include "core/math.h"
 #include "core/profile.h"
+#include "platform/time.h"
 #include "render/rhi/device.h"
 #include "render/rhi/upload.h"
 #include "render/scene/gpu_assets.h"
 #include "render/scene/ocean.h"
+#include "render/scene/shore_sim.h"
 #include "world/render_extract.h"
 
 #include <glm/gtc/matrix_access.hpp>
@@ -66,8 +68,36 @@ struct SceneFrame {
     uint32_t terrain_origin_steps[2] = {};
     uint32_t terrain_size_steps[2] = {};
     float sea[2] = {}; // the sea's level, relative to the render origin, and 1 if there is one
+    // The surf's simulation (shore_sim.h), 1 in shore_sim if it runs this frame: its window's corner relative to the
+    // render origin and in cells of the world, and its surface this frame and last (bindless indices).
+    float shore_corner[2] = {};
+    int32_t shore_corner_cell[2] = {};
+    uint32_t shore_surface = 0;
+    uint32_t shore_previous_surface = 0;
+    uint32_t shore_sim = 0;
+    uint32_t shore_padding = 0;
+    // A plain backdrop instead of the sky (SceneBackdrop): its colours, and 1 in the top's w if there is one.
+    float backdrop_top[4] = {};
+    float backdrop_bottom[4] = {};
+    // Local lights (local_lights.h, LocalLightFrame): this frame's, the clusters' words, the grid and its slices.
+    uint64_t lights = 0;
+    uint64_t light_clusters = 0;
+    uint32_t light_grid[4] = {};
+    float light_slices[4] = {};
+    uint64_t trace = 0;              // trace_scene.h: this frame's GpuTraceScene; 0 where nothing is traced
+    uint64_t local_shadow_views = 0; // kLocalShadowViewsOffset in the frame's buffer
+    uint64_t light_boxes = 0;        // light_boxes.h: this frame's GpuLightBoxes
+    uint32_t light_box_count = 0;
+    uint32_t sky_volume_count = 0; // the first this many of fog_volumes say how open to the sky their place is
+    uint64_t fog_volumes = 0;      // kFogVolumesOffset in the frame's buffer
 };
-static_assert(sizeof(SceneFrame) <= 1024);
+static_assert(sizeof(SceneFrame) == 1056);
+static_assert(offsetof(SceneFrame, local_shadow_views) == 1024);
+
+// Matches TraceViewPush in shaders/scene/trace_view.slang.
+struct TraceViewPush {
+    uint64_t frame = 0;
+};
 
 // Wind rhythms repeat within this, so its time can wrap without a jump; shaders/scene/wind.slang's kWindPeriodS.
 constexpr double kWindPeriodS = 256.0;
@@ -188,6 +218,29 @@ struct ShadowMaskPush {
     uint32_t sampler = 0;
 };
 
+// Matches RcApplyPush in shaders/scene/rc_apply.slang.
+struct RcApplyPush {
+    uint64_t frame = 0;
+    uint32_t gb0 = 0;
+    uint32_t gb1 = 0;
+    uint32_t gb2 = 0;
+    uint32_t scene_depth = 0;
+    uint32_t depth = 0;
+    uint32_t normal = 0;
+    uint32_t light = 0;
+    uint32_t scale = 1;
+    uint32_t size[2] = {};
+    uint32_t gi_size[2] = {};
+    float tolerance = 0.0f;
+    uint32_t flags = 0; // kRcApply...
+    float reserved_sky = 0.0f;
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(RcApplyPush) == 72);
+constexpr uint32_t kRcApplyMaterialOcclusion = 1; // times the material's own occlusion
+constexpr uint32_t kRcApplyIndirect = 2;          // only the light gathered (SceneView::Indirect)
+constexpr uint32_t kRcApplySpecular = 4;          // what surfaces mirror too (set_specular_ambient)
+
 // Matches DeferredLightPush in shaders/scene/deferred_light.slang.
 struct DeferredLightPush {
     uint64_t frame = 0;
@@ -196,7 +249,14 @@ struct DeferredLightPush {
     uint32_t gb2 = 0;
     uint32_t depth = 0;
     uint32_t shadow_mask = 0;
+    uint32_t indirect = 0; // 1: only the ambient that falls on each surface (SceneView::Indirect)
+    uint32_t ao = 0;       // gtao.h's occlusion, if ao_on
+    uint32_t ao_on = 0;
+    uint32_t local_shadows = 0; // the local shadow atlas; 0: none
+    uint32_t ambient_off = 0;   // bit 0: no diffuse ambient; bit 1: no specular ambient. Both while the radiance
+                                // cascades add them (radiance_cascades.h); bit 1 alone: set_specular_ambient
 };
+static_assert(sizeof(DeferredLightPush) == 48);
 
 // Matches FogPush in shaders/scene/fog.slang.
 struct FogPush {
@@ -216,7 +276,8 @@ struct GpuFogVolume {
     float to_local[12] = {};
     float half_extents[4] = {}; // w: edge, in meters
     float tint_density[4] = {}; // w: extinction per meter
-    float shape[4] = {};        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
+    float shape[4] = {};        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters;
+                                // w: how open to the sky its place is, negative if it doesn't say
     float noise[4] = {}; // xyz: how far the noise has moved past the render origin, in tiles, wrapped to [0, 4); w: its
                          // tiles a meter
 };
@@ -251,7 +312,12 @@ struct FogIntegratePush {
 
 // The froxel grid: a column per this many pixels, and slices spaced exponentially from the camera with
 // this offset, so the first ones aren't vanishingly thin.
-constexpr uint32_t kFroxelTilePixels = 8;
+// A froxel's column on the picture: 8 pixels up to 1080p, wider on a larger picture, so the grid is about 240 x 135
+// columns whatever the picture's size and the fog costs the same (fog is soft: a column of 11 pixels at 1440p shows
+// what one of 8 does, and at 8 the grid there had as many froxels as the picture has pixels).
+constexpr uint32_t froxel_tile_pixels(uint32_t picture_height) {
+    return std::clamp((picture_height + 67U) / 135U, 8U, 16U);
+}
 constexpr uint32_t kFroxelSlices = 64;
 constexpr uint32_t kFroxelJitterSamples = 16; // the places a froxel's samples go through, over and over
 constexpr uint32_t kFroxelIdleFrames = 240;   // how long the kept textures wait for fog volumes to come back in view
@@ -270,7 +336,12 @@ struct TaaPush {
     uint32_t sampler = 0;
     uint32_t has_history = 0;
     float exposure = 1.0f;
+    uint32_t coverage = 0;
+    uint32_t has_coverage = 0;
+    uint32_t reserved = 0;
+    uint64_t adapted = 0; // auto_exposure.h's multiplier, times exposure; 0: exposure alone
 };
+static_assert(sizeof(TaaPush) == 64);
 
 // TAA's sub-pixel offsets repeat after this many frames.
 constexpr uint32_t kTaaSamples = 16;
@@ -297,9 +368,18 @@ struct TonemapPush {
     uint32_t srgb_target = 0;
     uint32_t shadow_mask = 0;
     uint32_t motion = 0;
+    uint32_t ao = 0; // gtao.h's occlusion, if ao_on
+    uint32_t ao_on = 0;
+    uint32_t reserved = 0;
+    uint64_t adapted = 0; // auto_exposure.h's multiplier, times exposure; 0: exposure alone
 };
+static_assert(sizeof(TonemapPush) == 56);
 
-constexpr uint64_t kFogVolumesOffset = 1024; // after the SceneFrame
+// shaders/scene/sky.slang's kLeastSkyShare: the fog's ambient is written times the world's openness to the sky, but
+// never less than this of it, so a volume more open than its world can still be given its share.
+constexpr float kLeastSkyShare = 1.0f / 1024.0f;
+constexpr uint64_t kFogVolumesOffset = 1280; // after the SceneFrame
+static_assert(sizeof(SceneFrame) <= kFogVolumesOffset);
 // The nearest this many in reach go into the froxel grid each frame.
 constexpr uint32_t kMaxFogVolumes = 64;
 static_assert(kMaxFogVolumes <= 64, "a slice's mask has a bit per volume");
@@ -309,10 +389,14 @@ constexpr uint64_t kInstanceBytes = 96; // a GpuInstance: its transform, and las
 
 // The G-buffer's formats (shaders/scene/scene_common.slang documents the channels).
 constexpr rhi::Format kGBufferFormats[3] = {rhi::Format::RGBA8Srgb, rhi::Format::RG16Unorm, rhi::Format::RGBA8Unorm};
+// The graph's textures by name, for its logs and the frame debugger.
+constexpr const char* kGBufferNames[3] = {"gbuffer base color", "gbuffer normal", "gbuffer material"};
 constexpr rhi::Format kHdrFormat = rhi::Format::RGBA16Float;
 constexpr rhi::Format kMotionFormat = rhi::Format::RG16Float;
 constexpr rhi::Format kDepthFormat = rhi::Format::D32Float;
 constexpr rhi::Format kShadowMaskFormat = rhi::Format::RG8Unorm;
+// How much of each pixel see-through things cover, added up as they're drawn.
+constexpr rhi::Format kCoverageFormat = rhi::Format::R8Unorm;
 constexpr rhi::Format kWaterBehindDepthFormat = rhi::Format::R32Float;
 
 // Matches WaterBehindPush in shaders/scene/water_behind.slang.
@@ -328,19 +412,39 @@ struct WaterPush {
     uint32_t behind_color = 0;
     uint32_t behind_depth = 0;
     float sea_level = 0.0f; // relative to the render origin
-    uint32_t has_waves = 0;
+    uint32_t atlas = 0;     // the sun's shadow atlas
     uint32_t waves = 0;
     uint32_t previous_waves = 0;
     uint32_t slopes = 0;
-    uint32_t shore_material = 0; // the shore map's material slot, if has_shore
+    uint32_t shore_material = 0; // the shore map's material slot, if flags has kWaterShoreFlag
     float tile_offset[kOceanCascades][2] = {};
-    uint32_t has_shore = 0;
+    uint32_t flags = 0;            // kWaterShoreFlag, kWaterBandsFlag, kWaterFilmFlag
     float surf_period_s = 0.0f;    // the surf's sets: the swell's period
     float surf_height_m = 0.0f;    // their height, where they start to feel the bottom
     uint32_t foam_material = 0;    // the foam's material slot; 0: foam drawn from noise
     float swell_direction[2] = {}; // toward where the swell travels (x, z): its crests lie across it
+    // A lake's or pond's outline (shape not kWaterSea): its middle (x, z, relative to the render origin) and half
+    // extents along its own axes, its own x in the world's, and how much of the sea's waves it has.
+    float bounds[4] = {};
+    float axis[2] = {1.0f, 0.0f};
+    uint32_t shape = 0;
+    float wave_scale = 1.0f;
 };
-static_assert(sizeof(WaterPush) <= 128);
+static_assert(sizeof(WaterPush) == 128);
+
+// WaterPush::flags: a shore map to read; the shore waves' bands drawn in color (SceneWater::show_bands); the surf from
+// the shore material's film (SceneWater::surf_film).
+constexpr uint32_t kWaterShoreFlag = 1;
+constexpr uint32_t kWaterBandsFlag = 2;
+constexpr uint32_t kWaterFilmFlag = 4;
+constexpr uint32_t kWaterWavesFlag = 8; // the ocean's waves are there to read
+
+// WaterPush::shape.
+constexpr uint32_t kWaterSea = 0;
+constexpr uint32_t kWaterRectangle = 1;
+constexpr uint32_t kWaterEllipse = 2;
+// Lakes and ponds drawn a frame, the first the frame lists.
+constexpr uint32_t kMaxWaterBodies = 64;
 
 void copy3(const float (&from)[3], float (&to)[4]) {
     to[0] = from[0];
@@ -354,10 +458,16 @@ constexpr bool is_masked(uint32_t kind) {
 constexpr bool is_double_sided(uint32_t kind) {
     return (kind & 1U) != 0;
 }
+// The shadow views: the sun's cascades, then the local lights' faces (local_lights.h).
+constexpr uint32_t kShadowViewCount = kShadowCascadeCount + kLocalShadowFaces;
 // The draw lists the GPU cull fills: a list per kind for the camera, again for what's fading between LODs, then opaque
-// and masked for each cascade, whose casters differ only by the alpha test.
+// and masked for each shadow view, whose casters differ only by the alpha test, then what blends, for the camera: a
+// draw each, which the transparent pass puts in order and draws.
 constexpr uint32_t kCameraListCount = 2 * kDrawKindCount;
-constexpr uint32_t kDrawListCount = kCameraListCount + 2 * kShadowCascadeCount;
+constexpr uint32_t kBlendList = kCameraListCount + 2 * kShadowViewCount;
+constexpr uint32_t kDrawListCount = kBlendList + 1;
+// The most see-through draws a view holds: each is measured against every other to order them (scene.blend_sort).
+constexpr uint32_t kMaxBlendDraws = 4096;
 
 constexpr uint32_t cascade_list(uint32_t cascade, bool masked) {
     return kCameraListCount + (2 * cascade) + (masked ? 1U : 0U);
@@ -382,7 +492,13 @@ struct GpuDrawList {
     uint32_t capacity = 0;
 };
 
-constexpr uint32_t kCullViewCount = 1 + kShadowCascadeCount;
+constexpr uint32_t kCullViewCount = 1 + kShadowViewCount;
+// A local face's draw lists hold this many records at most: a light's reach holds a few things, and every face's
+// lists room for everything in the world would be most of the cull's memory.
+constexpr uint64_t kLocalFaceRecords = 2048;
+// The cull's part keys have room for this many parts in each group to begin with
+// (SceneRendererState::ensure_part_keys).
+constexpr uint32_t kFirstPartKeyParts = 4096;
 // The counts the cull writes: draws per list; the triangles it kept for the camera and for the cascades; records used
 // and lost in all; and then records per list. As in shaders/scene/scene_common.slang.
 constexpr uint32_t kCountTriangles = kDrawListCount;
@@ -390,12 +506,16 @@ constexpr uint32_t kCountRecordsLost = kDrawListCount + 3;
 constexpr uint32_t kCountDraws = kDrawListCount + 4;
 constexpr uint32_t kCountRecordsPerList = kDrawListCount + 6;
 constexpr uint32_t kCullCounterCount = kCountRecordsPerList + kDrawListCount;
-constexpr uint32_t kCullGroups = 2 + kShadowCascadeCount; // the camera's plain draws, what's fading, and each cascade
+// The camera's plain draws, what's fading, each shadow view, and what blends.
+constexpr uint32_t kCullGroups = 3 + kShadowViewCount;
 constexpr uint32_t kNoMesh = UINT32_MAX;
 // The water's levels around the camera (water.h).
 constexpr uint64_t kWaterLevelsOffset = kFogSliceMasksOffset + kFroxelSlices * sizeof(uint64_t);
+// The local shadow atlas's faces: 4 rows each, then its tile (SceneFrame::local_shadow_views).
+constexpr uint64_t kLocalShadowFaceBytes = uint64_t{5} * 4 * sizeof(float);
+constexpr uint64_t kLocalShadowViewsOffset = kWaterLevelsOffset + kWaterLevels * sizeof(GpuWaterLevel);
 // The views and lists, then what changed in the instances, which stay on the GPU between frames.
-constexpr uint64_t kCullViewsOffset = kWaterLevelsOffset + kWaterLevels * sizeof(GpuWaterLevel);
+constexpr uint64_t kCullViewsOffset = kLocalShadowViewsOffset + (uint64_t{kLocalShadowFaces} * kLocalShadowFaceBytes);
 constexpr uint64_t kDrawListsOffset = kCullViewsOffset + kCullViewCount * sizeof(GpuCullView);
 constexpr uint64_t kInstanceUpdatesOffset = kDrawListsOffset + kDrawListCount * sizeof(GpuDrawList);
 
@@ -464,6 +584,36 @@ struct CullAssignPush {
     uint32_t resetting = 0;
 };
 
+// Matches BlendSortPush in shaders/scene/blend_sort.slang.
+struct BlendSortPush {
+    uint64_t frame = 0;
+    uint64_t instances = 0;
+    uint64_t instance_meshes = 0;
+    uint64_t meshes = 0;
+    uint64_t records = 0;
+    uint64_t args = 0;
+    uint64_t sorted = 0;
+    uint64_t keys = 0;
+    uint64_t counts = 0;
+    uint32_t capacity = 0;
+    uint32_t placing = 0;
+};
+
+// Matches TransparentPush in shaders/scene/transparent.slang.
+struct TransparentPush {
+    uint64_t frame = 0;
+    uint64_t instances = 0;
+    uint64_t vertices = 0;
+    uint64_t materials = 0;
+    uint64_t draws = 0;
+    uint32_t sampler = 0;
+    uint32_t atlas = 0;
+    uint32_t integrated = 0;
+    uint32_t grid_sampler = 0;
+    uint32_t fog = 0;
+    uint32_t froxels = 0;
+};
+
 // Matches InstanceUpdatePush in shaders/scene/instance_update.slang.
 struct InstanceUpdatePush {
     uint64_t updates = 0;
@@ -517,6 +667,8 @@ struct SceneRendererState {
     shader::ProgramHandle gbuffer_opaque_fading;
     shader::ProgramHandle gbuffer_masked_fading;
     shader::ProgramHandle deferred_light;
+    shader::ProgramHandle rc_apply;         // the radiance cascades' light, added onto the lit picture
+    shader::ProgramHandle rc_apply_replace; // and in place of it, for the indirect light view
     shader::ProgramHandle tonemap;
     shader::ProgramHandle shadow_caster_opaque; // depth only
     shader::ProgramHandle shadow_caster_masked; // alpha-tested
@@ -527,6 +679,9 @@ struct SceneRendererState {
     shader::ProgramHandle cull;
     shader::ProgramHandle cull_assign;
     shader::ProgramHandle instance_update;
+    // What blends: its draws put farthest first, then drawn over the fogged image.
+    shader::ProgramHandle blend_sort;
+    shader::ProgramHandle transparent_program;
     // The instances, on the GPU between frames, and what the CPU keeps of them: each slot's mesh, to size the draw
     // lists without walking the instances.
     rhi::BufferHandle instance_data;
@@ -535,6 +690,7 @@ struct SceneRendererState {
     // They stay, so a frame clears only what it used.
     rhi::BufferHandle part_keys;
     rhi::BufferHandle part_used;
+    uint32_t part_key_parts = 0; // parts the keys have room for, in each group: the stride between groups
     rhi::BufferHandle part_dispatch;
     uint64_t part_keys_address = 0;
     uint64_t part_used_address = 0;
@@ -638,6 +794,7 @@ struct SceneRendererState {
     shader::ProgramHandle grass_gbuffer;
     shader::ProgramHandle grass_scatter;
     bool fog_low_camera = true;
+    bool terrain_hidden = false; // the ground not drawn, though the water still reads it (set_terrain_hidden)
     // Water: the world's, its programs, and its mesh's indices (water.h), uploaded once.
     SceneWater water;
     shader::ProgramHandle water_behind;
@@ -645,8 +802,109 @@ struct SceneRendererState {
     rhi::Uploader* uploader = nullptr;
     rhi::BufferHandle water_indices;
     uint64_t water_index_ticket = 0;
-    std::optional<Ocean> ocean;                   // the sea's waves
-    GpuWaterLevel water_levels_now[kWaterLevels]; // this frame's, as written into its constants
+    std::optional<Ocean> ocean;              // the sea's waves
+    std::optional<ShoreSim> shore_sim;       // the surf near the camera
+    std::optional<ParticleSystem> particles; // every effect's; none without a registry
+    std::optional<LocalLights> local_lights; // the frame's point lights and spots, and the view's clusters of them
+    LocalLightFrame lights_now;              // what this frame's constants say of them
+    std::optional<TraceScene> trace;         // what rays are traced against; none where nothing is traced
+    std::optional<Gtao> gtao;                // ambient occlusion on the screen
+    std::optional<RadianceCascades> radiance_cascades; // light that has bounced, on the screen (set_radiance_cascades)
+    bool radiance_cascades_on = false;                 // set_radiance_cascades
+    bool specular_ambient = true;                      // set_specular_ambient
+    uint32_t debug_jitter = 0;                         // set_debug_jitter
+    // The local shadow atlas, kept from frame to frame: a light's tiles are drawn again only when something in its
+    // reach changed (LocalShadowFace::draw).
+    rhi::TextureHandle local_atlas;
+    bool local_atlas_used = false;  // it has been in a graph: it's in the state a graph leaves it in
+    bool local_shadow_cache = true; // set_local_shadow_cache
+    // What each instance slot holds, as the lights' shadows need it: where it is and what mesh, to say where casters
+    // changed (local_shadow_changes).
+    struct SlotCaster {
+        world::RenderTransform transform;
+        asset::AssetHandle mesh;
+    };
+    core::Array<SlotCaster> slot_casters{render_heap()};
+    core::Array<uint32_t> casters_waiting{render_heap()}; // slots whose mesh wasn't on the GPU when they changed
+    core::Array<LocalShadowChange> shadow_changes{render_heap()};
+
+    // Where what casts shadows changed since the last frame, into shadow_changes: each instance that came, went or
+    // moved, where it was and where it is, and each whose mesh has only now reached the GPU (it's drawn from this
+    // frame). True if it can't be said where (everything was sent again, or tiles aren't to be kept): then every
+    // tile is drawn.
+    bool local_shadow_changes(const world::RenderFrame& frame) {
+        shadow_changes.clear();
+        const auto changed_at = [&](const SlotCaster& caster) {
+            const GpuMesh* mesh = caster.mesh.is_valid() ? gpu_assets->mesh(caster.mesh) : nullptr;
+            if (mesh == nullptr) {
+                return false;
+            }
+            LocalShadowChange change;
+            float longest = 0.0f;
+            for (int axis = 0; axis < 3; ++axis) {
+                const float* row = caster.transform.rows[axis].linear;
+                change.center[axis] = caster.transform.position_m(axis, frame.origin) +
+                                      (row[0] * mesh->bounds_center[0]) + (row[1] * mesh->bounds_center[1]) +
+                                      (row[2] * mesh->bounds_center[2]);
+                const float* r0 = caster.transform.rows[0].linear;
+                const float* r1 = caster.transform.rows[1].linear;
+                const float* r2 = caster.transform.rows[2].linear;
+                longest = std::max(longest, (r0[axis] * r0[axis]) + (r1[axis] * r1[axis]) + (r2[axis] * r2[axis]));
+            }
+            change.radius_m = mesh->bounds_radius_m * std::sqrt(longest);
+            shadow_changes.push(change);
+            return true;
+        };
+        for (size_t i = 0; i < frame.instances.size(); ++i) {
+            const world::RenderInstance& instance = frame.instances[i];
+            const uint32_t slot = instance.slot == world::kAutoRenderSlot ? static_cast<uint32_t>(i) : instance.slot;
+            if (slot >= max_instances) { // past the limit, or kSkipRenderInstance
+                continue;
+            }
+            if (slot >= slot_casters.size()) {
+                slot_casters.resize(slot + 1);
+            }
+            changed_at(slot_casters[slot]); // where it was
+            slot_casters[slot] = {.transform = instance.transform, .mesh = instance.mesh};
+            if (instance.mesh.is_valid() &&
+                (!changed_at(slot_casters[slot]) || !gpu_assets->mesh_on_gpu(instance.mesh))) {
+                casters_waiting.push(slot);
+            }
+        }
+        for (const uint32_t slot : frame.freed_slots) {
+            if (slot < slot_casters.size()) {
+                changed_at(slot_casters[slot]);
+                slot_casters[slot] = {};
+            }
+        }
+        for (size_t w = 0; w < casters_waiting.size();) {
+            const SlotCaster& caster = slot_casters[casters_waiting[w]];
+            if (!caster.mesh.is_valid()) {
+                casters_waiting.remove_swap(w);
+            } else if (gpu_assets->mesh_on_gpu(caster.mesh)) {
+                changed_at(caster);
+                casters_waiting.remove_swap(w);
+            } else {
+                ++w;
+            }
+        }
+        return !local_shadow_cache || frame.all_instances;
+    }
+    std::optional<PathTracer> path_tracer;                     // the other renderer (set_path_traced); only with trace
+    bool path_traced = false;                                  // set_path_traced
+    bool lighting_compare = false;                             // set_lighting_compare
+    std::optional<LightBoxes> light_boxes;                     // set_light_boxes; only with trace
+    bool light_boxes_on = true;                                // set_light_boxes_on
+    LightBoxes::Frame light_boxes_now;                         // this frame's
+    std::optional<AutoExposure> auto_exposure;                 // the exposure, following the scene
+    bool auto_exposure_on = false;                             // set_auto_exposure
+    uint64_t exposure_clock_ns = 0;                            // when the last frame adapted it
+    rhi::BufferHandle exposure_readback[rhi::kFramesInFlight]; // the state, a few frames late, for the stats
+    bool exposure_readback_written[rhi::kFramesInFlight] = {};
+    bool gtao_on = true;                                                 // set_ambient_occlusion
+    shader::ProgramHandle trace_view;                                    // SceneView::Traced
+    GpuWaterLevel water_levels_now[kWaterLevels];                        // this frame's, as written into its constants
+    core::Array<world::RenderWaterBody> water_bodies_now{render_heap()}; // this frame's lakes and ponds, to draw
 
     // How much of the height fog is left where the frame's camera is.
     [[nodiscard]] float fog_low_camera_share(const SceneFog& fog, const world::RenderFrame& frame) const {
@@ -665,6 +923,8 @@ struct SceneRendererState {
                                                     gbuffer_opaque_fading,
                                                     gbuffer_masked_fading,
                                                     deferred_light,
+                                                    rc_apply,
+                                                    rc_apply_replace,
                                                     tonemap,
                                                     shadow_caster_opaque,
                                                     shadow_caster_masked,
@@ -675,6 +935,8 @@ struct SceneRendererState {
                                                     cull,
                                                     cull_assign,
                                                     instance_update,
+                                                    blend_sort,
+                                                    transparent_program,
                                                     taa_program,
                                                     terrain_gbuffer,
                                                     terrain_shadow,
@@ -682,7 +944,8 @@ struct SceneRendererState {
                                                     grass_gbuffer,
                                                     grass_scatter,
                                                     water_behind,
-                                                    water_program}) {
+                                                    water_program,
+                                                    trace_view}) {
             shaders->destroy(program);
         }
         if (water_indices.is_valid()) {
@@ -718,6 +981,9 @@ struct SceneRendererState {
         device->destroy(part_keys);
         device->destroy(part_used);
         device->destroy(part_dispatch);
+        if (local_atlas.is_valid()) {
+            device->destroy(local_atlas);
+        }
         destroy_temporal();
         destroy_froxels();
     }
@@ -767,6 +1033,46 @@ struct SceneRendererState {
             }
             set = {};
         }
+    }
+
+    // The cull's part keys (a count per group and part, then where its records go) and the parts in use: room for parts
+    // parts in each group, grown to the next power of two when the loaded parts outgrow them (never past the table),
+    // each group's keys that far apart. Remade empty, so the next frame clears them.
+    bool ensure_part_keys(uint32_t parts) {
+        if (parts <= part_key_parts && part_keys.is_valid()) {
+            return true;
+        }
+        uint32_t room = std::max(part_key_parts, kFirstPartKeyParts);
+        while (room < parts) {
+            room *= 2;
+        }
+        room = std::min(room, gpu_assets->part_table_size());
+        for (const rhi::BufferHandle buffer : {part_keys, part_used}) {
+            if (buffer.is_valid()) {
+                device->destroy(buffer);
+            }
+        }
+        const uint64_t count = uint64_t{kCullGroups} * room;
+        const core::Result<rhi::BufferHandle> keys =
+            device->create_buffer({.size = count * sizeof(uint32_t),
+                                   .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                   .debug_name = "part keys"});
+        const core::Result<rhi::BufferHandle> used = device->create_buffer(
+            {.size = count * sizeof(uint32_t), .usage = rhi::BufferUsage::Storage, .debug_name = "parts in use"});
+        if (!keys || !used) {
+            part_keys = keys ? *keys : rhi::BufferHandle{};
+            part_used = used ? *used : rhi::BufferHandle{};
+            part_key_parts = 0;
+            return false;
+        }
+        part_keys = *keys;
+        part_used = *used;
+        part_keys_address = device->buffer_address(part_keys);
+        part_used_address = device->buffer_address(part_used);
+        part_key_parts = room;
+        part_keys_zero = false;    // cleared before it's used
+        part_buffers_read = false; // nothing of them is kept
+        return true;
     }
 
     // TAA's textures at this size (a new size starts with no history); false if they can't be made.
@@ -836,6 +1142,18 @@ struct SceneRendererState {
         light.color_formats[0] = kHdrFormat;
         light.blend[0] = rhi::BlendMode::Additive;
         deferred_light = make("scene.deferred_light", light);
+        rhi::GraphicsPipelineDesc gathered = light;
+        gathered.debug_name = "rc apply";
+        rc_apply = make("scene.rc_apply", gathered);
+        gathered.blend[0] = rhi::BlendMode::Opaque;
+        gathered.debug_name = "rc apply (indirect view)";
+        rc_apply_replace = make("scene.rc_apply", gathered);
+        if (trace) {
+            // Over the lit image, not added to it: the view is the rays' alone.
+            rhi::GraphicsPipelineDesc traced{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "trace view"};
+            traced.color_formats[0] = kHdrFormat;
+            trace_view = make("scene.trace_view", traced);
+        }
         rhi::GraphicsPipelineDesc fogged{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "fog"};
         fogged.color_formats[0] = kHdrFormat;
         fog_program = make("scene.fog", fogged);
@@ -894,6 +1212,25 @@ struct SceneRendererState {
         surface.color_formats[0] = kHdrFormat;
         surface.color_formats[1] = kMotionFormat;
         water_program = make("scene.water", surface);
+
+        // What blends: over the fogged image by its alpha (premultiplied, so one state serves glass and glows), tested
+        // against the scene's depth and writing none, seen from both sides. Its second target adds up how much of
+        // each pixel it covers, mixed the same way: one blend state for every target is all a device has to offer.
+        rhi::GraphicsPipelineDesc see_through{.color_count = 2,
+                                              .depth_format = kDepthFormat,
+                                              .depth_test = true,
+                                              .depth_write = false,
+                                              .depth_compare = rhi::CompareOp::GreaterEqual,
+                                              .cull = rhi::CullMode::None,
+                                              .debug_name = "transparents"};
+        see_through.color_formats[0] = kHdrFormat;
+        see_through.color_formats[1] = kCoverageFormat;
+        see_through.blend[0] = rhi::BlendMode::Premultiplied;
+        see_through.blend[1] = rhi::BlendMode::Premultiplied;
+        transparent_program = make("scene.transparent", see_through);
+        const core::Result<shader::ProgramHandle> sort_program =
+            shaders->create_compute({.module = "scene.blend_sort", .debug_name = "transparent sort"});
+        blend_sort = sort_program ? *sort_program : shader::ProgramHandle{};
     }
 
 #if DE_BUILD_DEV
@@ -993,11 +1330,13 @@ struct SceneRendererState {
         std::memcpy(counts, mapped.data(), sizeof(counts));
         for (uint32_t list = 0; list < kDrawListCount; ++list) {
             const uint32_t records = counts[kCountRecordsPerList + list];
-            (list < kCameraListCount ? stats.visible_draws : stats.visible_shadow_draws) += records;
+            (list < kCameraListCount || list == kBlendList ? stats.visible_draws : stats.visible_shadow_draws) +=
+                records;
             if (list >= kDrawKindCount && list < kCameraListCount) {
                 stats.visible_fading_draws += records;
             }
         }
+        stats.visible_blend_draws = counts[kCountRecordsPerList + kBlendList];
         stats.draws_lost = counts[kCountRecordsLost];
         if (stats.draws_lost > 0 && !warned_draws_lost) {
             DE_LOG_WARN(
@@ -1086,13 +1425,16 @@ struct SceneRendererState {
 
     // The fog volumes that reach the froxel grid, the nearest if there are too many, into the frame's
     // buffer. Each gets a bit in the masks of the slices its sphere's depth covers.
-    void write_fog_volumes(std::span<std::byte> mapped, const world::RenderFrame& frame, float froxel_reach,
-                           float aspect) {
+    // `sky_factor`: what a volume's openness to the sky is multiplied by (the radiance cascades' for the sky), or
+    // negative while nothing reads it. Those that say how open their place is are written first: how many is
+    // returned, for the frame's constants (shaders/scene/sky.slang's open_sky).
+    uint32_t write_fog_volumes(std::span<std::byte> mapped, const world::RenderFrame& frame, float froxel_reach,
+                               float aspect, float sky_factor) {
         fog_volumes_now = 0;
         stats.fog_volumes = 0;
         stats.fog_volumes_dropped = 0;
         if (froxel_reach <= 0.0f || frame.fog_volumes.empty()) {
-            return;
+            return 0;
         }
         struct KeptVolume {
             uint32_t index = 0;
@@ -1122,6 +1464,11 @@ struct SceneRendererState {
                 std::push_heap(kept, kept + kMaxFogVolumes, nearer);
             }
         }
+        const auto says_sky = [&](const KeptVolume& volume) {
+            return sky_factor >= 0.0f && frame.fog_volumes[volume.index].under_roof >= 0.0f;
+        };
+        const auto sky_volumes =
+            static_cast<uint32_t>(std::stable_partition(kept, kept + fog_volumes_now, says_sky) - kept);
         uint64_t slice_masks[kFroxelSlices] = {};
         const auto slice_of = [&](float depth) {
             const float t = std::log(std::max(depth, 0.0f) / kFroxelSliceOffsetM + 1.0f) /
@@ -1149,6 +1496,7 @@ struct SceneRendererState {
             gpu.shape[0] = volume.ellipsoid ? 1.0f : 0.0f;
             gpu.shape[1] = volume.noise_amount;
             gpu.shape[2] = volume.height_fade_m;
+            gpu.shape[3] = k < sky_volumes ? (1.0f - std::min(volume.under_roof, 1.0f)) * sky_factor : -1.0f;
             gpu.noise[0] = volume.noise_offset_tiles[0];
             gpu.noise[1] = volume.noise_offset_tiles[1];
             gpu.noise[2] = volume.noise_offset_tiles[2];
@@ -1158,6 +1506,7 @@ struct SceneRendererState {
         std::memcpy(mapped.data() + kFogSliceMasksOffset, slice_masks, sizeof(slice_masks));
         stats.fog_volumes = fog_volumes_now;
         stats.fog_volumes_dropped = dropped;
+        return sky_volumes;
     }
 
     // One slot's mesh, as the CPU knows it.
@@ -1207,6 +1556,9 @@ struct SceneRendererState {
             DE_ASSERT_MSG(slot_written[slot] != update_number, "two records for a slot would land in either order");
             slot_written[slot] = update_number;
             const uint32_t mesh = gpu_assets->mesh_slot(instance.mesh);
+            if (trace && mesh != kNoMesh) {
+                trace->want(mesh, instance.mesh); // rays should see it too
+            }
             if (mesh == kNoMesh && instance.mesh.is_valid()) {
                 waiting_for_mesh_slot = true;
                 mesh_slots_released_seen = gpu_assets->mesh_slots_released();
@@ -1280,6 +1632,43 @@ struct SceneRendererState {
             set_plane(view.planes[view.plane_count], view_proj, 2, -1.0f);
             ++view.plane_count;
         }
+        // A local light's face: its sides and near, and as far as the light reaches along its axis. One not used this
+        // frame holds nothing: a plane nothing is inside.
+        for (uint32_t f = 0; f < kLocalShadowFaces; ++f) {
+            GpuCullView& view = views[1 + kShadowCascadeCount + f];
+            if (f >= lights_now.face_count || !lights_now.faces[f].draw) { // or its tile holds what it held
+                view = {.plane_count = 1};
+                view.planes[0][3] = -1e30f;
+                continue;
+            }
+            const LocalShadowFace& face = lights_now.faces[f];
+            // Its LOD as the camera's is chosen: a face is a perspective view from the light, so a texel's size grows
+            // with the distance along its axis, and what's near the light takes its finest LOD (a light's reach as the
+            // texel size took coarse LODs for everything, and shadows didn't match the shapes drawn).
+            // The projection's second row is its up axis times 1 / tan(half the field of view).
+            const float focal =
+                std::sqrt((face.view_proj[4] * face.view_proj[4]) + (face.view_proj[5] * face.view_proj[5]) +
+                          (face.view_proj[6] * face.view_proj[6]));
+            const float tan_half = focal > 1e-6f ? 1.0f / focal : 1.0f;
+            view = {.lod_perspective = 1,
+                    .lod_scale = lod_scale_for(static_cast<float>(face.tile[2]) / (2.0f * tan_half)),
+                    .lod_fade_end = 1.0f};
+            for (int k = 0; k < 3; ++k) {
+                view.depth_plane[k] = face.forward[k];
+            }
+            view.depth_plane[3] = -((face.forward[0] * face.position[0]) + (face.forward[1] * face.position[1]) +
+                                    (face.forward[2] * face.position[2]));
+            set_side_planes(view, face.view_proj);
+            view.plane_count = 4;
+            set_plane(view.planes[view.plane_count++], face.view_proj, 2, -1.0f); // near: z <= w
+            // Far: dot(-forward, p) + forward . position + reach >= 0.
+            float* far = view.planes[view.plane_count++];
+            for (int k = 0; k < 3; ++k) {
+                far[k] = -face.forward[k];
+            }
+            far[3] = (face.forward[0] * face.position[0]) + (face.forward[1] * face.position[1]) +
+                     (face.forward[2] * face.position[2]) + face.far_m;
+        }
     }
 
     // The frozen views, relative to this frame's render origin. Always worked out from the origin they froze at, so
@@ -1316,6 +1705,7 @@ struct SceneRendererState {
         // What the instances can draw, from how many there are of each mesh.
         uint64_t kind_parts[kDrawKindCount] = {};
         uint64_t fading_parts[kDrawKindCount] = {};
+        uint64_t blend_parts = 0;
         const std::span<const GpuMeshKinds> kinds = gpu_assets->mesh_kinds();
         for (size_t mesh = 0; mesh < used_mesh_slots; ++mesh) {
             const uint32_t count = mesh_instances[mesh];
@@ -1331,6 +1721,8 @@ struct SceneRendererState {
                                           : 0;
                 drawable = drawable || kinds[mesh].parts[kind] > 0;
             }
+            blend_parts += uint64_t{count} * kinds[mesh].blend_parts;
+            drawable = drawable || kinds[mesh].blend_parts > 0;
             plan.drawn += drawable ? count : 0;
         }
         // Each list has room for a draw for all that could land in it, which merged is at most one per part in the
@@ -1338,12 +1730,13 @@ struct SceneRendererState {
         uint32_t slot = 0;
         uint64_t records = 0;
         const uint32_t call_limit = std::min(device->capabilities().max_draw_indirect_count, max_draws_per_call);
-        const auto add_list = [&](uint32_t index, uint64_t wanted) {
+        const auto add_list = [&](uint32_t index, uint64_t wanted, bool merges = true) {
             records += wanted;
             const auto capacity = static_cast<uint32_t>(std::min<uint64_t>(wanted, UINT32_MAX));
             // What one counted call can't reach is left out, and said so. The spec only promises 65535 draws in a call,
             // though desktop drivers take billions. Splitting a counted call needs the count known on the CPU.
-            const uint32_t draws = merged_draws ? std::min(capacity, gpu_assets->part_table_used()) : capacity;
+            const uint32_t draws =
+                merged_draws && merges ? std::min(capacity, gpu_assets->part_table_used()) : capacity;
             if (draws > call_limit && !warned_draw_limit) {
                 DE_LOG_WARN("render",
                             "a draw list may hold %u draws, and this device draws %u in a call: the rest are lost",
@@ -1366,6 +1759,16 @@ struct SceneRendererState {
             add_list(cascade_list(c, true), kind_parts[2] + kind_parts[3]);
             plan.shadow_draws += static_cast<uint32_t>(kind_parts[0] + kind_parts[1] + kind_parts[2] + kind_parts[3]);
         }
+        for (uint32_t f = 0; f < kLocalShadowFaces; ++f) {
+            const bool used = f < lights_now.face_count && lights_now.faces[f].draw;
+            add_list(cascade_list(kShadowCascadeCount + f, false),
+                     used ? std::min(kind_parts[0] + kind_parts[1], kLocalFaceRecords) : 0);
+            add_list(cascade_list(kShadowCascadeCount + f, true),
+                     used ? std::min(kind_parts[2] + kind_parts[3], kLocalFaceRecords) : 0);
+        }
+        // What blends: a draw each, never merged, since each has its own place in the order. Past the limit, the rest
+        // find no room and are lost, as the cull's counts say.
+        add_list(kBlendList, std::min<uint64_t>(blend_parts, kMaxBlendDraws), false);
         std::memcpy(mapped.data() + kDrawListsOffset, plan.lists, sizeof(plan.lists));
         // A power of two, so a graph buffer lasts while the counts move around.
         plan.draw_capacity = 1024;
@@ -1379,6 +1782,13 @@ struct SceneRendererState {
     }
 
     // Writes the frame's constants, instance transforms and what the cull reads; false without a buffer.
+    // Whether the surf's simulation runs this frame: a sea with its shore map in, and its shaders there.
+    [[nodiscard]] bool shore_sim_runs() const {
+        // Not while the surf is its film's.
+        return water.sea && !water.surf_film && shore_sim && shore_sim->running() && water.shore.is_valid() &&
+               gpu_assets != nullptr && gpu_assets->material_complete(water.shore);
+    }
+
     bool write_frame(rhi::BufferHandle buffer, CullPlan& plan, const world::RenderFrame& frame,
                      const SceneLighting& lighting, float froxel_reach, uint32_t taa_sample_now, uint32_t width,
                      uint32_t height) {
@@ -1427,8 +1837,40 @@ struct SceneRendererState {
         }
         copy3(lighting.sun_color, scene.sun_color);
         copy3(lighting.sky_color, scene.sky_color);
+        // How open to the sky the world is (shaders/scene/sky.slang's open_sky), for what lights by the sky's ambient
+        // without seeing what's above it: what the radiance cascades can't see, the fog, lit particles, water. The
+        // environment's, times the cascades' factor for the sky; only while they light the picture (the flat
+        // ambient they stand in for knows no roof either, and the two should agree). In a hall with a roof the open
+        // sky's blue on the fog alone would be most of the picture.
+        const bool placed = radiance_cascades && radiance_cascades_on;
+        const float sky_factor = placed ? radiance_cascades->settings().sky : -1.0f;
+        const float sky_share = placed ? (1.0f - std::clamp(lighting.under_roof, 0.0f, 1.0f)) * sky_factor : 1.0f;
+        scene.sky_color[3] = sky_share;
         copy3(lighting.ground_color, scene.ground_color);
         copy3(lighting.shadow_color, scene.shadow_color);
+        if (lighting.backdrop.enabled) {
+            copy3(lighting.backdrop.top, scene.backdrop_top);
+            copy3(lighting.backdrop.bottom, scene.backdrop_bottom);
+            scene.backdrop_top[3] = 1.0f;
+        }
+        scene.trace = trace ? trace->scene_address() : 0;
+        scene.local_shadow_views = device->buffer_address(buffer) + kLocalShadowViewsOffset;
+        scene.light_boxes = light_boxes_now.boxes;
+        scene.light_box_count = light_boxes_now.count;
+        for (uint32_t f = 0; f < lights_now.face_count; ++f) {
+            const LocalShadowFace& face = lights_now.faces[f];
+            std::byte* at = mapped.data() + kLocalShadowViewsOffset + (size_t{f} * kLocalShadowFaceBytes);
+            std::memcpy(at, face.view_proj, 16 * sizeof(float));
+            const float tile[4] = {static_cast<float>(face.tile[0]), static_cast<float>(face.tile[1]),
+                                   static_cast<float>(face.tile[2]), 0.0f};
+            std::memcpy(at + (16 * sizeof(float)), tile, sizeof(tile));
+        }
+        scene.lights = lights_now.lights;
+        scene.light_clusters = lights_now.clusters;
+        for (int i = 0; i < 4; ++i) {
+            scene.light_grid[i] = lights_now.grid[i];
+            scene.light_slices[i] = lights_now.slices[i];
+        }
         const float forward[3] = {-frame.camera.transform[2], -frame.camera.transform[6], -frame.camera.transform[10]};
         const float forward_length =
             std::max(std::sqrt(forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]), 1e-6f);
@@ -1462,7 +1904,9 @@ struct SceneRendererState {
         scene.fog_sun_forward[3] = fog.sun_height_attenuation;
         copy3(fog.sun_back, scene.fog_sun_back);
         scene.fog_sun_back[3] = fog.sun_start_m;
-        copy3(fog.ambient, scene.fog_ambient);
+        for (int i = 0; i < 3; ++i) {
+            scene.fog_ambient[i] = fog.ambient[i] * std::max(sky_share, kLeastSkyShare);
+        }
         scene.fog_ambient[3] = fog.start_m;
         scene.fog_range[0] = fog.end_m;
         scene.fog_range[1] = froxel_reach;
@@ -1484,14 +1928,25 @@ struct SceneRendererState {
             scene.sea[0] = static_cast<float>(water.sea_level_m - frame.origin.y);
             scene.sea[1] = 1.0f;
         }
+        if (shore_sim_runs() && shore_sim) {
+            const DVec3 camera =
+                frame.origin + DVec3(frame.camera.transform[3], frame.camera.transform[7], frame.camera.transform[11]);
+            const ShoreSimWindow window = shore_sim_window(camera, frame.origin);
+            std::copy_n(window.corner, 2, scene.shore_corner);
+            std::copy_n(window.corner_cell, 2, scene.shore_corner_cell);
+            scene.shore_surface = device->texture_index(shore_sim->surface());
+            scene.shore_previous_surface = device->texture_index(shore_sim->previous_surface());
+            scene.shore_sim = 1;
+        }
+        scene.sky_volume_count = write_fog_volumes(mapped, frame, froxel_reach, aspect, sky_factor);
+        scene.fog_volumes = device->buffer_address(buffer) + kFogVolumesOffset;
         std::memcpy(mapped.data(), &scene, sizeof(scene));
-        if (water.sea) {
+        if (water.sea || !frame.water_bodies.empty()) {
             const DVec3 camera =
                 frame.origin + DVec3(frame.camera.transform[3], frame.camera.transform[7], frame.camera.transform[11]);
             water_levels(camera, frame.origin, water_levels_now);
             std::memcpy(mapped.data() + kWaterLevelsOffset, water_levels_now, sizeof(water_levels_now));
         }
-        write_fog_volumes(mapped, frame, froxel_reach, aspect);
         write_cull_data(mapped, frame, scene, cascades, height, plan);
         device->flush_mapped(buffer, 0, frame_bytes(plan.updates));
         return true;
@@ -1505,7 +1960,11 @@ SceneLighting scene_lighting(const asset::EnvironmentAsset& environment) {
     std::copy_n(environment.sky_color, 3, lighting.sky_color);
     std::copy_n(environment.ground_color, 3, lighting.ground_color);
     std::copy_n(environment.shadow_color, 3, lighting.shadow_color);
+    lighting.under_roof = environment.under_roof;
     lighting.exposure_ev = environment.exposure_ev;
+    lighting.exposure_below_ev = environment.exposure_below_ev;
+    lighting.exposure_above_ev = environment.exposure_above_ev;
+    lighting.exposure_adaptation = environment.exposure_adaptation;
     lighting.shadows = {.resolution = environment.shadow_resolution,
                         .distance_m = environment.shadow_distance_m,
                         .split_lambda = environment.shadow_split_lambda,
@@ -1568,6 +2027,12 @@ const char* scene_view_name(SceneView view) {
         return "shadow cascades";
     case SceneView::TerrainLevel:
         return "terrain levels";
+    case SceneView::Traced:
+        return "ray traced";
+    case SceneView::Indirect:
+        return "indirect light";
+    case SceneView::AmbientOcclusion:
+        return "ambient occlusion";
     case SceneView::Count:
         break;
     }
@@ -1820,23 +2285,9 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
     }
     state->instance_meshes = *meshes;
     state->instance_meshes_address = desc.device->buffer_address(*meshes);
-    const uint64_t part_key_count = uint64_t{kCullGroups} * desc.gpu_assets->part_table_size();
-    const core::Result<rhi::BufferHandle> part_keys =
-        desc.device->create_buffer({.size = part_key_count * sizeof(uint32_t),
-                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
-                                    .debug_name = "part keys"});
-    if (!part_keys) {
-        return core::fail(part_keys.error());
+    if (!state->ensure_part_keys(kFirstPartKeyParts)) {
+        return core::fail(core::ErrorCode::OutOfMemory, "the cull's part keys couldn't be made");
     }
-    state->part_keys = *part_keys;
-    state->part_keys_address = desc.device->buffer_address(*part_keys);
-    const core::Result<rhi::BufferHandle> part_used = desc.device->create_buffer(
-        {.size = part_key_count * sizeof(uint32_t), .usage = rhi::BufferUsage::Storage, .debug_name = "parts in use"});
-    if (!part_used) {
-        return core::fail(part_used.error());
-    }
-    state->part_used = *part_used;
-    state->part_used_address = desc.device->buffer_address(*part_used);
     const core::Result<rhi::BufferHandle> part_dispatch = desc.device->create_buffer(
         {.size = 3 * sizeof(uint32_t),
          .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect | rhi::BufferUsage::CopyDst,
@@ -1870,7 +2321,82 @@ core::Result<SceneRenderer> SceneRenderer::create(const SceneRendererDesc& desc)
             return core::fail(ocean.error());
         }
         state->ocean.emplace(std::move(*ocean));
+        core::Result<ShoreSim> shore_sim = ShoreSim::create(*desc.device, *desc.shaders);
+        if (!shore_sim) {
+            return core::fail(shore_sim.error());
+        }
+        state->shore_sim.emplace(std::move(*shore_sim));
     }
+    if (desc.assets != nullptr) {
+        core::Result<ParticleSystem> particles = ParticleSystem::create({.device = desc.device,
+                                                                         .shaders = desc.shaders,
+                                                                         .assets = desc.assets,
+                                                                         .pool_blocks = desc.particle_pool_blocks,
+                                                                         .catch_up_steps = desc.particle_catch_up_steps,
+                                                                         .color_format = kHdrFormat,
+                                                                         .coverage_format = kCoverageFormat,
+                                                                         .depth_format = kDepthFormat});
+        if (!particles) {
+            return core::fail(particles.error());
+        }
+        state->particles.emplace(std::move(*particles));
+    }
+    if (desc.ray_tracing) {
+        core::Result<TraceScene> trace =
+            TraceScene::create({.device = desc.device,
+                                .shaders = desc.shaders,
+                                .gpu_assets = desc.gpu_assets,
+                                .assets = desc.assets,
+                                .max_instances = desc.max_instances,
+                                .max_meshes = static_cast<uint32_t>(desc.gpu_assets->mesh_kinds().size())});
+        if (trace) {
+            state->trace.emplace(std::move(*trace));
+            // Light that has bounced is baked by tracing: only with the above.
+            core::Result<LightBoxes> boxes = LightBoxes::create({.device = desc.device, .shaders = desc.shaders});
+            if (boxes) {
+                state->light_boxes.emplace(std::move(*boxes));
+            }
+            core::Result<PathTracer> path_tracer =
+                PathTracer::create({.device = desc.device, .shaders = desc.shaders, .hdr_format = kHdrFormat});
+            if (path_tracer) {
+                state->path_tracer.emplace(std::move(*path_tracer));
+            }
+        } else {
+            DE_LOG_INFO("render", "no ray tracing: %s", trace.error().message);
+        }
+    }
+    core::Result<AutoExposure> exposure = AutoExposure::create({.device = desc.device, .shaders = desc.shaders});
+    if (!exposure) {
+        return core::fail(exposure.error());
+    }
+    state->auto_exposure.emplace(std::move(*exposure));
+    for (rhi::BufferHandle& buffer : state->exposure_readback) {
+        const core::Result<rhi::BufferHandle> made =
+            desc.device->create_buffer({.size = sizeof(GpuExposureState),
+                                        .usage = rhi::BufferUsage::CopyDst,
+                                        .memory = rhi::MemoryLocation::Readback,
+                                        .debug_name = "exposure readback"});
+        if (!made) {
+            return core::fail(made.error());
+        }
+        buffer = *made;
+    }
+    core::Result<Gtao> gtao = Gtao::create({.device = desc.device, .shaders = desc.shaders});
+    if (!gtao) {
+        return core::fail(gtao.error());
+    }
+    state->gtao.emplace(std::move(*gtao));
+    core::Result<RadianceCascades> cascades =
+        RadianceCascades::create({.device = desc.device, .shaders = desc.shaders});
+    if (!cascades) {
+        return core::fail(cascades.error());
+    }
+    state->radiance_cascades.emplace(std::move(*cascades));
+    core::Result<LocalLights> local_lights = LocalLights::create({.device = desc.device, .shaders = desc.shaders});
+    if (!local_lights) {
+        return core::fail(local_lights.error());
+    }
+    state->local_lights.emplace(std::move(*local_lights));
     state->make_scene_programs();
     return renderer;
 }
@@ -1972,18 +2498,39 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const rhi::PipelineHandle taa_pipeline = state.shaders->pipeline(state.taa_program);
     const uint32_t width = graph.reference_width();
     const uint32_t height = graph.reference_height();
-    const bool taa_on =
-        taa && view == SceneView::Lit && taa_pipeline.is_valid() && state.ensure_temporal(width, height);
+    // Path traced, the lit picture is the path tracer's: no TAA, probes or GTAO under it.
+    const bool path_traced = state.path_traced && state.trace && state.path_tracer && view == SceneView::Lit;
+    // Compared, the rasterized picture is drawn as always and the path tracer adds up hidden behind it.
+    const bool compared =
+        !path_traced && state.lighting_compare && state.trace && state.path_tracer && view == SceneView::Lit;
+    const bool taa_on = taa && view == SceneView::Lit && !path_traced && !compared && taa_pipeline.is_valid() &&
+                        state.ensure_temporal(width, height);
     if (taa_on) {
         state.taa_sample = state.taa_sample % kTaaSamples + 1;
     }
+    // The frame's local lights, for its constants: those that reach what's in view.
+    const float light_aspect = static_cast<float>(width) / static_cast<float>(std::max(height, 1U));
+    const bool casters_all_changed = state.local_shadow_changes(frame);
+    state.lights_now = state.local_lights
+                           ? state.local_lights->update(frame, light_aspect, state.shadow_changes, casters_all_changed)
+                           : LocalLightFrame{};
+    state.stats.lights = state.local_lights ? state.local_lights->stats() : LocalLightStats{};
     // This frame's constants and draws, now: every pass below draws only if they're in.
     const rhi::BufferHandle frame_buffer =
         frame.camera.valid ? state.frame_buffer(frame_bytes(frame.instances.size() + frame.freed_slots.size()))
                            : rhi::BufferHandle{};
     CullPlan plan;
-    const bool written = frame_buffer.is_valid() && state.write_frame(frame_buffer, plan, frame, lighting, froxel_reach,
-                                                                      taa_on ? state.taa_sample : 0, width, height);
+    // The light boxes this frame (path traced, none: the path tracer's light has bounced already). Their bake waits
+    // for what rays meet to be all there.
+    state.light_boxes_now = {};
+    if (state.light_boxes && state.trace && state.light_boxes_on && !path_traced) {
+        const TraceStats traced = state.trace->stats();
+        state.light_boxes_now = state.light_boxes->update(frame.origin, traced.waiting == 0 && traced.instances > 0);
+    }
+    state.stats.light_boxes = state.light_boxes ? state.light_boxes->stats() : LightBoxStats{};
+    const bool written =
+        frame_buffer.is_valid() && state.write_frame(frame_buffer, plan, frame, lighting, froxel_reach,
+                                                     taa_on ? state.taa_sample : state.debug_jitter, width, height);
     const bool ready = written && gbuffer_opaque.is_valid() && gbuffer_masked.is_valid() &&
                        gbuffer_opaque_fading.is_valid() && gbuffer_masked_fading.is_valid() && light.is_valid() &&
                        tonemap.is_valid() && caster_opaque.is_valid() && caster_masked.is_valid() && mask.is_valid() &&
@@ -2002,13 +2549,25 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     }
     const uint64_t frame_address = state.device->buffer_address(frame_buffer);
     const uint32_t cascade_size = state.shadows.resolution;
+    // What rays see: bottom levels for the meshes this frame's instances asked for, and this frame's scene.
+    if (state.trace) {
+        state.trace->update(state.instance_data_address, state.instance_meshes_address, state.mesh_instances.span());
+    }
+    // Which local lights reach each cluster of the view: before anything is lit. Invalid: none this frame.
+    const GraphBuffer light_clusters =
+        state.local_lights ? state.local_lights->add_cull_pass(graph, frame_address, frame, light_aspect)
+                           : GraphBuffer{};
     state.stats.instances = state.live_instances;
     state.stats.instance_updates = plan.updates;
     state.stats.drawn = plan.drawn;
     state.stats.draws = plan.draws;
     state.stats.shadow_draws = plan.shadow_draws;
 
-    // The GPU cull: what's in each view, into the draw lists the G-buffer and shadow passes draw.
+    // The GPU cull: what's in each view, into the draw lists the G-buffer and shadow passes draw. Its part keys have
+    // room for every part loaded.
+    if (!state.ensure_part_keys(state.gpu_assets->part_table_used())) {
+        DE_LOG_ERROR("render", "the cull's part keys couldn't grow to %u parts", state.gpu_assets->part_table_used());
+    }
     const GraphBuffer part_keys_graph = graph.import_buffer(
         {.buffer = state.part_keys,
          .name = "part keys",
@@ -2044,9 +2603,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         [part_keys_graph, part_dispatch_graph](const CullClearPass& data, PassContext& context) {
             context.list.fill_buffer(context.buffer(data.counts), 0, kCullCounterCount * sizeof(uint32_t), 0);
             if (!data.state->part_keys_zero) {
-                context.list.fill_buffer(
-                    context.buffer(part_keys_graph), 0,
-                    uint64_t{kCullGroups} * data.state->gpu_assets->part_table_size() * sizeof(uint32_t), 0);
+                context.list.fill_buffer(context.buffer(part_keys_graph), 0,
+                                         uint64_t{kCullGroups} * data.state->part_key_parts * sizeof(uint32_t), 0);
             }
             data.state->part_keys_zero = false; // until the frame gets as far as putting them back
             // None so far, one by one: a dispatch of 1 group for each.
@@ -2094,6 +2652,21 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 context.list.push_constants(push);
                 context.list.dispatch((updates + 63) / 64);
             });
+    }
+    // The top level over the instances as they are now, for whatever traces this frame.
+    if (state.trace) {
+        state.trace->add_passes(graph, {.frame_address = frame_address,
+                                        .instance_data = instance_data_graph,
+                                        .instance_meshes = instance_meshes_graph,
+                                        .instance_data_address = state.instance_data_address,
+                                        .instance_meshes_address = state.instance_meshes_address,
+                                        .slots = plan.slots});
+        state.stats.trace = state.trace->stats();
+    }
+    // The light boxes' bake, against that top level, and their maps for the light.
+    std::span<const GraphTexture> box_maps;
+    if (state.light_boxes_now.count > 0) {
+        box_maps = state.light_boxes->add_passes(graph, frame_address, state.stats.lights.lit);
     }
     // The cull counts what's in each view, each part in use gets its draw and its records, the cull writes them, and
     // what was used goes back to 0.
@@ -2158,7 +2731,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                              .pipeline = cull,
                              .frame_address = frame_address,
                              .plan = plan,
-                             .part_count = state.gpu_assets->part_table_size()};
+                             .part_count = state.part_key_parts};
     graph.add_pass<CullPass>(
         "gpu cull count",
         [&](PassBuilder& pass, CullPass& data) {
@@ -2308,8 +2881,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             pass.use(draw_lists, rhi::ResourceState::IndirectArgument | rhi::ResourceState::ShaderRead,
                      rhi::ShaderStages::Vertex);
             pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
-            data.atlas = pass.create_texture(
-                {.desc = {.width = cascade_size * 2, .height = cascade_size * 2, .format = kDepthFormat}});
+            data.atlas = pass.create_texture({.desc = {.width = cascade_size * 2,
+                                                       .height = cascade_size * 2,
+                                                       .format = kDepthFormat,
+                                                       .debug_name = "shadow atlas"}});
             pass.use(data.atlas, rhi::ResourceState::DepthWrite);
             pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
             if (state.terrain) {
@@ -2335,7 +2910,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                                      .width = data.cascade_size,
                                      .height = data.cascade_size};
                 context.list.begin_rendering({.depth = &depth, .area = tile});
-                if (renderer.terrain) {
+                if (renderer.terrain && !renderer.terrain_hidden) {
                     renderer.terrain->draw_shadow(context, data.terrain, data.terrain_pipeline, data.frame_address,
                                                   cascade);
                 }
@@ -2355,6 +2930,80 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             }
         });
     const GraphTexture atlas = shadow.atlas;
+
+    // The local lights' shadows: each face to draw again this frame into its tile of the local shadow atlas, which is
+    // kept from frame to frame (the tiles of lights in whose reach nothing changed hold what they held).
+    GraphTexture local_atlas;
+    if (state.lights_now.face_count > 0 && !state.local_atlas.is_valid()) {
+        const core::Result<rhi::TextureHandle> kept_atlas =
+            state.device->create_texture({.width = kLocalShadowAtlasWidth,
+                                          .height = kLocalShadowAtlasHeight,
+                                          .format = kDepthFormat,
+                                          .usage = rhi::TextureUsage::DepthStencil | rhi::TextureUsage::Sampled,
+                                          .debug_name = "local shadow atlas"});
+        state.local_atlas = kept_atlas ? *kept_atlas : rhi::TextureHandle{};
+        state.local_atlas_used = false;
+    }
+    if (state.lights_now.face_count > 0 && state.local_atlas.is_valid()) {
+        const uint32_t faces = state.lights_now.face_count;
+        uint32_t to_draw = 0;
+        for (uint32_t f = 0; f < faces; ++f) {
+            to_draw += state.lights_now.faces[f].draw ? 1U : 0U;
+        }
+        local_atlas = graph.import_texture(
+            {.texture = state.local_atlas,
+             .name = "local shadow atlas",
+             .state = state.local_atlas_used ? rhi::ResourceState::ShaderRead : rhi::ResourceState::Undefined,
+             .final_state = rhi::ResourceState::ShaderRead});
+        state.local_atlas_used = true;
+        if (to_draw > 0) {
+            graph.add_pass(
+                "local shadows",
+                [&](PassBuilder& pass) {
+                    pass.use(draw_lists, rhi::ResourceState::IndirectArgument | rhi::ResourceState::ShaderRead,
+                             rhi::ShaderStages::Vertex);
+                    pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
+                    pass.use(local_atlas, rhi::ResourceState::DepthWrite);
+                    pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+                },
+                [&state, faces, frame_address, caster_opaque, caster_masked, draws = draw_lists, counts = draw_counts,
+                 plan, local_atlas, tiles = state.lights_now.faces](PassContext& context) {
+                    DE_PROFILE_ZONE("local shadows pass");
+                    const rhi::BufferHandle args = context.buffer(draws);
+                    const rhi::BufferHandle count_buffer = context.buffer(counts);
+                    ShadowCasterPush push{.frame = frame_address,
+                                          .instances = state.instance_data_address,
+                                          .vertices = state.gpu_assets->pool_vertex_address(),
+                                          .materials = state.gpu_assets->material_table_address(),
+                                          .draws = state.device->buffer_address(args) + plan.records_offset(),
+                                          .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap)};
+                    for (uint32_t f = 0; f < faces; ++f) {
+                        if (!tiles[f].draw) {
+                            continue; // its tile holds what it held
+                        }
+                        // Cleared over its own tile only: the rest of the atlas is other lights'.
+                        const rhi::DepthAttachment depth{.texture = context.texture(local_atlas)};
+                        const rhi::Rect tile{.x = static_cast<int32_t>(tiles[f].tile[0]),
+                                             .y = static_cast<int32_t>(tiles[f].tile[1]),
+                                             .width = tiles[f].tile[2],
+                                             .height = tiles[f].tile[2]};
+                        context.list.begin_rendering({.depth = &depth, .area = tile});
+                        context.list.bind_index_buffer(state.gpu_assets->pool_index_buffer(), 0,
+                                                       rhi::IndexType::Uint32);
+                        push.cascade = kShadowCascadeCount + f;
+                        context.list.push_constants(push);
+                        for (const bool masked : {false, true}) {
+                            const uint32_t index = cascade_list(kShadowCascadeCount + f, masked);
+                            if (plan.lists[index].capacity > 0) {
+                                context.list.bind_pipeline(masked ? caster_masked : caster_opaque);
+                                state.draw_list(context.list, args, count_buffer, plan, index);
+                            }
+                        }
+                        context.list.end_rendering();
+                    }
+                });
+        }
+    }
     const auto cull_slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
 
     struct Targets {
@@ -2414,7 +3063,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .ids = {}};
 #if DE_BUILD_DEV
             if (with_ids) {
-                data.ids = pass.create_texture({.desc = {.format = kIdFormat}, .reference_scale = 1.0f});
+                data.ids = pass.create_texture(
+                    {.desc = {.format = kIdFormat, .debug_name = "editor ids"}, .reference_scale = 1.0f});
                 pass.use(data.ids, rhi::ResourceState::RenderTarget);
             }
 #endif
@@ -2422,14 +3072,17 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                      rhi::ShaderStages::Vertex);
             pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
             for (uint32_t i = 0; i < 3; ++i) {
-                data.targets.gb[i] =
-                    pass.create_texture({.desc = {.format = kGBufferFormats[i]}, .reference_scale = 1.0f});
+                data.targets.gb[i] = pass.create_texture(
+                    {.desc = {.format = kGBufferFormats[i], .debug_name = kGBufferNames[i]}, .reference_scale = 1.0f});
                 pass.use(data.targets.gb[i], rhi::ResourceState::RenderTarget);
             }
-            data.targets.hdr = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-            data.targets.depth =
-                taa_on ? kept_depth : pass.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
-            data.targets.motion = pass.create_texture({.desc = {.format = kMotionFormat}, .reference_scale = 1.0f});
+            data.targets.hdr =
+                pass.create_texture({.desc = {.format = kHdrFormat, .debug_name = "hdr"}, .reference_scale = 1.0f});
+            data.targets.depth = taa_on ? kept_depth
+                                        : pass.create_texture({.desc = {.format = kDepthFormat, .debug_name = "depth"},
+                                                               .reference_scale = 1.0f});
+            data.targets.motion = pass.create_texture(
+                {.desc = {.format = kMotionFormat, .debug_name = "motion"}, .reference_scale = 1.0f});
             pass.use(data.targets.hdr, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.motion, rhi::ResourceState::RenderTarget);
             pass.use(data.targets.depth, rhi::ResourceState::DepthWrite);
@@ -2456,7 +3109,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             context.list.begin_rendering({.colors = std::span(colors, ids ? 6 : 5), .depth = &depth});
             // Grass, then the ground: blades are cheap to shade and the ground isn't, so what they cover isn't shaded.
             // The ground next: it hides the most, so what's behind a hill fails early depth.
-            if (renderer.terrain) {
+            if (renderer.terrain && !renderer.terrain_hidden) {
                 renderer.terrain->draw_grass(context, data.terrain, data.grass_pipeline, data.frame_address,
                                              data.screen_height);
                 renderer.terrain->draw_gbuffer(context, data.terrain, data.terrain_pipeline, data.frame_address,
@@ -2528,6 +3181,29 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             });
     }
 
+    // How open each pixel's surface is to the ambient, from what's near it on the screen: the light reads it.
+    // Not while the radiance cascades light the picture: they see what's near on the screen themselves.
+    const bool cascades_wanted = state.radiance_cascades && state.radiance_cascades_on && !path_traced &&
+                                 (view == SceneView::Lit || view == SceneView::Indirect);
+    const bool occluded =
+        state.gtao && state.gtao_on && !path_traced && !cascades_wanted &&
+        (view == SceneView::Lit || view == SceneView::Indirect || view == SceneView::AmbientOcclusion);
+    const GraphTexture ao = occluded ? state.gtao->add_passes(graph, {.frame_address = frame_address,
+                                                                      .depth = targets.depth,
+                                                                      .normals = targets.gb[1],
+                                                                      .frame = &frame,
+                                                                      .width = width,
+                                                                      .height = height})
+                                     : GraphTexture{};
+
+    // Light that has bounced from the radiance cascades, in place of the flat ambient: they read the deferred light's
+    // picture, which leaves the diffuse ambient out for them to add.
+    const rhi::PipelineHandle rc_apply =
+        state.shaders->pipeline(view == SceneView::Indirect ? state.rc_apply_replace : state.rc_apply);
+    const bool cascaded = state.radiance_cascades && state.radiance_cascades_on && !path_traced &&
+                          rc_apply.is_valid() && (view == SceneView::Lit || view == SceneView::Indirect);
+    state.stats.radiance_cascades = {};
+
     // The shadow mask: how much sun each pixel sees.
     struct MaskPass {
         GraphTexture mask;
@@ -2535,7 +3211,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
     const auto& mask_pass = graph.add_pass<MaskPass>(
         "shadow mask",
         [&](PassBuilder& pass, MaskPass& data) {
-            data.mask = pass.create_texture({.desc = {.format = kShadowMaskFormat}, .reference_scale = 1.0f});
+            data.mask = pass.create_texture(
+                {.desc = {.format = kShadowMaskFormat, .debug_name = "shadow mask"}, .reference_scale = 1.0f});
             pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(targets.gb[1], rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
@@ -2558,6 +3235,10 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         });
     const GraphTexture shadow_mask = mask_pass.mask;
 
+    // What glows, for the radiance cascades: the HDR target before the light is added holds only that.
+    const GraphTexture rc_glow =
+        cascades_wanted ? state.radiance_cascades->add_glow_pass(graph, targets.hdr, width, height) : GraphTexture{};
+
     graph.add_pass(
         "deferred light",
         [&](PassBuilder& pass) {
@@ -2566,9 +3247,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             }
             pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            if (light_clusters.is_valid()) {
+                pass.use(light_clusters, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            if (ao.is_valid()) {
+                pass.use(ao, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            if (local_atlas.is_valid()) {
+                pass.use(local_atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            for (const GraphTexture map : box_maps) {
+                pass.use(map, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
             pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
         },
-        [targets, shadow_mask, frame_address, light](PassContext& context) {
+        [targets, shadow_mask, frame_address, light, ao, local_atlas, cascaded,
+         specular_ambient = state.specular_ambient,
+         indirect = view == SceneView::Indirect && !cascaded](PassContext& context) {
             DE_PROFILE_ZONE("deferred light pass");
             const rhi::ColorAttachment color{.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
@@ -2580,17 +3275,120 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
                 .depth = context.device.texture_index(context.texture(targets.depth)),
                 .shadow_mask = context.device.texture_index(context.texture(shadow_mask)),
+                .indirect = indirect ? 1U : 0U,
+                .ao = ao.is_valid() ? context.device.texture_index(context.texture(ao)) : 0U,
+                .ao_on = ao.is_valid() ? 1U : 0U,
+                .local_shadows =
+                    local_atlas.is_valid() ? context.device.texture_index(context.texture(local_atlas)) : 0U,
+                .ambient_off = cascaded ? 3U : (specular_ambient ? 0U : 2U),
             });
             context.list.draw(3);
             context.list.end_rendering();
         });
 
+    if (cascaded) {
+        const RadianceCascadesResult cascades =
+            state.radiance_cascades->add_passes(graph, {.frame_address = frame_address,
+                                                        .depth = targets.depth,
+                                                        .radiance = targets.hdr,
+                                                        .glow = rc_glow,
+                                                        .base_color = targets.gb[0],
+                                                        .material = targets.gb[2],
+                                                        .frame = &frame,
+                                                        .width = width,
+                                                        .height = height});
+        state.stats.radiance_cascades = state.radiance_cascades->stats();
+        if (cascades.valid()) {
+            graph.add_pass(
+                "rc apply",
+                [&](PassBuilder& pass) {
+                    for (const GraphTexture gb : targets.gb) {
+                        pass.use(gb, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    }
+                    pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(cascades.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(cascades.normal, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(cascades.light, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                    pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
+                },
+                [targets, cascades, rc_apply, frame_address, width, height, specular_ambient = state.specular_ambient,
+                 indirect = view == SceneView::Indirect](PassContext& context) {
+                    DE_PROFILE_ZONE("rc apply pass");
+                    const rhi::ColorAttachment color{.texture = context.texture(targets.hdr),
+                                                     .load = rhi::LoadOp::Load};
+                    context.list.begin_rendering({.colors = std::span(&color, 1)});
+                    context.list.bind_pipeline(rc_apply);
+                    context.list.push_constants(RcApplyPush{
+                        .frame = frame_address,
+                        .gb0 = context.device.texture_index(context.texture(targets.gb[0])),
+                        .gb1 = context.device.texture_index(context.texture(targets.gb[1])),
+                        .gb2 = context.device.texture_index(context.texture(targets.gb[2])),
+                        .scene_depth = context.device.texture_index(context.texture(targets.depth)),
+                        .depth = context.device.texture_index(context.texture(cascades.depth)),
+                        .normal = context.device.texture_index(context.texture(cascades.normal)),
+                        .light = context.device.texture_index(context.texture(cascades.light)),
+                        .scale = cascades.scale,
+                        .size = {width, height},
+                        .gi_size = {cascades.size[0], cascades.size[1]},
+                        .tolerance = cascades.tolerance,
+                        .flags = (cascades.material_occlusion ? kRcApplyMaterialOcclusion : 0U) |
+                                 (indirect ? kRcApplyIndirect : 0U) | (specular_ambient ? kRcApplySpecular : 0U),
+                    });
+                    context.list.draw(3);
+                    context.list.end_rendering();
+                });
+        }
+    }
+
+    // The rays' own view: what a ray through each pixel meets, in place of the lit image.
+    const rhi::PipelineHandle trace_view = state.shaders->pipeline(state.trace_view);
+    if (view == SceneView::Traced && state.trace && trace_view.is_valid()) {
+        graph.add_pass(
+            "trace view", [&](PassBuilder& pass) { pass.use(targets.hdr, rhi::ResourceState::RenderTarget); },
+            [targets, trace_view, frame_address](PassContext& context) {
+                DE_PROFILE_ZONE("trace view pass");
+                const rhi::ColorAttachment color{.texture = context.texture(targets.hdr),
+                                                 .load = rhi::LoadOp::DontCare};
+                context.list.begin_rendering({.colors = std::span(&color, 1)});
+                context.list.bind_pipeline(trace_view);
+                context.list.push_constants(TraceViewPush{.frame = frame_address});
+                context.list.draw(3);
+                context.list.end_rendering();
+            });
+    }
+
+    // Path traced: the path tracer's mean so far, in place of the rasterized light. Compared: the same, hidden, and
+    // the rasterized light set against it.
+    state.stats.path_tracer_samples = 0;
+    state.stats.compare = {};
+    GraphTexture compare_heat;
+    if (path_traced || compared) {
+        state.path_tracer->add_passes(graph,
+                                      {.frame_address = frame_address,
+                                       .hdr = targets.hdr,
+                                       .frame = &frame,
+                                       .lighting = &lighting,
+                                       .width = width,
+                                       .height = height,
+                                       .light_count = state.stats.lights.lit},
+                                      path_traced);
+        state.stats.path_tracer_samples = state.path_tracer->samples();
+        state.stats.path_tracer_restart = state.path_tracer->restart_reason();
+        state.stats.path_tracer_restarts = state.path_tracer->restarts();
+        state.stats.path_tracer_bounces = state.path_tracer->max_bounces();
+        if (compared) {
+            compare_heat = state.path_tracer->add_compare(
+                graph, {.raster = targets.hdr, .depth = targets.depth, .width = width, .height = height});
+            state.stats.compare = state.path_tracer->compare_stats();
+        }
+    }
+
     // Water: what's behind it kept, then its surface drawn onto the lit image, with its depth and motion, before the
     // fog, which then takes it as any surface. Only in the lit view; without its shaders or its mesh, no water.
     const rhi::PipelineHandle water_behind = state.shaders->pipeline(state.water_behind);
     const rhi::PipelineHandle water = state.shaders->pipeline(state.water_program);
-    if (view == SceneView::Lit && state.water.sea && water_behind.is_valid() && water.is_valid() &&
-        state.uploader != nullptr && state.uploader->recorded(state.water_index_ticket)) {
+    if (view == SceneView::Lit && (state.water.sea || !frame.water_bodies.empty()) && water_behind.is_valid() &&
+        water.is_valid() && state.uploader != nullptr && state.uploader->recorded(state.water_index_ticket)) {
         struct WaterBehindPass {
             GraphTexture color;
             GraphTexture depth;
@@ -2598,9 +3396,11 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         const auto& behind = graph.add_pass<WaterBehindPass>(
             "water behind",
             [&](PassBuilder& pass, WaterBehindPass& data) {
-                data.color = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
-                data.depth =
-                    pass.create_texture({.desc = {.format = kWaterBehindDepthFormat}, .reference_scale = 1.0f});
+                data.color = pass.create_texture(
+                    {.desc = {.format = kHdrFormat, .debug_name = "water behind color"}, .reference_scale = 1.0f});
+                data.depth = pass.create_texture(
+                    {.desc = {.format = kWaterBehindDepthFormat, .debug_name = "water behind depth"},
+                     .reference_scale = 1.0f});
                 pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(data.color, rhi::ResourceState::RenderTarget);
@@ -2641,28 +3441,72 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         // wind's own waves breaking.
         const SceneSea& sea = lighting.sea;
         const float wind_waves_m = 0.21f * lighting.wind.speed_mps * lighting.wind.speed_mps / 9.81f;
-        WaterPush water_push{.frame = frame_address,
-                             .levels = frame_address + kWaterLevelsOffset,
-                             .sea_level = sea_level,
-                             .has_waves = ocean.valid ? 1U : 0U,
-                             .shore_material = shore_slot,
-                             .has_shore = shore_slot != 0 ? 1U : 0U,
-                             .surf_period_s = sea.swell_height_m > 0.0f ? sea.swell_period_s : 6.0f,
-                             .surf_height_m = std::max(0.5f * sea.swell_height_m, 0.4f * wind_waves_m),
-                             .foam_material = foam_slot,
-                             .swell_direction = {sea.swell_direction[0], sea.swell_direction[1]}};
+        WaterPush water_push{
+            .frame = frame_address,
+            .levels = frame_address + kWaterLevelsOffset,
+            .sea_level = sea_level,
+            .shore_material = shore_slot,
+            .flags = (shore_slot != 0 ? kWaterShoreFlag : 0U) | (state.water.show_bands ? kWaterBandsFlag : 0U) |
+                     (state.water.surf_film ? kWaterFilmFlag : 0U) | (ocean.valid ? kWaterWavesFlag : 0U),
+            .surf_period_s = sea.swell_height_m > 0.0f ? sea.swell_period_s : 6.0f,
+            .surf_height_m = std::max(0.5f * sea.swell_height_m, 0.4f * wind_waves_m),
+            .foam_material = foam_slot,
+            .swell_direction = {sea.swell_direction[0], sea.swell_direction[1]},
+            .shape = kWaterSea};
         for (uint32_t c = 0; c < kOceanCascades; ++c) {
             water_push.tile_offset[c][0] = ocean.tile_offset[c][0];
             water_push.tile_offset[c][1] = ocean.tile_offset[c][1];
         }
+        // The surf near the camera, simulated (shore_sim.h): stepped to this frame before the water reads it. The
+        // frame's constants already say it runs (write_frame), on the same terms.
+        ShoreSimFrame shore;
+        if (state.shore_sim_runs() && state.shore_sim) {
+            TerrainHeights heights;
+            const bool has_heights = state.terrain && state.terrain->heights(heights);
+            const ShoreSimInput input{.camera = frame.origin + DVec3(static_cast<double>(frame.camera.transform[3]),
+                                                                     static_cast<double>(frame.camera.transform[7]),
+                                                                     static_cast<double>(frame.camera.transform[11])),
+                                      .origin = frame.origin,
+                                      .sea_level_m = state.water.sea_level_m,
+                                      .time_s = frame.time_s,
+                                      .frame = frame_address,
+                                      .shore_material = shore_slot,
+                                      .terrain = has_heights ? &heights : nullptr,
+                                      .wave_amplitude_m = water_push.surf_height_m,
+                                      .wave_period_s = water_push.surf_period_s};
+            shore = state.shore_sim->add_pass(graph, input);
+        }
+        // Lakes and ponds: kept for the pass (the frame is gone by then). Same allocation each frame once it's grown.
+        state.water_bodies_now.clear();
+        for (const world::RenderWaterBody& body : frame.water_bodies) {
+            if (state.water_bodies_now.size() == kMaxWaterBodies) {
+                break;
+            }
+            state.water_bodies_now.push(body);
+        }
+        const bool draw_sea = state.water.sea;
         graph.add_pass(
             "water",
             [&](PassBuilder& pass) {
                 pass.use(behind_color, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(behind_depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                if (light_clusters.is_valid()) {
+                    pass.use(light_clusters, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
+                // What the place lets in: the sun's cascades, and the probes' light.
+                pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                for (const GraphTexture map : box_maps) { // the light boxes' light where it stands
+                    pass.use(map, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
                 pass.use(targets.hdr, rhi::ResourceState::RenderTarget);
                 pass.use(targets.motion, rhi::ResourceState::RenderTarget);
                 pass.use(targets.depth, rhi::ResourceState::DepthWrite);
+                if (shore.valid) {
+                    pass.use(shore.surface, rhi::ResourceState::ShaderRead, rhi::ShaderStages::All);
+                    if (shore.previous_surface.index != shore.surface.index) {
+                        pass.use(shore.previous_surface, rhi::ResourceState::ShaderRead, rhi::ShaderStages::All);
+                    }
+                }
                 if (ocean.valid) {
                     pass.use(ocean.waves, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
                     if (ocean.has_previous) {
@@ -2671,7 +3515,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     pass.use(ocean.slopes, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 }
             },
-            [targets, behind_color, behind_depth, water, water_push, ocean, renderer = &state](PassContext& context) {
+            [targets, behind_color, behind_depth, water, water_push, ocean, draw_sea, atlas,
+             renderer = &state](PassContext& context) {
                 DE_PROFILE_ZONE("water pass");
                 const rhi::ColorAttachment colors[2] = {
                     {.texture = context.texture(targets.hdr), .load = rhi::LoadOp::Load},
@@ -2682,17 +3527,52 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 WaterPush push = water_push;
                 push.behind_color = context.device.texture_index(context.texture(behind_color));
                 push.behind_depth = context.device.texture_index(context.texture(behind_depth));
+                push.atlas = context.device.texture_index(context.texture(atlas));
                 if (ocean.valid) {
                     push.waves = context.device.texture_index(context.texture(ocean.waves));
                     push.previous_waves = context.device.texture_index(context.texture(ocean.previous_waves));
                     push.slopes = context.device.texture_index(context.texture(ocean.slopes));
                 }
-                context.list.push_constants(push);
                 context.list.bind_index_buffer(renderer->water_indices, 0, rhi::IndexType::Uint16);
                 // A draw per level: each has its own hole. The instance says which level it is.
-                for (uint32_t level = 0; level < kWaterLevels; ++level) {
-                    const uint32_t hole = renderer->water_levels_now[level].hole;
-                    context.list.draw_indexed(water_index_count(hole), 1, water_first_index(hole), 0, level);
+                if (draw_sea) {
+                    context.list.push_constants(push);
+                    for (uint32_t level = 0; level < kWaterLevels; ++level) {
+                        const uint32_t hole = renderer->water_levels_now[level].hole;
+                        context.list.draw_indexed(water_index_count(hole), 1, water_first_index(hole), 0, level);
+                    }
+                }
+                // Each lake and pond: the same levels at its own height, their vertices held inside its outline (the
+                // squares outside it fold onto its edge and draw nothing), only the levels that reach it. No shore
+                // map: its edge is where the ground rises through it, which the water's depth shows.
+                for (const world::RenderWaterBody& body : renderer->water_bodies_now.span()) {
+                    WaterPush lake = push;
+                    lake.sea_level = body.center[1];
+                    lake.flags = push.flags & kWaterWavesFlag; // the ocean's waves, scaled, and nothing of the shore
+                    lake.surf_height_m = 0.0f;
+                    lake.bounds[0] = body.center[0];
+                    lake.bounds[1] = body.center[2];
+                    lake.bounds[2] = body.half_extents[0];
+                    lake.bounds[3] = body.half_extents[1];
+                    lake.axis[0] = body.axis[0];
+                    lake.axis[1] = body.axis[1];
+                    lake.shape = body.ellipse ? kWaterEllipse : kWaterRectangle;
+                    lake.wave_scale = body.waves;
+                    // Its box in the world's axes.
+                    const float reach_x = (body.half_extents[0] * std::abs(body.axis[0])) +
+                                          (body.half_extents[1] * std::abs(body.axis[1]));
+                    const float reach_z = (body.half_extents[0] * std::abs(body.axis[1])) +
+                                          (body.half_extents[1] * std::abs(body.axis[0]));
+                    context.list.push_constants(lake);
+                    for (uint32_t level = 0; level < kWaterLevels; ++level) {
+                        const GpuWaterLevel& at = renderer->water_levels_now[level];
+                        const float half = at.spacing_m * static_cast<float>(kWaterLevelQuads) * 0.5f;
+                        if (std::abs(at.center[0] - body.center[0]) > half + reach_x ||
+                            std::abs(at.center[1] - body.center[2]) > half + reach_z) {
+                            continue;
+                        }
+                        context.list.draw_indexed(water_index_count(at.hole), 1, water_first_index(at.hole), 0, level);
+                    }
                 }
                 context.list.end_rendering();
             });
@@ -2711,14 +3591,19 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
         }
     } else {
         state.froxels_idle_frames = 0;
-        const uint32_t grid_width = std::max((graph.reference_width() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
-        const uint32_t grid_height =
-            std::max((graph.reference_height() + kFroxelTilePixels - 1) / kFroxelTilePixels, 1U);
+        const uint32_t tile_pixels = froxel_tile_pixels(graph.reference_height());
+        const uint32_t grid_width = std::max((graph.reference_width() + tile_pixels - 1) / tile_pixels, 1U);
+        const uint32_t grid_height = std::max((graph.reference_height() + tile_pixels - 1) / tile_pixels, 1U);
         const rhi::TextureDesc grid{.width = grid_width,
                                     .height = grid_height,
                                     .depth = kFroxelSlices,
                                     .format = kFroxelFormat,
                                     .dimension = rhi::TextureDimension::Texture3D};
+        // The two the passes make each frame, by name (the graph's logs, the frame debugger).
+        rhi::TextureDesc injected_grid = grid;
+        injected_grid.debug_name = "froxels";
+        rhi::TextureDesc integrated_grid = grid;
+        integrated_grid.debug_name = "fog volume";
         struct GridPass {
             GraphTexture volume;
         };
@@ -2758,9 +3643,15 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .add_pass<GridPass>(
                     "fog inject",
                     [&](PassBuilder& pass, GridPass& data) {
-                        data.volume = froxels_kept ? kept_froxels : pass.create_texture({.desc = grid});
+                        data.volume = froxels_kept ? kept_froxels : pass.create_texture({.desc = injected_grid});
                         pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
                         pass.use(data.volume, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                        if (light_clusters.is_valid()) { // the local lights, glowing in it
+                            pass.use(light_clusters, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                        }
+                        for (const GraphTexture map : box_maps) { // the fog's ambient, where a light box holds it
+                            pass.use(map, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                        }
                         if (froxels_have_history) {
                             pass.use(last_froxels, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
                         }
@@ -2793,7 +3684,7 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                          .add_pass<GridPass>(
                              "fog integrate",
                              [&](PassBuilder& pass, GridPass& data) {
-                                 data.volume = pass.create_texture({.desc = grid});
+                                 data.volume = pass.create_texture({.desc = integrated_grid});
                                  pass.use(froxels, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
                                  pass.use(data.volume, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
                              },
@@ -2826,7 +3717,8 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .add_pass<FogPass>(
                     "fog",
                     [&](PassBuilder& pass, FogPass& data) {
-                        data.fogged = pass.create_texture({.desc = {.format = kHdrFormat}, .reference_scale = 1.0f});
+                        data.fogged = pass.create_texture(
+                            {.desc = {.format = kHdrFormat, .debug_name = "hdr fogged"}, .reference_scale = 1.0f});
                         pass.use(targets.hdr, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                         pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                         if (froxels_on) {
@@ -2857,7 +3749,199 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .fogged;
     }
 
-    const float exposure = std::exp2(lighting.exposure_ev);
+    // What blends: the cull's draws of it put farthest first, then each mixed over the fogged image, lit as it's drawn.
+    // Only in the lit view, and only when something among the instances blends; without its shaders, it isn't drawn.
+    GraphTexture coverage; // how much of each pixel it covers: TAA trusts its history less there
+    const rhi::PipelineHandle blend_sort = state.shaders->pipeline(state.blend_sort);
+    const rhi::PipelineHandle transparent = state.shaders->pipeline(state.transparent_program);
+    const uint32_t blend_capacity = plan.lists[kBlendList].capacity;
+    if (view == SceneView::Lit && blend_capacity > 0 && blend_sort.is_valid() && transparent.is_valid() &&
+        state.gpu_assets->mesh_table_ready()) {
+        struct BlendSortPass {
+            SceneRendererState* state = nullptr;
+            GraphBuffer keys;
+            GraphBuffer sorted;
+        };
+        const auto run_sort = [draw_lists, draw_counts, blend_sort, frame_address, blend_capacity,
+                               records_offset = plan.records_offset(), first_slot = plan.lists[kBlendList].first_slot](
+                                  const BlendSortPass& data, PassContext& context, uint32_t placing) {
+            const SceneRendererState& renderer = *data.state;
+            const uint64_t lists = renderer.device->buffer_address(context.buffer(draw_lists));
+            const BlendSortPush push{
+                .frame = frame_address,
+                .instances = renderer.instance_data_address,
+                .instance_meshes = renderer.instance_meshes_address,
+                .meshes = renderer.gpu_assets->mesh_table_address(),
+                .records = lists + records_offset,
+                .args = lists + uint64_t{first_slot} * sizeof(rhi::DrawIndexedIndirectArgs),
+                .sorted = data.sorted.is_valid() ? renderer.device->buffer_address(context.buffer(data.sorted)) : 0,
+                .keys = renderer.device->buffer_address(context.buffer(data.keys)),
+                .counts = renderer.device->buffer_address(context.buffer(draw_counts)),
+                .capacity = blend_capacity,
+                .placing = placing};
+            context.list.bind_pipeline(blend_sort);
+            context.list.push_constants(push);
+            context.list.dispatch((blend_capacity + 63) / 64);
+        };
+        const auto& measure = graph.add_pass<BlendSortPass>(
+            "transparent measure",
+            [&](PassBuilder& pass, BlendSortPass& data) {
+                data.state = &state;
+                data.keys = pass.create_buffer({.size = uint64_t{blend_capacity} * sizeof(float),
+                                                .usage = rhi::BufferUsage::Storage,
+                                                .debug_name = "transparent distances"});
+                pass.use(data.keys, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                pass.use(draw_lists, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                pass.use(draw_counts, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                pass.use(instance_meshes_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            },
+            [run_sort](const BlendSortPass& data, PassContext& context) {
+                DE_PROFILE_ZONE("transparent measure pass");
+                run_sort(data, context, 0);
+            });
+        const GraphBuffer blend_keys = measure.keys;
+        const auto& sort = graph.add_pass<BlendSortPass>(
+            "transparent sort",
+            [&](PassBuilder& pass, BlendSortPass& data) {
+                data.state = &state;
+                data.keys = blend_keys;
+                data.sorted =
+                    pass.create_buffer({.size = uint64_t{blend_capacity} * sizeof(rhi::DrawIndexedIndirectArgs),
+                                        .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::Indirect,
+                                        .debug_name = "transparent draws"});
+                pass.use(data.sorted, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
+                pass.use(blend_keys, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                pass.use(draw_lists, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+                pass.use(draw_counts, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Compute);
+            },
+            [run_sort](const BlendSortPass& data, PassContext& context) {
+                DE_PROFILE_ZONE("transparent sort pass");
+                run_sort(data, context, 1);
+            });
+        const GraphBuffer blend_draws = sort.sorted;
+        struct TransparentPass {
+            SceneRendererState* state = nullptr;
+            GraphTexture coverage;
+        };
+        coverage =
+            graph
+                .add_pass<TransparentPass>(
+                    "transparents",
+                    [&](PassBuilder& pass, TransparentPass& data) {
+                        data.state = &state;
+                        data.coverage = pass.create_texture(
+                            {.desc = {.format = kCoverageFormat, .debug_name = "transparent coverage"},
+                             .reference_scale = 1.0f});
+                        pass.use(fogged, rhi::ResourceState::RenderTarget);
+                        pass.use(data.coverage, rhi::ResourceState::RenderTarget);
+                        pass.use(targets.depth, rhi::ResourceState::DepthRead);
+                        pass.use(atlas, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        if (froxels_on) {
+                            pass.use(integrated, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        }
+                        if (light_clusters.is_valid()) {
+                            pass.use(light_clusters, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                        }
+                        pass.use(blend_draws, rhi::ResourceState::IndirectArgument);
+                        pass.use(draw_counts, rhi::ResourceState::IndirectArgument);
+                        pass.use(draw_lists, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+                        pass.use(instance_data_graph, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Vertex);
+                    },
+                    [fogged, targets, atlas, integrated, froxels_on, foggy, blend_draws, draw_counts, draw_lists,
+                     transparent, frame_address, blend_capacity,
+                     records_offset = plan.records_offset()](const TransparentPass& data, PassContext& context) {
+                        DE_PROFILE_ZONE("transparent pass");
+                        SceneRendererState& renderer = *data.state;
+                        const rhi::ColorAttachment colors[2] = {
+                            {.texture = context.texture(fogged), .load = rhi::LoadOp::Load},
+                            {.texture = context.texture(data.coverage)}}; // cleared to 0: nothing covered
+                        const rhi::DepthAttachment depth{
+                            .texture = context.texture(targets.depth), .load = rhi::LoadOp::Load, .read_only = true};
+                        context.list.begin_rendering({.colors = colors, .depth = &depth});
+                        context.list.bind_pipeline(transparent);
+                        context.list.bind_index_buffer(renderer.gpu_assets->pool_index_buffer(), 0,
+                                                       rhi::IndexType::Uint32);
+                        context.list.push_constants(TransparentPush{
+                            .frame = frame_address,
+                            .instances = renderer.instance_data_address,
+                            .vertices = renderer.gpu_assets->pool_vertex_address(),
+                            .materials = renderer.gpu_assets->material_table_address(),
+                            .draws = renderer.device->buffer_address(context.buffer(draw_lists)) + records_offset,
+                            .sampler = rhi::sampler_index(rhi::DefaultSampler::AnisotropicWrap),
+                            .atlas = context.device.texture_index(context.texture(atlas)),
+                            .integrated = froxels_on ? context.device.texture_index(context.texture(integrated)) : 0,
+                            .grid_sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
+                            .fog = foggy ? 1U : 0U,
+                            .froxels = froxels_on ? 1U : 0U,
+                        });
+                        // The draws in their order, as many as the cull counted.
+                        context.list.draw_indexed_indirect_count(
+                            context.buffer(blend_draws), 0, context.buffer(draw_counts),
+                            uint64_t{kBlendList} * sizeof(uint32_t), blend_capacity);
+                        ++renderer.stats.indirect_calls;
+                        context.list.end_rendering();
+                    })
+                .coverage;
+    }
+
+    // Particles: stepped if a step is due, then drawn over the same image and into the same coverage.
+    state.stats.particles = {};
+    if (view == SceneView::Lit && state.particles) {
+        coverage = state.particles->add_passes(
+            graph, {.frame = &frame,
+                    .frame_address = frame_address,
+                    .aspect = static_cast<float>(width) / static_cast<float>(std::max(height, 1U)),
+                    .wind_mps = lighting.wind.speed_mps + lighting.wind.gust_mps,
+                    .color = fogged,
+                    .coverage = coverage,
+                    .depth = targets.depth,
+                    .atlas = atlas,
+                    .integrated = integrated,
+                    .fog = foggy,
+                    .froxels = froxels_on});
+        state.stats.particles = state.particles->stats();
+    }
+
+    // The exposure: the environment's, or what auto exposure makes of this frame round it (the compensation is in its
+    // key, so nothing more multiplies it).
+    AutoExposure::Result adapted;
+    const bool exposed_view = view == SceneView::Lit || view == SceneView::Indirect || view == SceneView::Traced;
+    {
+        const uint64_t now_ns = platform::time_ns();
+        const float step_s = state.exposure_clock_ns != 0
+                                 ? static_cast<float>(static_cast<double>(now_ns - state.exposure_clock_ns) * 1e-9)
+                                 : 0.0f;
+        state.exposure_clock_ns = now_ns;
+        if (state.auto_exposure && state.auto_exposure_on && exposed_view) {
+            adapted = state.auto_exposure->add_passes(graph, {.image = fogged,
+                                                              .width = width,
+                                                              .height = height,
+                                                              .base_ev = lighting.exposure_ev,
+                                                              .below_ev = lighting.exposure_below_ev,
+                                                              .above_ev = lighting.exposure_above_ev,
+                                                              .adaptation = lighting.exposure_adaptation,
+                                                              .step_s = step_s});
+        }
+    }
+    const float exposure = adapted.exposure_address != 0 ? 1.0f : std::exp2(lighting.exposure_ev);
+    // A few frames late, what it came to, for the stats: a copy into this frame slot's readback buffer.
+    if (adapted.state.is_valid()) {
+        const size_t slot = state.device->frame_index() % rhi::kFramesInFlight;
+        const rhi::BufferHandle readback = state.exposure_readback[slot];
+        state.exposure_readback_written[slot] = true;
+        graph.add_pass(
+            "exposure readback",
+            [&](PassBuilder& pass) {
+                pass.use(adapted.state, rhi::ResourceState::CopySrc);
+                pass.never_cull();
+            },
+            [kept = adapted.state, readback](PassContext& context) {
+                context.list.copy_buffer(context.buffer(kept), 0, readback, 0, sizeof(GpuExposureState));
+                context.list.barrier(rhi::BufferBarrier{
+                    .buffer = readback, .before = rhi::ResourceState::CopyDst, .after = rhi::ResourceState::HostRead});
+            });
+    }
 
     // TAA: this frame into its history (what the tonemap shows, and next frame's history).
     GraphTexture resolved = fogged;
@@ -2868,17 +3952,23 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 pass.use(fogged, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(targets.depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 pass.use(targets.motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                if (coverage.is_valid()) {
+                    pass.use(coverage, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
                 if (has_history) {
                     pass.use(last_history, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                     pass.use(last_depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                     pass.use(last_object_motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
                 }
+                if (adapted.state.is_valid()) {
+                    pass.use(adapted.state, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+                }
                 pass.use(kept_history, rhi::ResourceState::RenderTarget);
                 pass.use(kept_object_motion, rhi::ResourceState::RenderTarget);
             },
-            [fogged, targets, kept_history, kept_object_motion, last_history, last_depth, last_object_motion,
+            [fogged, targets, coverage, kept_history, kept_object_motion, last_history, last_depth, last_object_motion,
              has_history, frame_address, taa_pipeline, exposure, renderer = &state,
-             frame_number = frame.number](PassContext& context) {
+             adapted_address = adapted.exposure_address, frame_number = frame.number](PassContext& context) {
                 DE_PROFILE_ZONE("taa pass");
                 renderer->temporal_frame = frame_number; // only now: a skipped pass leaves no history
                 const rhi::ColorAttachment colors[2] = {
@@ -2900,15 +3990,26 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                     .sampler = rhi::sampler_index(rhi::DefaultSampler::LinearClamp),
                     .has_history = has_history ? 1U : 0U,
                     .exposure = exposure,
+                    .coverage = coverage.is_valid() ? index(coverage) : 0,
+                    .has_coverage = coverage.is_valid() ? 1U : 0U,
+                    .adapted = adapted_address,
                 });
                 context.list.draw(3);
                 context.list.end_rendering();
             });
         resolved = kept_history;
     }
+    if (compare_heat.is_valid()) {
+        resolved = compare_heat; // shown as data (the tonemap's view 14)
+    }
 
     // Terrain's levels are in the base color.
-    const auto view_index = static_cast<uint32_t>(view == SceneView::TerrainLevel ? SceneView::BaseColor : view);
+    const auto view_index =
+        static_cast<uint32_t>(view == SceneView::TerrainLevel                            ? SceneView::BaseColor
+                              : view == SceneView::Traced || view == SceneView::Indirect ? SceneView::Lit
+                                                                                         : view);
+    static_assert(static_cast<uint32_t>(SceneView::AmbientOcclusion) == 13, "the tonemap's view 13");
+    static_assert(static_cast<uint32_t>(SceneView::Count) <= 14, "the tonemap's view 14 is the compare's heat map");
     const uint32_t srgb_target = rhi::format_info(target_format).srgb ? 1 : 0;
     graph.add_pass(
         "tonemap",
@@ -2919,9 +4020,16 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
             }
             pass.use(shadow_mask, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
             pass.use(targets.motion, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            if (ao.is_valid()) {
+                pass.use(ao, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
+            if (adapted.state.is_valid()) {
+                pass.use(adapted.state, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
+            }
             pass.use(target, rhi::ResourceState::RenderTarget);
         },
-        [targets, resolved, shadow_mask, target, tonemap, exposure, view_index, srgb_target](PassContext& context) {
+        [targets, resolved, shadow_mask, target, tonemap, exposure, view_index, srgb_target, ao,
+         adapted_address = adapted.exposure_address](PassContext& context) {
             DE_PROFILE_ZONE("tonemap pass");
             const rhi::ColorAttachment color{.texture = context.texture(target), .load = rhi::LoadOp::DontCare};
             context.list.begin_rendering({.colors = std::span(&color, 1)});
@@ -2936,6 +4044,9 @@ void SceneRenderer::add_passes(RenderGraph& graph, GraphTexture target, rhi::For
                 .srgb_target = srgb_target,
                 .shadow_mask = context.device.texture_index(context.texture(shadow_mask)),
                 .motion = context.device.texture_index(context.texture(targets.motion)),
+                .ao = ao.is_valid() ? context.device.texture_index(context.texture(ao)) : 0U,
+                .ao_on = ao.is_valid() ? 1U : 0U,
+                .adapted = adapted_address,
             });
             context.list.draw(3);
             context.list.end_rendering();
@@ -3120,8 +4231,9 @@ GraphTexture SceneRenderer::add_editor_passes(RenderGraph& graph, GraphTexture i
         const auto& pass = graph.add_pass<TerrainSelectionPass>(
             "editor terrain selection",
             [&](PassBuilder& builder, TerrainSelectionPass& data) {
-                data.mask =
-                    builder.create_texture({.desc = {.format = rhi::Format::RGBA8Unorm}, .reference_scale = 1.0f});
+                data.mask = builder.create_texture(
+                    {.desc = {.format = rhi::Format::RGBA8Unorm, .debug_name = "terrain selection mask"},
+                     .reference_scale = 1.0f});
                 builder.use(data.mask, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
                 builder.use(ids, rhi::ResourceState::ShaderWrite, rhi::ShaderStages::Compute);
             },
@@ -3198,8 +4310,10 @@ GraphTexture SceneRenderer::add_editor_passes(RenderGraph& graph, GraphTexture i
     const auto& pass = graph.add_pass<SelectionPass>(
         "editor selection",
         [&](PassBuilder& builder, SelectionPass& data) {
-            data.mask = builder.create_texture({.desc = {.format = kSelectionMaskFormat}, .reference_scale = 1.0f});
-            data.own_depth = builder.create_texture({.desc = {.format = kDepthFormat}, .reference_scale = 1.0f});
+            data.mask = builder.create_texture(
+                {.desc = {.format = kSelectionMaskFormat, .debug_name = "selection mask"}, .reference_scale = 1.0f});
+            data.own_depth = builder.create_texture(
+                {.desc = {.format = kDepthFormat, .debug_name = "selection depth"}, .reference_scale = 1.0f});
             builder.use(data.mask, rhi::ResourceState::RenderTarget);
             builder.use(data.own_depth, rhi::ResourceState::DepthWrite);
             builder.use(depth, rhi::ResourceState::ShaderRead, rhi::ShaderStages::Fragment);
@@ -3313,6 +4427,100 @@ void SceneRenderer::set_fog_low_camera(bool on) {
     state_->fog_low_camera = on;
 }
 
+void SceneRenderer::set_auto_exposure(bool on) {
+    if (on && !state_->auto_exposure_on && state_->auto_exposure) {
+        state_->auto_exposure->snap();
+    }
+    state_->auto_exposure_on = on;
+}
+
+void SceneRenderer::set_auto_exposure_settings(const AutoExposureSettings& settings) {
+    if (state_->auto_exposure) {
+        state_->auto_exposure->set_settings(settings);
+    }
+}
+
+bool SceneRenderer::auto_exposure_state(GpuExposureState& exposure) const {
+    // This frame slot's copy was made kFramesInFlight frames ago, and the GPU is done with it (begin_frame waited).
+    const size_t slot = state_->device->frame_index() % rhi::kFramesInFlight;
+    if (!state_->auto_exposure_on || !state_->exposure_readback_written[slot]) {
+        return false;
+    }
+    state_->device->invalidate_mapped(state_->exposure_readback[slot]);
+    std::memcpy(&exposure, state_->device->mapped(state_->exposure_readback[slot]).data(), sizeof(exposure));
+    return exposure.has_value != 0;
+}
+
+void SceneRenderer::set_ambient_occlusion(bool on) {
+    state_->gtao_on = on;
+}
+
+void SceneRenderer::set_radiance_cascades(bool on) {
+    state_->radiance_cascades_on = on;
+}
+
+void SceneRenderer::set_specular_ambient(bool on) {
+    state_->specular_ambient = on;
+}
+
+void SceneRenderer::set_debug_jitter(uint32_t sample) {
+    state_->debug_jitter = std::min(sample, kTaaSamples);
+}
+
+void SceneRenderer::set_local_shadow_cache(bool on) {
+    state_->local_shadow_cache = on;
+}
+
+void SceneRenderer::set_most_shadowed_lights(uint32_t lights) {
+    if (state_->local_lights) {
+        state_->local_lights->set_most_shadowed(lights);
+    }
+}
+
+void SceneRenderer::set_radiance_cascades_settings(const RadianceCascadesSettings& settings) {
+    if (state_->radiance_cascades) {
+        state_->radiance_cascades->set_settings(settings);
+    }
+}
+
+void SceneRenderer::set_ambient_occlusion_settings(const GtaoSettings& settings) {
+    if (state_->gtao) {
+        state_->gtao->set_settings(settings);
+    }
+}
+
+PathTracer* SceneRenderer::path_tracer() {
+    return state_->path_tracer ? &*state_->path_tracer : nullptr;
+}
+
+void SceneRenderer::set_path_traced(bool on) {
+    state_->path_traced = on;
+}
+
+void SceneRenderer::set_light_boxes(std::span<const LightBoxDesc> boxes) {
+    if (state_->light_boxes) {
+        state_->light_boxes->set_boxes(boxes);
+    }
+}
+
+void SceneRenderer::set_light_boxes_on(bool on) {
+    state_->light_boxes_on = on;
+}
+
+void SceneRenderer::rebake_light_boxes() {
+    if (state_->light_boxes) {
+        state_->light_boxes->rebake();
+    }
+}
+
+void SceneRenderer::set_lighting_compare(bool on) {
+    state_->lighting_compare = on;
+}
+
+void SceneRenderer::set_terrain_hidden(bool hidden) {
+    state_->terrain_hidden = hidden;
+}
+
 void SceneRenderer::set_terrain(const asset::TerrainAsset* terrain, std::span<const std::byte> file) {
     if (state_->terrain) {
         state_->terrain->set(terrain, file);
@@ -3331,6 +4539,10 @@ bool SceneRenderer::instances_stale() const {
 
 SceneRendererStats SceneRenderer::stats() const {
     return state_->stats;
+}
+
+const ParticleSystem* SceneRenderer::particles() const {
+    return state_->particles ? &*state_->particles : nullptr;
 }
 
 } // namespace de::render

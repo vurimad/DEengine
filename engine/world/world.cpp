@@ -7,6 +7,7 @@
 #include "core/profile.h"
 #include "world/cell.h"
 #include "world/flecs_os.h"
+#include "world/prefab.h"
 #include "world/transform.h"
 
 #include <algorithm>
@@ -52,6 +53,7 @@ struct WorldState {
     RenderFrame render_frame;
     RenderExtractScratch extract_scratch;
     CellSpawnScratch cell_scratch;
+    PrefabScratch prefab_scratch;
     flecs::world ecs;
     flecs::entity phases[static_cast<size_t>(Phase::Count)];
     flecs::entity simulation; // the pipelines
@@ -81,6 +83,7 @@ core::Result<World> World::create(const WorldDesc& desc) {
     register_transform(ecs);
     register_cells(ecs, desc.assets);
     register_render_components(ecs);
+    register_prefabs(ecs);
 
     // The phases: the simulation ones in a DependsOn chain, RenderExtract on its own. Only our tags,
     // not flecs::Phase: flecs' built-in pipeline (progress()) must never run them.
@@ -109,6 +112,9 @@ core::Result<World> World::create(const WorldDesc& desc) {
     if (desc.assets != nullptr) {
         add_cell_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], spawn_cells, *desc.assets,
                          state->cell_scratch);
+        // After the cells in both phases: a placement a cell just spawned has its parts already.
+        add_prefab_systems(ecs, state->phases[static_cast<size_t>(Phase::Input)], spawn_cells, *desc.assets,
+                           state->prefab_scratch);
     }
     add_render_extract(ecs, state->phases[static_cast<size_t>(Phase::RenderExtract)],
                        {.frame = &state->render_frame,

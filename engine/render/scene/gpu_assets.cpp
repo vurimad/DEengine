@@ -86,6 +86,7 @@ struct MeshEntry {
     core::Array<GpuMeshLod> lods{render_heap()};
     uint64_t bytes = 0;
     uint64_t upload_ticket = 0;        // the uploader's, when both its uploads are recorded
+    uint64_t table_ticket = 0;         // the uploader's, of its entry in the mesh table: the GPU has it once recorded
     uint64_t needs_table = UINT64_MAX; // the table upload its parts' materials are in (set in update)
     bool ready = false;
     bool missing = false;     // a material it names failed: its parts are resolved again when one loads
@@ -399,6 +400,7 @@ struct GpuAssetsState {
         entry.missing = missing;
         gpu.flags =
             (asset->alpha_mode == asset::AlphaMode::Masked ? GpuMaterialFlags::Masked : GpuMaterialFlags::None) |
+            (asset->alpha_mode == asset::AlphaMode::Blend ? GpuMaterialFlags::Blend : GpuMaterialFlags::None) |
             (core::has_any(asset->flags, asset::MaterialFlags::DoubleSided) ? GpuMaterialFlags::DoubleSided
                                                                             : GpuMaterialFlags::None) |
             (gpu.wind_bend_m > 0.0f || gpu.wind_flutter_m > 0.0f ? GpuMaterialFlags::Wind : GpuMaterialFlags::None);
@@ -565,6 +567,8 @@ struct GpuAssetsState {
                        .first_lod = lod_ranges.allocate(asset->lods.count),
                        .lod_count = asset->lods.count};
         entry.gpu.vertex_offset = static_cast<uint32_t>(entry.place.first_vertex);
+        entry.gpu.vertex_count = static_cast<uint32_t>(entry.place.vertex_count);
+        entry.gpu.first_table_part = static_cast<uint32_t>(entry.place.first_part);
         part_table_used = std::max(part_table_used, static_cast<uint32_t>(entry.place.first_part + parts_total));
         entry.gpu.table_slot = take_mesh_slot(handle);
         std::memcpy(entry.gpu.bounds_min, asset->bounds.min, sizeof(entry.gpu.bounds_min));
@@ -620,12 +624,19 @@ struct GpuAssetsState {
         entry.gpu.kinds = {.has_lods = entry.lods.size() > 1};
         for (size_t lod = 0; lod < entry.lods.size(); ++lod) {
             uint32_t kinds[kDrawKindCount] = {};
+            uint32_t blend = 0;
             for (const GpuMeshPart& part : entry.gpu.lod_parts(lod)) {
-                ++kinds[draw_kind(materials_now[part.material].flags)];
+                const GpuMaterialFlags flags = materials_now[part.material].flags;
+                if (core::has_any(flags, GpuMaterialFlags::Blend)) {
+                    ++blend;
+                } else {
+                    ++kinds[draw_kind(flags)];
+                }
             }
             for (uint32_t kind = 0; kind < kDrawKindCount; ++kind) {
                 entry.gpu.kinds.parts[kind] = std::max(entry.gpu.kinds.parts[kind], kinds[kind]);
             }
+            entry.gpu.kinds.blend_parts = std::max(entry.gpu.kinds.blend_parts, blend);
         }
     }
 
@@ -637,11 +648,15 @@ struct GpuAssetsState {
         bool changed = false;
         entry.lods.clear();
         entry.missing = false;
+        entry.gpu.seams_moved_lods = 0;
         const auto* asset = assets->get<asset::MeshAsset>(entry.handle);
         if (asset != nullptr) {
             const std::span<const asset::MeshPart> parts = asset->parts.get(asset);
             const std::span<const asset::MeshMaterialSlot> slots = asset->materials.get(asset);
             for (const asset::MeshLod& lod : asset->lods.get(asset)) {
+                if (lod.seams_moved != 0 && entry.lods.size() < 32) {
+                    entry.gpu.seams_moved_lods |= 1U << static_cast<uint32_t>(entry.lods.size());
+                }
                 entry.lods.push(
                     {.error_m = lod.error, .first_part = static_cast<uint32_t>(count), .part_count = lod.part_count});
                 for (uint32_t p = lod.first_part; p < lod.first_part + lod.part_count; ++p) {
@@ -798,9 +813,12 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
     }
     state->material_table = *table;
     state->material_table_address = desc.device->buffer_address(*table);
+    // Where the GPU traces rays, bottom levels are built straight from the pool (render/scene/trace_scene.h).
+    const rhi::BufferUsage traced =
+        desc.device->capabilities().ray_query ? rhi::BufferUsage::AccelerationInput : rhi::BufferUsage::None;
     const core::Result<rhi::BufferHandle> pool_vertices =
         desc.device->create_buffer({.size = uint64_t{desc.pool_vertices} * sizeof(asset::MeshVertex),
-                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                                    .usage = rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst | traced,
                                     .debug_name = "geometry pool vertices"});
     if (!pool_vertices) {
         return core::fail(pool_vertices.error());
@@ -809,7 +827,7 @@ core::Result<GpuAssets> GpuAssets::create(const GpuAssetsDesc& desc) {
     state->pool_vertex_address = desc.device->buffer_address(*pool_vertices);
     const core::Result<rhi::BufferHandle> pool_indices =
         desc.device->create_buffer({.size = uint64_t{desc.pool_indices} * sizeof(uint32_t),
-                                    .usage = rhi::BufferUsage::Index | rhi::BufferUsage::CopyDst,
+                                    .usage = rhi::BufferUsage::Index | rhi::BufferUsage::CopyDst | traced,
                                     .debug_name = "geometry pool indices"});
     if (!pool_indices) {
         return core::fail(pool_indices.error());
@@ -984,6 +1002,7 @@ void GpuAssets::update() {
             // Its entry is what lets the cull find it. Tried again next update if it fails.
             if (const core::Result<void> queued = state.upload_mesh_entry(entry->gpu.table_slot, entry->info); queued) {
                 entry->ready = true;
+                entry->table_ticket = state.uploader->buffer_upload_ticket();
                 state.publish_kinds(*entry);
             } else {
                 DE_LOG_ERROR("render", "mesh table upload: %s", queued.error().message);
@@ -1049,6 +1068,10 @@ uint64_t GpuAssets::pool_vertex_address() const {
     return state_->pool_vertex_address;
 }
 
+rhi::BufferHandle GpuAssets::pool_vertex_buffer() const {
+    return state_->pool_vertices;
+}
+
 rhi::BufferHandle GpuAssets::pool_index_buffer() const {
     return state_->pool_indices;
 }
@@ -1056,6 +1079,16 @@ rhi::BufferHandle GpuAssets::pool_index_buffer() const {
 const GpuMesh* GpuAssets::mesh(asset::AssetHandle mesh) const {
     const MeshEntry* entry = state_->meshes.find(key_of(mesh));
     return entry != nullptr && entry->ready ? &entry->gpu : nullptr;
+}
+
+bool GpuAssets::mesh_on_gpu(asset::AssetHandle mesh) const {
+    const MeshEntry* entry = state_->meshes.find(key_of(mesh));
+    return entry != nullptr && entry->ready && state_->uploader->recorded(entry->table_ticket);
+}
+
+bool GpuAssets::material_on_gpu(asset::AssetId material) const {
+    // Every write of the table queued so far has been recorded: whatever its entry was last written as is there.
+    return material_complete(material) && state_->table_recorded >= state_->table_uploads;
 }
 
 uint64_t GpuAssets::material_table_address() const {

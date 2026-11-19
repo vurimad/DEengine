@@ -30,9 +30,13 @@ inline constexpr uint32_t kStatsGpu = 1U << 6;         // GPU time, by render gr
 inline constexpr uint32_t kStatsRenderGraph = 1U << 7; // passes, barriers, the pool
 inline constexpr uint32_t kStatsUploads = 1U << 8;     // queued, staging, uploaded
 inline constexpr uint32_t kStatsDevice = 1U << 9;      // live objects, bindless entries, validation messages
+inline constexpr uint32_t kStatsParticles = 1U << 10;  // effects, their emitters and particles, the pool: with any
+inline constexpr uint32_t kStatsLights = 1U << 11;     // local lights: there, lighting the view, dropped: with any
+inline constexpr uint32_t kStatsRays = 1U << 12;       // what rays are traced against: where anything is
 inline constexpr uint32_t kStatsDefault = kStatsFrame | kStatsGraph | kStatsAllocations | kStatsCamera | kStatsCull |
-                                          kStatsMemory | kStatsGpu | kStatsRenderGraph;
-inline constexpr uint32_t kStatsAll = (1U << 10U) - 1U;
+                                          kStatsMemory | kStatsGpu | kStatsRenderGraph | kStatsParticles |
+                                          kStatsLights | kStatsRays;
+inline constexpr uint32_t kStatsAll = (1U << 13U) - 1U;
 
 // The sections' names, as --stats and the console's stat take them.
 struct StatsSectionName {
@@ -48,7 +52,10 @@ inline constexpr StatsSectionName kStatsSectionNames[] = {{.name = "frame", .bit
                                                           {.name = "gpu", .bits = kStatsGpu},
                                                           {.name = "render_graph", .bits = kStatsRenderGraph},
                                                           {.name = "uploads", .bits = kStatsUploads},
-                                                          {.name = "device", .bits = kStatsDevice}};
+                                                          {.name = "device", .bits = kStatsDevice},
+                                                          {.name = "particles", .bits = kStatsParticles},
+                                                          {.name = "lights", .bits = kStatsLights},
+                                                          {.name = "rays", .bits = kStatsRays}};
 
 // Sections by name, comma separated: those above, fps (frame, as Unreal's), default and all. False on a name it
 // doesn't know.
@@ -67,9 +74,52 @@ struct FrameStats {
     bool has_camera = false; // the active camera's place, to come back to a spot
     DVec3 camera_position{0.0};
     Quat camera_rotation{1.0f, 0.0f, 0.0f, 0.0f};
+    // The auto exposure, a few frames late (SceneRenderer::auto_exposure_state): where it is and where it's going, as
+    // powers of 2. has_exposure false while it's off.
+    bool has_exposure = false;
+    float exposure_ev = 0.0f;
+    float exposure_target_ev = 0.0f;
     bool cull_frozen = false; // SceneRenderer::set_cull_frozen: said in the panel, with what shadows can be judged by
     uint32_t visible_shadow_draws = 0;
     uint32_t visible_shadow_triangles = 0;
+    // The particle system's (render::ParticleStats): effects in the world, emitters near enough to hold particles,
+    // those in view, those the pool had no room for, particles alive (about), and how much of the pool is held.
+    uint32_t particle_effects = 0;
+    uint32_t particle_emitters = 0;
+    uint32_t particle_emitters_drawn = 0;
+    uint32_t particle_emitters_starved = 0;
+    uint32_t particles = 0;
+    uint32_t particle_blocks = 0;
+    uint32_t particle_pool_blocks = 0;
+    // Local lights (render::LocalLightStats): in the world, lighting what's in view, and left unlit because more
+    // than a frame lights with reached it.
+    uint32_t lights = 0;
+    uint32_t lights_lit = 0;
+    uint32_t lights_dropped = 0;
+    uint32_t lights_shadowed = 0; // of those lit, how many have shadows, in how many faces
+    uint32_t shadow_faces = 0;
+    // What rays are traced against (render::TraceStats): meshes with a bottom level, those waiting for one, and
+    // the instance slots in the top level. All 0 where nothing is traced.
+    uint32_t trace_meshes = 0;
+    uint32_t trace_waiting = 0;
+    uint32_t trace_instances = 0;
+    uint64_t trace_triangles = 0;
+    // The path tracer, while the picture is path traced: its samples, and why it last started again.
+    uint32_t path_tracer_samples = 0;
+    const char* path_tracer_restart = "";
+    uint32_t path_tracer_restarts = 0;
+    uint32_t path_tracer_bounces = 0;
+    // The light boxes (render::LightBoxStats).
+    uint32_t light_boxes = 0;
+    uint32_t light_box_voxels = 0;
+    float light_boxes_baked = 0.0f;
+    // The lighting compare (SceneRenderer::set_lighting_compare), while it's on: render::LightingCompareStats.
+    uint32_t compare_pixels = 0;
+    float compare_mean_stops = 0.0f;
+    float compare_over_10 = 0.0f;
+    float compare_over_25 = 0.0f;
+    float compare_darker_10 = 0.0f;
+    float compare_brighter_10 = 0.0f;
 };
 
 // The frame stats (M0a): frame time and its history, heap allocations per frame, GPU memory by category, GPU time per

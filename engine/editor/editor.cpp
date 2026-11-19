@@ -19,8 +19,10 @@
 #include "render/scene/scene_renderer.h"
 #include "tools/console_ui.h"
 #include "tools/debug_ui.h"
+#include "tools/frame_debugger.h"
 #include "tools/stats_panel.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -101,6 +103,8 @@ struct Settings {
     bool snap_ground = false;
     bool colliders = false;
     bool selected_colliders = false;
+    bool cook_auto = true;
+    uint32_t fps_cap = 0;
 };
 
 float to_number(std::string_view text, float fallback) {
@@ -150,6 +154,10 @@ Settings load_settings(const platform::Vfs& vfs) {
             settings.colliders = on;
         } else if (key == "selected_colliders") {
             settings.selected_colliders = on;
+        } else if (key == "cook_auto") {
+            settings.cook_auto = on;
+        } else if (key == "fps_cap") {
+            settings.fps_cap = static_cast<uint32_t>(std::clamp(to_number(value, 0.0f), 0.0f, 1000.0f));
         } else if (key == "drawer") {
             settings.drawer_share = std::clamp(to_number(value, settings.drawer_share), 0.15f, 0.85f);
         } else if (key == "handles") {
@@ -170,13 +178,14 @@ Settings load_settings(const platform::Vfs& vfs) {
 
 void save_settings(const platform::Vfs& vfs, const Settings& settings) {
     constexpr const char* kTools[] = {"select", "move", "rotate", "scale"};
-    char text[512];
+    char text[640];
     const int length = std::snprintf(
         text, sizeof(text),
         "# The editor's interface scale (on top of the display's), its tool, its axes, where its handles "
         "sit and its snapping.\n"
         "ui_scale %.2f\ntool %s\nspace %s\nhandles %s\nsnap_move %s %g\nsnap_rotate %s %g\n"
-        "snap_scale %s %g\ndrawer %.2f\ncell_grid %s\nsnap_ground %s\ncolliders %s\nselected_colliders %s\n",
+        "snap_scale %s %g\ndrawer %.2f\ncell_grid %s\nsnap_ground %s\ncolliders %s\nselected_colliders %s\n"
+        "cook_auto %s\nfps_cap %u\n",
         static_cast<double>(settings.ui_scale), kTools[static_cast<int>(settings.tool)],
         settings.space == Space::Local ? "local" : "world",
         settings.handles_at == HandlesAt::Center ? "center" : "pivot", settings.snap.move ? "on" : "off",
@@ -184,11 +193,72 @@ void save_settings(const platform::Vfs& vfs, const Settings& settings) {
         static_cast<double>(settings.snap.rotate_deg), settings.snap.scale ? "on" : "off",
         static_cast<double>(settings.snap.scale_step), static_cast<double>(settings.drawer_share),
         settings.cell_grid ? "on" : "off", settings.snap_ground ? "on" : "off", settings.colliders ? "on" : "off",
-        settings.selected_colliders ? "on" : "off");
+        settings.selected_colliders ? "on" : "off", settings.cook_auto ? "on" : "off", settings.fps_cap);
     if (length > 0) {
         static_cast<void>(vfs.write_file(kSettingsPath, std::as_bytes(std::span(text, static_cast<size_t>(length)))));
     }
 }
+
+// The world each project had open last, for the next start with no world named: a line per project, the world's ID
+// and then the project's folder.
+constexpr const char* kLastWorldsPath = "user:/editor/last_worlds.settings";
+
+asset::AssetId last_world(const platform::Vfs& vfs) {
+    const char* project = vfs.mount_root(platform::Mount::Src);
+    if (project == nullptr || !vfs.exists(kLastWorldsPath)) {
+        return {};
+    }
+    const auto file = vfs.read_whole_file(kLastWorldsPath, editor_heap());
+    if (!file) {
+        return {};
+    }
+    std::string_view text = core::skip_bom(std::string_view(reinterpret_cast<const char*>(file->data()), file->size()));
+    while (!text.empty()) {
+        const std::string_view line = core::strip_comment(core::next_line(text));
+        const size_t space = line.find(' ');
+        asset::AssetId id;
+        if (space != std::string_view::npos && core::trim(line.substr(space)) == project &&
+            asset::parse_asset_id(line.substr(0, space), id)) {
+            return id;
+        }
+    }
+    return {};
+}
+
+void remember_world(const platform::Vfs& vfs, asset::AssetId world) {
+    const char* project = vfs.mount_root(platform::Mount::Src);
+    if (project == nullptr || !world.is_valid()) {
+        return;
+    }
+    // The other projects' lines as they are, then this one's.
+    core::Array<char> kept(editor_heap());
+    const auto add = [&kept](std::string_view text) {
+        for (const char c : text) {
+            kept.push(c);
+        }
+    };
+    add("# The world each project had open last in the editor: its ID, then the project's folder.\n");
+    if (const auto file = vfs.read_whole_file(kLastWorldsPath, editor_heap())) {
+        std::string_view text =
+            core::skip_bom(std::string_view(reinterpret_cast<const char*>(file->data()), file->size()));
+        while (!text.empty()) {
+            const std::string_view line = core::strip_comment(core::next_line(text));
+            const size_t space = line.find(' ');
+            if (space != std::string_view::npos && core::trim(line.substr(space)) != project) {
+                add(line);
+                add("\n");
+            }
+        }
+    }
+    add(asset::format_asset_id(world).view());
+    add(" ");
+    add(project);
+    add("\n");
+    static_cast<void>(vfs.write_file(kLastWorldsPath, std::as_bytes(kept.span())));
+}
+
+// The frame rate limits Preferences offers; 0 is none.
+constexpr uint32_t kFrameRateLimits[] = {0, 30, 60, 120, 240};
 
 // A square toolbar button with an icon: the accent while on, a step lighter under the mouse.
 bool icon_button(const IconSet& icons, const char* id, Icon icon, const char* tip, bool on, bool enabled = true) {
@@ -244,6 +314,30 @@ void toolbar_rule() {
     ImGui::SameLine(0.0f, px(6.0f));
 }
 
+// A text button of the status bar: the accent while on, a step lighter under the mouse.
+float status_button_width(const char* label) {
+    return (2.0f * px(8.0f)) + ImGui::CalcTextSize(label).x;
+}
+
+bool status_button(const char* id, const char* label, bool on) {
+    const float height = ImGui::GetFrameHeight();
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    const ImVec2 size(status_button_width(label), height);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool held = ImGui::IsItemActive();
+    const ThemeColor background = on        ? (hovered ? ThemeColor::AccentHovered : ThemeColor::Accent)
+                                  : held    ? ThemeColor::ControlActive
+                                  : hovered ? ThemeColor::ControlHovered
+                                            : ThemeColor::Control;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(min, ImVec2(min.x + size.x, min.y + size.y), color_u32(background),
+                        px(theme().metrics.control_rounding));
+    draw->AddText(ImVec2(min.x + px(8.0f), std::floor(min.y + ((height - ImGui::GetFontSize()) * 0.5f))),
+                  color_u32(on || hovered ? ThemeColor::TextEmphasis : ThemeColor::Text), label);
+    return pressed;
+}
+
 // A snap's step, as a short list beside its switch.
 template <size_t N>
 void snap_step(const char* id, float& step, const float (&steps)[N], const char* unit) {
@@ -266,10 +360,15 @@ void snap_step(const char* id, float& step, const float (&steps)[N], const char*
 Editor::Editor()
     : commands_(editor_heap()), hierarchy_(editor_heap()), icons_(editor_heap()), selected_meshes_(editor_heap()),
       selected_entities_(editor_heap()), properties_(editor_heap()), thumbnails_(editor_heap()),
-      browser_(editor_heap()), cell_sources_(editor_heap()), cooking_(editor_heap()), holds_(editor_heap()),
-      members_(editor_heap()), scratch_entities_(editor_heap()) {}
+      pictures_(editor_heap()), effect_viewer_(editor_heap()), prefab_editor_(editor_heap()), browser_(editor_heap()),
+      cell_sources_(editor_heap()), cooking_(editor_heap()), holds_(editor_heap()), members_(editor_heap()),
+      scratch_entities_(editor_heap()) {}
 
 bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
+    // What this project had open last, unless --world names one. Not for a picture's run or a counted one.
+    if (!engine.scripted && args.frames == 0) {
+        viewer_.set_first_world(last_world(engine.vfs));
+    }
     if (!viewer_.startup(engine, args)) {
         return false;
     }
@@ -280,15 +379,65 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     engine.console.add_command("editor.save", "",
                                "Save the edits into the cells' text sources, then cook them (as Ctrl+S does).",
                                &Editor::save_command, this);
+    engine.console.add_command("editor.cook", "",
+                               "Cook the whole project in the background (as the status bar's Cook and Ctrl+B do).",
+                               &Editor::cook_command, this);
+    engine.console.add_variable("editor.cook_auto",
+                                "Cook by itself when the project's files change (the status bar's Cook automatically).",
+                                &cook_auto_, this);
+    engine.console.add_command("editor.open_world", "[name]",
+                               "Open a world of the project by its name under content/ (as File > Open World does); "
+                               "with no name, lists them.",
+                               &Editor::open_world_command, this);
+    engine.console.add_command("editor.open_project", "[name]",
+                               "Open a project beside the engine in an editor of its own, closing this one (as File > "
+                               "Open Project does); with no name, lists them.",
+                               &Editor::open_project_command, this);
     engine.console.add_command("editor.move", "<name> <x> <y> <z>",
                                "Move the entity of that name to a place in meters (undoable), and select it.",
                                &Editor::move_command, this);
-    engine.console.add_command("editor.place", "<src:/content/...model> <x> <y> <z>",
-                               "Place a model there (meters), as dropping it on the Playground does.",
+    engine.console.add_command("editor.place", "<src:/content/...model, .vfx or .prefab> <x> <y> <z>",
+                               "Place a model, an effect or a prefab there (meters), as dropping it on the Playground "
+                               "does.",
                                &Editor::place_command, this);
+    engine.console.add_command("editor.view_effect", "<src:/content/...vfx>",
+                               "Show an effect in the effect viewer (as a double click on it in Resources does).",
+                               &Editor::view_effect_command, this);
     engine.console.add_command(
-        "editor.drop", "<src:/content/...model>",
-        "Drop a model at the middle of the Playground, on the ground there (as the mouse would).",
+        "editor.effect",
+        "[play | hold | step N | seek S | speed X | loop on|off | length S | hide MASK | frame | close]",
+        "What the effect viewer's bar does: play or hold it, step N of the simulation's steps (back for less than 0), "
+        "set its age in seconds, its speed, its loop and the bar's length, leave emitters out (a bit each), frame it, "
+        "close it. Alone: where it is.",
+        &Editor::effect_command, this);
+    engine.console.add_command("editor.edit_prefab", "<src:/content/...prefab>",
+                               "Open a prefab in the prefab editor (as a double click on it in Resources does).",
+                               &Editor::edit_prefab_command, this);
+    engine.console.add_command("editor.new_prefab", "<src:/content/...prefab>",
+                               "Open a new prefab in the prefab editor (as Resources' New Prefab does): it's a file "
+                               "once it's saved.",
+                               &Editor::new_prefab_command, this);
+    engine.console.add_command("editor.add_light", "[x y z]",
+                               "Add a point light (as Edit > Add Light does): at a place in meters, or a little above "
+                               "where the middle of the Playground meets the ground.",
+                               &Editor::add_light_command, this);
+    engine.console.add_command("editor.prefab_from_selection", "<src:/content/...prefab>",
+                               "Open a new prefab in the prefab editor whose parts are the chosen things (as Edit > "
+                               "Make Prefab from Selection does): it's a file once it's saved, and they stay as they "
+                               "are.",
+                               &Editor::prefab_from_selection_command, this);
+    engine.console.add_command(
+        "editor.prefab",
+        "[add PATH [X Y Z] | remove ID | duplicate ID | rename ID NEW | move ID X Y Z | rotate ID X Y Z | "
+        "scale ID X Y Z | light ID off | light ID INTENSITY RADIUS_M [R G B] | select [ID] | variant NAME | "
+        "delete_variant NAME | keep NAME PART on|off | show [NAME] | undo | redo | save | frame | close]",
+        "What the prefab editor's window does to the prefab open in it: add a part from a model, an effect or another "
+        "prefab, take one out, copy or rename it, place it (meters, degrees, times), choose one; add or delete a "
+        "variant, say whether it keeps a part, show one; undo, redo, save, frame, close. Alone: what it holds.",
+        &Editor::prefab_command, this);
+    engine.console.add_command(
+        "editor.drop", "<src:/content/...model or .vfx>",
+        "Drop a model or an effect at the middle of the Playground, on the ground there (as the mouse would).",
         &Editor::drop_command, this);
     engine.console.add_command("editor.duplicate", "[name ...]", "Duplicate the entity of that name (as Ctrl+D does).",
                                &Editor::duplicate_command, this);
@@ -345,6 +494,16 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     snap_ground_ = settings.snap_ground;
     engine.show_colliders = settings.colliders;
     engine.show_selected_colliders = settings.selected_colliders;
+    cook_auto_ = settings.cook_auto;
+    fps_cap_kept_ = settings.fps_cap;
+    if (app::flag_value(args, "--fps-cap") == nullptr) {
+        engine.fps_cap = fps_cap_kept_; // Preferences': a flag says otherwise for one run, and isn't kept
+    }
+    // Nothing cooks by itself in a picture's run or a counted one.
+    watching_ = !engine.scripted && args.frames == 0;
+    if (watching_) {
+        remember_world(engine.vfs, viewer_.world_id());
+    }
     show_cells_ = show_cells_ || app::has_flag(args, "--cell-grid");
     if (const char* typed = app::flag_value(args, "--cmd"); typed != nullptr && engine.console_ui != nullptr) {
         engine.console_ui->set_command_line(typed);
@@ -358,6 +517,16 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     if (const char* file = app::flag_value(args, "--select-file")) {
         selection_.select_file(file);
         browser_.show_file(file);
+    }
+    if (const char* effect = app::flag_value(args, "--view-effect")) {
+        if (!view_effect(engine, effect)) {
+            DE_LOG_ERROR("editor", "--view-effect: %s", message_);
+        }
+    }
+    if (const char* prefab = app::flag_value(args, "--edit-prefab")) {
+        if (!edit_prefab(engine, prefab)) {
+            DE_LOG_ERROR("editor", "--edit-prefab: %s", message_);
+        }
     }
     if (const char* tool = app::flag_value(args, "--tool")) {
         const std::string_view name(tool);
@@ -392,30 +561,498 @@ bool Editor::startup(app::Engine& engine, const app::FrameworkArgs& args) {
     }
     browser_.load_settings(engine.vfs);
     browser_.set_thumbnails(&thumbnails_);
+    properties_.set_thumbnails(&thumbnails_);
     load_layout(engine.vfs);
     load_bookmarks(engine.vfs);
     DE_LOG_INFO("editor", "editing world %s", asset::format_asset_id(viewer_.world_id()).c_str());
     return true;
 }
 
-void Editor::shutdown(app::Engine& engine) {
-    if (keep_settings_) {
-        save_layout(engine.vfs);
-        browser_.save_settings(engine.vfs);
-        save_settings(engine.vfs, {.ui_scale = ui_scale_,
-                                   .tool = tool_,
-                                   .space = space_,
-                                   .handles_at = handles_at_,
-                                   .snap = snap_,
-                                   .drawer_share = drawer_share_,
-                                   .cell_grid = show_cells_,
-                                   .snap_ground = snap_ground_,
-                                   .colliders = engine.show_colliders,
-                                   .selected_colliders = engine.show_selected_colliders});
+void Editor::save_user_settings(app::Engine& engine) {
+    if (!keep_settings_) {
+        return;
     }
+    save_layout(engine.vfs);
+    browser_.save_settings(engine.vfs);
+    save_settings(engine.vfs, {.ui_scale = ui_scale_,
+                               .tool = tool_,
+                               .space = space_,
+                               .handles_at = handles_at_,
+                               .snap = snap_,
+                               .drawer_share = drawer_share_,
+                               .cell_grid = show_cells_,
+                               .snap_ground = snap_ground_,
+                               .colliders = engine.show_colliders,
+                               .selected_colliders = engine.show_selected_colliders,
+                               .cook_auto = cook_auto_,
+                               .fps_cap = fps_cap_kept_});
+}
+
+void Editor::shutdown(app::Engine& engine) {
+    watch_.stop(engine.jobs);
+    save_user_settings(engine);
     commands_.clear();
     release_holds();
+    effect_viewer_.shutdown(picture_engine(engine));
+    prefab_editor_.shutdown(picture_engine(engine));
+    pictures_.shutdown(picture_engine(engine));
     viewer_.shutdown(engine);
+}
+
+void Editor::draw(app::Engine& /*engine*/) {
+    pictures_.draw();
+    effect_viewer_.draw();
+    prefab_editor_.draw();
+}
+
+void Editor::show_in_resources(std::string_view path) {
+    browser_.show_file(path);
+    drawer_ = Drawer::Resources;
+}
+
+void Editor::update_sources(app::Engine& engine) {
+    const flecs::entity_t chosen = selection_.kind == Selection::Kind::Entity ? selection_.entity : 0;
+    if (chosen == sources_of_) {
+        return;
+    }
+    sources_of_ = chosen;
+    EntitySources sources;
+    sources.entity = chosen;
+    const flecs::world& ecs = engine.world.ecs();
+    if (chosen != 0 && ecs.is_alive(chosen)) {
+        core::FixedString<31> variant;
+        bool solid = false;
+        static_cast<void>(read_sources(ecs.entity(chosen), sources, variant, solid));
+    }
+    properties_.set_sources(sources);
+}
+
+bool Editor::read_sources(flecs::entity entity, EntitySources& sources, core::FixedString<31>& variant, bool& solid) {
+    // Its entry's own words for them (in its cell's file, or as the editor made it), from that file's folder.
+    EntityRecord recorded;
+    record(entity, recorded);
+    const std::string_view object = recorded.entry.object;
+    constexpr std::string_view kOpen = R"({"entities": [)";
+    constexpr std::string_view kClose = "]}";
+    core::Array<char> wrapped(editor_heap());
+    wrapped.resize(kOpen.size() + object.size() + kClose.size());
+    std::memcpy(wrapped.data(), kOpen.data(), kOpen.size());
+    std::memcpy(wrapped.data() + kOpen.size(), object.data(), object.size());
+    std::memcpy(wrapped.data() + kOpen.size() + object.size(), kClose.data(), kClose.size());
+    CellSource alone(editor_heap());
+    if (!recorded.has_entry || !alone.parse({wrapped.data(), wrapped.size()}) || alone.entity_count() != 1) {
+        return false;
+    }
+    const auto named = [&](std::string_view key, core::FixedString<255>& out) {
+        const std::string_view relative = alone.string_member(0, key);
+        char full[platform::kMaxPathLength];
+        size_t length = 0;
+        if (!relative.empty() && joined_path(recorded.entry.folder, relative, full, length)) {
+            static_cast<void>(out.assign(std::string_view(full, length)));
+        }
+    };
+    named("prefab", sources.prefab);
+    named("mesh", sources.mesh);
+    named("effect", sources.effect);
+    static_cast<void>(variant.assign(alone.string_member(0, "variant")));
+    solid = alone.string_member(0, "collision") == "mesh";
+    return true;
+}
+
+bool Editor::prefab_from_selection(app::Engine& engine, std::string_view path) {
+    const flecs::world& ecs = engine.world.ecs();
+    core::Array<flecs::entity_t> roots(editor_heap());
+    chosen_roots(engine, roots);
+    if (roots.empty()) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                        "Choose what the prefab is made of first: nothing placed is chosen"));
+        return false;
+    }
+    // Its origin: where the one the handles are on stands, in the world's axes.
+    flecs::entity_t first = roots[0];
+    for (const flecs::entity_t id : roots) {
+        first = id == selection_.entity ? id : first;
+    }
+    const auto* origin_at = ecs.entity(first).try_get<world::WorldTransform>();
+    const DVec3 origin = origin_at != nullptr ? origin_at->position : DVec3(0.0);
+    const size_t slash = path.rfind('/');
+    const std::string_view folder = slash == std::string_view::npos ? std::string_view() : path.substr(0, slash);
+    core::Array<PrefabDocPart> parts(editor_heap());
+    size_t left_out = 0;
+    for (const flecs::entity_t id : roots) {
+        const flecs::entity entity = ecs.entity(id);
+        const auto* at = entity.try_get<world::WorldTransform>();
+        EntitySources sources;
+        core::FixedString<31> variant;
+        bool solid = false;
+        PrefabDocPart part;
+        char relative[256];
+        size_t length = 0;
+        const auto take = [&](std::string_view full, core::FixedString<255>& out) {
+            return !full.empty() && relative_path(folder, full, relative, length) &&
+                   out.assign(std::string_view(relative, length));
+        };
+        bool any = false;
+        if (at != nullptr && read_sources(entity, sources, variant, solid)) {
+            if (take(sources.prefab.view(), part.prefab)) {
+                part.variant = variant;
+                any = true;
+            } else {
+                any = take(sources.mesh.view(), part.mesh);
+                any = take(sources.effect.view(), part.effect) || any;
+                part.collision = solid && !part.mesh.empty();
+            }
+        }
+        if (!any) {
+            ++left_out; // nothing of it to make a part from (a fog volume, a light, a thing with no entry)
+            continue;
+        }
+        char label[128];
+        entity_label(engine.assets, entity, label);
+        static_cast<void>(part.id.assign(std::string_view(label).substr(0, part.id.capacity())));
+        part.position = Vec3(at->position - origin);
+        part.set_rotation(at->rotation);
+        part.scale = at->scale;
+        parts.push(part);
+    }
+    if (parts.empty()) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                        "Nothing chosen has a model, an effect or a prefab to make a part of"));
+        return false;
+    }
+    if (!prefab_editor_.open_new_with(picture_engine(engine), path, parts.span(), message_)) {
+        return false;
+    }
+    static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                    "A new prefab of %zu parts%s: save it in the prefab editor, then place it from "
+                                    "Resources",
+                                    parts.size(), left_out > 0 ? " (some chosen had nothing to make a part of)" : ""));
+    return true;
+}
+
+void Editor::prefab_from_selection_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1) {
+        out.error("editor.prefab_from_selection takes the src:/ path the prefab will have");
+        return;
+    }
+    if (!editor->prefab_from_selection(*editor->engine_, args[0])) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("%s", editor->message_);
+}
+
+void Editor::ask_make_prefab(app::Engine& engine) {
+    // Beside what its first part is made from: the folder its name goes in.
+    const flecs::world& ecs = engine.world.ecs();
+    core::Array<flecs::entity_t> roots(editor_heap());
+    chosen_roots(engine, roots);
+    make_prefab_folder_.clear();
+    for (const flecs::entity_t id : roots) {
+        EntitySources sources;
+        core::FixedString<31> variant;
+        bool solid = false;
+        if (!make_prefab_folder_.empty() || !read_sources(ecs.entity(id), sources, variant, solid)) {
+            continue;
+        }
+        const std::string_view made_from = !sources.prefab.empty() ? sources.prefab.view()
+                                           : !sources.mesh.empty() ? sources.mesh.view()
+                                                                   : sources.effect.view();
+        if (const size_t slash = made_from.rfind('/'); slash != std::string_view::npos) {
+            static_cast<void>(make_prefab_folder_.assign(made_from.substr(0, slash)));
+        }
+    }
+    if (make_prefab_folder_.empty()) {
+        static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                        "Nothing chosen has a model, an effect or a prefab to make a part of"));
+        return;
+    }
+    static_cast<void>(std::snprintf(make_prefab_text_, sizeof(make_prefab_text_), "new_prefab"));
+    open_make_prefab_ = true;
+}
+
+void Editor::make_prefab_prompt(app::Engine& engine) {
+    constexpr const char* kPrompt = "Make Prefab from Selection";
+    if (open_make_prefab_) {
+        ImGui::OpenPopup(kPrompt);
+        open_make_prefab_ = false;
+    }
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(px(16.0f), px(14.0f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(8.0f), px(10.0f)));
+    if (ImGui::BeginPopupModal(kPrompt, nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+        const std::string_view folder = make_prefab_folder_.view().substr(std::string_view("src:/").size());
+        ImGui::Text("A new prefab of what's chosen, in %.*s", static_cast<int>(folder.size()), folder.data());
+        ImGui::TextColored(color(ThemeColor::TextSecondary),
+                           "It opens in the prefab editor. What's chosen stays as it is.");
+        ImGui::SetNextItemWidth(px(320.0f));
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        const bool entered = ImGui::InputText("##name", make_prefab_text_, sizeof(make_prefab_text_),
+                                              ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+        // Its name with the extension, whether that was typed or not.
+        char cleaned[128];
+        size_t length = 0;
+        core::FixedString<255> made = make_prefab_folder_;
+        bool valid = clean_file_name(make_prefab_text_, cleaned, length);
+        std::string_view name(cleaned, valid ? length : 0);
+        if (name.ends_with(".prefab")) {
+            name.remove_suffix(std::string_view(".prefab").size());
+        }
+        valid = valid && !name.empty() && made.append('/') && made.append(name) && made.append(".prefab");
+        const bool taken = valid && engine.vfs.exists(made.c_str());
+        if (!valid) {
+            ImGui::TextColored(color(ThemeColor::TextSecondary), "Lowercase letters, digits, _ - and . only");
+        } else if (taken) {
+            ImGui::TextColored(color(ThemeColor::Warning), "%.*s.prefab is there already",
+                               static_cast<int>(name.size()), name.data());
+        } else {
+            ImGui::TextColored(color(ThemeColor::TextSecondary), "%.*s.prefab: it's a file once it's saved",
+                               static_cast<int>(name.size()), name.data());
+        }
+        const ImVec2 button(px(96.0f), 0.0f);
+        ImGui::BeginDisabled(!valid || taken);
+        const bool make = (ImGui::Button("Make", button) || entered) && valid && !taken;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", button) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            ImGui::CloseCurrentPopup();
+        } else if (make) {
+            static_cast<void>(prefab_from_selection(engine, made.view())); // message_ says what came of it
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar(2);
+}
+
+bool Editor::view_effect(app::Engine& engine, std::string_view path) {
+    return effect_viewer_.open(picture_engine(engine), path, message_);
+}
+
+bool Editor::edit_prefab(app::Engine& engine, std::string_view path) {
+    return prefab_editor_.open(picture_engine(engine), path, message_);
+}
+
+bool Editor::new_prefab(app::Engine& engine, std::string_view path) {
+    return prefab_editor_.open_new(picture_engine(engine), path, message_);
+}
+
+void Editor::edit_prefab_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1) {
+        out.error("editor.edit_prefab takes a prefab's src:/ path");
+        return;
+    }
+    if (!editor->edit_prefab(*editor->engine_, args[0])) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("editing %.*s", static_cast<int>(args[0].size()), args[0].data());
+}
+
+void Editor::new_prefab_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1) {
+        out.error("editor.new_prefab takes the src:/ path the prefab will have");
+        return;
+    }
+    if (!editor->new_prefab(*editor->engine_, args[0])) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("a new prefab, %.*s: it's a file once it's saved", static_cast<int>(args[0].size()), args[0].data());
+}
+
+void Editor::prefab_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    PrefabEditor& prefab = editor->prefab_editor_;
+    if (!prefab.is_open()) {
+        out.error("no prefab is open in the prefab editor: editor.edit_prefab PATH opens one");
+        return;
+    }
+    const PictureEngine engine = picture_engine(*editor->engine_);
+    const std::string_view verb = args.empty() ? std::string_view() : args[0];
+    // Three numbers from an argument on.
+    const auto numbers = [&args](size_t from, Vec3& value) {
+        return args.size() == from + 3 && console::Args::parse_float(args[from], value.x) &&
+               console::Args::parse_float(args[from + 1], value.y) &&
+               console::Args::parse_float(args[from + 2], value.z);
+    };
+    const auto part_of = [&](std::string_view id) -> const PrefabDocPart* {
+        const uint32_t index = prefab.document().find_part(id);
+        return index == UINT32_MAX ? nullptr : &prefab.document().parts[index];
+    };
+    bool done = true;
+    bool known = true;
+    Vec3 value(0.0f);
+    bool on = false;
+    if (verb.empty()) {
+        // Only what it holds, below.
+    } else if (verb == "add" && (args.size() == 2 || numbers(2, value))) {
+        done = prefab.add_part(args[1], value);
+    } else if (verb == "remove" && args.size() == 2) {
+        done = prefab.remove_part(args[1]);
+    } else if (verb == "duplicate" && args.size() == 2) {
+        done = prefab.duplicate_part(args[1]);
+    } else if (verb == "rename" && args.size() == 3) {
+        done = prefab.rename_part(args[1], args[2]);
+    } else if ((verb == "move" || verb == "rotate" || verb == "scale") && numbers(2, value)) {
+        const PrefabDocPart* part = part_of(args[1]);
+        done = part != nullptr ? prefab.place_part(args[1], verb == "move" ? value : part->position,
+                                                   verb == "rotate" ? value : part->rotation_deg,
+                                                   verb == "scale" ? value : part->scale)
+                               : prefab.select(args[1]); // says there's none
+    } else if (verb == "light" && args.size() == 3 && args[2] == "off") {
+        done = prefab.set_light(args[1], nullptr);
+    } else if (verb == "light" && (args.size() == 4 || args.size() == 7)) {
+        // Its intensity and radius, and its colour if given; the rest as the part's light has it, or a light's own.
+        const PrefabDocPart* part = part_of(args[1]);
+        asset::LightDesc light = part != nullptr && part->has_light ? part->light : asset::LightDesc{};
+        const bool read = console::Args::parse_float(args[2], light.intensity) &&
+                          console::Args::parse_float(args[3], light.radius_m) &&
+                          (args.size() == 4 || (console::Args::parse_float(args[4], light.color[0]) &&
+                                                console::Args::parse_float(args[5], light.color[1]) &&
+                                                console::Args::parse_float(args[6], light.color[2])));
+        if (!read) {
+            out.error("editor.prefab light takes ID off, or ID INTENSITY RADIUS_M [R G B]");
+            return;
+        }
+        done = prefab.set_light(args[1], &light);
+    } else if (verb == "select" && args.size() <= 2) {
+        done = prefab.select(args.size() == 2 ? args[1] : std::string_view());
+    } else if (verb == "variant" && args.size() == 2) {
+        done = prefab.add_variant(args[1]);
+    } else if (verb == "delete_variant" && args.size() == 2) {
+        done = prefab.remove_variant(args[1]);
+    } else if (verb == "keep" && args.size() == 4 && console::Args::parse_bool(args[3], on)) {
+        done = prefab.leave_out(args[1], args[2], !on);
+    } else if (verb == "show" && args.size() <= 2) {
+        done = prefab.show_variant(args.size() == 2 ? args[1] : std::string_view());
+    } else if (verb == "undo" && args.size() == 1) {
+        done = prefab.undo();
+    } else if (verb == "redo" && args.size() == 1) {
+        done = prefab.redo();
+    } else if (verb == "save" && args.size() == 1) {
+        done = prefab.save(engine);
+    } else if (verb == "frame" && args.size() == 1) {
+        prefab.frame(true);
+    } else if (verb == "close" && args.size() == 1) {
+        prefab.close(engine); // as it is: what wasn't saved goes
+        out.info("closed");
+        return;
+    } else {
+        known = false;
+    }
+    if (!known) {
+        out.error("editor.prefab takes add, remove, duplicate, rename, move, rotate, scale, select, variant, "
+                  "delete_variant, keep, show, undo, redo, save, frame or close: help editor.prefab says how");
+        return;
+    }
+    if (!done) {
+        out.error("%s", prefab.message()[0] != '\0' ? prefab.message() : "nothing to do");
+        return;
+    }
+    const PrefabDocument& document = prefab.document();
+    const std::string_view path = prefab.path();
+    const std::string_view chosen = prefab.selected();
+    out.info("%.*s%s: %zu parts, %zu variants, %zu problems; chosen: %.*s", static_cast<int>(path.size()), path.data(),
+             prefab.dirty() ? " (changed, not saved)" : "", document.parts.size(), document.variants.size(),
+             prefab.problems().size(), static_cast<int>(chosen.size()), chosen.empty() ? "" : chosen.data());
+    for (const PrefabDocPart& part : document.parts) {
+        const char* made = !part.prefab.empty() ? part.prefab.c_str()
+                           : !part.mesh.empty() ? part.mesh.c_str()
+                                                : part.effect.c_str();
+        out.info("  %s: %s%s%s%s at %.4g %.4g %.4g, turned %.4g %.4g %.4g, scaled %.4g %.4g %.4g", part.id.c_str(),
+                 made, !part.mesh.empty() && !part.effect.empty() ? " + " : "",
+                 !part.mesh.empty() && !part.effect.empty() ? part.effect.c_str() : "",
+                 part.has_light ? (made[0] != '\0' ? " + a light" : "a light") : "",
+                 static_cast<double>(part.position.x), static_cast<double>(part.position.y),
+                 static_cast<double>(part.position.z), static_cast<double>(part.rotation_deg.x),
+                 static_cast<double>(part.rotation_deg.y), static_cast<double>(part.rotation_deg.z),
+                 static_cast<double>(part.scale.x), static_cast<double>(part.scale.y),
+                 static_cast<double>(part.scale.z));
+    }
+    for (const core::FixedString<159>& problem : prefab.problems()) {
+        out.info("  problem: %s", problem.c_str());
+    }
+}
+
+void Editor::effect_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    EffectViewer& viewer = editor->effect_viewer_;
+    if (!viewer.is_open()) {
+        out.error("no effect is open in the viewer: editor.view_effect PATH opens one");
+        return;
+    }
+    EffectPlayback& playback = viewer.playback();
+    const std::string_view verb = args.empty() ? std::string_view() : args[0];
+    float number = 0.0f;
+    bool on = false;
+    const bool has_number = args.size() == 2 && console::Args::parse_float(args[1], number);
+    if (verb == "play" && args.size() == 1) {
+        playback.playing = true;
+    } else if (verb == "hold" && args.size() == 1) {
+        playback.playing = false;
+    } else if (verb == "step" && (args.size() == 1 || has_number)) {
+        playback.step(args.size() == 1 ? 1 : static_cast<int>(std::lround(number)));
+    } else if (verb == "seek" && has_number) {
+        playback.seek(static_cast<double>(number));
+    } else if (verb == "speed" && has_number && number > 0.0f) {
+        playback.speed = number;
+    } else if (verb == "loop" && args.size() == 2 && console::Args::parse_bool(args[1], on)) {
+        playback.loop = on;
+    } else if (verb == "length" && has_number && number > 0.0f) {
+        playback.length_s = static_cast<double>(number);
+    } else if (verb == "hide" && has_number && number >= 0.0f) {
+        viewer.set_hidden(static_cast<uint32_t>(std::lround(number)));
+    } else if (verb == "frame" && args.size() == 1) {
+        viewer.frame();
+    } else if (verb == "close" && args.size() == 1) {
+        viewer.close(picture_engine(*editor->engine_));
+        out.info("closed");
+        return;
+    } else if (!args.empty()) {
+        out.error("editor.effect takes play, hold, step N, seek S, speed X, loop on|off, length S, hide MASK, frame "
+                  "or close");
+        return;
+    }
+    const std::string_view path = viewer.path();
+    out.info("%.*s: %s at %.3f s (step %llu), %.2gx%s, bar %.1f s; %zu emitters, step %.3f ms, draw %.3f ms",
+             static_cast<int>(path.size()), path.data(), playback.playing ? "playing" : "held", playback.age_s,
+             static_cast<unsigned long long>(playback.step_number()), static_cast<double>(playback.speed),
+             playback.loop ? ", looping" : "", playback.length_s, viewer.emitters().size(),
+             static_cast<double>(viewer.step_ms()), static_cast<double>(viewer.draw_ms()));
+    for (const EmitterRow& row : viewer.emitters()) {
+        out.info("  %s: %.4g a second, %u of %u alive%s", row.name.c_str(), static_cast<double>(row.rate_per_s),
+                 row.alive, row.capacity, row.held ? "" : " (holds nothing)");
+    }
+}
+
+void Editor::view_effect_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    if (args.size() != 1) {
+        out.error("editor.view_effect takes an effect's src:/ path");
+        return;
+    }
+    if (!editor->view_effect(*editor->engine_, args[0])) {
+        out.error("%s", editor->message_);
+        return;
+    }
+    out.info("viewing %.*s", static_cast<int>(args[0].size()), args[0].data());
+}
+
+PictureEngine Editor::picture_engine(app::Engine& engine) {
+    return {.device = &engine.device,
+            .shaders = &engine.shaders,
+            .assets = &engine.assets,
+            .gpu_assets = &engine.gpu_assets,
+            .jobs = &engine.jobs,
+            .vfs = &engine.vfs};
 }
 
 bool Editor::update(app::Engine& engine, float frame_s) {
@@ -429,6 +1066,10 @@ bool Editor::update(app::Engine& engine, float frame_s) {
         looking_ = true;
     }
     viewer_.set_camera_input(looking_);
+    // The pictures Resources waits for, one at a time; and the effect being looked at.
+    pictures_.update(picture_engine(engine), thumbnails_);
+    effect_viewer_.update(picture_engine(engine), frame_s, &engine.lighting);
+    prefab_editor_.update(picture_engine(engine), frame_s);
     return viewer_.update(engine, frame_s) && !quit_;
 }
 
@@ -504,20 +1145,68 @@ void Editor::ui(app::Engine& engine) {
     if (cell_map_.draw(engine, selection_, go_to)) {
         go_to_place(go_to);
     }
+    thumbnails_.update(engine.vfs); // every frame: the properties show pictures too, the drawer open or not
+    update_sources(engine);
     const bool open_asked = properties_.draw(engine, selection_, commands_);
+    if (const PropertiesRequest asked = properties_.take_request(); asked.kind != PropertiesRequest::Kind::None) {
+        switch (asked.kind) {
+        case PropertiesRequest::Kind::ShowFile:
+            show_in_resources(asked.path.view());
+            break;
+        case PropertiesRequest::Kind::EditPrefab:
+            static_cast<void>(edit_prefab(engine, asked.path.view()));
+            break;
+        case PropertiesRequest::Kind::ViewEffect:
+            static_cast<void>(view_effect(engine, asked.path.view()));
+            break;
+        case PropertiesRequest::Kind::None:
+            break;
+        }
+    }
     const bool opened = drawer(engine, panels_min, panels_size);
     gather_selection(engine);
     playground(engine);
+    effect_viewer_.ui(picture_engine(engine), icons_, kPlayground);
+    prefab_editor_.ui(picture_engine(engine), kPlayground,
+                      selection_.kind == Selection::Kind::File ? selection_.file.view() : std::string_view());
+    // What the prefab editor asks of the editor: a cook after its save (the watch does it by itself with Cook
+    // automatically on), a file shown in Resources, the window closed once its unsaved question is answered.
+    if (prefab_editor_.take_saved()) {
+        browser_.refresh(); // a new prefab's file is there now
+        if (!cook_auto_ || !watching_) {
+            cook_project(engine);
+        }
+    }
+    if (core::FixedString<255> shown; prefab_editor_.take_show_file(shown)) {
+        show_in_resources(shown.view());
+    }
+    if (core::FixedString<255> made; browser_.take_new_prefab(made)) {
+        if (new_prefab(engine, made.view())) {
+            drawer_ = Drawer::None; // out of the way of what was asked for
+        }
+    }
+    if (prefab_editor_.take_quit() && may_close(engine)) {
+        quit_ = true;
+    }
     shortcuts(engine);
     if (show_panel_ != nullptr && ImGui::GetFrameCount() > 2) { // once the panels exist
         ImGui::SetWindowFocus(show_panel_);
         show_panel_ = nullptr;
     }
-    if ((open_asked || opened) && selection_.kind == Selection::Kind::File &&
-        file_kind(selection_.file.view()) == "World") {
-        open_world(engine);
+    if ((open_asked || opened) && selection_.kind == Selection::Kind::File) {
+        // A world opens in place of the one shown; an effect in the viewer; a prefab in its editor.
+        if (file_kind(selection_.file.view()) == "World") {
+            open_world(engine);
+        } else if (file_kind(selection_.file.view()) == "Effect") {
+            static_cast<void>(view_effect(engine, selection_.file.view()));
+        } else if (file_kind(selection_.file.view()) == "Prefab") {
+            if (edit_prefab(engine, selection_.file.view())) {
+                drawer_ = Drawer::None;
+            }
+        }
     }
     unsaved_prompt(engine);
+    make_prefab_prompt(engine);
     if (selection_.frame_entity) {
         selection_.frame_entity = false;
         frame_selection(engine);
@@ -559,7 +1248,7 @@ void Editor::take_pick(app::Engine& engine) {
     if (answer.slot != render::kNothingPicked) {
         engine.world.ecs().each([&](flecs::entity entity, const world::RenderSlot& slot) {
             if (slot.slot == answer.slot) {
-                picked = entity.id();
+                picked = world::placement_of(entity).id(); // a part of a placed prefab stands for all of it
             }
         });
     }
@@ -603,8 +1292,12 @@ void Editor::gather_selection(app::Engine& engine) {
                 selected_entities_.push(entity.id());
                 return;
             }
+            // Up to what it's attached to, or for a part of a placed prefab, to its placement.
+            const auto* part = at.try_get<world::PrefabPart>();
             const auto* attached = at.try_get<flecs::Parent>();
-            at = attached != nullptr ? ecs.entity(attached->value) : at.parent();
+            at = part != nullptr       ? ecs.entity(part->placement)
+                 : attached != nullptr ? ecs.entity(attached->value)
+                                       : at.parent();
         }
     });
 }
@@ -695,6 +1388,9 @@ void Editor::header_row(app::Engine& engine) {
             save(engine);
         }
         ImGui::Separator();
+        world_menu(engine);
+        project_menu(engine);
+        ImGui::Separator();
         if (ImGui::MenuItem("Quit")) {
             if (unsaved()) {
                 pending_ = Pending::Quit; // asked first
@@ -733,6 +1429,13 @@ void Editor::header_row(app::Engine& engine) {
             static_cast<void>(drop_selection_to_ground(engine));
         }
         ImGui::Separator();
+        if (ImGui::MenuItem("Add Light")) {
+            static_cast<void>(add_light(engine));
+        }
+        if (ImGui::MenuItem("Make Prefab from Selection...", nullptr, false, an_entity)) {
+            ask_make_prefab(engine);
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem("Frame Selected", "F", false,
                             selection_.kind == Selection::Kind::Entity ||
                                 selection_.kind == Selection::Kind::Terrain)) {
@@ -750,6 +1453,27 @@ void Editor::header_row(app::Engine& engine) {
     prepare_menu_popup();
     if (ImGui::BeginMenu("Rendering Settings")) {
         ImGui::MenuItem("Temporal Anti-Aliasing", "F3", &engine.taa);
+        if (ImGui::BeginMenu("Renderer")) {
+            if (ImGui::MenuItem("Rasterized", nullptr, !engine.path_traced)) {
+                engine.path_traced = false;
+            }
+            if (ImGui::MenuItem("Path Traced", nullptr, engine.path_traced)) {
+                engine.path_traced = true;
+            }
+            // 0: direct light alone, for checking the rasterized direct light against it.
+            ImGui::SetNextItemWidth(ImGui::GetFontSize() * 6.0f);
+            ImGui::SliderInt("Bounces", &engine.path_tracer_bounces, 0, 64);
+            ImGui::Separator();
+            ImGui::MenuItem("Compare with Path Traced", nullptr, &engine.lighting_compare, !engine.path_traced);
+            ImGui::EndMenu();
+        }
+        ImGui::Separator();
+        ImGui::MenuItem("Light Boxes", nullptr, &engine.light_boxes);
+        ImGui::MenuItem("Ambient Occlusion", nullptr, &engine.ambient_occlusion);
+        ImGui::MenuItem("Radiance Cascades", nullptr, &engine.radiance_cascades);
+        ImGui::MenuItem("Auto Exposure", nullptr, &engine.auto_exposure);
+#if DE_BUILD_DEV
+#endif
         ImGui::EndMenu();
     }
     prepare_menu_popup();
@@ -762,6 +1486,17 @@ void Editor::header_row(app::Engine& engine) {
                 ui_scale_ = scale;
             }
         }
+        menu_section("Frame Rate Limit");
+        for (const uint32_t limit : kFrameRateLimits) {
+            char label[16] = "None";
+            if (limit != 0) {
+                static_cast<void>(std::snprintf(label, sizeof(label), "%u fps", limit));
+            }
+            if (ImGui::MenuItem(label, nullptr, engine.fps_cap == limit)) {
+                engine.fps_cap = limit;
+                fps_cap_kept_ = limit;
+            }
+        }
         ImGui::EndMenu();
     }
     prepare_menu_popup();
@@ -771,6 +1506,12 @@ void Editor::header_row(app::Engine& engine) {
         }
         if (ImGui::MenuItem("Output", nullptr, drawer_ == Drawer::Output)) {
             drawer_ = drawer_ == Drawer::Output ? Drawer::None : Drawer::Output;
+        }
+        if (engine.frame_debugger != nullptr) {
+            const bool open = engine.frame_debugger->open();
+            if (ImGui::MenuItem("Frame Debugger", "F8", open)) {
+                engine.frame_debugger->set_open(!open);
+            }
         }
         ImGui::Separator();
         if (ImGui::MenuItem("Reset Layout")) {
@@ -863,13 +1604,14 @@ void Editor::status_bar(app::Engine& engine, ImVec2 size) {
         }
         // A command line: the console's (` over the Playground opens its window too).
         ImGui::SameLine(0.0f, px(12.0f));
-        const float label_y = ImGui::GetCursorPosY() + ((ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f);
+        const float frame_y = ImGui::GetCursorPosY();
+        const float label_y = frame_y + ((ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f);
         const float label_x = ImGui::GetCursorPosX();
         ImGui::SetCursorPosY(label_y);
         const bool typing = engine.console_ui != nullptr && engine.console_ui->command_line_active();
         ImGui::TextColored(color(typing ? ThemeColor::Accent : ThemeColor::TextSecondary), "Cmd");
         ImGui::SameLine(label_x + ImGui::CalcTextSize("Cmd").x + px(6.0f));
-        ImGui::SetCursorPosY(label_y - ((ImGui::GetFrameHeight() - ImGui::GetFontSize()) * 0.5f));
+        ImGui::SetCursorPosY(frame_y);
         if (engine.console_ui != nullptr) {
             engine.console_ui->draw_command_line(px(380.0f), "a console command (help lists them)");
         }
@@ -878,16 +1620,12 @@ void Editor::status_bar(app::Engine& engine, ImVec2 size) {
                            : cell_map_.focused()          ? cell_map_.status()
                            : drawer_ == Drawer::Resources ? browser_.status()
                                                           : message_;
+        // After a framed item, text goes down by the frame's padding on its own: from the frame's top, not the label's.
         ImGui::SameLine(0.0f, px(14.0f));
-        ImGui::SetCursorPosY(label_y);
+        ImGui::SetCursorPosY(frame_y);
+        ImGui::AlignTextToFramePadding();
         ImGui::TextColored(color(ThemeColor::TextSecondary), "%s", text);
-        if (unsaved() || cooker_.running()) {
-            const char* state = cooker_.running() ? "Cooking..." : "Unsaved edits (Ctrl+S)";
-            ImGui::SameLine(std::max(ImGui::GetCursorPosX() + px(14.0f),
-                                     ImGui::GetWindowWidth() - ImGui::CalcTextSize(state).x - px(12.0f)));
-            ImGui::SetCursorPosY(label_y);
-            ImGui::TextColored(color(cooker_.running() ? ThemeColor::TextSecondary : ThemeColor::Warning), "%s", state);
-        }
+        cook_controls(engine, frame_y);
         status_hovered_ = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows);
     }
     ImGui::EndChild();
@@ -968,7 +1706,6 @@ bool Editor::drawer(app::Engine& engine, ImVec2 min, ImVec2 size) {
         const ImVec2 room(size.x, std::max(1.0f, height - edge - row));
         if (content) {
             if (ImGui::BeginChild("##content", room)) {
-                thumbnails_.update(engine.vfs);
                 opened = browser_.draw(engine.vfs, selection_);
                 if (browser_.take_files_changed()) {
                     static_cast<void>(cell_sources_.scan(engine.vfs)); // cells moved or renamed: their sources anew
@@ -1227,14 +1964,16 @@ void Editor::playground(app::Engine& engine) {
         if (engine.frame_stats && engine.stats_panel != nullptr) {
             engine.stats_panel->draw_in_window(corner.x, corner.y, size.x, size.y);
         }
-        if (engine.freeze_cull) {
-            tools::draw_viewport_notice(draw, corner.x, corner.y, size.x, "CULL FROZEN (F4)");
+        char notice_text[64];
+        if (const char* notice = app::viewport_notice(engine, notice_text); notice != nullptr) {
+            tools::draw_viewport_notice(draw, corner.x, corner.y, size.x, notice);
         }
         engine.viewport.overlays_drawn = true;
         draw->PushClipRect(corner, far_corner, true);
         if (show_cells_) {
             draw_cell_grid(engine, view, draw);
         }
+        draw_light_reach(engine, view, draw);
         // Alt keeps the mouse for the camera: no handle takes it then.
         const bool mouse_free = playground_hovered_ && !looking_ && !io.KeyAlt && !navigation_.dragging();
         gizmo_.set_ground(snap_ground_ ? this : nullptr);
@@ -1303,6 +2042,9 @@ void Editor::shortcuts(app::Engine& engine) {
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
         save(engine);
+    }
+    if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_B, ImGuiInputFlags_RouteGlobal)) {
+        cook_project(engine);
     }
     if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_D, ImGuiInputFlags_RouteGlobal)) {
         duplicate_selection(engine);
@@ -1404,12 +2146,12 @@ void Editor::save(app::Engine& engine) {
     DE_LOG_INFO("editor", "%s", message_);
 }
 
-void Editor::start_cook(app::Engine& engine) {
-    if (cooking_.empty() || cooker_.running()) {
+void Editor::start_cook(app::Engine& engine, bool whole_project) {
+    if ((cooking_.empty() && !whole_project) || cooker_.running()) {
         return;
     }
-    // In the background, the open project into the cooked folder the engine reads: cells and worlds (the shaders stay
-    // as they are).
+    // In the background, the open project into the cooked folder the engine reads: everything in it that has changed
+    // (the shaders stay as they are). A save's cook is judged by what the save wrote, the whole project's by all of it.
     const core::Result<platform::PathString> cooker = platform::program_beside_engine("cooker");
     const char* src_root = engine.vfs.mount_root(platform::Mount::Src);
     const char* game_root = engine.vfs.mount_root(platform::Mount::Game);
@@ -1417,8 +2159,107 @@ void Editor::start_cook(app::Engine& engine) {
         const char* args[] = {cooker->c_str(), "--project", src_root, "--out", game_root, "--no-shaders"};
         if (core::Result<platform::Process> started = platform::Process::start(args)) {
             cooker_ = std::move(*started);
+            cook_whole_ = whole_project;
+            // A save has just written files the watch hasn't seen: what they were before says nothing.
+            cook_start_stamp_ = whole_project ? watch_.stamp() : 0;
+        } else {
+            DE_LOG_ERROR("editor", "the cooker didn't start: %s", started.error().message);
+        }
+    } else {
+        DE_LOG_ERROR("editor", "no cooker beside the engine, or no project open: nothing cooked");
+    }
+    if (!cooker_.running()) {
+        cook_failed_ = true;
+        static_cast<void>(std::snprintf(cook_state_, sizeof(cook_state_), "The cooker didn't start: see Output"));
+    }
+}
+
+const char* Editor::cook_project(app::Engine& engine) {
+    if (cooker_.running()) {
+        return "Already cooking";
+    }
+    start_cook(engine, true);
+    return cooker_.running() ? "Cooking the project" : "The cooker didn't start: the Output says why";
+}
+
+void Editor::cook_command(void* user, const console::Args& /*args*/, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    const char* said = editor->cook_project(*editor->engine_);
+    if (editor->cooker_.running()) {
+        out.info("%s", said);
+    } else {
+        out.error("%s", said);
+    }
+}
+
+void Editor::watch_project(app::Engine& engine) {
+    if (!watching_ || engine.vfs.mount_root(platform::Mount::Src) == nullptr) {
+        return;
+    }
+    watch_.update(engine.vfs, engine.jobs, ImGui::GetIO().DeltaTime);
+    if (cook_marks_due_ && watch_.ended() >= cook_marks_look_) {
+        cook_marks_due_ = false;
+        // What the files are now is what's cooked. Unless they changed while it cooked (the cooker's own new metas, or
+        // someone's edit): with the switch on, what it started from stands, and one more cook settles it.
+        const uint64_t now = watch_.stamp();
+        cooked_stamp_ = cook_auto_ && cook_start_stamp_ != 0 && now != cook_start_stamp_ ? cook_start_stamp_ : now;
+    }
+    if (cook_auto_ && !cooker_.running() && !cook_marks_due_ && watch_.settled() && watch_.stamp() != cooked_stamp_) {
+        start_cook(engine, true);
+        if (!cooker_.running()) {
+            cooked_stamp_ = watch_.stamp(); // it can't be started (said in the Output): not again every frame
         }
     }
+}
+
+void Editor::report_cook(app::Engine& engine, int exit_code) {
+    const auto report = engine.vfs.read_whole_file("game:/cook_report.json", editor_heap());
+    if (!report) {
+        cook_failed_ = true;
+        static_cast<void>(std::snprintf(cook_state_, sizeof(cook_state_), "Cook failed (exit %d)", exit_code));
+        DE_LOG_ERROR("cook", "the cooker ended with %d and left no report (game:/cook_report.json)", exit_code);
+        return;
+    }
+    const std::string_view text(reinterpret_cast<const char*>(report->data()), report->size());
+    // The report's own layout: "cooked": N in its stats, then a severity, a path and a message per finding.
+    const auto number_after = [&text](std::string_view key) {
+        const size_t at = text.find(key);
+        return at == std::string_view::npos ? 0U
+                                            : static_cast<uint32_t>(to_number(text.substr(at + key.size(), 12), 0.0f));
+    };
+    const auto value_after = [&text](size_t from, size_t until, std::string_view key) {
+        const size_t at = text.find(key, from);
+        if (at == std::string_view::npos || at > until) {
+            return std::string_view();
+        }
+        const size_t begin = at + key.size();
+        const size_t close = text.find('"', begin);
+        return close == std::string_view::npos ? std::string_view() : text.substr(begin, close - begin);
+    };
+    const uint32_t cooked = number_after(R"("cooked": )");
+    constexpr std::string_view kError = R"("severity": "error")";
+    uint32_t errors = 0;
+    for (size_t at = text.find(kError); at != std::string_view::npos; at = text.find(kError, at + 1)) {
+        const size_t end = text.find('}', at);
+        const std::string_view path = value_after(at, end, R"("path": ")");
+        const std::string_view message = value_after(at, end, R"("message": ")");
+        DE_LOG_ERROR("cook", "%.*s: %.*s", static_cast<int>(path.size()), path.data(), static_cast<int>(message.size()),
+                     message.data());
+        ++errors;
+    }
+    cook_failed_ = errors > 0 || exit_code != 0;
+    if (errors > 0) {
+        static_cast<void>(std::snprintf(cook_state_, sizeof(cook_state_), "Cooked %u, %u %s: see Output", cooked,
+                                        errors, errors == 1 ? "error" : "errors"));
+    } else if (exit_code != 0) {
+        static_cast<void>(std::snprintf(cook_state_, sizeof(cook_state_), "Cook failed (exit %d)", exit_code));
+    } else if (cooked > 0) {
+        static_cast<void>(
+            std::snprintf(cook_state_, sizeof(cook_state_), "Cooked %u %s", cooked, cooked == 1 ? "file" : "files"));
+    } else {
+        static_cast<void>(std::snprintf(cook_state_, sizeof(cook_state_), "Cooked: nothing had changed"));
+    }
+    DE_LOG_INFO("cook", "%s", cook_state_);
 }
 
 asset::AssetHandle Editor::hold(const asset::AssetRef& ref) {
@@ -1467,8 +2308,23 @@ flecs::entity Editor::make(const EntityRecord& record) {
         entity.set(
             world::MeshCollider{.collision = hold({.id = record.collision, .type = asset::AssetType::Collision})});
     }
+    if (record.effect.is_valid()) {
+        entity.set(world::EffectInstance{.effect = hold({.id = record.effect, .type = asset::AssetType::Effect})});
+    }
+    if (record.prefab.is_valid()) {
+        // Its parts are made once the prefab is loaded: by the next frame if it already is.
+        entity.set(world::PrefabInstance{.prefab = hold({.id = record.prefab, .type = asset::AssetType::Prefab}),
+                                         .variant = record.variant});
+        entity.add<world::PrefabPending>();
+    }
     if (record.has_fog) {
         entity.set(record.fog);
+    }
+    if (record.has_light) {
+        entity.set(record.light);
+    }
+    if (record.has_water) {
+        entity.set(record.water);
     }
     // In its folder; one the editor made has nothing filed yet.
     EditorFolder folder = record.folder;
@@ -1495,9 +2351,24 @@ void Editor::record(flecs::entity entity, EntityRecord& out) {
         collider != nullptr && collider->collision.is_valid()) {
         out.collision = assets.asset(collider->collision).id;
     }
+    if (const auto* effect = entity.try_get<world::EffectInstance>(); effect != nullptr && effect->effect.is_valid()) {
+        out.effect = assets.asset(effect->effect).id;
+    }
+    if (const auto* placed = entity.try_get<world::PrefabInstance>(); placed != nullptr && placed->prefab.is_valid()) {
+        out.prefab = assets.asset(placed->prefab).id;
+        out.variant = placed->variant;
+    }
     if (const auto* fog = entity.try_get<world::FogVolume>()) {
         out.has_fog = true;
         out.fog = *fog;
+    }
+    if (const auto* light = entity.try_get<world::LocalLight>()) {
+        out.has_light = true;
+        out.light = *light;
+    }
+    if (const auto* water = entity.try_get<world::WaterBody>()) {
+        out.has_water = true;
+        out.water = *water;
     }
     out.is_static = entity.has<world::StaticTransform>();
     if (const auto* folder = entity.try_get<EditorFolder>()) {
@@ -1890,7 +2761,7 @@ void Editor::preview_model(app::Engine& engine, const View& view, bool hovering,
     const std::string_view path = dragging ? std::string_view(static_cast<const char*>(drag->Data),
                                                               static_cast<size_t>(std::max(drag->DataSize - 1, 0)))
                                            : std::string_view(preview_flag_);
-    if (file_kind(path) != "Model") {
+    if (file_kind(path) != "Model" && file_kind(path) != "Effect" && file_kind(path) != "Prefab") {
         end_preview(engine);
         return;
     }
@@ -1921,8 +2792,12 @@ void Editor::end_preview(app::Engine& engine) {
 }
 
 bool Editor::model_record(app::Engine& engine, std::string_view path, const DVec3& point, EntityRecord& out) {
-    if (file_kind(path) != "Model") {
-        static_cast<void>(std::snprintf(message_, sizeof(message_), "Only models (.gltf, .glb, .fbx) can be placed"));
+    const bool effect = file_kind(path) == "Effect";
+    const bool prefab = file_kind(path) == "Prefab";
+    if (file_kind(path) != "Model" && !effect && !prefab) {
+        static_cast<void>(
+            std::snprintf(message_, sizeof(message_),
+                          "Only models (.gltf, .glb, .fbx), effects (.vfx) and prefabs (.prefab) can be placed"));
         return false;
     }
     asset::Guid guid;
@@ -1932,18 +2807,23 @@ bool Editor::model_record(app::Engine& engine, std::string_view path, const DVec
                                         static_cast<int>(path.size()), path.data()));
         return false;
     }
-    // Its entry: named after its file, the model by its name from its own folder, solid as props are.
+    // Its entry: named after its file, the model by its name from its own folder, solid as props are; or the effect
+    // it plays or the prefab it places, likewise.
     const size_t slash = path.rfind('/');
     const std::string_view file = path.substr(slash + 1);
     const std::string_view stem = file.substr(0, file.rfind('.'));
     out = EntityRecord{};
     out.transform = {.position = point};
-    out.mesh = mesh;
+    // The source's own asset: a model's mesh, the effect, or the prefab.
+    (prefab ? out.prefab : effect ? out.effect : out.mesh) = mesh;
     out.is_static = true;
     out.has_entry = true;
-    static_cast<void>(std::snprintf(
-        out.entry.object, sizeof(out.entry.object), R"({"name": "%.*s", "mesh": "%.*s", "collision": "mesh"})",
-        static_cast<int>(stem.size()), stem.data(), static_cast<int>(file.size()), file.data()));
+    static_cast<void>(std::snprintf(out.entry.object, sizeof(out.entry.object),
+                                    prefab   ? R"({"name": "%.*s", "prefab": "%.*s"})"
+                                    : effect ? R"({"name": "%.*s", "effect": "%.*s"})"
+                                             : R"({"name": "%.*s", "mesh": "%.*s", "collision": "mesh"})",
+                                    static_cast<int>(stem.size()), stem.data(), static_cast<int>(file.size()),
+                                    file.data()));
     const std::string_view folder = path.substr(0, slash);
     const size_t folder_length = std::min(folder.size(), sizeof(out.entry.folder) - 1);
     std::memcpy(out.entry.folder, folder.data(), folder_length);
@@ -1954,6 +2834,111 @@ bool Editor::model_record(app::Engine& engine, std::string_view path, const DVec
     unique_name(engine, out.entry.name, name);
     static_cast<void>(rename_entry(out.entry, name));
     return true;
+}
+
+bool Editor::add_light(app::Engine& engine, const DVec3* at) {
+    // Where: given, or a man's height above where the middle of the Playground meets the ground.
+    DVec3 point(0.0);
+    if (at != nullptr) {
+        point = *at;
+    } else {
+        const ImVec2 middle(last_view_.min.x + (last_view_.size.x * 0.5f),
+                            last_view_.min.y + (last_view_.size.y * 0.5f));
+        point = drop_point(engine, last_view_, middle) + DVec3(0.0, 1.8, 0.0);
+    }
+    EntityRecord placed;
+    placed.transform = {.position = point};
+    placed.is_static = true;
+    placed.has_light = true;
+    placed.light = world::LocalLight{.color = {1.0f, 0.78f, 0.55f}, .intensity = 2.0f, .radius_m = 6.0f}; // a warm lamp
+    // Its entry: a light and nothing else. The save writes its values as they are then.
+    placed.has_entry = true;
+    static_cast<void>(
+        std::snprintf(placed.entry.object, sizeof(placed.entry.object), R"({"name": "light", "light": {}})"));
+    static_cast<void>(std::snprintf(placed.entry.folder, sizeof(placed.entry.folder), "src:/content"));
+    static_cast<void>(std::snprintf(placed.entry.name, sizeof(placed.entry.name), "light"));
+    char name[128];
+    unique_name(engine, placed.entry.name, name);
+    static_cast<void>(rename_entry(placed.entry, name));
+    const flecs::entity made = make(placed);
+    commands_.created(made);
+    selection_.select_entity(made.id());
+    static_cast<void>(std::snprintf(message_, sizeof(message_),
+                                    "Added %s: its colour, intensity and radius are in Properties (saved into its "
+                                    "cell with Ctrl+S)",
+                                    placed.entry.name));
+    return true;
+}
+
+void Editor::add_light_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    const bool placed = args.size() == 3 && console::Args::parse_float(args[0], x) &&
+                        console::Args::parse_float(args[1], y) && console::Args::parse_float(args[2], z);
+    if (!args.empty() && !placed) {
+        out.error("editor.add_light takes nothing, or a place: x y z in meters");
+        return;
+    }
+    const DVec3 point(static_cast<double>(x), static_cast<double>(y), static_cast<double>(z));
+    static_cast<void>(editor->add_light(*editor->engine_, placed ? &point : nullptr));
+    out.info("%s", editor->message_);
+}
+
+void Editor::draw_light_reach(app::Engine& engine, const View& view, ImDrawList* draw) {
+    if (selection_.kind != Selection::Kind::Entity) {
+        return;
+    }
+    const flecs::world& ecs = engine.world.ecs();
+    constexpr int kSegments = 48;
+    const ImU32 ring = IM_COL32(245, 197, 57, 200); // a warm yellow
+    const auto reach_of = [&](flecs::entity entity) {
+        const auto* light = entity.try_get<world::LocalLight>();
+        const auto* at = entity.try_get<world::WorldTransform>();
+        if (light == nullptr || at == nullptr) {
+            return;
+        }
+        const float scale = std::max({std::abs(at->scale.x), std::abs(at->scale.y), std::abs(at->scale.z)});
+        const auto reach = static_cast<double>(light->radius_m * scale);
+        // A ring about each axis: a sphere's outline from any side.
+        for (int axis = 0; axis < 3; ++axis) {
+            ImVec2 last;
+            bool last_seen = false;
+            for (int i = 0; i <= kSegments; ++i) {
+                const double angle = glm::two_pi<double>() * static_cast<double>(i) / static_cast<double>(kSegments);
+                DVec3 offset(0.0);
+                offset[(axis + 1) % 3] = std::cos(angle) * reach;
+                offset[(axis + 2) % 3] = std::sin(angle) * reach;
+                ImVec2 now;
+                const bool seen = view.project(at->position + offset, now);
+                if (seen && last_seen) {
+                    draw->AddLine(last, now, ring, px(1.0f));
+                }
+                last = now;
+                last_seen = seen;
+            }
+        }
+        // A spot: the way it shines.
+        if (light->cone_deg > 0.0f) {
+            ImVec2 from;
+            ImVec2 to;
+            const DVec3 tip = at->position + (DVec3(at->rotation * Vec3(0.0f, 0.0f, -1.0f)) * reach);
+            if (view.project(at->position, from) && view.project(tip, to)) {
+                draw->AddLine(from, to, ring, px(1.5f));
+            }
+        }
+    };
+    for (const flecs::entity_t id : selection_.entities) {
+        if (!ecs.is_alive(id)) {
+            continue;
+        }
+        const flecs::entity entity = ecs.entity(id);
+        reach_of(entity);
+        if (const auto* placed = entity.try_get<world::PrefabInstance>(); placed != nullptr) {
+            world::each_prefab_part(ecs, placed->first_part, reach_of);
+        }
+    }
 }
 
 bool Editor::place_model_at(app::Engine& engine, std::string_view path, const DVec3& point) {
@@ -2033,7 +3018,7 @@ void Editor::place_command(void* user, const console::Args& args, console::Outpu
         numbers = parsed.ec == std::errc() && parsed.ptr == word.data() + word.size();
     }
     if (!numbers) {
-        out.error("editor.place takes a model's src:/ path and x y z");
+        out.error("editor.place takes a model's, an effect's or a prefab's src:/ path and x y z");
         return;
     }
     if (!editor->place_model_at(*editor->engine_, args[0], DVec3(place[0], place[1], place[2]))) {
@@ -2046,7 +3031,7 @@ void Editor::place_command(void* user, const console::Args& args, console::Outpu
 void Editor::drop_command(void* user, const console::Args& args, console::Output& out) {
     auto* editor = static_cast<Editor*>(user);
     if (args.size() != 1 || editor->last_view_.size.x <= 0.0f) {
-        out.error("editor.drop takes a model's src:/ path, with the Playground shown");
+        out.error("editor.drop takes a model's or an effect's src:/ path, with the Playground shown");
         return;
     }
     const View& view = editor->last_view_;
@@ -2409,8 +3394,15 @@ void Editor::delete_command(void* user, const console::Args& args, console::Outp
 }
 
 bool Editor::may_close(app::Engine& /*engine*/) {
-    if (!unsaved() || !keep_settings_) {
-        return true; // nothing to lose (or a picture's run)
+    if (!keep_settings_) {
+        return true; // a picture's run
+    }
+    // The prefab open in its editor first, then the world's edits: each asks for itself.
+    if (!prefab_editor_.may_quit()) {
+        return false;
+    }
+    if (!unsaved()) {
+        return true; // nothing to lose
     }
     pending_ = Pending::Quit;
     return false;
@@ -2430,8 +3422,9 @@ void Editor::unsaved_prompt(app::Engine& engine) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(px(8.0f), px(10.0f)));
     if (ImGui::BeginPopupModal(kPrompt, nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
-        ImGui::TextUnformatted(pending_ == Pending::Quit ? "Save your edits before closing?"
-                                                         : "Save your edits before opening another world?");
+        ImGui::TextUnformatted(pending_ == Pending::Quit          ? "Save your edits before closing?"
+                               : pending_ == Pending::OpenProject ? "Save your edits before opening another project?"
+                                                                  : "Save your edits before opening another world?");
         ImGui::TextColored(color(ThemeColor::TextSecondary), "What isn't saved is lost.");
         enum class Choice : uint8_t { None, Save, Discard, Cancel };
         Choice choice = Choice::None;
@@ -2458,6 +3451,8 @@ void Editor::unsaved_prompt(app::Engine& engine) {
             if (choice == Choice::Discard || (choice == Choice::Save && !unsaved())) {
                 if (pending == Pending::Quit) {
                     quit_ = true; // the cooker, if it's running, finishes on its own
+                } else if (pending == Pending::OpenProject) {
+                    open_project(engine, true);
                 } else {
                     open_world(engine, true);
                 }
@@ -2612,7 +3607,9 @@ void Editor::follow_saves(app::Engine& engine) {
                 DE_LOG_ERROR("editor", "%s didn't cook: game:/cook_report.json says why", path.c_str());
             }
         }
-        if (failed == 0) {
+        if (cook_whole_) {
+            report_cook(engine, code); // the whole project's: by all the report says
+        } else if (failed == 0) {
             static_cast<void>(std::snprintf(message_, sizeof(message_), "Saved and cooked"));
             DE_LOG_INFO("editor", "the saved cells cooked%s: hot reload brings them in",
                         code == 0 ? "" : " (something else didn't: the cook report says what)");
@@ -2622,7 +3619,13 @@ void Editor::follow_saves(app::Engine& engine) {
                                             failed == 1 ? "cell" : "cells"));
         }
         cooker_ = {};
+        cook_whole_ = false;
+        // What the files are now is what's cooked: the first look to start from here says what that is.
+        cook_marks_due_ = true;
+        cook_marks_look_ = watch_.started() + 1;
+        watch_.look_now();
     }
+    watch_project(engine);
     // What the commands and the selection name, where it came from, while it's alive; and after a cell is spawned
     // again, what took its place.
     const flecs::world& ecs = engine.world.ecs();
@@ -2728,6 +3731,276 @@ void Editor::frame_selection(app::Engine& engine) {
     navigation_.frame(camera_pose(), center, std::max(radius_m, 0.25f), fov_rad);
 }
 
+void Editor::cook_controls(app::Engine& engine, float frame_y) {
+    // What the cook's doing, or what's waiting on one.
+    const bool stale = !cook_auto_ && cooked_stamp_ != 0 && watch_.stamp() != cooked_stamp_;
+    const char* state = cooker_.running() ? "Cooking..."
+                        : unsaved()       ? "Unsaved edits (Ctrl+S)"
+                        : stale           ? "Files changed: not cooked"
+                                          : cook_state_;
+    const bool warns = !cooker_.running() && (unsaved() || stale || cook_failed_);
+    constexpr const char* kAuto = "Cook automatically";
+    constexpr const char* kCook = "Cook";
+    const float gap = px(6.0f);
+    const float state_width = state[0] != '\0' ? ImGui::CalcTextSize(state).x + px(12.0f) : 0.0f;
+    const float width = state_width + status_button_width(kAuto) + gap + status_button_width(kCook);
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + px(14.0f), ImGui::GetWindowWidth() - width - px(8.0f)));
+    if (state[0] != '\0') {
+        ImGui::SetCursorPosY(frame_y);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextColored(color(warns ? ThemeColor::Warning : ThemeColor::TextSecondary), "%s", state);
+        ImGui::SameLine(0.0f, px(12.0f));
+    }
+    ImGui::SetCursorPosY(frame_y);
+    if (status_button("##cook automatically", kAuto, cook_auto_)) {
+        cook_auto_ = !cook_auto_;
+    }
+    if (ImGui::IsItemHovered()) {
+        tooltip("Cook by itself whenever a file of the project changes: a model dropped in, a file edited by hand");
+    }
+    ImGui::SameLine(0.0f, gap);
+    ImGui::SetCursorPosY(frame_y);
+    if (status_button("##cook", kCook, false)) {
+        cook_project(engine);
+    }
+    if (ImGui::IsItemHovered()) {
+        tooltip("Cook the project now, in the background: what changed shows as it's done (Ctrl+B)");
+    }
+}
+
+namespace {
+
+constexpr std::string_view kContentRoot = "src:/content/";
+constexpr std::string_view kWorldExtension = ".world";
+
+// A world's name: its place under content, without its extension ("terrain/coast").
+std::string_view world_name(const platform::PathString& file) {
+    std::string_view name = file.view().substr(kContentRoot.size());
+    name.remove_suffix(kWorldExtension.size());
+    return name;
+}
+
+} // namespace
+
+void Editor::list_worlds(app::Engine& engine) {
+    // Every .world under src:/content, and the ID the cooker gave each (none: it hasn't seen it).
+    world_files_.clear();
+    world_ids_.clear();
+    core::Array<platform::PathString> folders(editor_heap());
+    platform::PathString root;
+    root.assign("src:/content");
+    folders.push(root);
+    while (!folders.empty()) {
+        const platform::PathString folder = folders.back();
+        folders.pop();
+        static_cast<void>(engine.vfs.list(folder.c_str(), [&](const char* name, bool is_directory) {
+            platform::PathString path = folder;
+            if (!path.append('/') || !path.append(name)) {
+                return;
+            }
+            if (is_directory) {
+                folders.push(path);
+            } else if (path.view().ends_with(kWorldExtension)) {
+                world_files_.push(path);
+            }
+        }));
+    }
+    std::ranges::sort(world_files_,
+                      [](const platform::PathString& a, const platform::PathString& b) { return a.view() < b.view(); });
+    for (const platform::PathString& path : world_files_) {
+        asset::Guid guid;
+        asset::AssetId id;
+        world_ids_.push(source_asset_id(engine.vfs, path.view(), guid, id) ? id : asset::AssetId{});
+    }
+}
+
+void Editor::list_projects(app::Engine& engine) {
+    // Each folder beside the engine's own projects that has its <name>.deproject in it.
+    project_names_.clear();
+    static_cast<void>(engine.vfs.list("engine:/projects", [&](const char* name, bool is_directory) {
+        core::FixedString<63> project;
+        platform::PathString marker;
+        if (is_directory && project.assign(name) && marker.assign("engine:/projects/") && marker.append(name) &&
+            marker.append('/') && marker.append(name) && marker.append(".deproject") &&
+            engine.vfs.exists(marker.c_str())) {
+            project_names_.push(project);
+        }
+    }));
+    std::ranges::sort(project_names_, [](const core::FixedString<63>& a, const core::FixedString<63>& b) {
+        return a.view() < b.view();
+    });
+}
+
+std::string_view Editor::open_project_name(const app::Engine& engine) {
+    const char* root = engine.vfs.mount_root(platform::Mount::Src);
+    const std::string_view open = root != nullptr ? std::string_view(root) : std::string_view();
+    return open.substr(open.rfind('/') + 1);
+}
+
+void Editor::open_world_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    app::Engine& engine = *editor->engine_;
+    if (args.size() > 1) {
+        out.error("editor.open_world takes one world's name (editor.open_world alone lists them)");
+        return;
+    }
+    editor->list_worlds(engine);
+    editor->worlds_listed_ = false; // the menu lists again when it next opens
+    if (args.empty()) {
+        for (size_t i = 0; i < editor->world_files_.size(); ++i) {
+            const std::string_view name = world_name(editor->world_files_[i]);
+            const asset::AssetId id = editor->world_ids_[i];
+            out.info("%.*s%s", static_cast<int>(name.size()), name.data(),
+                     !id.is_valid()                     ? "  (new to the cooker: cook the project first)"
+                     : id == editor->viewer_.world_id() ? "  (open)"
+                                                        : "");
+        }
+        if (editor->world_files_.empty()) {
+            out.info("No worlds in this project");
+        }
+        return;
+    }
+    for (size_t i = 0; i < editor->world_files_.size(); ++i) {
+        if (world_name(editor->world_files_[i]) != args[0]) {
+            continue;
+        }
+        if (!editor->world_ids_[i].is_valid()) {
+            out.error("%s is new to the cooker: cook the project first", editor->world_files_[i].c_str());
+        } else if (editor->world_ids_[i] == editor->viewer_.world_id()) {
+            out.info("%s is the world that's open", editor->world_files_[i].c_str());
+        } else {
+            editor->selection_.select_file(editor->world_files_[i].view());
+            editor->open_world(engine);
+            out.info("%s", editor->pending_ == Pending::OpenWorld ? "Unsaved edits: asked in the editor first"
+                                                                  : "Opening it");
+        }
+        return;
+    }
+    out.error("No world of that name (editor.open_world alone lists them)");
+}
+
+void Editor::open_project_command(void* user, const console::Args& args, console::Output& out) {
+    auto* editor = static_cast<Editor*>(user);
+    app::Engine& engine = *editor->engine_;
+    if (args.size() > 1) {
+        out.error("editor.open_project takes one project's name (editor.open_project alone lists them)");
+        return;
+    }
+    editor->list_projects(engine);
+    editor->projects_listed_ = false; // the menu lists again when it next opens
+    const std::string_view open = open_project_name(engine);
+    if (args.empty()) {
+        for (const core::FixedString<63>& name : editor->project_names_) {
+            out.info("%s%s", name.c_str(), name.view() == open ? "  (open)" : "");
+        }
+        if (editor->project_names_.empty()) {
+            out.info("No projects beside the engine");
+        }
+        return;
+    }
+    for (const core::FixedString<63>& name : editor->project_names_) {
+        if (name.view() != args[0]) {
+            continue;
+        }
+        if (name.view() == open) {
+            out.info("%s is the project that's open", name.c_str());
+            return;
+        }
+        editor->project_to_open_ = name;
+        editor->open_project(engine);
+        if (editor->pending_ == Pending::OpenProject) {
+            out.info("Unsaved edits: asked in the editor first");
+        } else if (editor->quit_) {
+            out.info("Opening %s in an editor of its own; this one closes", name.c_str());
+        } else {
+            out.error("%s", editor->message_);
+        }
+        return;
+    }
+    out.error("No project of that name beside the engine (editor.open_project alone lists them)");
+}
+
+void Editor::world_menu(app::Engine& engine) {
+    if (!ImGui::BeginMenu("Open World")) {
+        worlds_listed_ = false;
+        return;
+    }
+    if (!worlds_listed_) {
+        worlds_listed_ = true; // once as the menu opens
+        list_worlds(engine);
+    }
+    if (world_files_.empty()) {
+        ImGui::MenuItem("No worlds in this project", nullptr, false, false);
+    }
+    for (size_t i = 0; i < world_files_.size(); ++i) {
+        const std::string_view name = world_name(world_files_[i]);
+        char label[platform::kMaxPathLength + 1];
+        static_cast<void>(std::snprintf(label, sizeof(label), "%.*s", static_cast<int>(name.size()), name.data()));
+        const bool cooked = world_ids_[i].is_valid();
+        if (ImGui::MenuItem(label, nullptr, cooked && world_ids_[i] == viewer_.world_id(), cooked)) {
+            selection_.select_file(world_files_[i].view());
+            open_world(engine);
+        }
+        if (!cooked && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            tooltip("New to the cooker: cook the project first");
+        }
+    }
+    ImGui::EndMenu();
+}
+
+void Editor::project_menu(app::Engine& engine) {
+    if (!ImGui::BeginMenu("Open Project")) {
+        projects_listed_ = false;
+        return;
+    }
+    if (!projects_listed_) {
+        projects_listed_ = true; // once as the menu opens
+        list_projects(engine);
+    }
+    const std::string_view open = open_project_name(engine); // the one open: its folder's name
+    if (project_names_.empty()) {
+        ImGui::MenuItem("No projects beside the engine", nullptr, false, false);
+    }
+    for (const core::FixedString<63>& name : project_names_) {
+        const bool is_open = name.view() == open;
+        if (ImGui::MenuItem(name.c_str(), nullptr, is_open) && !is_open) {
+            project_to_open_ = name;
+            open_project(engine);
+        }
+    }
+    ImGui::EndMenu();
+}
+
+void Editor::open_project(app::Engine& engine, bool unsaved_asked) {
+    if (unsaved() && !unsaved_asked) {
+        pending_ = Pending::OpenProject; // asked first; it comes back here
+        return;
+    }
+    // Another editor, on that project, and this one closes: what's mounted can't change while the engine runs.
+    const core::Result<platform::PathString> program = platform::program_beside_engine("deengine");
+    const char* engine_root = engine.vfs.mount_root(platform::Mount::Engine);
+    platform::PathString project;
+    char limit[16];
+    static_cast<void>(std::snprintf(limit, sizeof(limit), "%u", engine.fps_cap));
+    bool started = false;
+    if (program && engine_root != nullptr && project.assign(engine_root) && project.append("/projects/") &&
+        project.append(project_to_open_.view())) {
+        // The settings first: the next editor reads them as it starts, before this one has closed. And this run's
+        // frame rate limit goes with it: a flag's isn't among them.
+        save_user_settings(engine);
+        const char* args[] = {program->c_str(), "--editor", "--project", project.c_str(), "--fps-cap", limit};
+        started = platform::Process::start(args).ok();
+    }
+    if (started) {
+        DE_LOG_INFO("editor", "opening project %s in an editor of its own", project_to_open_.c_str());
+        quit_ = true; // the cooker, if it's running, finishes on its own
+    } else {
+        static_cast<void>(std::snprintf(message_, sizeof(message_), "Project %s didn't open: deengine didn't start",
+                                        project_to_open_.c_str()));
+        DE_LOG_ERROR("editor", "%s", message_);
+    }
+}
+
 void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     asset::Guid guid;
     asset::AssetId id;
@@ -2755,6 +4028,9 @@ void Editor::open_world(app::Engine& engine, bool unsaved_asked) {
     hierarchy_.reset();
     if (viewer_.open_world(engine, id)) {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "Opened %s", selection_.file.c_str()));
+        if (watching_) {
+            remember_world(engine.vfs, id); // what the next start opens
+        }
     } else {
         static_cast<void>(std::snprintf(message_, sizeof(message_), "%s didn't load: is it cooked? (the log says why)",
                                         selection_.file.c_str()));

@@ -1,5 +1,6 @@
 #include "platform/project.h"
 
+#include <span>
 #include <string_view>
 
 namespace de::platform {
@@ -26,7 +27,50 @@ PathString folder_of(std::string_view given) {
     return path;
 }
 
+// Where the last project's folder is kept.
+core::Result<PathString> last_project_file() {
+    core::Result<PathString> path = user_data_folder();
+    if (path && !path->append("/DEengine/editor/last_project")) {
+        return core::fail(core::ErrorCode::InvalidArgument, "the user's data folder's path is too long");
+    }
+    return path;
+}
+
 } // namespace
+
+core::Result<Project> last_project() {
+    const core::Result<PathString> path = last_project_file();
+    if (!path) {
+        return core::fail(path.error());
+    }
+    core::Result<File> file = File::open_read(path->c_str());
+    if (!file) {
+        return core::fail(core::ErrorCode::NotFound, "no project has been opened yet");
+    }
+    char text[kMaxPathLength + 1] = {};
+    const core::Result<size_t> read = file->read_at(0, std::as_writable_bytes(std::span(text, kMaxPathLength)));
+    if (!read) {
+        return core::fail(read.error());
+    }
+    std::string_view folder(text, *read);
+    while (!folder.empty() && (folder.back() == '\n' || folder.back() == '\r' || folder.back() == ' ')) {
+        folder.remove_suffix(1);
+    }
+    text[folder.size()] = '\0';
+    return find_project(text, nullptr);
+}
+
+void remember_project(const Project& project) {
+    const core::Result<PathString> path = last_project_file();
+    if (!path) {
+        return;
+    }
+    PathString folder = *path;
+    folder.truncate(folder.view().rfind('/'));
+    if (create_directories(folder.c_str()).ok()) {
+        static_cast<void>(write_file_atomic(path->c_str(), std::as_bytes(std::span(project.root.view()))));
+    }
+}
 
 core::Result<Project> find_project(const char* given, const char* engine_root) {
     using core::ErrorCode;

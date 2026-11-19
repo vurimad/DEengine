@@ -33,7 +33,13 @@ struct ImGuiPush {
     uint32_t sampler = 0;
     uint32_t srgb_target = 0;
     uint32_t vertex_base = 0; // the draw's first vertex in the buffer (SV_VertexID is its index)
+    // 1: the texture is one of ImGui's own (its font atlas, a page of pictures). Those hold 8-bit colours as a screen
+    // is sent them, as ImGui's own colours are, in a texture that doesn't say so: the shader makes light of them.
+    // The engine's textures shown in the UI (the scene, the frame debugger's) are light already when sampled.
+    uint32_t coded_texture = 0;
+    uint32_t reserved = 0;
 };
+static_assert(sizeof(ImGuiPush) == 48);
 
 static_assert(sizeof(ImDrawVert) == 20, "shaders/imgui.slang reads 20-byte vertices");
 static_assert(sizeof(ImDrawIdx) == 2, "the index buffer is bound as 16-bit");
@@ -276,7 +282,9 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
         rhi::GraphicsPipelineDesc pipeline{.color_count = 1, .cull = rhi::CullMode::None, .debug_name = "imgui"};
         pipeline.color_formats[0] = format;
         pipeline.blend[0] = rhi::BlendMode::Alpha;
-        const auto program = state.shaders->create_graphics({.module = "imgui", .state = pipeline});
+        // Ahead of whatever else is waiting to compile: the UI is where the wait is shown.
+        const auto program =
+            state.shaders->create_graphics({.module = "imgui", .state = pipeline, .build_first = true});
         state.program = program.ok() ? *program : shader::ProgramHandle{};
         state.program_format = format;
     }
@@ -372,6 +380,7 @@ void ImGuiRenderer::add_pass(RenderGraph& graph, GraphTexture target, rhi::Forma
                                               .width = static_cast<uint32_t>(right - left),
                                               .height = static_cast<uint32_t>(bottom - top)});
                     push.texture = bindless_of(texture);
+                    push.coded_texture = command.TexRef._TexData != nullptr ? 1U : 0U;
                     // The vertex base goes through push constants, not the draw's vertex offset:
                     // SV_VertexID leaves that offset out.
                     push.vertex_base = command.VtxOffset + vertex_base;

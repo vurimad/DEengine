@@ -102,7 +102,7 @@ core::Result<size_t> TcpStream::write(std::span<const std::byte> bytes) {
 }
 
 core::Result<TcpStream> TcpStream::connect_loopback(uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP); // not for programs started from here
     if (fd < 0) {
         return core::fail(core::ErrorCode::IoError, "no socket");
     }
@@ -140,7 +140,7 @@ void TcpListener::close() {
 }
 
 core::Result<TcpListener> TcpListener::listen_loopback(uint16_t port) {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP); // not for programs started from here
     if (fd < 0) {
         return core::fail(core::ErrorCode::IoError, "no socket");
     }
@@ -164,7 +164,7 @@ TcpStream TcpListener::accept() {
     if (!is_open()) {
         return {};
     }
-    const int fd = ::accept(as_socket(handle_), nullptr, nullptr);
+    const int fd = ::accept4(as_socket(handle_), nullptr, nullptr, SOCK_CLOEXEC);
     if (fd < 0) {
         return {};
     }

@@ -2,9 +2,11 @@
 
 #include "asset/cell_format.h"
 #include "asset/collision_format.h"
+#include "asset/effect_format.h"
 #include "asset/environment_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
+#include "asset/prefab_format.h"
 #include "asset/shader_format.h"
 #include "asset/terrain_format.h"
 #include "asset/terrain_layers_format.h"
@@ -79,6 +81,10 @@ core::Result<void> check(AssetType type, std::span<const std::byte> file) {
         return checked(load_in_place<TerrainAsset>(file));
     case AssetType::TerrainLayers:
         return checked(load_in_place<TerrainLayersAsset>(file));
+    case AssetType::Effect:
+        return checked(load_in_place<EffectAsset>(file));
+    case AssetType::Prefab:
+        return checked(load_in_place<PrefabAsset>(file));
     case AssetType::TerrainHeights: // start_read refuses these before reading them
     case AssetType::Unknown:
         break;
@@ -672,6 +678,11 @@ std::span<const std::byte> AssetRegistry::file(AssetHandle handle) const {
 uint32_t AssetRegistry::revision(AssetHandle handle) const {
     const Entry* entry = find_entry(*state_, handle);
     return entry != nullptr && entry->state == AssetState::Ready ? entry->revision : 0;
+}
+
+platform::FileInfo AssetRegistry::file_info(AssetHandle handle) const {
+    const Entry* entry = find_entry(*state_, handle);
+    return entry != nullptr && entry->state == AssetState::Ready && !entry->busy() ? entry->info : platform::FileInfo{};
 }
 
 std::span<const AssetHandle> AssetRegistry::dependencies(AssetHandle handle) const {

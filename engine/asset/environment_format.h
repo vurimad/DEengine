@@ -57,7 +57,7 @@ struct SeaLimits {
 // reads it as render::SceneLighting (render::scene_lighting()).
 struct EnvironmentAsset {
     static constexpr AssetType kType = AssetType::Environment;
-    static constexpr uint16_t kFormatVersion = 6; // 5: wind; 6: the sea
+    static constexpr uint16_t kFormatVersion = 8; // 5: wind; 6: the sea; 7: auto exposure; 8: under_roof
 
     AssetHeader header;
     float sun_direction[3] = {0, 1, 0}; // toward the sun, unit length
@@ -105,12 +105,21 @@ struct EnvironmentAsset {
     float sea_swell_direction[2] = {0.0f, -1.0f}; // toward where it travels (x, z), unit length
     float sea_fetch_m = 100000.0f;                // how far the wind has blown over open water
     float sea_choppiness = 0.8f;                  // how far crests sharpen, 0 (round) to SeaLimits::kMaxChoppiness
+    // How the exposure follows the scene here (render::AutoExposureSettings): how much less and more than exposure_ev
+    // it may give, and how far it goes toward what puts the scene at middle grey. Negative: the engine's own.
+    float exposure_below_ev = -1.0f;
+    float exposure_above_ev = -1.0f;
+    float exposure_adaptation = -1.0f;
+    // How far the place is closed to the sky, 0 to 1: 0 open ground, 1 a hall or a cave (a dungeon). What lights by
+    // the sky's ambient without seeing what's above it (the radiance cascades for what the screen doesn't show, fog,
+    // particles, water) takes 1 - this of it; a fog volume can say otherwise for its own place (CellFogVolume).
+    float under_roof = 0.0f;
 
     // Finite values in range: a unit sun direction, colors not negative, the shadow settings
     // within ShadowLimits, the fog's within FogLimits, the wind's within WindLimits and its direction unit length, the
     // sea's within SeaLimits and its swell's direction unit length.
     core::Result<void> validate(std::span<const std::byte> file) const;
 };
-static_assert(sizeof(EnvironmentAsset) == 304);
+static_assert(sizeof(EnvironmentAsset) == 320);
 
 } // namespace de::asset

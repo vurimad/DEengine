@@ -27,6 +27,27 @@ inline constexpr uint32_t kFramesInFlight = 2;
 inline constexpr uint32_t kMaxTimestampsPerFrame = 256;
 // What write_timestamp() returns when it wrote nothing.
 inline constexpr uint32_t kNoTimestamp = UINT32_MAX;
+
+// What a command list has recorded so far that puts the GPU to work (CommandList::work()), for debug views: the
+// render graph gives each pass the difference across it. Indirect calls decide their draws on the GPU, so the list
+// knows only the most they can make.
+struct ListWork {
+    uint32_t draws = 0;          // draw and draw_indexed calls
+    uint32_t indirect_calls = 0; // draw_indirect, draw_indexed_indirect and their counted forms
+    uint32_t indirect_max = 0;   // the most draws those calls can make: their draw_count or max_draws, summed
+    uint32_t dispatches = 0;     // dispatch and dispatch_indirect calls
+    uint32_t copies = 0;         // buffer and texture copies, blits and fills
+    uint64_t vertices = 0;       // of the direct draws: vertices (or indices) times instances
+
+    ListWork operator-(const ListWork& earlier) const {
+        return {.draws = draws - earlier.draws,
+                .indirect_calls = indirect_calls - earlier.indirect_calls,
+                .indirect_max = indirect_max - earlier.indirect_max,
+                .dispatches = dispatches - earlier.dispatches,
+                .copies = copies - earlier.copies,
+                .vertices = vertices - earlier.vertices};
+    }
+};
 inline constexpr uint32_t kMaxColorAttachments = 8;
 // Every pipeline shares one layout: push constants of this size, visible to all stages (the
 // guaranteed minimum on every GPU), and the bindless tables. Resources are reached by index.
@@ -107,11 +128,13 @@ inline constexpr uint32_t sampler_index(DefaultSampler sampler) {
 struct Texture;
 struct Buffer;
 struct Pipeline;
+struct Acceleration;
 
 // Generational handles: a handle to a destroyed resource never resolves, even after its slot is reused.
 using TextureHandle = core::SlotHandle<Texture>;
 using BufferHandle = core::SlotHandle<Buffer>;
 using PipelineHandle = core::SlotHandle<Pipeline>;
+using AccelerationHandle = core::SlotHandle<Acceleration>;
 
 enum class QueueType : uint8_t {
     Graphics, // graphics, compute and copies
@@ -239,7 +262,7 @@ struct MipExtent {
 };
 MipExtent mip_extent(const TextureDesc& desc, uint32_t mip);
 
-enum class BufferUsage : uint8_t {
+enum class BufferUsage : uint16_t {
     None = 0,
     Vertex = 1 << 0,
     Index = 1 << 1,
@@ -248,6 +271,8 @@ enum class BufferUsage : uint8_t {
     Indirect = 1 << 4,
     CopySrc = 1 << 5,
     CopyDst = 1 << 6,
+    // An acceleration structure is built from it: a bottom level's vertices and indices, a top level's instances.
+    AccelerationInput = 1 << 7,
 };
 DE_ENUM_FLAGS(BufferUsage)
 
@@ -263,6 +288,46 @@ struct BufferDesc {
     MemoryLocation memory = MemoryLocation::GpuOnly;
     const char* debug_name = nullptr; // copied
 };
+
+// --- Acceleration structures: what rays are traced against, from any shader (Capabilities::ray_query) ---
+//
+// Two levels. A bottom level holds triangles, built once from vertex and index buffers. A top level holds instances
+// of bottom levels, each with a transform, built again whenever they move (every frame, for a scene). Shaders trace
+// against a top level by its address (Device::acceleration_address), as they reach buffers by theirs.
+
+inline constexpr uint32_t kMaxAccelerationGeometry = 64; // runs of triangles in one bottom level
+
+// One run of triangles of a bottom level: indexed, 32-bit indices, each vertex beginning with its position as three
+// floats. A hit reports which run it was (its place in the list), so a run is a mesh's part.
+struct AccelerationTriangles {
+    BufferHandle vertices;      // AccelerationInput usage
+    uint64_t vertex_offset = 0; // bytes, to the first vertex the indices count from
+    uint32_t vertex_stride = 0; // bytes from a vertex to the next
+    uint32_t vertex_count = 0;  // no index reaches past it
+    BufferHandle indices;       // AccelerationInput usage
+    uint64_t index_offset = 0;  // bytes
+    uint32_t index_count = 0;   // three a triangle
+};
+
+struct BottomLevelDesc {
+    // What it will be built from: build_bottom_level() takes the same runs (their counts and strides at least).
+    std::span<const AccelerationTriangles> geometry;
+    const char* debug_name = nullptr; // copied
+};
+
+struct TopLevelDesc {
+    uint32_t max_instances = 0;
+    const char* debug_name = nullptr; // copied
+};
+
+// One instance in a top level, as the GPU reads it from the instances' buffer. A bottom level of 0 is no instance.
+struct AccelerationInstance {
+    float transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}; // rows of a 3 x 4: where the bottom level stands
+    uint32_t id_and_mask = 0xff000000U; // low 24 bits: what a hit reports as its instance; high 8: which rays see it
+    uint32_t flags = 0;                 // high 8 bits: 1 no culling by facing, 4 always opaque (as Vulkan and D3D12)
+    uint64_t bottom_level = 0;          // Device::acceleration_address of a bottom level
+};
+static_assert(sizeof(AccelerationInstance) == 64);
 
 // How a resource is used. Barriers move resources between states; the render graph will emit them
 // from the reads and writes passes declare.

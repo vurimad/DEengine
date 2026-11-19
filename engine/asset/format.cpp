@@ -30,6 +30,10 @@ const char* asset_type_extension(AssetType type) {
         return ".dephys";
     case AssetType::TerrainLayers:
         return ".delayers";
+    case AssetType::Effect:
+        return ".devfx";
+    case AssetType::Prefab:
+        return ".deprefab";
     case AssetType::Unknown:
         break;
     }
@@ -60,6 +64,10 @@ const char* asset_type_name(AssetType type) {
         return "collision";
     case AssetType::TerrainLayers:
         return "terrain layers";
+    case AssetType::Effect:
+        return "effect";
+    case AssetType::Prefab:
+        return "prefab";
     case AssetType::Unknown:
         break;
     }

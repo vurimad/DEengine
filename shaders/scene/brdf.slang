@@ -31,3 +31,10 @@ public float3 env_brdf(float3 f0, float roughness, float n_dot_v)
     const float2 ab = float2(-1.04, 1.04) * a004 + r.zw;
     return f0 * ab.x + ab.y;
 }
+
+// How much of a reflection's light an occluded spot still gets: more of it the smoother the surface and the more
+// it's seen face on (Lagarde and de Rousiers, "Moving Frostbite to PBR", 2014).
+public float specular_occlusion(float n_dot_v, float visibility, float roughness)
+{
+    return saturate(pow(n_dot_v + visibility, exp2(-16.0 * roughness - 1.0)) - 1.0 + visibility);
+}

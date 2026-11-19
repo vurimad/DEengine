@@ -17,7 +17,7 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 | `thread.h` | `Thread` (named, joined on destruction), thread names and ids, core count |
 | `cpu.h` | What the CPU has: what links Jolt stops before any static initializer if it lacks AVX2, with a message |
 | `debug.h` | Debugger detection, break, and the debugger output log sink |
-| `socket.h` | `TcpListener` (on 127.0.0.1 only) and `TcpStream`: TCP that never blocks, for the agents' socket (Winsock or BSD sockets, here alone) |
+| `socket.h` | `TcpListener` (on 127.0.0.1 only) and `TcpStream`: TCP that never blocks, for the agents' socket (Winsock or BSD sockets, here alone). No program started from this one inherits them: a listener a child held would keep its port, unanswered, after the engine had gone |
 | `random.h` | Random bytes from the OS: GUIDs for new assets, seeds (not gameplay randomness) |
 | `imgui_platform.h` | Dear ImGui's platform side: display size, time step and input events, so SDL stays here |
 | `imgui_events.h` | Inside `platform/` only: how `pump_events()` hands each SDL event to ImGui |
@@ -33,6 +33,6 @@ Everything OS-specific: the window, input, files, time, threads and debugger hoo
 - The platform tests never initialize SDL video, so they run on headless CI.
 - Engine code reads and writes files only through the `Vfs`; `file.h` is for the VFS and tools. Paths are `mount:/lowercase/forward/slashes`.
 - `src:/` is the open project's sources (`projects/<name>/`: `content/`, `meta/`, `config/`), `engine:/` the engine's (the repository root: `shaders/`), both mounted only in dev builds and tools (`VfsDesc::src_root`, `engine_root`). Shaders compile from `engine:/`; the editor writes sources through `src:/`.
-- `project.h`: `find_project`, the project `--project` names (docs/design.md, Projects): its folder or `.deproject` file, relative to the working folder or the engine's repository.
+- `project.h`: `find_project`, the project `--project` names (docs/design.md, Projects): its folder or `.deproject` file, relative to the working folder or the engine's repository. `remember_project` and `last_project`: the project the editor had open last, one line in the user's data folder, read before anything is mounted, for a start that names none.
 - `game:/` is read only. Writes to `user:/`, `temp:/`, `src:/` and `engine:/` are atomic (temp file, then rename). `temp:/` is emptied at every start; the VFS only ever clears folders it named itself (`DEengine`, `deengine_temp`).
 - Async reads go straight into caller memory; queueing, polling and finishing never allocate. Phase 1: blocking positional reads on a small reader pool behind one lock; phase 2 (IoRing / io_uring) keeps the API.

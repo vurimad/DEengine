@@ -362,6 +362,71 @@ void secondary_text(const char* text) {
     }
 }
 
+bool compact_checkbox(bool& value) {
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const float frame = ImGui::GetFrameHeight();
+    const float box = std::max(px(12.0f), std::floor(ImGui::GetFontSize() * 0.95f));
+    const float padding = std::max(0.0f, std::floor((box - ImGui::GetFontSize()) * 0.5f));
+    ImGui::SetCursorScreenPos(
+        ImVec2(cursor.x, cursor.y + std::floor((frame - (ImGui::GetFontSize() + (padding * 2.0f))) * 0.5f)));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(padding, padding));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleColor(ImGuiCol_FrameBg, color(ThemeColor::Recessed));
+    ImGui::PushStyleColor(ImGuiCol_Border, color(ThemeColor::ControlActive));
+    const bool changed = ImGui::Checkbox("##value", &value);
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
+    return changed;
+}
+
+float chip_width(const char* label) {
+    return (2.0f * px(8.0f)) + ImGui::CalcTextSize(label).x;
+}
+
+FlowRow::FlowRow(float margin, float limit_x) : margin_(margin), limit_x_(limit_x), x_(margin), y_(margin) {}
+
+void FlowRow::place(float item_width, float gap) {
+    if (!first_ && x_ + gap + item_width > limit_x_) {
+        x_ = margin_;
+        y_ += ImGui::GetFrameHeight() + px(4.0f);
+    } else if (!first_) {
+        x_ += gap;
+    }
+    first_ = false;
+    ImGui::SetCursorPos(ImVec2(x_, y_));
+    x_ += item_width;
+}
+
+float FlowRow::bottom() const {
+    return y_ + ImGui::GetFrameHeight() + margin_;
+}
+
+bool toggle_chip(const char* label, bool on, const char* tip) {
+    const float height = ImGui::GetFrameHeight();
+    const float width = chip_width(label);
+    const ImVec2 min = ImGui::GetCursorScreenPos();
+    ImGui::PushID(label);
+    const bool pressed = ImGui::InvisibleButton("##chip", ImVec2(width, height));
+    ImGui::PopID();
+    const bool hovered = ImGui::IsItemHovered();
+    const bool enabled = (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) == 0;
+    const ThemeColor background = on        ? (hovered ? ThemeColor::AccentHovered : ThemeColor::Accent)
+                                  : hovered ? ThemeColor::ControlHovered
+                                            : ThemeColor::Control;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(min, ImVec2(min.x + width, min.y + height), color_u32(background),
+                        px(theme().metrics.control_rounding));
+    draw_clipped_label(min, ImVec2(min.x + width, min.y + height), label,
+                       color_u32(!enabled ? ThemeColor::TextDisabled
+                                 : on     ? ThemeColor::TextEmphasis
+                                          : ThemeColor::Text),
+                       true);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        tooltip("%s", tip);
+    }
+    return pressed;
+}
+
 void draw_folder_glyph(ImVec2 min, float width, float height) {
     if (width <= 0.0f || height <= 0.0f) {
         return;

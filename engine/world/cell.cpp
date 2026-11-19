@@ -2,6 +2,7 @@
 
 #include "core/log.h"
 #include "core/profile.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 
 #include <cmath>
@@ -115,7 +116,29 @@ void spawn_members(flecs::world& ecs, const asset::AssetRegistry& assets, flecs:
                                  .noise_size_m = fog.noise_size_m,
                                  .noise_amount = fog.noise_amount,
                                  .drift_mps = {fog.drift_mps[0], fog.drift_mps[1], fog.drift_mps[2]},
-                                 .height_fade_m = fog.height_fade_m});
+                                 .height_fade_m = fog.height_fade_m,
+                                 .under_roof = fog.under_roof});
+        }
+        if (source.water_body != asset::CellEntity::kNone) {
+            const asset::CellWaterBody& water = asset->water_bodies.get(asset)[source.water_body];
+            member.set(WaterBody{.ellipse = water.shape == asset::CellWaterShape::Ellipse, .waves = water.waves});
+        }
+        if (source.effect != asset::CellEntity::kNone) {
+            member.set(EffectInstance{.effect = scratch.meshes[source.effect]});
+        }
+        if (source.light != asset::CellEntity::kNone) {
+            member.set(LocalLight::from(asset->lights.get(asset)[source.light]));
+        }
+        if (source.prefab != asset::CellEntity::kNone) {
+            // The prefab is one of the cell's dependencies, so it's loaded (or failed, and has no parts): its
+            // parts are made with the cell's members, in the same batch.
+            const asset::AssetHandle prefab = scratch.meshes[source.prefab];
+            member.set(PrefabInstance{
+                .prefab = prefab,
+                .variant = source.variant,
+                .revision = assets.revision(prefab),
+                .first_part = make_prefab_parts(ecs, assets, prefab, source.variant, member.id(), world, is_static),
+                .placed = world});
         }
         const Transform placed =
             attached ? local : Transform{.position = world.position, .rotation = world.rotation, .scale = world.scale};

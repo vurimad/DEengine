@@ -3,6 +3,7 @@
 #include "core/hash.h"
 #include "core/profile.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/transform.h"
 
 #include <cstring>
@@ -35,6 +36,19 @@ void apply_component(flecs::entity entity, flecs::id_t component, std::span<cons
         world::Transform transform;
         std::memcpy(&transform, value.data(), sizeof(transform));
         world::place(entity, transform);
+        return;
+    }
+    if (component == ecs.component<world::PrefabInstance>().id() && value.size() == sizeof(world::PrefabInstance)) {
+        // Which prefab and which variant of it are the value's; the parts it has now are the entity's own business,
+        // and are made again from what it asks for.
+        world::PrefabInstance asked;
+        std::memcpy(&asked, value.data(), sizeof(asked));
+        if (const auto* now = entity.try_get<world::PrefabInstance>()) {
+            asked.first_part = now->first_part;
+            asked.revision = now->revision;
+            asked.placed = now->placed;
+        }
+        entity.set(asked).add<world::PrefabPending>();
         return;
     }
     ecs_set_id(ecs.c_ptr(), entity.id(), component, value.size(), value.data());

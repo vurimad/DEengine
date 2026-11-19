@@ -59,7 +59,7 @@ void entity_label(const asset::AssetRegistry& assets, flecs::entity entity, std:
 // one gets "_2", "_3"...
 void free_name(std::string_view base, core::FunctionRef<bool(std::string_view name)> taken, std::span<char> out);
 
-// What the entity is, for people: "Cell", "Camera", "Fog volume", "Body", "Mesh" or "Entity".
+// What the entity is, for people: "Cell", "Camera", "Fog volume", "Water", "Body", "Mesh" or "Entity".
 const char* entity_kind(flecs::entity entity);
 
 // Whether text holds part (ASCII letters in either case); an empty part is in everything.

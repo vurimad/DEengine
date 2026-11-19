@@ -137,6 +137,15 @@ void fill_capabilities(DeviceImpl& impl, bool ray_query) {
                               family(QueueType::Transfer) != family(QueueType::Compute);
     caps.transfer_queue = family(QueueType::Transfer) != family(QueueType::Graphics);
     caps.ray_query = ray_query;
+    if (ray_query) {
+        // What a build's scratch has to be aligned to.
+        VkPhysicalDeviceAccelerationStructurePropertiesKHR acceleration{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 with_acceleration{.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                                      .pNext = &acceleration};
+        vkGetPhysicalDeviceProperties2(impl.physical_device, &with_acceleration);
+        impl.scratch_alignment = std::max(acceleration.minAccelerationStructureScratchOffsetAlignment, 1U);
+    }
 
     uint32_t family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(impl.physical_device, &family_count, nullptr);
@@ -508,6 +517,17 @@ void DeviceImpl::shutdown() {
             vmaDestroyBuffer(allocator, buffer.buffer, buffer.allocation);
         }
         buffers.clear();
+        if (!accelerations.empty()) {
+            DE_LOG_WARN("render", "%zu acceleration structures still alive at device shutdown", accelerations.size());
+        }
+        for (const Acceleration& acceleration : accelerations) {
+            vkDestroyAccelerationStructureKHR(device, acceleration.handle, nullptr);
+            vmaDestroyBuffer(allocator, acceleration.buffer, acceleration.allocation);
+            if (acceleration.scratch != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(allocator, acceleration.scratch, acceleration.scratch_allocation);
+            }
+        }
+        accelerations.clear();
         destroy_bindless();
         for (VkSemaphore& semaphore : present_semaphores) {
             vkDestroySemaphore(device, semaphore, nullptr);
@@ -563,6 +583,39 @@ Buffer& DeviceImpl::buffer(BufferHandle handle) {
     return *buffer;
 }
 
+Acceleration& DeviceImpl::acceleration(AccelerationHandle handle) {
+    Acceleration* acceleration = accelerations.get(handle);
+    DE_VERIFY_MSG(acceleration != nullptr, "stale or invalid AccelerationHandle");
+    return *acceleration;
+}
+
+bool DeviceImpl::create_acceleration_buffer(uint64_t size, bool scratch, const char* name, VkBuffer& buffer,
+                                            VmaAllocation& allocation, uint64_t& address, uint64_t& memory_bytes) {
+    const VkBufferCreateInfo buffer_info{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = size,
+        .usage = static_cast<VkBufferUsageFlags>(
+            (scratch ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR) |
+            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT),
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+    };
+    const VmaAllocationCreateInfo allocation_info{.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VmaAllocationInfo allocated{};
+    const VkResult result = vmaCreateBufferWithAlignment(
+        allocator, &buffer_info, &allocation_info, scratch ? scratch_alignment : 256, &buffer, &allocation, &allocated);
+    if (result != VK_SUCCESS) {
+        DE_LOG_ERROR("render", "acceleration structure buffer '%s' (%llu bytes): %s", name != nullptr ? name : "",
+                     static_cast<unsigned long long>(size), vk_result_name(result));
+        return false;
+    }
+    const VkBufferDeviceAddressInfo address_info{.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO,
+                                                 .buffer = buffer};
+    address = vkGetBufferDeviceAddress(device, &address_info);
+    set_debug_name(VK_OBJECT_TYPE_BUFFER, reinterpret_cast<uint64_t>(buffer), name);
+    memory_bytes = allocated.size;
+    return true;
+}
+
 void DeviceImpl::set_debug_name(VkObjectType type, uint64_t object, const char* name) const {
     if (!debug_utils || name == nullptr || name[0] == '\0') {
         return;
@@ -590,6 +643,9 @@ void DeviceImpl::free_pending(FrameSlot& slot) {
         }
         if (entry.image != VK_NULL_HANDLE) {
             vmaDestroyImage(allocator, entry.image, entry.allocation);
+        }
+        if (entry.acceleration != VK_NULL_HANDLE) {
+            vkDestroyAccelerationStructureKHR(device, entry.acceleration, nullptr);
         }
         if (entry.buffer != VK_NULL_HANDLE) {
             vmaDestroyBuffer(allocator, entry.buffer, entry.allocation);
@@ -774,6 +830,7 @@ DeviceStats Device::stats() const {
         .live_textures = static_cast<uint32_t>(impl_->textures.size()),
         .live_buffers = static_cast<uint32_t>(impl_->buffers.size()),
         .live_pipelines = static_cast<uint32_t>(impl_->pipelines.size()),
+        .live_accelerations = static_cast<uint32_t>(impl_->accelerations.size()),
         .bindless_textures = impl_->sampled_slots.used(),
         .bindless_storage_textures = impl_->storage_slots.used(),
         .swapchain_recreations = impl_->swapchain_recreations,
@@ -1063,6 +1120,13 @@ core::Result<BufferHandle> Device::create_buffer(const BufferDesc& desc) {
     use(BufferUsage::Indirect, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
     use(BufferUsage::CopySrc, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     use(BufferUsage::CopyDst, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (core::has_any(desc.usage, BufferUsage::AccelerationInput)) {
+        if (!impl_->capabilities.ray_query) {
+            return core::fail(core::ErrorCode::Unsupported, "this GPU builds no acceleration structures");
+        }
+        usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    }
     // Shaders reach every buffer they read by address (bindless, docs/design.md Rendering).
     if (core::has_any(desc.usage, BufferUsage::Vertex | BufferUsage::Index | BufferUsage::Uniform |
                                       BufferUsage::Storage | BufferUsage::Indirect)) {
@@ -1139,6 +1203,152 @@ void Device::destroy(BufferHandle handle) {
         .buffer = buffer->buffer, .allocation = buffer->allocation, .memory_bytes = buffer->memory_bytes});
     impl_->uncount_memory(buffer_memory_category(buffer->desc.memory), buffer->memory_bytes);
     impl_->buffers.remove(handle);
+}
+
+namespace {
+
+// A bottom level's runs of triangles as Vulkan takes them, and how many triangles each holds.
+void fill_triangles(DeviceImpl& impl, std::span<const AccelerationTriangles> runs,
+                    VkAccelerationStructureGeometryKHR* geometries, uint32_t* triangle_counts) {
+    for (size_t i = 0; i < runs.size(); ++i) {
+        const AccelerationTriangles& run = runs[i];
+        const Buffer& vertices = impl.buffer(run.vertices);
+        const Buffer& indices = impl.buffer(run.indices);
+        DE_ASSERT_MSG(core::has_any(vertices.desc.usage, BufferUsage::AccelerationInput) &&
+                          core::has_any(indices.desc.usage, BufferUsage::AccelerationInput),
+                      "an acceleration structure's vertices and indices need AccelerationInput usage");
+        DE_ASSERT(run.vertex_stride >= 12 && run.vertex_count > 0 && run.index_count >= 3 && run.index_count % 3 == 0);
+        geometries[i] = VkAccelerationStructureGeometryKHR{
+            .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+            .geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+            .geometry = {.triangles = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR,
+                                       .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT,
+                                       .vertexData = {.deviceAddress = vertices.address + run.vertex_offset},
+                                       .vertexStride = run.vertex_stride,
+                                       .maxVertex = run.vertex_count - 1,
+                                       .indexType = VK_INDEX_TYPE_UINT32,
+                                       .indexData = {.deviceAddress = indices.address + run.index_offset}}},
+            .flags = VK_GEOMETRY_OPAQUE_BIT_KHR,
+        };
+        triangle_counts[i] = run.index_count / 3;
+    }
+}
+
+// The structure itself, in a buffer of the size it needs.
+core::Result<AccelerationHandle> make_acceleration(DeviceImpl& impl, bool top_level, uint32_t capacity,
+                                                   const VkAccelerationStructureBuildSizesInfoKHR& sizes,
+                                                   const char* debug_name) {
+    Acceleration made{.scratch_bytes = sizes.buildScratchSize, .capacity = capacity, .top_level = top_level};
+    uint64_t buffer_address = 0;
+    if (!impl.create_acceleration_buffer(sizes.accelerationStructureSize, false, debug_name, made.buffer,
+                                         made.allocation, buffer_address, made.memory_bytes)) {
+        return core::fail(core::ErrorCode::OutOfMemory, "GPU memory for the acceleration structure ran out");
+    }
+    const VkAccelerationStructureCreateInfoKHR create_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR,
+        .buffer = made.buffer,
+        .size = sizes.accelerationStructureSize,
+        .type =
+            top_level ? VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR : VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+    };
+    if (vkCreateAccelerationStructureKHR(impl.device, &create_info, nullptr, &made.handle) != VK_SUCCESS) {
+        vmaDestroyBuffer(impl.allocator, made.buffer, made.allocation);
+        return core::fail(core::ErrorCode::OutOfMemory, "the acceleration structure could not be made");
+    }
+    if (top_level) {
+        // Built every frame: its scratch stays.
+        uint64_t scratch_memory = 0;
+        if (!impl.create_acceleration_buffer(made.scratch_bytes, true, debug_name, made.scratch,
+                                             made.scratch_allocation, made.scratch_address, scratch_memory)) {
+            vkDestroyAccelerationStructureKHR(impl.device, made.handle, nullptr);
+            vmaDestroyBuffer(impl.allocator, made.buffer, made.allocation);
+            return core::fail(core::ErrorCode::OutOfMemory, "GPU memory for the acceleration structure ran out");
+        }
+        made.memory_bytes += scratch_memory;
+    }
+    const VkAccelerationStructureDeviceAddressInfoKHR address_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR,
+        .accelerationStructure = made.handle,
+    };
+    made.address = vkGetAccelerationStructureDeviceAddressKHR(impl.device, &address_info);
+    impl.set_debug_name(VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR, reinterpret_cast<uint64_t>(made.handle), debug_name);
+    impl.count_memory(buffer_memory_category(MemoryLocation::GpuOnly), made.memory_bytes);
+    return impl.accelerations.insert(made);
+}
+
+} // namespace
+
+core::Result<AccelerationHandle> Device::create_bottom_level(const BottomLevelDesc& desc) {
+    if (!impl_->capabilities.ray_query) {
+        return core::fail(core::ErrorCode::Unsupported, "this GPU builds no acceleration structures");
+    }
+    if (desc.geometry.empty() || desc.geometry.size() > kMaxAccelerationGeometry) {
+        return core::fail(core::ErrorCode::InvalidArgument, "a bottom level takes 1 to 64 runs of triangles");
+    }
+    VkAccelerationStructureGeometryKHR geometries[kMaxAccelerationGeometry];
+    uint32_t triangle_counts[kMaxAccelerationGeometry];
+    fill_triangles(*impl_, desc.geometry, geometries, triangle_counts);
+    const VkAccelerationStructureBuildGeometryInfoKHR build_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .geometryCount = static_cast<uint32_t>(desc.geometry.size()),
+        .pGeometries = geometries,
+    };
+    VkAccelerationStructureBuildSizesInfoKHR sizes{.sType =
+                                                       VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(impl_->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
+                                            triangle_counts, &sizes);
+    return make_acceleration(*impl_, false, static_cast<uint32_t>(desc.geometry.size()), sizes, desc.debug_name);
+}
+
+core::Result<AccelerationHandle> Device::create_top_level(const TopLevelDesc& desc) {
+    if (!impl_->capabilities.ray_query) {
+        return core::fail(core::ErrorCode::Unsupported, "this GPU builds no acceleration structures");
+    }
+    if (desc.max_instances == 0) {
+        return core::fail(core::ErrorCode::InvalidArgument, "a top level needs room for an instance");
+    }
+    const VkAccelerationStructureGeometryKHR geometry{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR,
+        .geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR,
+        .geometry = {.instances = {.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR}},
+    };
+    const VkAccelerationStructureBuildGeometryInfoKHR build_info{
+        .sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR,
+        .type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR,
+        .flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR,
+        .mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR,
+        .geometryCount = 1,
+        .pGeometries = &geometry,
+    };
+    VkAccelerationStructureBuildSizesInfoKHR sizes{.sType =
+                                                       VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
+    vkGetAccelerationStructureBuildSizesKHR(impl_->device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &build_info,
+                                            &desc.max_instances, &sizes);
+    return make_acceleration(*impl_, true, desc.max_instances, sizes, desc.debug_name);
+}
+
+void Device::destroy(AccelerationHandle handle) {
+    const Acceleration* acceleration = impl_->accelerations.get(handle);
+    if (acceleration == nullptr) {
+        return;
+    }
+    impl_->current_slot().pending.push(PendingDestroy{.buffer = acceleration->buffer,
+                                                      .allocation = acceleration->allocation,
+                                                      .acceleration = acceleration->handle,
+                                                      .memory_bytes = acceleration->memory_bytes});
+    if (acceleration->scratch != VK_NULL_HANDLE) {
+        impl_->current_slot().pending.push(
+            PendingDestroy{.buffer = acceleration->scratch, .allocation = acceleration->scratch_allocation});
+    }
+    impl_->uncount_memory(buffer_memory_category(MemoryLocation::GpuOnly), acceleration->memory_bytes);
+    impl_->accelerations.remove(handle);
+}
+
+uint64_t Device::acceleration_address(AccelerationHandle handle) const {
+    return impl_->acceleration(handle).address;
 }
 
 void Device::destroy(PipelineHandle handle) {

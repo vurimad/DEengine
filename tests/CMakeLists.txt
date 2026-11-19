@@ -12,11 +12,18 @@ add_executable(de_tests
     asset/asset_test.cpp
     asset/registry_test.cpp
     cooker/cooker_test.cpp
+    cooker/effect_test.cpp
+    cooker/prefab_test.cpp
     cooker/terrain_test.cpp
     console/console_test.cpp
     editor/cell_saver_test.cpp
     editor/cell_source_test.cpp
     editor/editor_test.cpp
+    editor/effect_viewer_test.cpp
+    editor/prefab_document_test.cpp
+    editor/prefab_editor_test.cpp
+    editor/preview_pictures_test.cpp
+    editor/project_watch_test.cpp
     core/allocator_test.cpp
     core/arena_test.cpp
     core/array_test.cpp
@@ -43,17 +50,25 @@ add_executable(de_tests
     platform/input_test.cpp
     platform/thread_test.cpp
     platform/vfs_test.cpp
+    render/auto_exposure_test.cpp
     render/barrier_test.cpp
     render/bindless_test.cpp
+    render/frame_debugger_test.cpp
     render/graph_test.cpp
+    render/gtao_test.cpp
+    render/path_tracer_test.cpp
     render/imgui_test.cpp
     render/indirect_test.cpp
+    render/local_lights_test.cpp
     render/memory_test.cpp
     render/mips_test.cpp
     render/rhi_test.cpp
     render/geometry_pool_test.cpp
+    render/particles_test.cpp
+    render/ray_query_test.cpp
     render/scene_test.cpp
     render/terrain_test.cpp
+    render/trace_scene_test.cpp
     render/shader_test.cpp
     render/upload_test.cpp
     physics/mesh_collision_test.cpp

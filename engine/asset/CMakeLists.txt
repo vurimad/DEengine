@@ -7,6 +7,8 @@ add_library(de_asset STATIC
     cell_format.h
     collision_format.cpp
     collision_format.h
+    effect_format.cpp
+    effect_format.h
     environment_format.cpp
     environment_format.h
     format.cpp
@@ -15,6 +17,8 @@ add_library(de_asset STATIC
     material_format.h
     mesh_format.cpp
     mesh_format.h
+    prefab_format.cpp
+    prefab_format.h
     registry.cpp
     registry.h
     shader_format.cpp

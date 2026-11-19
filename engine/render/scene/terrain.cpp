@@ -1063,6 +1063,22 @@ bool Terrain::extent(uint32_t (&origin_steps)[2], uint32_t (&size_steps)[2]) con
     return true;
 }
 
+bool Terrain::heights(TerrainHeights& out) const {
+    const TerrainState& state = *state_;
+    if (state.terrain == nullptr || state.level_count == 0) {
+        return false;
+    }
+    const auto slot = static_cast<uint32_t>(state.device->frame_index() % rhi::kFramesInFlight);
+    out.levels = state.device->buffer_address(state.levels);
+    out.nodes = state.device->buffer_address(state.nodes_buffer);
+    out.slots = state.device->buffer_address(state.slots[slot]);
+    out.heights = state.heights_address;
+    std::copy_n(state.origin_steps, 2, out.origin_steps);
+    std::copy_n(state.size_steps, 2, out.size_steps);
+    out.finest_level = state.level_count - 1;
+    return true;
+}
+
 void Terrain::update(const DVec3& camera) {
     DE_PROFILE_ZONE("Terrain::update");
     TerrainState& state = *state_;

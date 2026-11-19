@@ -11,11 +11,11 @@ namespace de::render {
 // The sea's state (docs/design.md, Water; engine/render/scene/ocean.h): a swell come in from far off, and the waves the
 // environment's wind raises over its fetch. The default is a calm sea: no swell, and what wind there is.
 struct SceneSea {
-    float swell_height_m = 0.0f;                // significant height (the mean of the highest third)
-    float swell_period_s = 10.0f;               // its peak period
-    float swell_direction[2] = {0.0f, -1.0f};   // toward where it travels (x, z)
-    float fetch_m = 100000.0f;                  // how far the wind has blown over open water
-    float choppiness = 0.8f;                    // how far crests sharpen: 0 round, about 1 sharp
+    float swell_height_m = 0.0f;              // significant height (the mean of the highest third)
+    float swell_period_s = 10.0f;             // its peak period
+    float swell_direction[2] = {0.0f, -1.0f}; // toward where it travels (x, z)
+    float fetch_m = 100000.0f;                // how far the wind has blown over open water
+    float choppiness = 0.8f;                  // how far crests sharpen: 0 round, about 1 sharp
 };
 
 // Water (docs/design.md, Water): what the world has of it. For now, a sea: a surface at one height, to the horizon.
@@ -24,6 +24,10 @@ struct SceneWater {
     double sea_level_m = 0.0; // world space
     asset::AssetId shore;     // the sea's shore map, a material (tools/worldgen/shore.py); none: open water everywhere
     asset::AssetId foam;      // its foam, a material (base color; alpha how much is foam); none: foam drawn from noise
+    bool show_bands = false;  // the shore waves' bands drawn in color over the sea: a debug view (r.water_bands)
+    // The surf from the film the shore's material carries as its base color (tools/worldgen/surf_film.py), where it
+    // carries one. Off (r.surf_film 0): the simulated surf near the camera and the band surf past it, to compare.
+    bool surf_film = true;
 };
 
 // The water's mesh: kWaterLevels square grids around the camera, each kWaterLevelQuads squares across, the first

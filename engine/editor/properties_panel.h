@@ -2,6 +2,7 @@
 
 #include "core/allocator.h"
 #include "core/array.h"
+#include "core/fixed_string.h"
 #include "core/math.h"
 #include "editor/selection.h"
 #include "editor/widgets.h"
@@ -19,6 +20,22 @@ struct Engine;
 namespace de::editor {
 
 class CommandStack;
+class Thumbnails;
+
+// What a placed entity is made from, as its cell's file names it: src:/ paths, empty where it has none.
+struct EntitySources {
+    flecs::entity_t entity = 0; // whose these are
+    core::FixedString<255> prefab;
+    core::FixedString<255> mesh;
+    core::FixedString<255> effect;
+};
+
+// What a button in the properties asked for.
+struct PropertiesRequest {
+    enum class Kind : uint8_t { None, ShowFile, EditPrefab, ViewEffect };
+    Kind kind = Kind::None;
+    core::FixedString<255> path;
+};
 
 // The properties of what's selected, in the user's property grid look: a search field, then a category per
 // component, a row per field (label | value | reset), a divider between the columns that drags. Fields come from
@@ -27,7 +44,9 @@ class CommandStack;
 // structs open under their row. A reset arrow shows on fields edited this session, and puts back what they were.
 // Every edit is a command (CommandStack): one drag is one undo. What the engine computes or holds for assets stays
 // hidden until asked for (a link at the bottom), and then is read only. For a source file: what it is, and the asset it
-// cooks to.
+// cooks to. A placed thing says first what it's made from: a prefab's placement its prefab (with its picture, the
+// variant it asks for, chosen there, and its parts), a model's or an effect's entity its file, each with buttons to
+// show the file in Resources and to open it (the prefab editor, the effect viewer).
 class PropertiesPanel {
 public:
     static constexpr const char* kWindow = "Properties";
@@ -36,6 +55,16 @@ public:
 
     // True when the selected file was asked to be opened (a world's Open button).
     bool draw(const app::Engine& engine, Selection& selection, CommandStack& commands);
+    // The pictures a prefab's placement shows its prefab by.
+    void set_thumbnails(Thumbnails* thumbnails) { thumbnails_ = thumbnails; }
+    // What the chosen entity is made from: the editor finds it, when the choice changes.
+    void set_sources(const EntitySources& sources) { sources_ = sources; }
+    // What a button asked for since this was last taken.
+    PropertiesRequest take_request() {
+        const PropertiesRequest asked = request_;
+        request_ = {};
+        return asked;
+    }
 
 private:
     // Which widget changed the value this frame, and whether an edit ended.
@@ -53,6 +82,8 @@ private:
     };
 
     void draw_entity(const app::Engine& engine, Selection& selection, CommandStack& commands);
+    // What the entity is made from, before its components.
+    void draw_made_from(const app::Engine& engine, flecs::entity entity, CommandStack& commands);
     bool draw_file(const app::Engine& engine, const Selection& selection);
     // The terrain: what it is, read only (it isn't moved, turned or scaled).
     void draw_terrain(const app::Engine& engine);
@@ -69,6 +100,10 @@ private:
     bool matches(const flecs::world& ecs, const char* name, flecs::entity_t type) const;
 
     core::Array<std::byte> scratch_; // the component's value while it's drawn
+    Thumbnails* thumbnails_ = nullptr;
+    EntitySources sources_{};
+    PropertiesRequest request_{};
+    bool parts_open_ = false; // a placement's parts are listed
     char filter_[128] = {};
     float label_fraction_ = 0.4f;
     bool show_engine_ = false; // what the engine computes or owns shows too

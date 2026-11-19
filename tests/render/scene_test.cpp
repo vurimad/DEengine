@@ -1,6 +1,8 @@
+#include "asset/effect_format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
 #include "asset/registry.h"
+#include "cooker/effect_cooker.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/texture_cooker.h"
@@ -11,6 +13,7 @@
 #include "render/scene/fog_noise.h"
 #include "render/scene/gpu_assets.h"
 #include "render/scene/scene_renderer.h"
+#include "render/scene/shore_sim.h"
 #include "render/shader/shader_compiler.h"
 #include "render/shader/shader_library.h"
 #include "support/gpu.h"
@@ -330,7 +333,7 @@ TEST_CASE("loaded meshes and materials reach the GPU, draw where the camera look
         static_cast<void>(render(de::render::SceneView::Lit));
         CHECK(graph->stats().passes == foggy_passes - 1);
         static_cast<void>(render(de::render::SceneView::BaseColor, green));
-        CHECK(graph->stats().passes == foggy_passes - 1);
+        CHECK(graph->stats().passes == foggy_passes - 1 - 4); // nor the ambient occlusion's four, in a data view
         // Nothing to look through: cleared to the empty color (0.10, 0.11, 0.15 by default).
         frame.camera.valid = false;
         const de::core::Array<std::byte> cleared = render(de::render::SceneView::Lit);
@@ -940,6 +943,292 @@ TEST_CASE("masked materials are cut out, double-sided ones seen from behind, eac
         for (const de::asset::AssetHandle mesh : meshes) {
             assets->release(mesh);
         }
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}
+
+TEST_CASE("what blends is mixed over what's behind it, the farthest first, and stays out of the G-buffer") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    // A green wall, and two squares to stand in front of it, each half see-through: one red, one blue.
+    struct Look {
+        de::asset::AlphaMode mode;
+        float color[4];
+    };
+    const Look looks[] = {
+        {.mode = de::asset::AlphaMode::Opaque, .color = {0.0f, 1.0f, 0.0f, 1.0f}},
+        {.mode = de::asset::AlphaMode::Blend, .color = {1.0f, 0.0f, 0.0f, 0.5f}},
+        {.mode = de::asset::AlphaMode::Blend, .color = {0.0f, 0.0f, 1.0f, 0.5f}},
+    };
+    constexpr uint32_t kLooks = 3;
+    for (uint32_t i = 0; i < kLooks; ++i) {
+        const AssetId material_id = AssetId::from_value(0x320 + i);
+        put_quad(*vfs, AssetId::from_value(0x420 + i), material_id);
+        de::cooker::MaterialBuild build;
+        build.alpha_mode = looks[i].mode;
+        build.set_param(de::asset::material::kBaseColor, looks[i].color[0], looks[i].color[1], looks[i].color[2],
+                        looks[i].color[3]);
+        build.set_param(de::asset::material::kRoughness, 1.0f);
+        const auto material = de::cooker::cook_material(build, material_id);
+        REQUIRE(
+            vfs->write_file(de::asset::cooked_path(material_id, AssetType::Material).c_str(), material.span()).ok());
+    }
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer =
+            de::render::SceneRenderer::create({.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets});
+        REQUIRE(renderer.ok());
+        de::asset::AssetHandle meshes[kLooks];
+        for (uint32_t i = 0; i < kLooks; ++i) {
+            meshes[i] = assets->load<de::asset::MeshAsset>(AssetId::from_value(0x420 + i));
+        }
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+        // Even light from all round and no sun: a surface shows its own colour.
+        de::render::SceneLighting lighting;
+        for (int c = 0; c < 3; ++c) {
+            lighting.sun_color[c] = 0.0f;
+            lighting.sky_color[c] = 1.0f;
+            lighting.ground_color[c] = 1.0f;
+        }
+        struct Rgb {
+            int r = 0;
+            int g = 0;
+            int b = 0;
+        };
+        // The middle of the picture, from 3 m in front of the wall: the squares 1 and 2 m in front of it, either one
+        // the nearer, in either order in the frame.
+        const auto middle = [&](bool red_nearer, bool red_first, de::render::SceneView view) {
+            for (const de::asset::AssetHandle mesh : meshes) {
+                REQUIRE(gpu_assets->mesh(mesh) != nullptr);
+            }
+            de::world::RenderFrame frame;
+            frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+            const auto at = [&](uint32_t mesh, float z) {
+                return de::world::RenderInstance{.transform =
+                                                     de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, z}),
+                                                 .mesh = meshes[mesh]};
+            };
+            const de::world::RenderInstance red = at(1, red_nearer ? 2.0f : 1.0f);
+            const de::world::RenderInstance blue = at(2, red_nearer ? 1.0f : 2.0f);
+            frame.instances.push(at(0, 0.0f));
+            frame.instances.push(red_first ? red : blue);
+            frame.instances.push(red_first ? blue : red);
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, lighting, view);
+            graph->execute();
+            device->end_frame();
+            const de::core::Array<std::byte> pixels = de::test::read_texture(*device, *target);
+            const uint8_t* const pixel = texel(pixels, kSize / 2, kSize / 2);
+            return Rgb{.r = pixel[0], .g = pixel[1], .b = pixel[2]};
+        };
+        const auto close_to = [](int a, int b) { return std::abs(a - b) <= 2; };
+        using de::render::SceneView;
+        // Blue in front: it counts for most, and red and the wall still show through it.
+        const Rgb blue_in_front = middle(false, true, SceneView::Lit);
+        CHECK(blue_in_front.b > blue_in_front.r + 20);
+        CHECK(blue_in_front.r > 20);
+        CHECK(blue_in_front.g > 20);
+        // The same picture whichever of the two came first in the frame: they're drawn by distance.
+        const Rgb other_order = middle(false, false, SceneView::Lit);
+        CHECK(close_to(other_order.r, blue_in_front.r));
+        CHECK(close_to(other_order.g, blue_in_front.g));
+        CHECK(close_to(other_order.b, blue_in_front.b));
+        // Red in front: the other way round, again in either order.
+        const Rgb red_in_front = middle(true, true, SceneView::Lit);
+        CHECK(red_in_front.r > red_in_front.b + 20);
+        CHECK(red_in_front.b > 20);
+        const Rgb red_other_order = middle(true, false, SceneView::Lit);
+        CHECK(close_to(red_other_order.r, red_in_front.r));
+        CHECK(close_to(red_other_order.b, red_in_front.b));
+        // The two are the same picture with red and blue changed over.
+        CHECK(close_to(red_in_front.r, blue_in_front.b));
+        CHECK(close_to(red_in_front.b, blue_in_front.r));
+        // What blends isn't in the G-buffer: there, the wall alone.
+        const Rgb base = middle(false, true, SceneView::BaseColor);
+        CHECK(base.g > 200);
+        CHECK(base.r < 20);
+        CHECK(base.b < 20);
+        for (const de::asset::AssetHandle mesh : meshes) {
+            assets->release(mesh);
+        }
+        assets->update();
+        device->wait_idle();
+        device->destroy(*target);
+    }
+    device->wait_idle();
+    de::test::check_clean(*device);
+}
+
+TEST_CASE("particles draw over the lit image where they're in front of the scene, and not through it") {
+    auto device = de::test::make_device();
+    if (!device) {
+        return;
+    }
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    const de::platform::PathString game_root = sandbox.game();
+    auto vfs = de::platform::Vfs::create(
+        {.game_root = game_root.c_str(), .engine_root = DE_SOURCE_DIR, .jobs = &jobs, .game_writable = true});
+    REQUIRE(vfs.ok());
+    // A nearly black wall, and a red glow: six particles or so, each staying where it's born.
+    const AssetId wall_id = AssetId::from_value(0x440);
+    const AssetId wall_material = AssetId::from_value(0x340);
+    const AssetId glow_id = AssetId::from_value(0x540);
+    put_quad(*vfs, wall_id, wall_material);
+    de::cooker::MaterialBuild dark;
+    dark.set_param(de::asset::material::kBaseColor, 0.02f, 0.02f, 0.02f, 1.0f);
+    dark.set_param(de::asset::material::kRoughness, 1.0f);
+    const auto cooked_dark = de::cooker::cook_material(dark, wall_material);
+    REQUIRE(
+        vfs->write_file(de::asset::cooked_path(wall_material, AssetType::Material).c_str(), cooked_dark.span()).ok());
+    {
+        constexpr std::string_view kGlow = R"({
+  "emitters": [
+    {"name": "glow", "rate_per_s": 6, "lifetime_s": 1, "prewarm_s": 1,
+     "modules": [{"type": "size", "m": 0.5}, {"type": "color", "rgb": [1, 0.1, 0.05]}],
+     "look": {"shape": "glow", "intensity": 0.25, "soft_m": 0}}
+  ]
+})";
+        de::cooker::Source source;
+        REQUIRE(source.path.assign("content/glow.vfx"));
+        de::cooker::Diagnostics diagnostics;
+        const auto effect = de::cooker::import_effect(source, std::as_bytes(std::span(kGlow)), diagnostics);
+        REQUIRE(effect.ok());
+        const auto cooked = de::cooker::cook_effect(*effect, glow_id);
+        REQUIRE(vfs->write_file(de::asset::cooked_path(glow_id, AssetType::Effect).c_str(), cooked.span()).ok());
+    }
+    auto compiler = de::shader::ShaderCompiler::create(*vfs);
+    REQUIRE(compiler.ok());
+    auto shaders = de::shader::ShaderLibrary::create(*device, *vfs, jobs, *compiler, {.hot_reload = false});
+    REQUIRE(shaders.ok());
+    auto uploader = de::rhi::Uploader::create(*device);
+    REQUIRE(uploader.ok());
+    auto assets = de::asset::AssetRegistry::create({.vfs = &*vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    {
+        auto gpu_assets =
+            de::render::GpuAssets::create({.device = &*device, .uploader = &*uploader, .assets = &*assets});
+        REQUIRE(gpu_assets.ok());
+        auto renderer = de::render::SceneRenderer::create(
+            {.device = &*device, .shaders = &*shaders, .gpu_assets = &*gpu_assets, .assets = &*assets});
+        REQUIRE(renderer.ok());
+        REQUIRE(renderer->particles() != nullptr);
+        const de::asset::AssetHandle wall = assets->load<de::asset::MeshAsset>(wall_id);
+        const de::asset::AssetHandle glow = assets->load<de::asset::EffectAsset>(glow_id);
+        assets->wait_all();
+        gpu_assets->update();
+        uploader->flush_and_wait();
+        gpu_assets->update();
+        REQUIRE(gpu_assets->mesh(wall) != nullptr);
+        const auto target =
+            device->create_texture({.width = kSize,
+                                    .height = kSize,
+                                    .format = de::rhi::Format::RGBA8Unorm,
+                                    .usage = de::rhi::TextureUsage::RenderTarget | de::rhi::TextureUsage::CopySrc,
+                                    .debug_name = "target"});
+        REQUIRE(target.ok());
+        auto graph = de::render::RenderGraph::create(*device);
+        REQUIRE(graph.ok());
+        // A dim even light and no sun: the wall is close to black.
+        de::render::SceneLighting lighting;
+        for (int c = 0; c < 3; ++c) {
+            lighting.sun_color[c] = 0.0f;
+            lighting.sky_color[c] = 0.05f;
+            lighting.ground_color[c] = 0.05f;
+        }
+        struct Rgb {
+            int r = 0;
+            int g = 0;
+            int b = 0;
+        };
+        double time_s = 0.0;
+        // The middle of the picture, from 3 m in front of the wall: with no effect, or with the glow at a place
+        // along the view (each place an effect of its own, by its slot).
+        const auto middle = [&](bool with_glow, float glow_z, uint32_t slot) {
+            de::world::RenderFrame frame;
+            time_s += 1.0 / 60.0;
+            frame.time_s = time_s;
+            frame.camera = {.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3}, .vertical_fov_rad = 1.0f, .valid = true};
+            frame.instances.push(de::world::RenderInstance{
+                .transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}), .mesh = wall});
+            if (with_glow) {
+                frame.effects.push({.transform = de::test::render_transform({1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, glow_z}),
+                                    .effect = glow,
+                                    .slot = slot,
+                                    .seed = 11 + slot});
+            }
+            device->begin_frame();
+            uploader->record();
+            graph->begin(kSize, kSize);
+            const de::render::GraphTexture color = graph->import_texture(
+                {.texture = *target, .name = "target", .final_state = de::rhi::ResourceState::CopySrc});
+            renderer->add_passes(*graph, color, de::rhi::Format::RGBA8Unorm, frame, lighting,
+                                 de::render::SceneView::Lit);
+            graph->execute();
+            device->end_frame();
+            const de::core::Array<std::byte> pixels = de::test::read_texture(*device, *target);
+            const uint8_t* const pixel = texel(pixels, kSize / 2, kSize / 2);
+            return Rgb{.r = pixel[0], .g = pixel[1], .b = pixel[2]};
+        };
+        const Rgb bare = middle(false, 0.0f, 0);
+        CHECK(bare.r < 40);
+        CHECK(renderer->stats().particles.effects == 0);
+        // A meter in front of the wall: its light is added to what's behind it. It was running a second already
+        // (prewarm_s), so it's there in its first frame.
+        const Rgb in_front = middle(true, 1.0f, 0);
+        CHECK(renderer->stats().particles.effects == 1);
+        CHECK(renderer->stats().particles.emitters_drawn == 1);
+        CHECK(renderer->stats().particles.blocks == 1);
+        CHECK(in_front.r > bare.r + 60);
+        CHECK(in_front.r > in_front.b + 40);
+        // A meter behind it: there, stepped, and hidden by the wall.
+        const Rgb behind = middle(true, -1.0f, 1);
+        CHECK(renderer->stats().particles.emitters_drawn == 1);
+        CHECK(std::abs(behind.r - bare.r) <= 2);
+        // Gone from the frame, gone from the picture.
+        const Rgb after = middle(false, 0.0f, 0);
+        CHECK(std::abs(after.r - bare.r) <= 2);
+        CHECK(renderer->stats().particles.blocks == 0);
+        assets->release(wall);
+        assets->release(glow);
         assets->update();
         device->wait_idle();
         device->destroy(*target);
@@ -2800,4 +3089,26 @@ TEST_CASE("TAA smooths edges and stays still, and moving things leave no ghost")
     }
     device->wait_idle();
     de::test::check_clean(*device);
+}
+
+TEST_CASE("the surf's simulation window stays on its cells round the camera, wherever the render origin is") {
+    using de::render::kShoreSimCellM;
+    using de::render::kShoreSimSide;
+    using de::render::shore_sim_window;
+    // The camera near the middle: the window's corner half its side back, on a whole cell.
+    const de::DVec3 origin(1000.0, 0.0, 2000.0);
+    const auto window = shore_sim_window(de::DVec3(760.3, 12.0, 1630.9), origin);
+    CHECK(window.corner_cell[0] == 1520 - static_cast<int32_t>(kShoreSimSide / 2));
+    CHECK(window.corner_cell[1] == 3261 - static_cast<int32_t>(kShoreSimSide / 2));
+    CHECK(window.corner[0] == doctest::Approx(window.corner_cell[0] * kShoreSimCellM - 1000.0));
+    CHECK(window.corner[1] == doctest::Approx(window.corner_cell[1] * kShoreSimCellM - 2000.0));
+    // Moving less than a cell keeps it; a cell's worth moves it by one.
+    const auto nudged = shore_sim_window(de::DVec3(760.45, 12.0, 1630.9), origin);
+    CHECK(nudged.corner_cell[0] == window.corner_cell[0]);
+    const auto moved = shore_sim_window(de::DVec3(760.6, 12.0, 1630.9), origin);
+    CHECK(moved.corner_cell[0] == window.corner_cell[0] + 1);
+    // Below zero, cells still round down.
+    const auto negative = shore_sim_window(de::DVec3(-0.1, 0.0, -0.6), de::DVec3(0.0));
+    CHECK(negative.corner_cell[0] == -1 - static_cast<int32_t>(kShoreSimSide / 2));
+    CHECK(negative.corner_cell[1] == -2 - static_cast<int32_t>(kShoreSimSide / 2));
 }

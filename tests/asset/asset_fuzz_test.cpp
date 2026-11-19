@@ -5,6 +5,7 @@
 
 #include "asset/cell_format.h"
 #include "asset/collision_format.h"
+#include "asset/effect_format.h"
 #include "asset/format.h"
 #include "asset/material_format.h"
 #include "asset/mesh_format.h"
@@ -14,6 +15,7 @@
 #include "asset/world_format.h"
 #include "cooker/blob_writer.h"
 #include "cooker/cell_cooker.h"
+#include "cooker/effect_cooker.h"
 #include "cooker/material_cooker.h"
 #include "cooker/mesh_cooker.h"
 #include "cooker/terrain_cooker.h"
@@ -135,8 +137,8 @@ bool safe(std::span<const std::byte> file, const de::asset::CollisionAsset& coll
 // What spawning relies on: parents already made, meshes among the dependencies, names in the file,
 // finite transforms.
 bool safe(std::span<const std::byte> file, const CellAsset& cell) {
-    if (!inside(file, cell.fog_volumes) || !inside(file, cell.entities) || !inside(file, cell.names) ||
-        !inside(file, cell.header.dependencies)) {
+    if (!inside(file, cell.fog_volumes) || !inside(file, cell.water_bodies) || !inside(file, cell.entities) ||
+        !inside(file, cell.names) || !inside(file, cell.header.dependencies)) {
         return false;
     }
     const auto entities = cell.entities.get(file.data());
@@ -148,6 +150,7 @@ bool safe(std::span<const std::byte> file, const CellAsset& cell) {
               cell.header.dependencies.get(file.data())[entity.mesh].type != AssetType::Mesh)) ||
             uint64_t{entity.name_offset} + entity.name_length > cell.names.count ||
             (entity.fog_volume != CellEntity::kNone && entity.fog_volume >= cell.fog_volumes.count) ||
+            (entity.water_body != CellEntity::kNone && entity.water_body >= cell.water_bodies.count) ||
             (entity.collision != CellEntity::kNone &&
              (entity.collision >= cell.header.dependencies.count ||
               cell.header.dependencies.get(file.data())[entity.collision].type != AssetType::Collision)) ||
@@ -235,6 +238,67 @@ bool safe(std::span<const std::byte> file, const WorldAsset& world) {
     }
     return world.terrain == WorldAsset::kNone ||
            (world.terrain < dependencies.size() && dependencies[world.terrain].type == AssetType::Terrain);
+}
+
+// What the particle system's shaders rely on: every run inside the words, every record of a kind its run takes and
+// ending inside it, a curve's keys as many as its length holds and rising, every number finite.
+bool safe(std::span<const std::byte> file, const de::asset::EffectAsset& effect) {
+    using de::asset::EffectModule;
+    if (!inside(file, effect.emitters) || !inside(file, effect.words) || !inside(file, effect.names) ||
+        effect.emitters.count == 0 || !std::isfinite(effect.draw_distance_m)) {
+        return false;
+    }
+    const std::span<const uint32_t> words = effect.words.get(file.data());
+    for (const de::asset::EffectEmitter& emitter : effect.emitters.get(file.data())) {
+        if (emitter.capacity == 0 || emitter.capacity > de::asset::EffectLimits::kMaxCapacity ||
+            !(emitter.rate_per_s > 0.0f) || !(emitter.lifetime_s[0] > 0.0f) ||
+            !(emitter.lifetime_s[1] >= emitter.lifetime_s[0]) || !std::isfinite(emitter.lifetime_s[1]) ||
+            !std::isfinite(emitter.reach_m) || emitter.shape >= de::asset::EffectShape::Count) {
+            return false;
+        }
+        const de::asset::EffectRun runs[3] = {emitter.birth, emitter.step, emitter.draw};
+        for (uint32_t kind = 0; kind < 3; ++kind) {
+            if (uint64_t{runs[kind].first} + runs[kind].words > words.size()) {
+                return false;
+            }
+            const std::span<const uint32_t> run = words.subspan(runs[kind].first, runs[kind].words);
+            size_t at = 0;
+            uint32_t modules = 0;
+            while (at < run.size()) {
+                const auto type = static_cast<uint32_t>(de::asset::effect_module_type(run[at]));
+                const uint32_t count = de::asset::effect_module_words(run[at]);
+                // Birth modules are numbered from 1, a step's from 16, a draw's from 32.
+                const uint32_t of_kind = type >= 32 ? 2U : type >= 16 ? 1U : 0U;
+                if (count == 0 || count > run.size() - at || of_kind != kind || ++modules > 16) {
+                    return false; // a walk that never ends, or leaves its run
+                }
+                const bool curve = type == static_cast<uint32_t>(EffectModule::SizeOverLife) ||
+                                   type == static_cast<uint32_t>(EffectModule::ColorOverLife) ||
+                                   type == static_cast<uint32_t>(EffectModule::OpacityOverLife);
+                if (curve) {
+                    const uint32_t per_key = type == static_cast<uint32_t>(EffectModule::ColorOverLife) ? 4U : 2U;
+                    if (count < 2 || run[at + 1] == 0 || run[at + 1] > 8 || 2 + (run[at + 1] * per_key) != count) {
+                        return false; // keys read past the record
+                    }
+                    float last_t = -1.0f;
+                    for (uint32_t key = 0; key < run[at + 1]; ++key) {
+                        const float t = de::asset::effect_word_float(run[at + 2 + (size_t{key} * per_key)]);
+                        if (!(t > last_t)) {
+                            return false; // a division by nothing between two keys
+                        }
+                        last_t = t;
+                    }
+                }
+                for (uint32_t word = curve ? 2U : 1U; word < count; ++word) {
+                    if (!std::isfinite(de::asset::effect_word_float(run[at + word]))) {
+                        return false;
+                    }
+                }
+                at += count;
+            }
+        }
+    }
+    return true;
 }
 
 // Corrupts a copy of file many ways; every copy that still loads must be safe. The asset struct
@@ -358,7 +422,8 @@ std::vector<std::byte> sample_material() {
 }
 
 // A cell with a parent, two meshes, and names.
-std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = {.density_per_m = 0.2f}) {
+std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = {.density_per_m = 0.2f},
+                                   const de::asset::CellWaterBody& water_body = {}) {
     de::cooker::CellBuild build;
     build.meshes.push({.id = AssetId::from_value(21), .type = AssetType::Mesh});
     build.meshes.push({.id = AssetId::from_value(22), .type = AssetType::Mesh});
@@ -371,6 +436,8 @@ std::vector<std::byte> sample_cell(const de::asset::CellFogVolume& fog_volume = 
     build.entities.push({.parent = 0, .mesh = 1, .name_offset = 4, .name_length = 5});
     build.fog_volumes.push(fog_volume);
     build.entities.push({.parent = 1, .name_offset = 9, .name_length = 5, .fog_volume = 0});
+    build.water_bodies.push(water_body);
+    build.entities.push({.water_body = 0});
     return to_vector(de::cooker::cook_cell(build, AssetId::from_value(14)));
 }
 
@@ -409,6 +476,42 @@ std::vector<std::byte> sample_world() {
     build.cells.push({.cell = AssetId::from_value(33), .coord_x = 0, .coord_z = 0});
     build.cells.push({.cell = AssetId::from_value(34), .coord_x = 1, .coord_z = 0});
     return to_vector(de::cooker::cook_world(build, AssetId::from_value(16)));
+}
+
+// An effect of two emitters, with modules of every kind, cooked from its text.
+std::vector<std::byte> sample_effect() {
+    constexpr std::string_view kText = R"({
+  "emitters": [
+    {"name": "flame", "rate_per_s": 30, "lifetime_s": [0.5, 1],
+     "modules": [
+       {"type": "sphere", "radius_m": 0.5, "surface": true},
+       {"type": "cone_velocity", "direction": [0, 1, 0], "angle_deg": 20, "speed_mps": [1, 2]},
+       {"type": "acceleration", "mps2": [0, 0.5, 0]},
+       {"type": "drag", "per_s": 1},
+       {"type": "size", "m": [0.01, 0.02]},
+       {"type": "size_over_life", "keys": [[0, 0.5], [0.25, 1], [1, 0]]},
+       {"type": "color_over_life", "keys": [[0, 1, 0.8, 0.4], [1, 1, 0.2, 0]]},
+       {"type": "stretch", "seconds": 0.05}]},
+    {"name": "motes", "space": "local", "rate_per_s": 4, "lifetime_s": 6,
+     "modules": [
+       {"type": "box", "half_extents_m": [1, 2, 2]},
+       {"type": "disc", "radius_m": 0.25},
+       {"type": "velocity", "mps": [0, 0, 0.1]},
+       {"type": "random_velocity", "speed_mps": 0.02},
+       {"type": "turbulence", "strength_mps2": 0.05, "size_m": 0.5},
+       {"type": "wind", "follow_per_s": 2},
+       {"type": "color", "rgb": [1, 0.9, 0.7]},
+       {"type": "opacity_over_life", "keys": [[0, 0], [0.5, 1], [1, 0]]},
+       {"type": "rotation", "deg": [0, 90], "spin_dps": 180}],
+     "look": {"shape": "puff", "opacity": 0.75, "lit": true}}
+  ]
+})";
+    de::cooker::Source source;
+    REQUIRE(source.path.assign("content/fuzz.vfx"));
+    de::cooker::Diagnostics diagnostics;
+    const auto build = de::cooker::import_effect(source, std::as_bytes(std::span(kText)), diagnostics);
+    REQUIRE(build.ok());
+    return to_vector(de::cooker::cook_effect(*build, AssetId::from_value(17)));
 }
 
 // A shader file as the cooker lays it out, around stand-in SPIR-V.
@@ -498,6 +601,15 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     bad_volume = good_volume;
     bad_volume.drift_mps[2] = not_a_number;
     CHECK(refused(bad_volume));
+    // And water bodies.
+    const auto water_refused = [&](const de::asset::CellWaterBody& water) {
+        Buffer file(sample_cell(good_volume, water));
+        return !load_in_place<CellAsset>(file.bytes()).ok();
+    };
+    CHECK_FALSE(water_refused({}));
+    CHECK(water_refused({.waves = 1.5f}));
+    CHECK(water_refused({.waves = not_a_number}));
+    CHECK(water_refused({.shape = static_cast<de::asset::CellWaterShape>(9)}));
     bad_volume = good_volume;
     bad_volume.height_fade_m = -1.0f;
     CHECK(refused(bad_volume));
@@ -514,6 +626,11 @@ TEST_CASE("corrupted cooked files are refused, or safe to use") {
     Buffer collision_file(collision);
     REQUIRE(load_in_place<de::asset::CollisionAsset>(collision_file.bytes()).ok());
     fuzz<de::asset::CollisionAsset>(collision, 8, kRounds);
+    const std::vector<std::byte> effect = sample_effect();
+    Buffer effect_file(effect);
+    REQUIRE(load_in_place<de::asset::EffectAsset>(effect_file.bytes()).ok());
+    REQUIRE(safe(effect_file.bytes(), **load_in_place<de::asset::EffectAsset>(effect_file.bytes())));
+    fuzz<de::asset::EffectAsset>(effect, 9, kRounds);
 }
 
 TEST_CASE("textures whose sizes overflow the mip arithmetic are refused") {

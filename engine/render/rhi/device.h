@@ -88,6 +88,7 @@ struct DeviceStats {
     uint32_t live_textures = 0; // swapchain textures included
     uint32_t live_buffers = 0;
     uint32_t live_pipelines = 0;
+    uint32_t live_accelerations = 0;
     uint32_t bindless_textures = 0;         // sampled texture entries in use (the fallback included)
     uint32_t bindless_storage_textures = 0; // storage texture entries in use (one per mip, the fallback included)
     uint32_t pending_destroys = 0;          // destroyed resources waiting for the GPU to finish with them
@@ -139,12 +140,17 @@ public:
     // Fails if the driver rejects the shader code or the state.
     core::Result<PipelineHandle> create_graphics_pipeline(const GraphicsPipelineDesc& desc);
     core::Result<PipelineHandle> create_compute_pipeline(const ComputePipelineDesc& desc);
+    // Acceleration structures (rhi.h): only with Capabilities::ray_query, else they fail. Made empty: a command
+    // list builds them (build_bottom_level, build_top_level) before anything traces against them.
+    core::Result<AccelerationHandle> create_bottom_level(const BottomLevelDesc& desc);
+    core::Result<AccelerationHandle> create_top_level(const TopLevelDesc& desc);
 
     // The handle stops resolving at once; the GPU memory is freed when the frames in flight that
     // may still use it are done. Invalid handles are ignored. Swapchain textures can't be destroyed.
     void destroy(TextureHandle texture);
     void destroy(BufferHandle buffer);
     void destroy(PipelineHandle pipeline);
+    void destroy(AccelerationHandle acceleration);
 
     // The texture's bindless index, for shaders (TextureUsage::Sampled): its entry in the table of
     // its shape (BindlessTable). kInvalidBindlessIndex without that usage or for a stale handle.
@@ -163,6 +169,10 @@ public:
     // The GPU address shaders reach the buffer by (a pointer in Slang). Every buffer with a
     // shader-visible usage (vertex, index, uniform, storage, indirect) has one.
     uint64_t buffer_address(BufferHandle buffer) const;
+
+    // The address of an acceleration structure: what an instance names its bottom level by
+    // (AccelerationInstance::bottom_level), and what a shader makes its top level from.
+    uint64_t acceleration_address(AccelerationHandle acceleration) const;
 
     // The persistent mapping of an Upload or Readback buffer; empty for GpuOnly buffers.
     std::span<std::byte> mapped(BufferHandle buffer);

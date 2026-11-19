@@ -125,7 +125,9 @@ public struct FogVolumeData
     public float4 to_local[3];  // rows: into its own axes, in meters
     public float4 half_extents; // w: its soft edge, in meters
     public float4 tint_density; // w: extinction per meter at its heart, before noise
-    public float4 shape;        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters
+    public float4 shape;        // x: 1 for an ellipsoid; y: how much noise eats away; z: its height fade, in meters;
+                                // w: how open to the sky the place it fills is (scene.sky's open_sky), negative if it
+                                // doesn't say
     public float4 noise;        // xyz: how far the noise has moved past the render origin, in tiles, wrapped to [0, 4); w: its tiles a meter
 };
 
@@ -162,6 +164,15 @@ float fog_volume_share(FogVolumeData volume, float3 local)
     const float3 axes_up = float3(volume.to_local[0].y, volume.to_local[1].y, volume.to_local[2].y);
     const float top = volume.shape.x > 0.5 ? length(axes_up * half_extents) : dot(abs(axes_up), half_extents);
     return edge * smoothstep(0.0, 1.0, saturate((top - dot(local, axes_up)) / volume.shape.z));
+}
+
+// How far inside a volume a place (relative to the render origin) is: 0 outside it, 1 at its heart, over its soft
+// edge, without its noise.
+public float fog_volume_weight(FogVolumeData volume, float3 position)
+{
+    const float4 place = float4(position, 1.0);
+    return fog_volume_share(volume, float3(dot(volume.to_local[0], place), dot(volume.to_local[1], place),
+                                           dot(volume.to_local[2], place)));
 }
 
 // The mip of the fog noise that a footprint in meters can hold, for a layer of this many tiles a meter.

@@ -61,6 +61,7 @@ struct TimedPass {
     core::FixedString<31> name;
     uint32_t begin = 0; // timestamp indices
     uint32_t end = 0;
+    uint32_t pass = 0; // its index among the frame's passes
 };
 
 // Tracy keeps plot names by pointer, and may read them until the process exits: the names of
@@ -100,6 +101,7 @@ struct Pass {
     const void* closure = nullptr;
     bool never_cull = false;
     bool live = true;
+    rhi::ListWork work{}; // what its execute recorded
 };
 
 struct TextureResource {
@@ -283,7 +285,10 @@ struct RenderGraphState {
     uint64_t resolved_frame = 0; // the device frame whose begin() last read the times
     uint32_t reference_width = 0;
     uint32_t reference_height = 0;
-    uint32_t open_pass = kNone; // in add_pass, between begin_pass and end_pass
+    uint32_t open_pass = kNone;           // in add_pass, between begin_pass and end_pass
+    RenderGraph::PassHook hook = nullptr; // set_pass_hook()
+    void* hook_user = nullptr;
+    bool in_hook = false; // the hook is adding passes: it isn't called for those
     uint32_t barriers = 0;
     uint32_t pool_creations = 0;
     uint32_t skipped_passes = 0;
@@ -603,10 +608,13 @@ struct RenderGraphState {
         const uint32_t begin = desc.gpu_timing ? list.write_timestamp() : rhi::kNoTimestamp; // barriers count
         batch.flush(list);
         PassContext context(list, *device, *this, pass_index);
+        const rhi::ListWork before = list.work();
         pass.execute(pass.closure, context);
+        pass.work = list.work() - before;
         const uint32_t end = begin != rhi::kNoTimestamp ? list.write_timestamp() : rhi::kNoTimestamp;
         if (begin != rhi::kNoTimestamp && end != rhi::kNoTimestamp) {
-            timed[timing_slot].push({.name = core::FixedString<31>(pass.name), .begin = begin, .end = end});
+            timed[timing_slot].push(
+                {.name = core::FixedString<31>(pass.name), .begin = begin, .end = end, .pass = pass_index});
         }
     }
 
@@ -631,7 +639,7 @@ struct RenderGraphState {
             last = std::max(last, end_ns);
             const auto ms = static_cast<float>(static_cast<double>(end_ns - start_ns) * 1e-6);
             if (gpu_pass_count < kMaxTimedPasses) {
-                gpu_passes[gpu_pass_count++] = {.name = pass.name, .ms = ms};
+                gpu_passes[gpu_pass_count++] = {.name = pass.name, .ms = ms, .pass = pass.pass};
             }
             const core::StringId key(pass.name.c_str(), pass.name.size());
             const char* const* plot = plot_names.find(key);
@@ -1015,6 +1023,57 @@ void RenderGraph::end_pass(uint32_t pass, ExecuteFn execute_fn, const void* clos
     if (state.desc.immediate) {
         state.run(pass);
     }
+    if (state.hook != nullptr && !state.in_hook) {
+        state.in_hook = true;
+        state.hook(state.hook_user, *this, pass);
+        state.in_hook = false;
+    }
+}
+
+void RenderGraph::set_pass_hook(PassHook hook, void* user) {
+    state_->hook = hook;
+    state_->hook_user = user;
+}
+
+uint32_t RenderGraph::pass_count() const {
+    return static_cast<uint32_t>(state_->passes.size());
+}
+
+GraphPassInfo RenderGraph::pass_info(uint32_t pass) const {
+    DE_ASSERT_MSG(pass < state_->passes.size(), "no such pass in the frame's graph");
+    const Pass& from = state_->passes[pass];
+    return {.name = from.name, .use_count = from.use_count, .ran = from.live, .work = from.work};
+}
+
+GraphUseInfo RenderGraph::pass_use(uint32_t pass, uint32_t use) const {
+    DE_ASSERT_MSG(pass < state_->passes.size() && use < state_->passes[pass].use_count, "no such use in the pass");
+    const Use& from = state_->uses[state_->passes[pass].first_use + use];
+    return {.is_texture = from.texture,
+            .resource = from.resource,
+            .state = from.state,
+            .stages = from.stages,
+            .range = from.range,
+            .writes = core::has_any(from.state, rhi::kWriteStates)};
+}
+
+uint32_t RenderGraph::texture_count() const {
+    return static_cast<uint32_t>(state_->textures.size());
+}
+
+GraphTextureInfo RenderGraph::texture_info(uint32_t texture) const {
+    DE_ASSERT_MSG(texture < state_->textures.size(), "no such texture in the frame's graph");
+    const TextureResource& from = state_->textures[texture];
+    return {.name = from.name, .desc = from.desc, .imported = from.imported, .used = from.used};
+}
+
+uint32_t RenderGraph::buffer_count() const {
+    return static_cast<uint32_t>(state_->buffers.size());
+}
+
+GraphBufferInfo RenderGraph::buffer_info(uint32_t buffer) const {
+    DE_ASSERT_MSG(buffer < state_->buffers.size(), "no such buffer in the frame's graph");
+    const BufferResource& from = state_->buffers[buffer];
+    return {.name = from.name, .desc = from.desc, .imported = from.imported, .used = from.used};
 }
 
 void RenderGraph::execute() {

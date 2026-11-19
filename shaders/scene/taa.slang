@@ -6,6 +6,8 @@
 //     last frame) differs from the object motion here: it was about something else. It goes where the
 //     depth there says another surface was in front, and off the screen. A pixel loses its sharpness
 //     as it loses its history: without any, it's a soft blur of this frame.
+//   - What's see-through writes no depth and no motion (scene.transparent): history is trusted less by how much
+//     of the pixel it covers.
 // All of it in a tonemapped space, so a bright pixel neither dominates its neighbours nor flickers.
 
 import common.bindless;
@@ -23,6 +25,10 @@ struct TaaPush
     uint sampler;      // linear clamp
     uint has_history;  // 0: the first frame, after a cut or a gap: no history at all
     float exposure;    // what the tonemap will multiply by: the tonemapped space matches what's seen
+    uint coverage;     // how much of each pixel see-through things cover
+    uint has_coverage; // 0: nothing see-through was drawn
+    uint reserved;
+    float* adapted;    // auto exposure's, as the tonemap reads it; none: exposure alone
 };
 
 [[vk::push_constant]]
@@ -40,6 +46,8 @@ static const float kMotionTolerance = 0.25;
 static const float kStillPx = 0.05;
 // More than this many of the 9 pixels around one share its depth: it isn't a sliver.
 static const uint kSliverPixels = 4;
+// How much history a pixel wholly covered by something see-through gives up: whatever moved there said nothing.
+static const float kCoverageDistrust = 0.5;
 // Room in the colour box beyond its extent, so an axis with none (a neutral or single-hue area has no
 // chroma to speak of) doesn't stop history that only rounding moved along it.
 static const float kBoxPadding = 1e-3;
@@ -64,16 +72,30 @@ VertexOutput vertex_main(uint vertex_id: SV_VertexID)
     return output;
 }
 
+// What the tonemap will multiply by: auto exposure's, once it has one.
+float exposure_now()
+{
+    if (push.adapted != nullptr)
+    {
+        const float adapted = *push.adapted;
+        if (adapted > 0.0)
+        {
+            return adapted * push.exposure;
+        }
+    }
+    return push.exposure;
+}
+
 // A bad value counts as black: alone, not with everything that blends with it.
 float3 tonemapped(float3 color)
 {
-    const float3 exposed = select(isfinite(color), max(color, 0.0), 0.0) * push.exposure;
+    const float3 exposed = select(isfinite(color), max(color, 0.0), 0.0) * exposure_now();
     return exposed / (1.0 + max(exposed.r, max(exposed.g, exposed.b)));
 }
 
 float3 untonemapped(float3 color)
 {
-    return color / max(1.0 - max(color.r, max(color.g, color.b)), 1e-4) / push.exposure;
+    return color / max(1.0 - max(color.r, max(color.g, color.b)), 1e-4) / exposure_now();
 }
 
 float3 to_ycocg(float3 c)
@@ -226,6 +248,11 @@ ResolveOutput fragment_main(VertexOutput input)
             const float outside = max(came, expected - far_z * (1.0 + kDepthSlack));
             weight *= saturate(1.0 - outside / expected * 20.0);
         }
+    }
+
+    if (push.has_coverage != 0)
+    {
+        weight *= 1.0 - kCoverageDistrust * saturate(load_texture(push.coverage, texel).r);
     }
 
     // This frame softens as history goes: raw aliasing would show where nothing covers it.

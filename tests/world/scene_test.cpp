@@ -1,11 +1,15 @@
+#include "asset/effect_format.h"
 #include "asset/mesh_format.h"
 #include "asset/registry.h"
 #include "cooker/cell_cooker.h"
+#include "cooker/effect_cooker.h"
 #include "cooker/mesh_cooker.h"
+#include "cooker/prefab_cooker.h"
 #include "core/job_system.h"
 #include "core/memory_stats.h"
 #include "support/sandbox.h"
 #include "world/cell.h"
+#include "world/prefab.h"
 #include "world/render_extract.h"
 #include "world/transform.h"
 #include "world/world.h"
@@ -13,8 +17,11 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <span>
+#include <string_view>
 #include <vector>
 
 using de::DVec3;
@@ -589,14 +596,18 @@ TEST_CASE("render extraction: fog volumes, relative to the render origin, and th
 
     // Its noise: tiles a meter, and how far it's drifted by the world's time, along the world's axes whatever way
     // the volume is turned.
-    const flecs::entity windy = ecs.entity().set(de::world::FogVolume{
-        .noise_size_m = 10.0f, .noise_amount = 0.5f, .drift_mps = {5.0f, 0.0f, 0.0f}, .height_fade_m = 2.0f});
+    const flecs::entity windy = ecs.entity().set(de::world::FogVolume{.noise_size_m = 10.0f,
+                                                                      .noise_amount = 0.5f,
+                                                                      .drift_mps = {5.0f, 0.0f, 0.0f},
+                                                                      .height_fade_m = 2.0f,
+                                                                      .under_roof = 0.5f});
     de::world::place(windy, Transform{.position = {0.0, 0.0, 0.0}, .rotation = yaw, .scale = {4.0f, 2.0f, 1.0f}});
     world->advance(1.0 / 60.0);
     REQUIRE(frame.fog_volumes.size() == 1);
     CHECK(near(frame.fog_volumes[0].noise_tiles_per_m, 0.1, 1e-6));
     CHECK(frame.fog_volumes[0].noise_amount == 0.5f);
     CHECK(frame.fog_volumes[0].height_fade_m == 2.0f);
+    CHECK(frame.fog_volumes[0].under_roof == 0.5f); // how far its place is closed to the sky
     const float offset_before = frame.fog_volumes[0].noise_offset_tiles[0];
     for (int i = 0; i < 30; ++i) {
         world->advance(1.0 / 60.0);
@@ -1163,4 +1174,399 @@ TEST_CASE("a cell given another loaded asset spawns that asset's members") {
     cell.destruct();
     assets->update();
     CHECK(assets->stats().assets == 0);
+}
+
+TEST_CASE("render extraction: lakes and ponds lie flat at their height, as wide as their scale, turned by their yaw") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    world->advance(1.0 / 60.0);
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.water_bodies.empty());
+
+    // Tilted as well as turned: only the turn counts.
+    const Quat turned = yaw_deg(90.0f) * glm::angleAxis(0.3f, Vec3(1.0f, 0.0f, 0.0f));
+    const flecs::entity lake = ecs.entity().set(de::world::WaterBody{.ellipse = false, .waves = 0.4f});
+    de::world::place(lake,
+                     Transform{.position = {100.0, 40.0, -20.0}, .rotation = turned, .scale = {30.0f, 1.0f, 12.0f}});
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.water_bodies.size() == 1);
+    const de::world::RenderWaterBody& body = frame.water_bodies[0];
+    CHECK_FALSE(body.ellipse);
+    CHECK(body.waves == 0.4f);
+    CHECK(near(body.center[0] + frame.origin.x, 100.0, 1e-3));
+    CHECK(near(body.center[1] + frame.origin.y, 40.0, 1e-3));
+    CHECK(near(body.center[2] + frame.origin.z, -20.0, 1e-3));
+    CHECK(body.half_extents[0] == 30.0f);
+    CHECK(body.half_extents[1] == 12.0f);
+    // A quarter turn about y takes x to -z.
+    CHECK(near(body.axis[0], 0.0, 1e-5));
+    CHECK(near(body.axis[1], -1.0, 1e-5));
+    lake.destruct();
+    world->advance(1.0 / 60.0);
+    CHECK(frame.water_bodies.empty());
+}
+
+TEST_CASE(
+    "render extraction: every effect each frame, where its entity is, with a slot it keeps and a seed of its own") {
+    auto world = World::create();
+    REQUIRE(world.ok());
+    const flecs::world& ecs = world->ecs();
+    world->advance(1.0 / 60.0);
+    const de::world::RenderFrame& frame = world->render_frame();
+    CHECK(frame.effects.empty());
+
+    // The world doesn't look a handle up: any will do.
+    const de::asset::AssetHandle fire{.index = 3, .generation = 1};
+    const de::asset::AssetHandle smoke{.index = 4, .generation = 1};
+    const flecs::entity candle = ecs.entity().set(de::world::EffectInstance{.effect = fire});
+    de::world::place(candle, Transform{.position = {4.0, 1.0, -2.0}});
+    const flecs::entity chimney = ecs.entity().set(de::world::EffectInstance{.effect = smoke});
+    de::world::place(chimney, Transform{.position = {-8.0, 0.0, 0.0}, .scale = {2.0f, 2.0f, 2.0f}});
+    const auto find = [&frame](de::asset::AssetHandle effect) -> const de::world::RenderEffect* {
+        for (const de::world::RenderEffect& placed : frame.effects) {
+            if (placed.effect == effect) {
+                return &placed;
+            }
+        }
+        return nullptr;
+    };
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.effects.size() == 2);
+    REQUIRE(find(fire) != nullptr);
+    REQUIRE(find(smoke) != nullptr);
+    const de::world::RenderEffect at_candle = *find(fire);
+    const de::world::RenderEffect at_chimney = *find(smoke);
+    CHECK(at_candle.transform.position_m(0) == 4.0f);
+    CHECK(at_candle.transform.position_m(1) == 1.0f);
+    CHECK(at_candle.transform.position_m(2) == -2.0f);
+    CHECK(at_chimney.transform.position_m(0) == -8.0f);
+    CHECK(at_chimney.transform.rows[0].linear[0] == 2.0f); // its scale, for its emitters' shapes
+    CHECK(at_candle.slot != at_chimney.slot);
+    CHECK(at_candle.slot < 2);
+    CHECK(at_chimney.slot < 2);
+    CHECK(at_candle.seed != at_chimney.seed);
+
+    // A frame later: all of them again (not only what changed), each the same.
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.effects.size() == 2);
+    CHECK(find(fire)->slot == at_candle.slot);
+    CHECK(find(fire)->seed == at_candle.seed);
+    CHECK(find(smoke)->slot == at_chimney.slot);
+
+    // One gone: it's in no frame from then on, and the next effect to come takes its slot.
+    candle.destruct();
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.effects.size() == 1);
+    CHECK(frame.effects[0].effect == smoke);
+    const flecs::entity torch = ecs.entity().set(de::world::EffectInstance{.effect = fire});
+    de::world::place(torch, Transform{.position = {1.0, 0.0, 0.0}});
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.effects.size() == 2);
+    REQUIRE(find(fire) != nullptr);
+    CHECK(find(fire)->slot == at_candle.slot);
+    // Losing its effect alone does the same as going.
+    chimney.remove<de::world::EffectInstance>();
+    world->advance(1.0 / 60.0);
+    REQUIRE(frame.effects.size() == 1);
+    CHECK(frame.effects[0].effect == fire);
+    CHECK_FALSE(chimney.has<de::world::EffectSlot>());
+}
+
+TEST_CASE("a cell's entity plays the effect it names: loaded with the cell, and gone with it") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId cell_id = de::asset::AssetId::from_value(0xa0);
+    const de::asset::AssetId effect_id = de::asset::AssetId::from_value(0xa1);
+    {
+        constexpr std::string_view kText = R"({"emitters": [{"name": "flame", "rate_per_s": 30, "lifetime_s": 0.5}]})";
+        de::cooker::Source source;
+        REQUIRE(source.path.assign("content/flame.vfx"));
+        de::cooker::Diagnostics diagnostics;
+        const auto effect = de::cooker::import_effect(source, std::as_bytes(std::span(kText)), diagnostics);
+        REQUIRE(effect.ok());
+        const auto cooked = de::cooker::cook_effect(*effect, effect_id);
+        REQUIRE(vfs.write_file(de::asset::cooked_path(effect_id, de::asset::AssetType::Effect).c_str(), cooked.span())
+                    .ok());
+        de::cooker::CellBuild build;
+        build.effects.push({.id = effect_id, .type = de::asset::AssetType::Effect});
+        build.entities.push({.position = {5.0, 1.5, -3.0}, .flags = de::asset::CellEntityFlags::Static, .effect = 0});
+        build.entities.push({.position = {9.0, 0.0, 0.0}, .flags = de::asset::CellEntityFlags::Static});
+        const auto cell = de::cooker::cook_cell(build, cell_id);
+        REQUIRE(vfs.write_file(de::asset::cooked_path(cell_id, de::asset::AssetType::Cell).c_str(), cell.span()).ok());
+    }
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(ecs, cell_id);
+    assets->wait_all();
+    world->advance(1.0 / 60.0);
+    // The one entity that names it, and the effect itself is in with the cell.
+    int playing = 0;
+    ecs.query_builder<const de::world::EffectInstance>().build().each(
+        [&](flecs::entity, const de::world::EffectInstance& instance) {
+            ++playing;
+            const auto* effect = assets->get<de::asset::EffectAsset>(instance.effect);
+            REQUIRE(effect != nullptr);
+            CHECK(effect->emitters.count == 1);
+        });
+    CHECK(playing == 1);
+    const de::world::RenderFrame& frame = world->render_frame();
+    REQUIRE(frame.effects.size() == 1);
+    CHECK(frame.effects[0].transform.position_m(0) == 5.0f);
+    CHECK(frame.effects[0].transform.position_m(1) == 1.5f);
+    CHECK(assets->get<de::asset::EffectAsset>(frame.effects[0].effect) != nullptr);
+    // The cell gone: its entity, and with nothing else holding it, the effect.
+    cell.destruct();
+    world->advance(1.0 / 60.0);
+    assets->update();
+    CHECK(frame.effects.empty());
+    CHECK_FALSE(assets->find({.id = effect_id, .type = de::asset::AssetType::Effect}).is_valid());
+}
+
+namespace {
+
+// A prefab of two effects, cooked by hand: a flame a fifth of a meter up, and a spark a meter along x that the
+// variant "unlit" leaves out. `flame_y` moves the flame, for a prefab cooked again.
+void put_prefab(const de::platform::Vfs& vfs, de::asset::AssetId id, de::asset::AssetId effect, float flame_y = 0.2f) {
+    de::cooker::PrefabBuild build;
+    build.dependencies.push({.id = effect, .type = de::asset::AssetType::Effect});
+    for (const char c : std::string_view("flamesparkunlit")) {
+        build.names.push(c);
+    }
+    build.parts.push({.position = {0.0f, flame_y, 0.0f}, .effect = 0, .name_offset = 0, .name_length = 5, .id = 1});
+    build.parts.push(
+        {.position = {1.0f, 0.0f, 0.0f}, .effect = 0, .absent_in = 1, .name_offset = 5, .name_length = 5, .id = 2});
+    build.variants.push({.name_offset = 10, .name_length = 5, .name_hash = de::asset::prefab_variant_hash("unlit")});
+    const auto cooked = de::cooker::cook_prefab(build, id);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(id, de::asset::AssetType::Prefab).c_str(), cooked.span()).ok());
+}
+
+void put_flame(const de::platform::Vfs& vfs, de::asset::AssetId id) {
+    constexpr std::string_view kText = R"({"emitters": [{"name": "flame", "rate_per_s": 30, "lifetime_s": 0.5}]})";
+    de::cooker::Source source;
+    REQUIRE(source.path.assign("content/flame.vfx"));
+    de::cooker::Diagnostics diagnostics;
+    const auto effect = de::cooker::import_effect(source, std::as_bytes(std::span(kText)), diagnostics);
+    REQUIRE(effect.ok());
+    const auto cooked = de::cooker::cook_effect(*effect, id);
+    REQUIRE(vfs.write_file(de::asset::cooked_path(id, de::asset::AssetType::Effect).c_str(), cooked.span()).ok());
+}
+
+int count_parts(const flecs::world& ecs) {
+    int count = 0;
+    ecs.each([&](const de::world::PrefabPart&) { ++count; });
+    return count;
+}
+
+} // namespace
+
+TEST_CASE("a placed prefab's parts are entities beside it: made with its cell, placed from it, gone with it") {
+    using de::world::PrefabInstance;
+    using de::world::PrefabPart;
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId cell_id = de::asset::AssetId::from_value(0xb0);
+    const de::asset::AssetId prefab_id = de::asset::AssetId::from_value(0xb1);
+    const de::asset::AssetId effect_id = de::asset::AssetId::from_value(0xb2);
+    put_flame(vfs, effect_id);
+    put_prefab(vfs, prefab_id, effect_id);
+    {
+        // The whole prefab, turned a quarter and twice the size; and its unlit variant, as it is.
+        const Quat yaw = yaw_deg(90.0f);
+        de::cooker::CellBuild build;
+        build.prefabs.push({.id = prefab_id, .type = de::asset::AssetType::Prefab});
+        build.entities.push({.position = {5.0, 1.0, -3.0},
+                             .rotation = {yaw.x, yaw.y, yaw.z, yaw.w},
+                             .scale = {2.0f, 2.0f, 2.0f},
+                             .flags = de::asset::CellEntityFlags::Static,
+                             .prefab = 0});
+        build.entities.push({.position = {20.0, 0.0, 0.0},
+                             .flags = de::asset::CellEntityFlags::Static,
+                             .prefab = 0,
+                             .variant = de::asset::prefab_variant_hash("unlit")});
+        const auto cell = de::cooker::cook_cell(build, cell_id);
+        REQUIRE(vfs.write_file(de::asset::cooked_path(cell_id, de::asset::AssetType::Cell).c_str(), cell.span()).ok());
+    }
+    auto assets = de::asset::AssetRegistry::create(
+        {.vfs = &vfs, .jobs = &jobs, .hot_reload = true, .reload_checks_per_update = 64});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    const flecs::entity cell = de::world::load_cell(ecs, cell_id);
+    assets->wait_all();
+    world->advance(1.0 / 60.0);
+    const de::world::RenderFrame& frame = world->render_frame();
+
+    // Two placements; three parts between them, each an effect in the frame.
+    flecs::entity whole;
+    flecs::entity unlit;
+    ecs.each([&](flecs::entity placement, const PrefabInstance& instance) {
+        (instance.variant == 0 ? whole : unlit) = placement;
+    });
+    REQUIRE(whole.is_valid());
+    REQUIRE(unlit.is_valid());
+    CHECK(count_parts(ecs) == 3);
+    CHECK(frame.effects.size() == 3);
+    const de::asset::AssetHandle effect = assets->find({.id = effect_id, .type = de::asset::AssetType::Effect});
+    CHECK(effect.is_valid()); // held by the prefab, which the cell holds
+
+    // The whole one's parts, in the prefab's order: each where the placement puts it, turned and sized with it, a
+    // root that never moves, and the placement's.
+    const auto parts_of = [&ecs](flecs::entity placement) {
+        std::vector<flecs::entity> parts;
+        de::world::each_prefab_part(ecs, placement.get<PrefabInstance>().first_part,
+                                    [&parts](flecs::entity part) { parts.push_back(part); });
+        return parts;
+    };
+    const std::vector<flecs::entity> two = parts_of(whole);
+    REQUIRE(two.size() == 2);
+    CHECK(two[0].get<PrefabPart>().index == 0);
+    CHECK(two[1].get<PrefabPart>().index == 1);
+    CHECK(two[0].get<PrefabPart>().placement == whole.id());
+    CHECK(de::world::placement_of(two[1]) == whole);
+    CHECK(de::world::placement_of(whole) == whole);
+    CHECK(two[0].has<de::world::StaticTransform>());
+    CHECK_FALSE(two[0].parent().is_valid());
+    CHECK(two[0].get<de::world::EffectInstance>().effect == effect);
+    const WorldTransform flame = two[0].get<WorldTransform>();
+    CHECK(near(flame.position.x, 5.0));
+    CHECK(near(flame.position.y, 1.4)); // 0.2 up, in a prefab twice the size
+    CHECK(near(flame.position.z, -3.0));
+    CHECK(flame.scale.x == 2.0f);
+    const WorldTransform spark = two[1].get<WorldTransform>();
+    CHECK(near(spark.position.x, 5.0)); // a meter along x, turned a quarter about y: along -z, twice as far
+    CHECK(near(spark.position.z, -5.0));
+    CHECK(near(two[1].get<de::world::PreviousWorldTransform>().value.position.z, -5.0)); // nothing slides in
+    // The variant leaves the spark out.
+    const std::vector<flecs::entity> one = parts_of(unlit);
+    REQUIRE(one.size() == 1);
+    CHECK(one[0].get<PrefabPart>().index == 0);
+    CHECK(near(one[0].get<WorldTransform>().position.y, 0.2));
+
+    // Put somewhere else: its parts go with it, in the same frame.
+    de::world::place(whole,
+                     Transform{.position = {8.0, 1.0, -3.0}, .rotation = yaw_deg(90.0f), .scale = {2.0f, 2.0f, 2.0f}});
+    world->advance(0.0);
+    CHECK(near(two[0].get<WorldTransform>().position.x, 8.0));
+    CHECK(near(two[1].get<WorldTransform>().position.x, 8.0));
+    CHECK(near(two[1].get<WorldTransform>().position.z, -5.0));
+    CHECK(count_parts(ecs) == 3);
+
+    // One placed outside a cell (the editor, gameplay): it waits for its parts, and has them by the next frame.
+    const flecs::entity made =
+        ecs.entity()
+            .add<de::world::StaticTransform>()
+            .set(PrefabInstance{.prefab = assets->find({.id = prefab_id, .type = de::asset::AssetType::Prefab})})
+            .add<de::world::PrefabPending>();
+    de::world::place(made, Transform{.position = {-4.0, 0.0, 0.0}});
+    world->advance(0.0);
+    CHECK_FALSE(made.has<de::world::PrefabPending>());
+    REQUIRE(parts_of(made).size() == 2);
+    CHECK(near(parts_of(made)[1].get<WorldTransform>().position.x, -3.0));
+    CHECK(frame.effects.size() == 5);
+    // Gone: its parts with it.
+    made.destruct();
+    world->advance(0.0);
+    CHECK(count_parts(ecs) == 3);
+    CHECK(frame.effects.size() == 3);
+
+    // The prefab cooked again, its flame higher: every placement's parts are made again from it, where it stands.
+    put_prefab(vfs, prefab_id, effect_id, 0.5f);
+    for (int i = 0; i < 4 && assets->stats().reloads == 0; ++i) {
+        assets->update();
+        assets->wait_all();
+    }
+    REQUIRE(assets->stats().reloads == 1);
+    world->advance(1.0 / 60.0); // noticed, and marked
+    world->advance(0.0);
+    CHECK_FALSE(two[0].is_alive());
+    CHECK(count_parts(ecs) == 3);
+    const std::vector<flecs::entity> again = parts_of(whole);
+    REQUIRE(again.size() == 2);
+    CHECK(near(again[0].get<WorldTransform>().position.x, 8.0));
+    CHECK(near(again[0].get<WorldTransform>().position.y, 2.0)); // 0.5 up, twice the size, from y 1
+
+    // The cell gone: its placements, and their parts with them.
+    cell.destruct();
+    world->advance(0.0);
+    assets->update();
+    CHECK(count_parts(ecs) == 0);
+    CHECK(frame.effects.empty());
+    CHECK_FALSE(assets->find({.id = prefab_id, .type = de::asset::AssetType::Prefab}).is_valid());
+}
+
+TEST_CASE("benchmark: two thousand placed prefabs of four parts, spawned with their cell and deleted with it") {
+    const de::test::Sandbox sandbox;
+    de::core::JobSystem jobs({.worker_count = 2});
+    de::platform::Vfs vfs = sandbox.make_vfs({.jobs = &jobs, .game_writable = true});
+    const de::asset::AssetId cell_id = de::asset::AssetId::from_value(0xc0);
+    const de::asset::AssetId prefab_id = de::asset::AssetId::from_value(0xc1);
+    const de::asset::AssetId effect_id = de::asset::AssetId::from_value(0xc2);
+    put_flame(vfs, effect_id);
+    constexpr uint32_t kPlacements = 2000;
+    constexpr uint32_t kParts = 4;
+    {
+        de::cooker::PrefabBuild build;
+        build.dependencies.push({.id = effect_id, .type = de::asset::AssetType::Effect});
+        for (uint32_t p = 0; p < kParts; ++p) {
+            build.names.push(static_cast<char>('a' + p));
+            build.parts.push({.position = {static_cast<float>(p), 0.0f, 0.0f},
+                              .effect = 0,
+                              .name_offset = p,
+                              .name_length = 1,
+                              .id = p + 1});
+        }
+        const auto prefab = de::cooker::cook_prefab(build, prefab_id);
+        REQUIRE(vfs.write_file(de::asset::cooked_path(prefab_id, de::asset::AssetType::Prefab).c_str(), prefab.span())
+                    .ok());
+        de::cooker::CellBuild cell;
+        cell.prefabs.push({.id = prefab_id, .type = de::asset::AssetType::Prefab});
+        for (uint32_t i = 0; i < kPlacements; ++i) {
+            const uint32_t column = i % 50; // rows of fifty, 2 m apart
+            const uint32_t row = i / 50;
+            cell.entities.push({.position = {static_cast<double>(column) * 2.0, 0.0, static_cast<double>(row) * 2.0},
+                                .flags = de::asset::CellEntityFlags::Static,
+                                .prefab = 0});
+        }
+        const auto cooked = de::cooker::cook_cell(cell, cell_id);
+        REQUIRE(
+            vfs.write_file(de::asset::cooked_path(cell_id, de::asset::AssetType::Cell).c_str(), cooked.span()).ok());
+    }
+    auto assets = de::asset::AssetRegistry::create({.vfs = &vfs, .jobs = &jobs, .hot_reload = false});
+    REQUIRE(assets.ok());
+    auto world = World::create({.jobs = &jobs, .assets = &*assets});
+    REQUIRE(world.ok());
+    flecs::world& ecs = world->ecs();
+    world->advance(1.0 / 60.0);
+    const flecs::entity cell = de::world::load_cell(ecs, cell_id);
+    assets->wait_all();
+    const auto clock = [] { return std::chrono::steady_clock::now(); };
+    const auto ms_since = [&clock](std::chrono::steady_clock::time_point start) {
+        return std::chrono::duration<double, std::milli>(clock() - start).count();
+    };
+    auto start = clock();
+    world->advance(1.0 / 60.0); // the cell's members and their parts, and the first extraction
+    const double spawn_ms = ms_since(start);
+    CHECK(count_parts(ecs) == static_cast<int>(kPlacements * kParts));
+    CHECK(world->render_frame().effects.size() == kPlacements * kParts);
+    start = clock();
+    constexpr int kFrames = 60;
+    for (int i = 0; i < kFrames; ++i) {
+        world->advance(1.0 / 60.0);
+    }
+    const double frame_ms = ms_since(start) / kFrames;
+    start = clock();
+    cell.destruct();
+    world->advance(1.0 / 60.0);
+    const double delete_ms = ms_since(start);
+    CHECK(count_parts(ecs) == 0);
+    MESSAGE(kPlacements, " placements of ", kParts, " parts (", kPlacements * (kParts + 1), " entities): spawned in ",
+            spawn_ms, " ms (", spawn_ms * 1000.0 / kPlacements, " ms per thousand placements), ", frame_ms,
+            " ms a frame while they stand, deleted in ", delete_ms, " ms");
 }
